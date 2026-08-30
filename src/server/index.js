@@ -18,6 +18,19 @@ function serializeDate(value) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function publicEpisodeGroups(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((group) => ({
+      start: Number(group?.start),
+      end: Number(group?.end),
+      label: cleanText(group?.label, 50),
+      fileCount: Math.max(1, Number(group?.fileCount) || 1)
+    }))
+    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
+    .slice(0, 100);
+}
+
 export function toPublicContent(content, config) {
   if (!content) return null;
   const category = categoryDetails(content.category);
@@ -41,6 +54,8 @@ export function toPublicContent(content, config) {
     posterUrl: content.posterUrl || null,
     backdropUrl: content.backdropUrl || content.posterUrl || null,
     filesCount: Number(content.filesCount) || 0,
+    episodeGroups: publicEpisodeGroups(content.episodeGroups),
+    episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
     publishedAt: serializeDate(content.publishedAt),
     telegramUrl: deliveryUrl,

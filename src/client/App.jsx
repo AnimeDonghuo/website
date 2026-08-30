@@ -276,6 +276,7 @@ function DetailPage({ onGetFiles }) {
               <div className="detail-facts">
                 {item.year ? <span><Icon name="calendar" size={15} /> {item.year}</span> : null}
                 {item.releaseLabel ? <span><Icon name="clock" size={15} /> {item.releaseLabel}</span> : null}
+                {item.episodeCount ? <span><Icon name="layers" size={15} /> {item.episodeCount} episode{item.episodeCount === 1 ? '' : 's'}</span> : null}
                 <span><Icon name="layers" size={15} /> {item.filesCount || '—'} file{item.filesCount === 1 ? '' : 's'}</span>
               </div>
               {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
@@ -303,6 +304,22 @@ function DetailPage({ onGetFiles }) {
           <button className="text-link" type="button" onClick={() => onGetFiles(item)}>Open delivery guide <Icon name="arrow" size={16} /></button>
         </div>
       </section>
+
+      {item.episodeGroups?.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
+        <div className="episode-section__heading">
+          <div><Eyebrow>SMART EPISODE INDEX</Eyebrow><h2 id="episode-guide-title">Episode <em>guide.</em></h2></div>
+          <span>{item.episodeCount || item.episodeGroups.length} indexed episode{(item.episodeCount || item.episodeGroups.length) === 1 ? '' : 's'}</span>
+        </div>
+        <div className="episode-grid">
+          {item.episodeGroups.map((group) => <div className="episode-card" key={`${group.start}-${group.end}`}>
+            <span className={`episode-card__number ${group.start === group.end ? '' : 'episode-card__number--range'}`}>{group.start === group.end ? `EP ${String(group.start).padStart(2, '0')}` : `${String(group.start).padStart(2, '0')}–${String(group.end).padStart(2, '0')}`}</span>
+            <strong>{group.label}</strong>
+            <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
+            <Icon name="telegram" size={15} />
+          </div>)}
+        </div>
+        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Open Telegram delivery to receive the listed files.</p>
+      </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">
         <div className="section-heading"><div><Eyebrow>MORE IN {item.categoryLabel.toUpperCase()}</Eyebrow><h2 id="related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>

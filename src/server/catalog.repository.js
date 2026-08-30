@@ -1,6 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
-import { CATEGORY_IDS, cleanText, makeShareCode, slugify } from './lib/strings.js';
+import { CATEGORY_IDS, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
+import { summarizeEpisodes } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 
@@ -18,7 +19,7 @@ function escapeRegex(value) {
 
 function searchPredicate(item, query) {
   if (!query) return true;
-  const haystack = [
+  const haystack = item.searchText || [
     item.title,
     item.description,
     ...(item.genres || []),
@@ -28,7 +29,7 @@ function searchPredicate(item, query) {
     .join(' ')
     .toLowerCase();
 
-  return haystack.includes(query.toLowerCase());
+  return query.toLowerCase().split(/\s+/).filter(Boolean).every((term) => haystack.includes(term));
 }
 
 function sortByPublishedAt(items) {
@@ -43,28 +44,52 @@ function normalizeContent(input) {
   const category = CATEGORY_IDS.has(input.category) ? input.category : 'movie';
   const files = Array.isArray(input.files) ? input.files : [];
   const parsedYear = Number.parseInt(input.year, 10);
+  const languages = Array.isArray(input.languages)
+    ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : [];
+  const genres = Array.isArray(input.genres)
+    ? input.genres.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : [];
+  const description = cleanText(input.description, 1400);
+  const episodeSummary = summarizeEpisodes(files);
+  const suppliedEpisodeGroups = Array.isArray(input.episodeGroups)
+    ? input.episodeGroups
+      .map((group) => ({
+        start: Number(group?.start),
+        end: Number(group?.end),
+        label: cleanText(group?.label, 50),
+        fileCount: Math.max(1, Number(group?.fileCount) || 1)
+      }))
+      .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
+      .slice(0, 100)
+    : [];
+  const episodeGroups = episodeSummary.groups.length ? episodeSummary.groups : suppliedEpisodeGroups;
+  const suppliedEpisodeCount = Number(input.episodeCount);
+  const episodeCount = episodeSummary.count || (Number.isInteger(suppliedEpisodeCount) && suppliedEpisodeCount >= 0 ? suppliedEpisodeCount : 0);
+  const suppliedFilesCount = Number.isInteger(Number(input.filesCount)) ? Number(input.filesCount) : 0;
+  const filesCount = files.length || suppliedFilesCount;
 
   return {
     title,
     category,
     year: Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5 ? parsedYear : null,
-    languages: Array.isArray(input.languages)
-      ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
-      : [],
-    genres: Array.isArray(input.genres)
-      ? input.genres.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
-      : [],
-    description: cleanText(input.description, 1400),
+    languages,
+    genres,
+    description,
     status: cleanText(input.status, 60) || 'New release',
-    releaseLabel: cleanText(input.releaseLabel, 80) || (files.length === 1 ? 'Feature' : `${files.length} files`),
+    releaseLabel: cleanText(input.releaseLabel, 80) || episodeSummary.releaseLabel || (files.length === 1 ? 'Feature' : `${files.length} files`),
     posterUrl: input.posterUrl || null,
     backdropUrl: input.backdropUrl || input.posterUrl || null,
     poster: input.poster || null,
+    metadataProvider: cleanText(input.metadataProvider, 30) || null,
     tmdbId: input.tmdbId || null,
     art: input.art || null,
     files,
-    filesCount: files.length || (Number.isInteger(Number(input.filesCount)) ? Number(input.filesCount) : 0),
+    filesCount,
     hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
+    episodeGroups,
+    episodeCount,
+    searchText: [title, description, category, ...languages, ...genres].join(' ').toLowerCase(),
     featured: Boolean(input.featured),
     published: true,
     publishedAt: input.publishedAt || now,
@@ -85,11 +110,15 @@ export class MemoryCatalogRepository {
           id: item.id || `memory-${item.slug}`,
           slug: item.slug,
           shareCode: item.shareCode || makeShareCode(),
+          adminId: item.adminId || makeReference('SB'),
           deliveryCount: item.deliveryCount || 0
         }];
       })
     );
     this.sessions = new Map();
+    this.adminSessions = new Map();
+    this.requests = new Map();
+    this.announcementChannels = new Map();
   }
 
   async init() {}
@@ -114,6 +143,18 @@ export class MemoryCatalogRepository {
     return item ? clone(item) : null;
   }
 
+  async findContentByAdminId(adminId) {
+    const item = [...this.contents.values()].find((entry) => entry.adminId === String(adminId).toUpperCase());
+    return item ? clone(item) : null;
+  }
+
+  async deleteContentByAdminId(adminId) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    this.contents.delete(item.slug);
+    return item;
+  }
+
   async createContent(input) {
     const baseSlug = slugify(input.title);
     let suffix = 0;
@@ -127,7 +168,8 @@ export class MemoryCatalogRepository {
       ...normalizeContent(input),
       id: `memory-${makeShareCode()}`,
       slug,
-      shareCode: makeShareCode()
+      shareCode: makeShareCode(),
+      adminId: makeReference('SB')
     };
     this.contents.set(slug, content);
     return clone(content);
@@ -195,6 +237,78 @@ export class MemoryCatalogRepository {
     this.sessions.delete(sessionKey(chatId, ownerId));
   }
 
+  async createAdminSession({ chatId, ownerId, expiresAt }) {
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(expiresAt).toISOString()
+    };
+    this.adminSessions.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findAdminSession(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.adminSessions.get(key);
+    if (!session) return null;
+    if (new Date(session.expiresAt).getTime() <= Date.now()) {
+      this.adminSessions.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteAdminSession(chatId, ownerId) {
+    this.adminSessions.delete(sessionKey(chatId, ownerId));
+  }
+
+  async createRequest({ requestText, requester }) {
+    const request = {
+      id: makeReference('REQ'),
+      requestText: cleanText(requestText, 500),
+      requester: {
+        id: String(requester?.id || ''),
+        username: cleanText(requester?.username || '', 60),
+        name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
+      },
+      status: 'open',
+      createdAt: new Date().toISOString()
+    };
+    this.requests.set(request.id, request);
+    return clone(request);
+  }
+
+  async listRequests(limit = 12) {
+    return [...this.requests.values()]
+      .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 12, 30)))
+      .map(clone);
+  }
+
+  async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {
+    const channel = {
+      channelId: String(channelId),
+      title: cleanText(title, 120),
+      username: cleanText(username, 80),
+      addedBy: String(addedBy),
+      addedAt: new Date().toISOString()
+    };
+    this.announcementChannels.set(channel.channelId, channel);
+    return clone(channel);
+  }
+
+  async listAnnouncementChannels() {
+    return [...this.announcementChannels.values()].sort((first, second) => first.title.localeCompare(second.title)).map(clone);
+  }
+
+  async removeAnnouncementChannel(channelId) {
+    const key = String(channelId);
+    const channel = this.announcementChannels.get(key);
+    this.announcementChannels.delete(key);
+    return channel ? clone(channel) : null;
+  }
+
   async close() {}
 }
 
@@ -206,16 +320,25 @@ export class MongoCatalogRepository {
     this.db = db;
     this.contents = db.collection('content');
     this.sessions = db.collection('upload_sessions');
+    this.adminSessions = db.collection('admin_sessions');
+    this.requests = db.collection('requests');
+    this.announcementChannels = db.collection('announcement_channels');
   }
 
   async init() {
     await Promise.all([
       this.contents.createIndex({ slug: 1 }, { unique: true }),
       this.contents.createIndex({ shareCode: 1 }, { unique: true }),
+      this.contents.createIndex({ adminId: 1 }, { unique: true }),
       this.contents.createIndex({ publishedAt: -1 }),
       this.contents.createIndex({ category: 1, publishedAt: -1 }),
       this.sessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
-      this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+      this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.adminSessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.adminSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.requests.createIndex({ id: 1 }, { unique: true }),
+      this.requests.createIndex({ status: 1, createdAt: -1 }),
+      this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
   }
 
@@ -225,13 +348,19 @@ export class MongoCatalogRepository {
 
     const normalizedQuery = cleanText(query, 100);
     if (normalizedQuery) {
-      const expression = new RegExp(escapeRegex(normalizedQuery), 'i');
-      filter.$or = [
-        { title: expression },
-        { description: expression },
-        { genres: expression },
-        { languages: expression }
-      ];
+      const terms = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
+      filter.$and = terms.map((term) => {
+        const expression = new RegExp(escapeRegex(term), 'i');
+        return {
+          $or: [
+            { searchText: expression },
+            { title: expression },
+            { description: expression },
+            { genres: expression },
+            { languages: expression }
+          ]
+        };
+      });
     }
 
     return this.contents
@@ -252,6 +381,17 @@ export class MongoCatalogRepository {
     return this.contents.findOne({ shareCode, published: true });
   }
 
+  async findContentByAdminId(adminId) {
+    return this.contents.findOne({ adminId: String(adminId).toUpperCase() });
+  }
+
+  async deleteContentByAdminId(adminId) {
+    return this.contents.findOneAndDelete(
+      { adminId: String(adminId).toUpperCase() },
+      { includeResultMetadata: false }
+    );
+  }
+
   async createContent(input) {
     const baseSlug = slugify(input.title);
     for (let attempt = 0; attempt < 16; attempt += 1) {
@@ -259,7 +399,8 @@ export class MongoCatalogRepository {
       const document = {
         ...normalizeContent(input),
         slug: `${baseSlug}${suffix}`,
-        shareCode: makeShareCode()
+        shareCode: makeShareCode(),
+        adminId: makeReference('SB')
       };
 
       try {
@@ -341,6 +482,90 @@ export class MongoCatalogRepository {
 
   async deleteSession(chatId, ownerId) {
     await this.sessions.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async createAdminSession({ chatId, ownerId, expiresAt }) {
+    const now = new Date().toISOString();
+    const result = await this.adminSessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: { createdAt: now, expiresAt: new Date(expiresAt) },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId) }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async findAdminSession(chatId, ownerId) {
+    return this.adminSessions.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteAdminSession(chatId, ownerId) {
+    await this.adminSessions.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async createRequest({ requestText, requester }) {
+    const document = {
+      id: makeReference('REQ'),
+      requestText: cleanText(requestText, 500),
+      requester: {
+        id: String(requester?.id || ''),
+        username: cleanText(requester?.username || '', 60),
+        name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
+      },
+      status: 'open',
+      createdAt: new Date().toISOString()
+    };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        await this.requests.insertOne(document);
+        return document;
+      } catch (error) {
+        if (error?.code !== 11000 || attempt === 7) throw error;
+        document.id = makeReference('REQ');
+      }
+    }
+    throw new Error('Could not create a request ID.');
+  }
+
+  async listRequests(limit = 12) {
+    return this.requests
+      .find({ status: 'open' })
+      .sort({ createdAt: -1 })
+      .limit(Math.max(1, Math.min(Number(limit) || 12, 30)))
+      .toArray();
+  }
+
+  async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {
+    const document = {
+      channelId: String(channelId),
+      title: cleanText(title, 120),
+      username: cleanText(username, 80),
+      addedBy: String(addedBy),
+      addedAt: new Date().toISOString()
+    };
+    await this.announcementChannels.updateOne(
+      { channelId: document.channelId },
+      { $set: document },
+      { upsert: true }
+    );
+    return document;
+  }
+
+  async listAnnouncementChannels() {
+    return this.announcementChannels.find({}).sort({ title: 1, addedAt: 1 }).toArray();
+  }
+
+  async removeAnnouncementChannel(channelId) {
+    return this.announcementChannels.findOneAndDelete(
+      { channelId: String(channelId) },
+      { includeResultMetadata: false }
+    );
   }
 
   async close() {

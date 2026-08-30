@@ -38,7 +38,7 @@ export default function DeliveryDialog({ item, onClose }) {
         <div className="delivery-dialog__stamp"><Icon name="telegram" size={21} /></div>
         <p className="eyebrow">TELEGRAM DELIVERY</p>
         <h2 id="delivery-title">Get <em>{item.title}</em> in the bot</h2>
-        <p className="delivery-dialog__intro">Files are delivered privately by the catalog bot. The website never stores your media files.</p>
+        <p className="delivery-dialog__intro">{item.episodeCount ? `${item.episodeCount} indexed episode${item.episodeCount === 1 ? '' : 's'} and ` : ''}files are delivered privately by the catalog bot. The website never stores your media files.</p>
 
         <ol className="delivery-steps">
           <li><span>1</span><p><strong>Open the delivery bot</strong><br />Telegram verifies the link and opens a private chat.</p></li>

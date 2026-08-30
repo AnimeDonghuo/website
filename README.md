@@ -19,8 +19,9 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
 - Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, related releases, and a polished Telegram delivery dialog
-- Safe public API responses: no Telegram file IDs, database-channel IDs, or storage-message IDs are exposed
+- Dedicated details pages with metadata, tags, availability labels, smart episode index, related releases, and a polished Telegram delivery dialog
+- Search that supports multi-word title, genre, and language matching
+- Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
 
 ### Telegram publisher bot
@@ -34,12 +35,17 @@ A production-minded, responsive catalog for **media you are authorized to distri
   - `/series Title`
 - Start a draft, send the title, upload files in the same private bot chat, then use `/done`
 - Optional metadata commands: `/lang`, `/year`, `/genres`, `/description`, and `/poster`
-- Automatic TMDB title/poster/synopsis matching when a TMDB key is configured
+- Category-aware metadata fallback chain: AniList for Anime/Donghua, TMDB, then OMDb when configured
 - Server-side poster download validation, then permanent ImgBB upload during publishing
-- A generated PNG fallback poster is also uploaded to ImgBB if TMDB has no suitable match
+- A generated PNG fallback poster is also uploaded to ImgBB if no provider has suitable artwork
+- Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
+- Post pages show a safe, public episode index while storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
-- Admin-only publishing using `TELEGRAM_ADMIN_IDS`; anyone else can only receive a delivery
-- Draft sessions survive restarts when MongoDB is configured and expire automatically after 48 hours
+- Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
+- Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel
+- Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and delivery button
+- Every post receives a private `SB-…` Post ID which a logged-in publisher can remove with `/delete SB-…`
+- Draft/login sessions survive restarts when MongoDB is configured and expire automatically
 
 ---
 
@@ -55,7 +61,7 @@ Telegram bot ──copies media──► Private Telegram database channel
    ▼                                  ▼
 MongoDB ◄──── SoraBox Node service ───┘
    │            │
-   │            ├─ looks up title/poster from TMDB (optional)
+   │            ├─ looks up title/poster via AniList → TMDB → OMDb fallbacks
    │            └─ mirrors poster once to ImgBB
    ▼
 React catalog ──opens deep link──► Telegram bot ──copyMessage──► visitor chat
@@ -115,11 +121,17 @@ The app creates its indexes automatically. `content` stores published catalog re
 TELEGRAM_BOT_TOKEN=your_botfather_token
 TELEGRAM_BOT_USERNAME=YourBotUsernameWithoutTheAtSign
 TELEGRAM_STORAGE_CHANNEL_ID=-1001234567890
+# Optional separate private channel for user requests; otherwise storage channel is used.
+TELEGRAM_REQUEST_CHANNEL_ID=-1001234567890
+# Optional allowlist. If set, only these IDs may successfully use /login.
 TELEGRAM_ADMIN_IDS=123456789,987654321
+# Required publisher passcode; set your desired value as a Koyeb secret (for example, AYU).
+ADMIN_LOGIN_CODE=your_private_publisher_passcode
+ADMIN_SESSION_HOURS=24
 TELEGRAM_MODE=polling
 ```
 
-`TELEGRAM_ADMIN_IDS` is important: if it is empty, nobody can publish. Use a comma-separated allowlist of numeric Telegram user IDs, not usernames.
+`ADMIN_LOGIN_CODE` is required to unlock publishing. A logged-in publisher session expires automatically after the configured number of hours. `TELEGRAM_ADMIN_IDS` is an optional additional safety layer: when it is populated, only those numeric Telegram user IDs can log in even if somebody knows the passcode. When it is empty, the passcode itself controls access.
 
 ### 4. Configure permanent ImgBB posters
 
@@ -131,40 +143,49 @@ IMGBB_API_KEY=your_imgbb_server_key
 
 At `/done`, the server does this once:
 
-1. Uses the selected/manual/TMDB poster if available.
+1. Uses the selected/manual/AniList/TMDB/OMDb poster if available.
 2. Validates the source is a public HTTPS image and limits it to 8 MB.
 3. Uploads a copy to ImgBB.
 4. Saves only the hosted ImgBB URL and non-sensitive provider metadata in MongoDB.
 
 If automatic matching finds no poster, SoraBox generates a branded fallback PNG and uploads that to ImgBB instead. This keeps the poster path hosted externally and avoids loading Koyeb storage.
 
-### 5. Optional: enable automatic TMDB metadata
+### 5. Optional: enable automatic metadata and artwork matching
 
-Create a TMDB API key or read-access token and configure one of:
+SoraBox uses a category-aware fallback chain before it generates a fallback poster:
+
+1. **AniList** for Anime and Donghua — public GraphQL, no API key needed.
+2. **TMDB** for Movies, K-Drama, Cartoons, Web Series, and as an animation fallback.
+3. **OMDb** as a movie/series fallback if TMDB has no usable result.
+
+Configure TMDB and/or OMDb for the fullest coverage:
 
 ```dotenv
 TMDB_API_KEY=your_tmdb_api_key
 # or
 TMDB_READ_ACCESS_TOKEN=your_tmdb_read_access_token
+OMDB_API_KEY=your_omdb_api_key
 ```
 
-TMDB is optional. Without it, publisher-entered titles still work and receive a permanent ImgBB fallback poster. With it, the bot tries to populate the canonical title, year, synopsis, genre labels, and poster source before publishing.
+The first confident provider result supplies the canonical title, year, synopsis, genres, language labels where available, and poster source. The source image is still copied to ImgBB at publishing time. If every provider misses, publishing continues with the publisher-entered title and a generated ImgBB-hosted poster.
 
 ---
 
 ## Publishing through Telegram
 
-The shortest workflow is exactly this:
+A normal user sees a welcome screen plus `/request`. Publisher commands are unavailable until they unlock a session:
 
 ```text
+/login your_private_publisher_passcode
 /movie Red Sand Signal
 [upload one or more files]
 /done
 ```
 
-Or use a guided title step:
+Or use the guided title step:
 
 ```text
+/login your_private_publisher_passcode
 /cartoon
 Pocket Planet
 [upload one or more files]
@@ -173,21 +194,29 @@ Pocket Planet
 /done
 ```
 
+For episode-based posts, use a descriptive media caption such as `Perfect World @yourchannel — Ep 1 To 5`. The parser removes the Telegram attribution and checks this caption before trying the filename. It recognizes individual episodes and episode ranges, then renders a safe episode guide on the public post page.
+
 Useful commands:
 
 | Command | Purpose |
 | --- | --- |
-| `/panel` | Open category buttons and draft controls |
+| `/request Perfect World Hindi` | Public command: send a request to MongoDB and the private request/database channel |
+| `/login passcode` / `/logout` | Unlock or end the expiring publisher session |
+| `/panel` | Open category buttons and draft controls after login |
 | `/anime`, `/cartoon`, `/donghua`, `/kdrama`, `/movie`, `/series` | Start a category draft; title may follow the command |
-| `/title Title` | Replace a draft title and re-run metadata lookup |
+| `/title Title` | Replace a draft title and re-run provider lookup |
 | `/lang Hindi, English` | Set public language labels |
 | `/year 2026` | Set the release year |
 | `/genres Action, Fantasy` | Set public genre labels |
 | `/description …` | Set a public synopsis |
 | `/poster https://…` | Override automatic artwork with a public HTTPS image |
-| `/status` | See the active draft state |
+| `/status` | See the active draft state and detected episode index |
 | `/cancel` | Discard the active draft |
-| `/done` | Mirror the poster, create the MongoDB record, and return the share link |
+| `/done` | Mirror poster, create MongoDB record, announce to every configured channel, and return share + Post ID |
+| `/delete SB-0123ABCDEF` | Remove a published catalog record and disable its deep link |
+| `/addchannel -1001234567890` | Add a channel for automatic professional new-post announcements |
+| `/channels` / `/removechannel ID` | View or remove announcement destinations |
+| `/requests` | Review the latest open user requests |
 
 When publishing succeeds, the bot replies with a URL like:
 
@@ -195,7 +224,19 @@ When publishing succeeds, the bot replies with a URL like:
 https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 ```
 
-Put that generated URL behind the site's **Get files on Telegram** button. The public site builds it from the record's short delivery code, and the bot resolves it privately. The user never sees the storage channel or raw Telegram file IDs.
+The public site automatically builds this URL behind the **Get files on Telegram** button from the record's short delivery code, and the bot resolves it privately. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
+
+### Automatic announcement channels
+
+After logging in, add every destination where you want polished new-release cards to appear:
+
+```text
+/addchannel -1001234567890
+/addchannel -1009876543210
+/channels
+```
+
+The bot verifies that the target is a Telegram channel it can access, stores it in MongoDB, and then sends every future published item to every saved channel. Each announcement includes the permanent ImgBB poster, category/title/metadata, episode or file summary, synopsis, and a deep-link delivery button. Use `/removechannel <channel_id>` to stop future announcements. The bot needs administrator rights in each destination channel.
 
 ---
 
@@ -221,11 +262,15 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `TELEGRAM_BOT_TOKEN` | Secret | Yes | BotFather token |
 | `TELEGRAM_BOT_USERNAME` | Plaintext | Yes | No leading `@` |
 | `TELEGRAM_STORAGE_CHANNEL_ID` | Secret or plaintext | Yes | Private channel numeric ID |
-| `TELEGRAM_ADMIN_IDS` | Secret or plaintext | Yes | CSV numeric admin IDs |
+| `TELEGRAM_REQUEST_CHANNEL_ID` | Secret or plaintext | No | Separate private request channel; defaults to storage channel |
+| `ADMIN_LOGIN_CODE` | Secret | Yes | Publisher passcode; use your chosen value, not a client variable |
+| `ADMIN_SESSION_HOURS` | Plaintext | No | Defaults to `24` |
+| `TELEGRAM_ADMIN_IDS` | Secret or plaintext | No | Optional CSV numeric login allowlist |
 | `TELEGRAM_MODE` | Plaintext | Yes | `polling` |
-| `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN` | Secret | Recommended | Enables automatic metadata/posters |
+| `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN` | Secret | Recommended | Enables broader automatic metadata/posters |
+| `OMDB_API_KEY` | Secret | Optional | Movie/series metadata fallback |
 
-Koyeb's default route/port conventions also recognize port 8000, but setting it explicitly makes the service configuration clear. Keep the bot token, ImgBB key, TMDB credential, and MongoDB URI in Koyeb's secret store rather than in Git.
+Koyeb's default route/port conventions also recognize port 8000, but setting it explicitly makes the service configuration clear. Keep the bot token, publisher passcode, ImgBB key, TMDB/OMDb credentials, and MongoDB URI in Koyeb's secret store rather than in Git.
 
 ### Why it fits a small Koyeb instance
 

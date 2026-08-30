@@ -86,6 +86,13 @@ export const demoContent = [
     status: 'Ongoing',
     releaseLabel: 'Episode 24',
     filesCount: 24,
+    episodeCount: 24,
+    episodeGroups: [
+      { start: 1, end: 6, label: 'Episodes 01–06', fileCount: 1 },
+      { start: 7, end: 12, label: 'Episodes 07–12', fileCount: 1 },
+      { start: 13, end: 18, label: 'Episodes 13–18', fileCount: 1 },
+      { start: 19, end: 24, label: 'Episodes 19–24', fileCount: 1 }
+    ],
     art: { tone: 'cyan', mark: 'JC', motif: 'jade' },
     publishedAt: daysAgo(4)
   },

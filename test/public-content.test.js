@@ -19,5 +19,6 @@ test('public serialization creates a deep link and hides storage file metadata',
   assert.match(publicRecord.telegramUrl, /^https:\/\/t\.me\/ExampleDeliveryBot\?start=get-/);
   assert.equal(publicRecord.files, undefined);
   assert.equal(publicRecord.telegramFileId, undefined);
+  assert.equal(publicRecord.adminId, undefined);
   assert.equal(publicRecord.filesCount, 1);
 });

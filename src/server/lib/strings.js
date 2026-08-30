@@ -37,6 +37,10 @@ export function makeShareCode() {
   return crypto.randomBytes(7).toString('base64url');
 }
 
+export function makeReference(prefix = 'SB') {
+  return `${prefix}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
+}
+
 export function cleanText(value, maxLength = 280) {
   return String(value || '')
     .replace(/[\u0000-\u001F\u007F]/g, ' ')

@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
+import { summarizeEpisodes, detectUploadEpisode } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
@@ -14,12 +16,32 @@ function chatId(ctx) {
   return ctx.chat?.id;
 }
 
-function isAdmin(ctx, config) {
+function categoryCommandLabel(category) {
+  return category === 'web-series' ? 'series' : category;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function hasAllowedPublisherId(ctx, config) {
   return Boolean(userId(ctx) && isTelegramAdmin(config, userId(ctx)));
 }
 
-function categoryCommandLabel(category) {
-  return category === 'web-series' ? 'series' : category;
+async function isPublisher(ctx, repository, config) {
+  if (!hasAllowedPublisherId(ctx, config) || !config.adminLoginCode) return false;
+  return Boolean(await repository.findAdminSession(chatId(ctx), userId(ctx)));
+}
+
+function sameSecret(candidate, expected) {
+  if (!candidate || !expected) return false;
+  const candidateBytes = Buffer.from(String(candidate));
+  const expectedBytes = Buffer.from(String(expected));
+  return candidateBytes.length === expectedBytes.length && crypto.timingSafeEqual(candidateBytes, expectedBytes);
 }
 
 function panelKeyboard() {
@@ -51,37 +73,86 @@ function deliveryKeyboard(url) {
     : undefined;
 }
 
-function welcomeText(admin) {
-  if (admin) {
-    return [
-      'SoraBox publisher is ready.',
-      '',
-      'Start with a category below or send /movie Title. Then upload the files one by one and use /done.',
-      'The poster is matched automatically when possible, mirrored to ImgBB during publishing, and files are copied to your private Telegram storage channel.'
-    ].join('\n');
-  }
+const VISITOR_COMMANDS = [
+  { command: 'request', description: 'Request a title for the catalog' },
+  { command: 'login', description: 'Unlock publisher controls' },
+  { command: 'help', description: 'Get bot help' }
+];
 
+const PUBLISHER_COMMANDS = [
+  ...VISITOR_COMMANDS,
+  { command: 'panel', description: 'Open the publisher panel' },
+  { command: 'movie', description: 'New movie draft' },
+  { command: 'anime', description: 'New anime draft' },
+  { command: 'cartoon', description: 'New cartoon draft' },
+  { command: 'donghua', description: 'New donghua draft' },
+  { command: 'kdrama', description: 'New K-Drama draft' },
+  { command: 'series', description: 'New web series draft' },
+  { command: 'done', description: 'Publish current draft' },
+  { command: 'status', description: 'Show current draft' },
+  { command: 'delete', description: 'Delete a post by post ID' },
+  { command: 'addchannel', description: 'Add an announcement channel' },
+  { command: 'channels', description: 'List announcement channels' },
+  { command: 'removechannel', description: 'Remove an announcement channel' },
+  { command: 'requests', description: 'View open catalog requests' },
+  { command: 'logout', description: 'Lock publisher controls' }
+];
+
+async function setPublisherCommands(bot, ctx) {
+  try {
+    await bot.telegram.setMyCommands(PUBLISHER_COMMANDS, {
+      scope: { type: 'chat', chat_id: chatId(ctx) }
+    });
+  } catch (error) {
+    console.warn('[telegram] Could not set publisher command scope:', error?.message || 'Unknown error');
+  }
+}
+
+async function clearPublisherCommands(bot, ctx) {
+  try {
+    await bot.telegram.deleteMyCommands({ scope: { type: 'chat', chat_id: chatId(ctx) } });
+  } catch (error) {
+    console.warn('[telegram] Could not clear publisher command scope:', error?.message || 'Unknown error');
+  }
+}
+
+function publisherWelcomeText() {
   return [
+    'SoraBox publisher unlocked.',
+    '',
+    'Start with a category below or send /movie Title. Upload files to this private chat and finish with /done.',
+    'Artwork is matched from AniList, TMDB, or OMDb when available, then mirrored to ImgBB. Files are copied into the private storage channel.'
+  ].join('\n');
+}
+
+function visitorWelcomeText(canLogIn) {
+  const lines = [
     'Welcome to SoraBox.',
     '',
-    'Open a catalog delivery link to receive its available files here. This bot does not accept public uploads.'
-  ].join('\n');
+    'Open a catalog delivery link to receive its available files here.',
+    'Looking for something? Send /request followed by the title, series, movie, or other item you would like to see.'
+  ];
+  if (canLogIn) lines.push('', 'Publisher access is available with /login followed by your private passcode.');
+  return lines.join('\n');
 }
 
 function displayDraft(session) {
   const category = categoryDetails(session.category).label;
   const title = session.title || 'Waiting for title';
   const files = session.files?.length || 0;
-  const matched = session.metadata?.matched ? 'Auto-match ready' : 'Fallback artwork ready';
+  const matched = session.metadata?.matched ? `${String(session.metadata.provider || 'metadata').toUpperCase()} match ready` : 'Fallback artwork ready';
   const language = session.overrides?.languages?.length ? session.overrides.languages.join(', ') : 'Not set';
+  const episodeSummary = summarizeEpisodes(session.files || []);
 
   return [
     `Draft · ${category}`,
     `Title: ${title}`,
     `Files: ${files}`,
+    `Episodes: ${episodeSummary.releaseLabel || 'No episode labels detected yet'}`,
     `Poster: ${session.posterOriginalUrl ? 'Manual poster selected' : matched}`,
     `Languages: ${language}`,
     '',
+    'Caption episode labels are checked before filenames. Telegram @channel names are removed automatically.',
     'Upload more files, then use /done to publish.'
   ].join('\n');
 }
@@ -99,14 +170,23 @@ function fileFromMessage(message, storedMessageId) {
             ? 'photo'
             : 'file';
   const source = message.document || message.video || message.audio || message.animation || message.photo?.at(-1);
+  const filename = source?.file_name || `${kind}-${message.message_id}`;
+  const episode = detectUploadEpisode({ caption: message.caption, filename });
 
   return {
     storageMessageId,
     telegramFileId: source?.file_id || null,
-    name: cleanText(source?.file_name || `${kind}-${message.message_id}`, 180),
+    name: cleanText(filename, 180),
+    displayName: episode.displayName,
     mimeType: cleanText(source?.mime_type || '', 80),
     size: Number(source?.file_size) || 0,
     kind,
+    episode: episode.start ? {
+      start: episode.start,
+      end: episode.end,
+      label: episode.label,
+      source: episode.source
+    } : null,
     addedAt: new Date().toISOString()
   };
 }
@@ -129,6 +209,18 @@ function parseStartPayload(ctx) {
   return payload || '';
 }
 
+function normalizeChannelId(value) {
+  const parsed = cleanText(value, 80);
+  if (/^-?\d+$/.test(parsed)) return parsed;
+  if (/^@[A-Za-z][A-Za-z0-9_]{4,}$/i.test(parsed)) return parsed;
+  return null;
+}
+
+function episodeUploadNote(file) {
+  if (!file.episode?.label) return '';
+  return ` · ${file.episode.label} detected from ${file.episode.source}`;
+}
+
 async function updateTitleAndMetadata({ ctx, repository, config, title }) {
   const current = await repository.findSession(chatId(ctx), userId(ctx));
   if (!current) return null;
@@ -140,12 +232,12 @@ async function updateTitleAndMetadata({ ctx, repository, config, title }) {
 
   if (metadata.matched) {
     await ctx.reply(
-      `Title saved. I found “${metadata.title}” (${metadata.year || 'year unavailable'}). Upload files whenever you are ready.`,
+      `Title saved. ${String(metadata.provider || 'metadata').toUpperCase()} found “${metadata.title}” (${metadata.year || 'year unavailable'}). Upload files whenever you are ready.`,
       uploadKeyboard()
     );
   } else {
     await ctx.reply(
-      'Title saved. I could not confidently match it, so a branded fallback poster will be created and mirrored to ImgBB when you publish. Upload your files whenever you are ready.',
+      'Title saved. No confident metadata match was found, so a branded fallback poster will be created and mirrored to ImgBB when you publish. Upload files whenever you are ready.',
       uploadKeyboard()
     );
   }
@@ -153,7 +245,7 @@ async function updateTitleAndMetadata({ ctx, repository, config, title }) {
 }
 
 async function beginDraft(ctx, category, suppliedTitle, repository, config) {
-  const session = await repository.startSession({
+  await repository.startSession({
     chatId: chatId(ctx),
     ownerId: userId(ctx),
     category,
@@ -169,18 +261,28 @@ async function beginDraft(ctx, category, suppliedTitle, repository, config) {
     [
       `New ${categoryDetails(category).shortLabel} draft created.`,
       '',
-      'Send the title next. After that, upload the files directly to this chat and finish with /done.',
+      'Send the title next. After that, upload files directly to this chat and finish with /done.',
+      'Episode detection checks the clean caption first, strips @channel tags, then checks the filename.',
       'Optional: /lang Hindi, English · /year 2026 · /poster https://image.example/poster.jpg'
     ].join('\n'),
     uploadKeyboard()
   );
-  return session;
 }
 
-async function requireAdmin(ctx, config) {
-  if (isAdmin(ctx, config)) return true;
-  await ctx.reply('Publishing is restricted to the catalog administrators. Use a delivery link to request available files.');
-  return false;
+async function requirePublisher(ctx, repository, config) {
+  if (!hasAllowedPublisherId(ctx, config)) {
+    await ctx.reply('This is a delivery bot. Open a catalog link to receive files, or use /request to send the catalog team a request.');
+    return false;
+  }
+  if (!config.adminLoginCode) {
+    await ctx.reply('Publisher login is not configured yet. Add ADMIN_LOGIN_CODE as a server secret.');
+    return false;
+  }
+  if (!(await isPublisher(ctx, repository, config))) {
+    await ctx.reply('Publisher area is locked. Use /login followed by your private passcode first.');
+    return false;
+  }
+  return true;
 }
 
 async function showDraftStatus(ctx, repository) {
@@ -193,7 +295,64 @@ async function showDraftStatus(ctx, repository) {
   return session;
 }
 
-async function publishDraft(ctx, repository, config) {
+function announcementCaption(content) {
+  const episodeSummary = content.episodeCount ? `${content.episodeCount} episode${content.episodeCount === 1 ? '' : 's'}` : null;
+  const facts = [
+    content.year ? `📅 <b>Year:</b> ${content.year}` : null,
+    content.languages?.length ? `🗣 <b>Audio:</b> ${escapeHtml(content.languages.join(' · '))}` : null,
+    content.genres?.length ? `✦ <b>Genres:</b> ${escapeHtml(content.genres.join(' · '))}` : null,
+    episodeSummary ? `▣ <b>Included:</b> ${episodeSummary}` : `▣ <b>Delivery files:</b> ${content.filesCount}`
+  ].filter(Boolean);
+  const synopsis = cleanText(content.description, 420);
+
+  return [
+    `🎬 <b>NEW ${escapeHtml(String(content.categoryLabel || categoryDetails(content.category).label).toUpperCase())} DROP</b>`,
+    '',
+    `<b>${escapeHtml(content.title)}</b>`,
+    '━━━━━━━━━━━━━━━━',
+    ...facts,
+    synopsis ? '' : null,
+    synopsis ? escapeHtml(synopsis) : null,
+    '',
+    'Tap the button below for private Telegram delivery.'
+  ].filter((line) => line !== null).join('\n').slice(0, 1000);
+}
+
+async function announcePublishedContent({ bot, repository, content, config, deliveryUrl }) {
+  const channels = await repository.listAnnouncementChannels();
+  if (!channels.length) return { sent: 0, failed: 0 };
+
+  const keyboard = deliveryUrl ? Markup.inlineKeyboard([[Markup.button.url('📦 GET FILES', deliveryUrl)]]) : undefined;
+  const caption = announcementCaption(content);
+  let sent = 0;
+  let failed = 0;
+
+  for (const channel of channels) {
+    try {
+      await bot.telegram.sendPhoto(channel.channelId, content.posterUrl, {
+        caption,
+        parse_mode: 'HTML',
+        ...keyboard
+      });
+      sent += 1;
+    } catch (photoError) {
+      try {
+        await bot.telegram.sendMessage(channel.channelId, caption, {
+          parse_mode: 'HTML',
+          ...keyboard
+        });
+        sent += 1;
+      } catch (messageError) {
+        failed += 1;
+        console.error('[telegram] announcement failed:', channel.channelId, messageError?.description || messageError?.message || photoError?.message || 'Unknown error');
+      }
+    }
+  }
+
+  return { sent, failed };
+}
+
+async function publishDraft(ctx, bot, repository, config) {
   const session = await repository.findSession(chatId(ctx), userId(ctx));
   if (!session) {
     await ctx.reply('There is no active draft. Start one from /panel first.');
@@ -217,6 +376,7 @@ async function publishDraft(ctx, repository, config) {
   try {
     const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
     const overrides = session.overrides || {};
+    const episodeSummary = summarizeEpisodes(session.files);
     const posterResult = await mirrorPosterToImgBB({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
@@ -226,6 +386,7 @@ async function publishDraft(ctx, repository, config) {
     });
 
     const title = metadata.matched ? metadata.title : session.title;
+    const releaseLabel = overrides.releaseLabel || episodeSummary.releaseLabel || metadata.releaseLabel || `${session.files.length} files`;
     const content = await repository.createContent({
       title,
       category: session.category,
@@ -234,7 +395,7 @@ async function publishDraft(ctx, repository, config) {
       genres: overrides.genres || metadata.genres || [],
       description: overrides.description || metadata.description || '',
       status: overrides.status || metadata.status || 'New release',
-      releaseLabel: overrides.releaseLabel || metadata.releaseLabel || `${session.files.length} files`,
+      releaseLabel,
       posterUrl: posterResult.url,
       backdropUrl: posterResult.url,
       poster: {
@@ -244,6 +405,7 @@ async function publishDraft(ctx, repository, config) {
         source: posterResult.source,
         mirroredAt: new Date().toISOString()
       },
+      metadataProvider: metadata.provider,
       tmdbId: metadata.tmdbId,
       art: { tone: categoryDetails(session.category).tone },
       files: session.files
@@ -251,15 +413,36 @@ async function publishDraft(ctx, repository, config) {
     await repository.deleteSession(chatId(ctx), userId(ctx));
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
+    let announcements = { sent: 0, failed: 0, configured: false };
+    try {
+      const configuredChannels = await repository.listAnnouncementChannels();
+      announcements = {
+        ...(await announcePublishedContent({ bot, repository, content, config, deliveryUrl: url })),
+        configured: configuredChannels.length > 0
+      };
+    } catch (error) {
+      console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
+      announcements = { sent: 0, failed: 1, configured: true };
+    }
     const posterNote = posterResult.source === 'generated-fallback'
       ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
-      : 'The matched poster was mirrored to ImgBB.';
+      : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
+    const episodeNote = episodeSummary.releaseLabel ? `Episode index: ${episodeSummary.releaseLabel}.` : 'No episode labels were found; the post lists delivery files instead.';
+    const channelNote = announcements.sent
+      ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}.`
+      : announcements.configured
+        ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
+        : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
+
     await ctx.reply(
       [
         'Published successfully.',
         '',
-        `${content.title} is now live in the catalog with ${content.filesCount} file${content.filesCount === 1 ? '' : 's'}.`,
+        `${content.title} is now live with ${content.filesCount} file${content.filesCount === 1 ? '' : 's'}.`,
+        `Post ID: ${content.adminId} — delete later with /delete ${content.adminId}`,
+        episodeNote,
         posterNote,
+        channelNote,
         '',
         'Share this delivery link:',
         url
@@ -315,6 +498,31 @@ async function deliverContent(ctx, payload, repository, config) {
   }
 }
 
+async function logRequestToChannel(ctx, request, config) {
+  const channelId = config.telegram.requestChannelId || config.telegram.storageChannelId;
+  if (!channelId) return false;
+  const requester = request.requester?.username
+    ? `@${escapeHtml(request.requester.username)}`
+    : escapeHtml(request.requester?.name || 'Telegram user');
+  const caption = [
+    '📨 <b>NEW CATALOG REQUEST</b>',
+    '',
+    `<b>Request:</b> ${escapeHtml(request.requestText)}`,
+    `<b>Request ID:</b> ${escapeHtml(request.id)}`,
+    `<b>From:</b> ${requester}`,
+    `<b>User ID:</b> <code>${escapeHtml(request.requester?.id)}</code>`,
+    '',
+    'Use this private channel entry to review or fulfill the request.'
+  ].join('\n');
+  try {
+    await ctx.telegram.sendMessage(channelId, caption, { parse_mode: 'HTML' });
+    return true;
+  } catch (error) {
+    console.error('[telegram] request channel log failed:', error?.description || error?.message || 'Unknown error');
+    return false;
+  }
+}
+
 export async function launchTelegramBot({ config, repository }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
@@ -329,43 +537,83 @@ export async function launchTelegramBot({ config, repository }) {
       await deliverContent(ctx, payload, repository, config);
       return;
     }
-    await ctx.reply(welcomeText(isAdmin(ctx, config)), isAdmin(ctx, config) ? panelKeyboard() : undefined);
+    const publisher = await isPublisher(ctx, repository, config);
+    if (publisher) await setPublisherCommands(bot, ctx);
+    await ctx.reply(publisher ? publisherWelcomeText() : visitorWelcomeText(hasAllowedPublisherId(ctx, config)), publisher ? panelKeyboard() : undefined);
+  });
+
+  bot.command('login', async (ctx) => {
+    if (!hasAllowedPublisherId(ctx, config) || !config.adminLoginCode) {
+      await ctx.reply(visitorWelcomeText(false));
+      return;
+    }
+    const passcode = parseCommandArgument(ctx.message.text);
+    if (!sameSecret(passcode, config.adminLoginCode)) {
+      await ctx.reply('Login failed. Check the passcode and try again.');
+      return;
+    }
+    const expiresAt = new Date(Date.now() + config.adminSessionHours * 60 * 60 * 1000);
+    await repository.createAdminSession({ chatId: chatId(ctx), ownerId: userId(ctx), expiresAt });
+    await setPublisherCommands(bot, ctx);
+    await ctx.reply(`Publisher session unlocked for ${config.adminSessionHours} hour${config.adminSessionHours === 1 ? '' : 's'}.`, panelKeyboard());
+  });
+
+  bot.command('logout', async (ctx) => {
+    await repository.deleteAdminSession(chatId(ctx), userId(ctx));
+    await clearPublisherCommands(bot, ctx);
+    await ctx.reply('Publisher session locked. You can still open delivery links or use /request.');
+  });
+
+  bot.command('request', async (ctx) => {
+    const requestText = parseCommandArgument(ctx.message.text);
+    if (!requestText || requestText.length < 2) {
+      await ctx.reply('Tell us what you are looking for. Example: /request Perfect World season 1 Hindi');
+      return;
+    }
+    const request = await repository.createRequest({ requestText, requester: ctx.from });
+    const logged = await logRequestToChannel(ctx, request, config);
+    await ctx.reply(
+      logged
+        ? `Request received. Your reference is ${request.id}; the catalog team can review it now.`
+        : `Request received. Your reference is ${request.id}. It was saved for the catalog team.`
+    );
   });
 
   bot.command('help', async (ctx) => {
-    if (isAdmin(ctx, config)) {
+    if (await isPublisher(ctx, repository, config)) {
       await ctx.reply(
         [
           'Publisher quick guide',
           '1. /movie Title, /anime Title, /cartoon Title, /donghua Title, /kdrama Title, or /series Title',
           '2. Upload your files to this private chat',
-          '3. Use /done to make the catalog record and its Telegram delivery link',
+          '3. Use /done to create the catalog post, permanent ImgBB poster, delivery link, and channel announcements',
           '',
+          'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
           'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
-          'Use /status to inspect a draft and /cancel to discard it.'
+          'Management: /status · /cancel · /delete POST_ID · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
     } else {
-      await ctx.reply('Open a catalog delivery link to receive available files.');
+      await ctx.reply(visitorWelcomeText(hasAllowedPublisherId(ctx, config)));
     }
   });
 
   bot.command('panel', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await ctx.reply('Choose a category for a new draft.', panelKeyboard());
   });
 
   for (const category of PUBLISH_CATEGORIES) {
     const command = categoryCommandLabel(category);
     bot.command(command, async (ctx) => {
-      if (!(await requireAdmin(ctx, config))) return;
+      if (!(await requirePublisher(ctx, repository, config))) return;
       await beginDraft(ctx, category, parseCommandArgument(ctx.message.text), repository, config);
     });
   }
 
   bot.command('title', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const title = parseCommandArgument(ctx.message.text);
     if (!title) {
       await ctx.reply('Usage: /title Your release title');
@@ -380,7 +628,7 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('lang', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const languages = parseDelimitedList(parseCommandArgument(ctx.message.text));
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !languages.length) {
@@ -393,7 +641,7 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('year', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const year = Number.parseInt(parseCommandArgument(ctx.message.text), 10);
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !Number.isInteger(year) || year < 1888 || year > new Date().getFullYear() + 5) {
@@ -406,7 +654,7 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('genres', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const genres = parseDelimitedList(parseCommandArgument(ctx.message.text));
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !genres.length) {
@@ -419,7 +667,7 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('description', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const description = cleanText(parseCommandArgument(ctx.message.text), 1400);
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !description) {
@@ -432,7 +680,7 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('poster', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     const posterOriginalUrl = parseCommandArgument(ctx.message.text);
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !posterOriginalUrl.startsWith('https://')) {
@@ -444,48 +692,122 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.command('status', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await showDraftStatus(ctx, repository);
   });
 
   bot.command('cancel', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await repository.deleteSession(chatId(ctx), userId(ctx));
     await ctx.reply('Draft discarded. No catalog record was created.', panelKeyboard());
   });
 
   bot.command('done', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
-    await publishDraft(ctx, repository, config);
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await publishDraft(ctx, bot, repository, config);
+  });
+
+  bot.command('delete', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const adminId = parseCommandArgument(ctx.message.text).toUpperCase();
+    if (!/^SB-[A-F0-9]{10}$/.test(adminId)) {
+      await ctx.reply('Usage: /delete SB-0123ABCDEF\nUse the Post ID shown when the release was published.');
+      return;
+    }
+    const removed = await repository.deleteContentByAdminId(adminId);
+    if (!removed) {
+      await ctx.reply('No published post was found with that ID.');
+      return;
+    }
+    await ctx.reply(
+      `Deleted “${removed.title}” from the public catalog. Its delivery link no longer resolves. The original files remain in the private storage channel so you can manage them separately.`
+    );
+  });
+
+  bot.command('addchannel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedId = normalizeChannelId(parseCommandArgument(ctx.message.text));
+    if (!suppliedId) {
+      await ctx.reply('Usage: /addchannel -1001234567890\nThe bot must be an administrator in that Telegram channel first.');
+      return;
+    }
+    try {
+      const chat = await ctx.telegram.getChat(suppliedId);
+      if (chat.type !== 'channel') {
+        await ctx.reply('That ID is not a Telegram channel. Add a channel ID (normally beginning with -100) or a public @channelusername.');
+        return;
+      }
+      const channel = await repository.addAnnouncementChannel({
+        channelId: chat.id,
+        title: chat.title || '',
+        username: chat.username || '',
+        addedBy: userId(ctx)
+      });
+      await ctx.reply(`Announcement channel saved: ${channel.title || channel.username || channel.channelId}. Every future published post will be sent there with poster, details, and delivery button.`);
+    } catch (error) {
+      console.error('[telegram] add channel failed:', error?.description || error?.message || 'Unknown error');
+      await ctx.reply('I could not access that channel. Check the ID and make the bot an administrator there, then try again.');
+    }
+  });
+
+  bot.command('channels', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const channels = await repository.listAnnouncementChannels();
+    if (!channels.length) {
+      await ctx.reply('No announcement channels are configured. Use /addchannel <channel_id> after making the bot an admin.');
+      return;
+    }
+    await ctx.reply(['Announcement channels:', '', ...channels.map((channel, index) => `${index + 1}. ${channel.title || channel.username || 'Untitled channel'} — ${channel.channelId}`), '', 'Remove one with /removechannel <channel_id>.'].join('\n'));
+  });
+
+  bot.command('removechannel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedId = normalizeChannelId(parseCommandArgument(ctx.message.text));
+    if (!suppliedId) {
+      await ctx.reply('Usage: /removechannel -1001234567890');
+      return;
+    }
+    const removed = await repository.removeAnnouncementChannel(suppliedId);
+    await ctx.reply(removed ? `Removed ${removed.title || removed.channelId} from automatic announcements.` : 'That channel was not in the announcement list.');
+  });
+
+  bot.command('requests', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const requests = await repository.listRequests(12);
+    if (!requests.length) {
+      await ctx.reply('There are no open catalog requests.');
+      return;
+    }
+    await ctx.reply(['Latest open requests:', '', ...requests.map((request, index) => `${index + 1}. ${request.requestText}\n   ${request.id} · ${request.requester?.username ? `@${request.requester.username}` : request.requester?.name || 'Telegram user'}`)].join('\n'));
   });
 
   bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series)$/, async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
     await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await beginDraft(ctx, ctx.match[1], '', repository, config);
   });
 
   bot.action('draft:status', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
     await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await showDraftStatus(ctx, repository);
   });
 
   bot.action('draft:cancel', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
-    await ctx.answerCbQuery('Draft discarded');
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
     await repository.deleteSession(chatId(ctx), userId(ctx));
     await ctx.reply('Draft discarded. No catalog record was created.', panelKeyboard());
   });
 
   bot.action('draft:done', async (ctx) => {
-    if (!(await requireAdmin(ctx, config))) return;
     await ctx.answerCbQuery();
-    await publishDraft(ctx, repository, config);
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await publishDraft(ctx, bot, repository, config);
   });
 
   bot.on('message', async (ctx) => {
-    if (!isAdmin(ctx, config)) return;
+    if (!(await isPublisher(ctx, repository, config))) return;
     const message = ctx.message;
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
@@ -517,8 +839,9 @@ export async function launchTelegramBot({ config, repository }) {
         );
         const last = updated.files.at(-1);
         const size = formatBytes(last.size);
+        const summary = summarizeEpisodes(updated.files);
         await ctx.reply(
-          `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}. Use /done when the upload is complete.`,
+          `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''} Use /done when the upload is complete.`,
           uploadKeyboard()
         );
       } catch (error) {
@@ -548,18 +871,9 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   try {
-    await bot.telegram.setMyCommands([
-      { command: 'panel', description: 'Open the publisher panel' },
-      { command: 'movie', description: 'New movie draft' },
-      { command: 'anime', description: 'New anime draft' },
-      { command: 'cartoon', description: 'New cartoon draft' },
-      { command: 'donghua', description: 'New donghua draft' },
-      { command: 'kdrama', description: 'New K-Drama draft' },
-      { command: 'series', description: 'New web series draft' },
-      { command: 'done', description: 'Publish current draft' },
-      { command: 'status', description: 'Show current draft' },
-      { command: 'help', description: 'Publisher help' }
-    ]);
+    // Public command menu stays intentionally small. A successful /login installs
+    // the full publisher menu only in that administrator's private bot chat.
+    await bot.telegram.setMyCommands(VISITOR_COMMANDS);
   } catch (error) {
     console.warn('[telegram] Could not register bot commands:', error?.message || 'Unknown error');
   }
