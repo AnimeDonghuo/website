@@ -1,0 +1,35 @@
+{
+  "name": "sorabox-catalog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A Telegram-delivered media catalog with permanent ImgBB poster mirroring.",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node --watch src/server/index.js",
+    "dev:client": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "start": "node src/server/index.js",
+    "test": "node --test",
+    "check": "npm run build && npm test"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "mongodb": "^6.18.0",
+    "react-router-dom": "^7.18.3",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.2",
+    "concurrently": "^9.2.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "vite": "^7.1.4"
+  }
+}
