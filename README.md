@@ -37,17 +37,18 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Optional metadata commands: `/lang`, `/year`, `/genres`, `/description`, and `/poster`
 - Category-aware metadata fallback chain: AniList for Anime/Donghua, TMDB, then OMDb when configured
 - Server-side poster download validation, then permanent ImgBB upload during publishing
-- A generated PNG fallback poster is also uploaded to ImgBB if no provider has suitable artwork
+- A generated category-colored PNG fallback poster **renders the release title** and is uploaded to ImgBB if no provider has suitable artwork
 - Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
 - Upload captions/file names also resolve explicit language labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label
 - Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
-- `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel, preserving original storage message IDs while inferring title/category when no name is supplied
-- `/auto` presents persistent ON/OFF controls; when ON, newly posted supported media in the database channel is classified, matched, poster-mirrored, and published through the same safe workflow
+- `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel, preserving original storage message IDs while inferring title/category when no name is supplied; it enumerates every already-published, active-draft, non-media, inaccessible, or protected message ID instead of reporting a vague skip count
+- `/auto` presents persistent ON/OFF controls; when ON, direct database-channel media is collected by normalized release title for 90 seconds of quiet (15-minute maximum), then classified, matched, poster-mirrored, and published as one combined post. Later matching uploads append to that post without a duplicate announcement
+- Auto completion/failure reports are delivered to the authorized publisher's bot chat, including the private `SB-…` ID, while database-channel error replies are suppressed
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
-- Every post receives a private `SB-…` Post ID which a logged-in publisher can remove with `/delete SB-…`
+- Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs and `/delete SB-…` can remove one or several unwanted catalog cards
 - Draft/login sessions survive restarts when MongoDB is configured and expire automatically
 
 ---
@@ -157,7 +158,7 @@ Check `/api/health` after deployment: `deliveryBotUsername` must be the replacem
 
 #### Storage-channel troubleshooting
 
-Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel. `/batch` only accepts a private `t.me/c/...` link whose internal ID maps exactly to `TELEGRAM_STORAGE_CHANNEL_ID`; it temporarily forwards each requested message into the logged-in publisher’s private chat to inspect it, then deletes that preview. Inaccessible, protected, non-media, already-published, and active-draft messages are skipped rather than linked incorrectly.
+Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel. `/batch` only accepts a private `t.me/c/...` link whose internal ID maps exactly to `TELEGRAM_STORAGE_CHANNEL_ID`; it temporarily forwards each requested message into the logged-in publisher’s private chat to inspect it, then deletes that preview. Its final report names every inaccessible/protected, non-media, already-published, and active-draft message ID and reason. If a previous broken auto run already created one-file cards, those IDs are deliberately reported as already linked; use `/posts 50`, remove the unwanted cards with `/delete`, then rerun `/batch` to build one clean post.
 
 ### 4. Configure permanent ImgBB posters
 
@@ -174,7 +175,7 @@ At `/done`, the server does this once:
 3. Uploads a copy to ImgBB.
 4. Saves only the hosted ImgBB URL and non-sensitive provider metadata in MongoDB.
 
-If automatic matching finds no poster, SoraBox generates a branded fallback PNG and uploads that to ImgBB instead. This keeps the poster path hosted externally and avoids loading Koyeb storage.
+If automatic matching finds no poster, SoraBox generates a branded category-colored fallback PNG **with the release title rendered on it** and uploads that to ImgBB instead. This keeps the poster path hosted externally, recognizable in the catalog, and avoids loading Koyeb storage.
 
 ### 5. Optional: enable automatic metadata and artwork matching
 
@@ -242,7 +243,8 @@ Useful commands:
 | `/teststorage` | Send a harmless test message to verify the configured database channel |
 | `/cancel` | Discard the active draft |
 | `/done` | Mirror poster, create MongoDB record, announce to every configured channel, and return share + Post ID |
-| `/delete SB-0123ABCDEF` | Remove a published catalog record and disable its deep link |
+| `/posts 50` | List recent private `SB-…` post IDs for cleanup or management |
+| `/delete SB-0123ABCDEF[, SB-FEDCBA3210]` | Remove one or several published catalog records and disable their deep links |
 | `/addchannel -1001234567890` | Add a channel for automatic professional new-post announcements |
 | `/channels` / `/removechannel ID` | View or remove announcement destinations |
 | `/requests` | Review the latest open user requests |
@@ -279,7 +281,11 @@ In that case, cleaned file captions/descriptions and names supply the title and 
 
 ### Automatically publish direct database-channel uploads
 
-After logging in, run `/auto` and press **Turn ON**. The ON/OFF setting and its activation time are stored in MongoDB, so they survive Koyeb restarts. While enabled, a newly posted document, video, audio, animation, or photo in the configured database channel is inspected directly in that channel, given an inferred title/category, enriched with TMDB/OMDb/AniList metadata, mirrored to ImgBB, and published/announced without a draft conversation. Messages dated before the most recent ON activation are ignored.
+After logging in, run `/auto` and press **Turn ON**. The ON/OFF setting, authorized publisher notification chat, and pending upload groups are stored in MongoDB, so they survive Koyeb restarts. While enabled, a newly posted document, video, audio, animation, or photo in the configured database channel is inspected directly in that channel and assigned a normalized release key.
+
+Matching files are collected for **90 seconds after the latest matching upload** (with a **15-minute maximum** for an uninterrupted large upload). One group can contain 100+ files. When its deadline is reached, the bot infers title/category, enriches it with TMDB/OMDb/AniList metadata, mirrors one permanent poster to ImgBB, creates one catalog post, and sends one announcement. A later matching upload is appended to the same record and is not announced again. Completion notices include the `SB-…` Post ID and go to the publisher's private bot chat; errors are logged and reported there rather than being replied into the private database channel. An interrupted in-flight group is safely released for retry when the single Koyeb service starts again.
+
+Name cleanup ignores dotted/underscore release separators, file extensions, years, quality/provider/codec/audio tags, bracketed release labels, Telegram handles, Markdown links, and ordinary URLs. For example, `Cocktail.2.2026.1080p.NF.WEB-DL.Hindi.DDP5.1.H.265~[C_B].mkv` becomes **Cocktail 2**, while `Raakh.S01E03.1080p.AMZN` becomes **Raakh** and is recognized as episode-based Web Series content.
 
 The automation ignores bot-originated storage copies, any message already attached to an active draft, and storage message IDs already present in a published catalog record. This prevents normal manual uploads and announcement activity from being duplicated or causing a loop. Keep the storage channel private and use `/auto` OFF before bulk housekeeping; use `/batch` for an intentional historical range.
 

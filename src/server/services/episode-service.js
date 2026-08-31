@@ -53,9 +53,15 @@ export function formatEpisodeLabel(start, end = start) {
 export function stripTelegramAttribution(value) {
   return cleanText(
     String(value || '')
-      .replace(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/[A-Za-z0-9_+\-/]+/gi, ' ')
+      // Publisher captions frequently append a Markdown attribution such as
+      // [t.is](http://t.is). It is metadata, not part of the release name.
+      .replace(/\[[^\]\n]{1,120}\]\(\s*(?:https?:\/\/|www\.)[^)\s]+\s*\)/gi, ' ')
+      .replace(/(?:https?:\/\/|www\.)[^\s<>()]+/gi, ' ')
+      .replace(/(?:t\.me|telegram\.me)\/[A-Za-z0-9_+\-/]+/gi, ' ')
       .replace(/@[A-Za-z][A-Za-z0-9_]{2,}/g, ' ')
-      .replace(/[\[\]{}]/g, ' ')
+      // Keep square brackets until cleanMediaName can remove an entire release
+      // label such as [C_B], rather than leaving its inner letters behind.
+      .replace(/[{}]/g, ' ')
       .replace(/\s{2,}/g, ' '),
     500
   );
@@ -92,10 +98,25 @@ export function extractEpisodeRange(value) {
 
 export function cleanMediaName(value) {
   const withoutAttribution = stripTelegramAttribution(value)
-    .replace(/\.(mkv|mp4|avi|webm|mov|m4v|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
-    .replace(/[_.]+/g, ' ')
-    .replace(/\b(?:360|480|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
-    .replace(/\b(?:web[- ]?dl|webrip|bluray|brrip|hdrip|x264|x265|hevc|aac|ddp|10bit)\b/gi, ' ')
+    // Release extensions and bracketed group/source labels do not identify a title.
+    .replace(/\.(mkv|mp4|avi|webm|mov|m4v|ts|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
+    .replace(/[\[\(][^\]\)]{0,160}[\]\)]/g, ' ')
+    .replace(/[._~|]+/g, ' ')
+    // A year belongs in metadata. Keeping it in the inferred title causes every
+    // re-encode of one film to be treated as a new catalog entry.
+    .replace(/\b(?:19\d{2}|20\d{2})\b/g, ' ')
+    // Remove only a standalone season package label. The negative lookahead
+    // deliberately keeps S01E03 / Season 1 Episode 3 for episode detection.
+    .replace(/\bS(?:EASON)?\s*0*\d{1,2}(?!\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3})\b/gi, ' ')
+    .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
+    .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
+    .replace(/\b(?:web[- ]?(?:dl|rip)?|blu[- ]?ray|brrip|hdrip|dvdrip|remux|cam|hdcam|predvd|proper|repack|uncut|extended|unrated)\b/gi, ' ')
+    .replace(/\b(?:x\s*26[45]|h\s*26[45]|hevc|av1|avc|vp9|10bit|8bit)\b/gi, ' ')
+    .replace(/\b(?:ddp?|eac3|ac3|truehd|dts(?:[- ]?hd)?|aac|opus|flac|mp3)\s*\d+(?:\s+\d+)?\b/gi, ' ')
+    .replace(/\b(?:atmos|dolby[- ]?vision|hdr10(?:\+)?|sdr)\b/gi, ' ')
+    // Common providers/release labels found in direct Telegram uploads.
+    .replace(/\b(?:nf|netflix|amzn|amazon|prime(?:video)?|zee\s*5?|jiocinema|jiohotstar|hotstar|sonyliv|sony\s*liv|mx(?:player)?|altbalaji|aha|hoichoi|voot|hulu|hbo(?:max)?|max|atvp|apple\s*tv\+?|disney\+?|youtube|tubi|crunchyroll|bilibili|wetv|iqiyi)\b/gi, ' ')
+    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio)\b/gi, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return cleanText(withoutAttribution, 180);

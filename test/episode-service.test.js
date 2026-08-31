@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectMediaQuality, detectUploadEpisode, detectUploadLanguages, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
+import { cleanMediaName, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -13,6 +13,16 @@ test('caption is cleaned of Telegram attribution before episode parsing', () => 
     { start: result.start, end: result.end, source: result.source, label: result.label },
     { start: 1, end: 5, source: 'caption', label: 'Episodes 01–05' }
   );
+});
+
+test('release cleaner removes Markdown URLs, providers, codecs, and bracketed labels while preserving sequel numbers', () => {
+  assert.equal(
+    cleanMediaName('Cocktail.2.2026.1080p.NF.WEB-DL.Hindi.DDP5.1.H.265~[C_B].mkv'),
+    'Cocktail 2 Hindi'
+  );
+  assert.equal(cleanMediaName('A Film [t.is](http://t.is) https://example.com @release_source 720p AMZN'), 'A Film');
+  assert.equal(cleanMediaName('Raakh.S01E03.1080p.AMZN.mkv'), 'Raakh S01E03');
+  assert.equal(cleanMediaName('Raakh.Season.01.1080p.AMZN.mkv'), 'Raakh');
 });
 
 test('filename is used only when the caption has no episode number', () => {

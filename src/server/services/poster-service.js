@@ -184,6 +184,148 @@ function blend(first, second, factor) {
   return Math.max(0, Math.min(255, Math.round(first + (second - first) * factor)));
 }
 
+// Small built-in display font. Keeping it here avoids adding a native canvas
+// dependency just to make generated fallback artwork useful on Koyeb.
+const POSTER_FONT = {
+  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
+  B: ['11110', '10001', '10001', '11110', '10001', '10001', '11110'],
+  C: ['01111', '10000', '10000', '10000', '10000', '10000', '01111'],
+  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
+  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
+  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
+  G: ['01111', '10000', '10000', '10111', '10001', '10001', '01110'],
+  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
+  I: ['11111', '00100', '00100', '00100', '00100', '00100', '11111'],
+  J: ['00111', '00010', '00010', '00010', '00010', '10010', '01100'],
+  K: ['10001', '10010', '10100', '11000', '10100', '10010', '10001'],
+  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
+  M: ['10001', '11011', '10101', '10101', '10001', '10001', '10001'],
+  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
+  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
+  P: ['11110', '10001', '10001', '11110', '10000', '10000', '10000'],
+  Q: ['01110', '10001', '10001', '10001', '10101', '10010', '01101'],
+  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
+  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
+  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
+  U: ['10001', '10001', '10001', '10001', '10001', '10001', '01110'],
+  V: ['10001', '10001', '10001', '10001', '10001', '01010', '00100'],
+  W: ['10001', '10001', '10001', '10101', '10101', '10101', '01010'],
+  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
+  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
+  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
+  0: ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
+  1: ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+  2: ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
+  3: ['11110', '00001', '00001', '01110', '00001', '00001', '11110'],
+  4: ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
+  5: ['11111', '10000', '10000', '11110', '00001', '00001', '11110'],
+  6: ['01110', '10000', '10000', '11110', '10001', '10001', '01110'],
+  7: ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
+  8: ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+  9: ['01110', '10001', '10001', '01111', '00001', '00001', '01110'],
+  '&': ['01010', '10100', '10100', '01000', '10101', '10010', '01101'],
+  ':': ['00000', '00100', '00100', '00000', '00100', '00100', '00000'],
+  '.': ['00000', '00000', '00000', '00000', '00000', '00110', '00110'],
+  ',': ['00000', '00000', '00000', '00000', '00110', '00110', '00100'],
+  '!': ['00100', '00100', '00100', '00100', '00100', '00000', '00100'],
+  '(': ['00010', '00100', '01000', '01000', '01000', '00100', '00010'],
+  ')': ['01000', '00100', '00010', '00010', '00010', '00100', '01000'],
+  '+': ['00000', '00100', '00100', '11111', '00100', '00100', '00000'],
+  '-': ['00000', '00000', '00000', '11111', '00000', '00000', '00000'],
+  "'": ['00100', '00100', '01000', '00000', '00000', '00000', '00000'],
+  '?': ['01110', '10001', '00001', '00010', '00100', '00000', '00100'],
+  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000']
+};
+
+function pixelOffset(width, x, y) {
+  return y * (width * 4 + 1) + 1 + x * 4;
+}
+
+function paintPixel(raw, width, height, x, y, color, opacity = 1) {
+  if (x < 0 || x >= width || y < 0 || y >= height) return;
+  const offset = pixelOffset(width, x, y);
+  raw[offset] = blend(raw[offset], color[0], opacity);
+  raw[offset + 1] = blend(raw[offset + 1], color[1], opacity);
+  raw[offset + 2] = blend(raw[offset + 2], color[2], opacity);
+}
+
+function paintRect(raw, width, height, x, y, rectWidth, rectHeight, color, opacity = 1) {
+  const left = Math.max(0, Math.floor(x));
+  const top = Math.max(0, Math.floor(y));
+  const right = Math.min(width, Math.ceil(x + rectWidth));
+  const bottom = Math.min(height, Math.ceil(y + rectHeight));
+  for (let py = top; py < bottom; py += 1) {
+    for (let px = left; px < right; px += 1) paintPixel(raw, width, height, px, py, color, opacity);
+  }
+}
+
+function titleLines(title, maxCharacters) {
+  const words = String(title || 'Untitled release')
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 78)
+    .split(' ')
+    .filter(Boolean);
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (candidate.length <= maxCharacters || !line) {
+      line = candidate;
+      continue;
+    }
+    lines.push(line);
+    line = word;
+    if (lines.length === 2) break;
+  }
+  if (line && lines.length < 3) lines.push(line);
+  if (!lines.length) lines.push('UNTITLED RELEASE');
+  return lines.map((lineText, index) => index === 2 && lineText.length > maxCharacters
+    ? `${lineText.slice(0, Math.max(1, maxCharacters - 1))}…`
+    : lineText);
+}
+
+function drawGlyph(raw, width, height, character, x, y, scale, color) {
+  const glyph = POSTER_FONT[character] || POSTER_FONT['?'];
+  for (let row = 0; row < glyph.length; row += 1) {
+    for (let column = 0; column < glyph[row].length; column += 1) {
+      if (glyph[row][column] !== '1') continue;
+      paintRect(raw, width, height, x + column * scale, y + row * scale, scale, scale, color);
+    }
+  }
+}
+
+function drawFallbackPosterTitle(raw, width, height, title, category, accent) {
+  const availableWidth = width - 76;
+  const lines = titleLines(title, 22);
+  const longest = Math.max(...lines.map((line) => line.length));
+  const scale = Math.max(4, Math.min(8, Math.floor(availableWidth / Math.max(1, longest * 6))));
+  const lineHeight = 9 * scale;
+  const panelHeight = lines.length * lineHeight + 72;
+  const panelY = height - panelHeight - 44;
+
+  paintRect(raw, width, height, 24, panelY - 18, width - 48, panelHeight + 36, [7, 10, 22], 0.76);
+  paintRect(raw, width, height, 48, panelY, 8, lines.length * lineHeight + 10, accent, 0.96);
+  paintRect(raw, width, height, 76, panelY - 29, 104, 4, accent, 0.9);
+
+  const label = String(category || 'SoraBox').replace(/-/g, ' ').toUpperCase();
+  for (let index = 0; index < Math.min(label.length, 20); index += 1) {
+    drawGlyph(raw, width, height, label[index], 77 + index * 14, panelY - 18, 2, [229, 235, 255]);
+  }
+
+  lines.forEach((line, row) => {
+    const text = line.toUpperCase();
+    const textWidth = text.length * 6 * scale - scale;
+    const x = Math.max(68, Math.round((width + 60 - textWidth) / 2));
+    const y = panelY + row * lineHeight;
+    for (let index = 0; index < text.length; index += 1) {
+      drawGlyph(raw, width, height, text[index], x + index * 6 * scale, y, scale, [249, 251, 255]);
+    }
+  });
+}
+
 // A compact original PNG fallback means a title can still receive an ImgBB-hosted
 // poster when TMDB does not have a matching artwork. It avoids storing images on Koyeb.
 export function createFallbackPosterPng(title, category) {
@@ -221,6 +363,11 @@ export function createFallbackPosterPng(title, category) {
       offset += 4;
     }
   }
+
+  // A fallback must still be recognizable in the catalog: render the release
+  // title on top of the category-colored artwork rather than returning only a
+  // decorative gradient.
+  drawFallbackPosterTitle(raw, width, height, title, category, accent);
 
   const header = Buffer.alloc(13);
   header.writeUInt32BE(width, 0);

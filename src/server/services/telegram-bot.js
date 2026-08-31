@@ -1,14 +1,21 @@
 import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
-import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
+import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
 import { cleanMediaName, summarizeEpisodes, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
 const MAX_BATCH_MESSAGE_COUNT = 100;
-const AUTO_PUBLISH_OWNER_PREFIX = 'auto-storage-message-';
+// Storage channel uploads can arrive as a burst of hundreds of separate
+// channel posts. Persist a quiet-period deadline, rather than publishing each
+// event immediately, so one release becomes one catalog record.
+const AUTO_PUBLISH_OWNER_PREFIX = 'auto-storage-group-';
+const AUTO_PUBLISH_LATE_OWNER_PREFIX = 'auto-storage-late-';
+const AUTO_COLLECTION_IDLE_MS = 90_000;
+const AUTO_COLLECTION_MAX_WAIT_MS = 15 * 60_000;
+const AUTO_QUEUE_INTERVAL_MS = 15_000;
 
 function userId(ctx) {
   return ctx.from?.id;
@@ -120,7 +127,8 @@ const PUBLISHER_COMMANDS = [
   { command: 'done', description: 'Publish current draft' },
   { command: 'status', description: 'Show current draft' },
   { command: 'teststorage', description: 'Check the storage channel connection' },
-  { command: 'delete', description: 'Delete a post by post ID' },
+  { command: 'delete', description: 'Delete one or more post IDs' },
+  { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'addchannel', description: 'Add an announcement channel' },
   { command: 'channels', description: 'List announcement channels' },
   { command: 'removechannel', description: 'Remove an announcement channel' },
@@ -362,6 +370,9 @@ export function inferBatchTitle(files = []) {
       const candidate = cleanMediaName(source)
         .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:ISODE)?)?\s*)?\d{1,3})?\b/gi, ' ')
         .replace(/\b(?:EPISODES?|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
+        // Keep sequel numbers (Cocktail 2), but remove a standalone season
+        // marker because it describes packaging rather than the series title.
+        .replace(/\b(?:S(?:EASON)?\s*0*\d{1,2})\b/gi, ' ')
         .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|eng|indo|cc)\b/gi, ' ')
         .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|indonesian|thai|vietnamese|spanish|french|german|portuguese|arabic|russian)\b/gi, ' ')
         .replace(/\b(?:360|480|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
@@ -415,13 +426,16 @@ function autoPublishStatusText(settings, config) {
     `Storage-channel auto-publish is ${enabled ? 'ON' : 'OFF'}.`,
     '',
     enabled
-      ? 'New supported media posted directly in the configured database channel will be classified, matched with metadata, mirrored to ImgBB, and published automatically.'
+      ? 'New supported media posted directly in the configured database channel is collected by cleaned release name. After 90 seconds with no matching upload (or 15 minutes maximum), one combined post is classified, matched with metadata, mirrored to ImgBB, and published.'
       : 'Nothing posted in the database channel will be published automatically while this is OFF.',
     '',
     config.telegram.storageChannelId
       ? `Database channel: ${config.telegram.storageChannelId}`
       : 'TELEGRAM_STORAGE_CHANNEL_ID is not configured. Set it before turning automation on.',
     'Bot-originated storage copies, active-draft files, and already-published storage messages are ignored to prevent loops and duplicates.',
+    settings?.notifyChatId || settings?.updatedBy
+      ? 'Completion and error diagnostics are sent to the authorized publisher, never into the database channel.'
+      : 'Turn the setting ON from your private publisher chat to receive completion and error diagnostics.',
     'Use /batch to publish an existing inclusive range of storage-channel files.'
   ].join('\n');
 }
@@ -451,6 +465,12 @@ function normalizeChannelId(value) {
   if (/^-?\d+$/.test(parsed)) return parsed;
   if (/^@[A-Za-z][A-Za-z0-9_]{4,}$/i.test(parsed)) return parsed;
   return null;
+}
+
+function postIdsFromCommand(value) {
+  return [...new Set(
+    [...String(value || '').toUpperCase().matchAll(/\bSB-[A-F0-9]{10}\b/g)].map((match) => match[0])
+  )].slice(0, 50);
 }
 
 function episodeUploadNote(file) {
@@ -561,23 +581,69 @@ async function removeBatchPreview(ctx, message) {
   }
 }
 
+function batchReasonRecordsLine(label, records, detailFormatter) {
+  if (!records.length) return null;
+  return `${label} (${records.length}): ${records.map((record) => detailFormatter(record)).join(', ')}`;
+}
+
+function batchDiagnosticLines({ skippedByReason, failures }) {
+  return [
+    batchReasonRecordsLine('Already linked to a catalog post', skippedByReason.alreadyPublished, (record) => `${record.messageId}${record.detail ? ` (${record.detail})` : ''}`),
+    batchReasonRecordsLine('Already attached to an active draft', skippedByReason.activeDraft, (record) => `${record.messageId}${record.detail ? ` (${record.detail})` : ''}`),
+    batchReasonRecordsLine('Not supported media / text-only', skippedByReason.nonMedia, (record) => String(record.messageId)),
+    batchReasonRecordsLine('Could not inspect (inaccessible, deleted, or protected)', failures, (record) => `${record.messageId} (${record.detail})`)
+  ].filter(Boolean);
+}
+
+async function replyBatchDiagnostics(ctx, lines) {
+  const maximumLength = 3_700;
+  let chunk = '';
+  for (const originalLine of lines) {
+    let line = originalLine;
+    const next = chunk ? `${chunk}\n${line}` : line;
+    if (next.length <= maximumLength) {
+      chunk = next;
+      continue;
+    }
+    if (chunk) await ctx.reply(chunk);
+    // Details are compact, but Telegram's 4096-character limit should never
+    // hide why the final IDs in a 100-message range were skipped.
+    while (line.length > maximumLength) {
+      await ctx.reply(line.slice(0, maximumLength));
+      line = line.slice(maximumLength);
+    }
+    chunk = line;
+  }
+  if (chunk) await ctx.reply(chunk);
+}
+
 export async function importStorageRange(ctx, session, lastLink, bot, repository, config, publish = publishDraft) {
   const batch = session.batch || {};
   const firstMessageId = Number(batch.firstMessageId);
   const lastMessageId = Number(lastLink.messageId);
   const imported = [];
-  const skipped = [];
+  const skippedByReason = {
+    alreadyPublished: [],
+    activeDraft: [],
+    nonMedia: []
+  };
   const failures = [];
 
   for (let storageMessageId = firstMessageId; storageMessageId <= lastMessageId; storageMessageId += 1) {
     const existing = await repository.findContentByStorageMessageId(storageMessageId);
     if (existing) {
-      skipped.push(`${storageMessageId} already belongs to ${existing.adminId || existing.title || 'a published post'}`);
+      skippedByReason.alreadyPublished.push({
+        messageId: storageMessageId,
+        detail: existing.adminId || cleanText(existing.title, 70) || 'published post'
+      });
       continue;
     }
     const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
     if (pendingDraft) {
-      skipped.push(`${storageMessageId} is already attached to an active ${pendingDraft.workflow || 'upload'} draft`);
+      skippedByReason.activeDraft.push({
+        messageId: storageMessageId,
+        detail: pendingDraft.workflow || 'upload draft'
+      });
       continue;
     }
 
@@ -593,7 +659,7 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
         { disable_notification: true }
       );
       if (!isMediaMessage(preview)) {
-        skipped.push(`${storageMessageId} is not a supported media message`);
+        skippedByReason.nonMedia.push({ messageId: storageMessageId });
         continue;
       }
 
@@ -602,35 +668,49 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
       if (!updated?.files?.length) throw new Error('The batch session expired while importing files.');
       imported.push(file);
     } catch (error) {
-      const details = error?.description || error?.message || 'Unknown Telegram error';
-      failures.push(`${storageMessageId}: ${details}`);
+      const details = automationDiagnostic(error);
+      failures.push({ messageId: storageMessageId, detail: details });
       console.error('[telegram] batch import message failed:', storageMessageId, details);
     } finally {
       await removeBatchPreview(ctx, preview);
     }
   }
 
+  const skippedCount = Object.values(skippedByReason).reduce((total, records) => total + records.length, 0);
   const latestSession = await repository.findSession(chatId(ctx), userId(ctx));
+  const diagnostics = batchDiagnosticLines({ skippedByReason, failures });
+  const diagnosticCounts = {
+    alreadyPublished: skippedByReason.alreadyPublished.length,
+    activeDraft: skippedByReason.activeDraft.length,
+    nonMedia: skippedByReason.nonMedia.length
+  };
+
   if (!imported.length || !latestSession) {
-    await repository.updateSession(chatId(ctx), userId(ctx), {
-      batch: {
-        ...batch,
-        stage: 'import-failed',
-        lastMessageId,
-        importedCount: 0,
-        skippedCount: skipped.length,
-        failureCount: failures.length
-      }
-    });
-    await ctx.reply(
-      [
-        `No supported new media could be imported from messages ${firstMessageId}–${lastMessageId}.`,
-        skipped.length ? `${skipped.length} message${skipped.length === 1 ? ' was' : 's were'} skipped.` : null,
-        failures.length ? `Telegram could not access ${failures.length} message${failures.length === 1 ? '' : 's'}. Make sure the active bot is an administrator in this exact storage channel and that the files are not protected.` : null,
-        'No catalog post was created. Use /batch again after correcting the links or permissions.'
-      ].filter(Boolean).join('\n')
-    );
-    return;
+    if (latestSession) {
+      await repository.updateSession(chatId(ctx), userId(ctx), {
+        batch: {
+          ...batch,
+          stage: 'import-failed',
+          lastMessageId,
+          importedCount: 0,
+          skippedCount,
+          skipReasons: diagnosticCounts,
+          failureCount: failures.length
+        }
+      });
+    }
+    const allAlreadyPublished = skippedByReason.alreadyPublished.length > 0
+      && skippedByReason.alreadyPublished.length === lastMessageId - firstMessageId + 1;
+    await replyBatchDiagnostics(ctx, [
+      `No supported new media could be imported from messages ${firstMessageId}–${lastMessageId}.`,
+      ...diagnostics,
+      allAlreadyPublished
+        ? 'Every selected message is already linked to an existing catalog post, so no duplicate delivery records were created. Use /posts 50 to see post IDs, remove unwanted old cards with /delete SB-…, then run /batch again to rebuild the range as one post.'
+        : failures.length
+          ? 'Check that this bot is an administrator in this exact storage channel. Protected/forward-disabled messages cannot be inspected by Telegram and must be uploaded again directly.'
+          : 'No new catalog post was created. Correct the identified messages or links, then run /batch again.'
+    ]);
+    return { imported: 0, skippedByReason, failures };
   }
 
   const title = cleanText(session.title || inferBatchTitle(latestSession.files), 180) || `Storage import ${firstMessageId}–${lastMessageId}`;
@@ -644,17 +724,19 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
       stage: 'ready',
       lastMessageId,
       importedCount: imported.length,
-      skippedCount: skipped.length,
+      skippedCount,
+      skipReasons: diagnosticCounts,
       failureCount: failures.length
     }
   });
 
-  const skippedNote = skipped.length ? ` ${skipped.length} non-media, already-published, or active-draft message${skipped.length === 1 ? ' was' : 's were'} skipped.` : '';
-  const failedNote = failures.length ? ` ${failures.length} inaccessible/protected message${failures.length === 1 ? ' was' : 's were'} skipped.` : '';
-  await ctx.reply(
-    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.${skippedNote}${failedNote} Matching metadata and publishing now…`
-  );
-  await publish(ctx, bot, repository, config);
+  await replyBatchDiagnostics(ctx, [
+    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.`,
+    ...diagnostics,
+    'Matching metadata and publishing now…'
+  ]);
+  const publication = await publish(ctx, bot, repository, config);
+  return { imported: imported.length, skippedByReason, failures, publication };
 }
 
 async function handleBatchLink(ctx, session, bot, repository, config) {
@@ -807,23 +889,27 @@ async function announcePublishedContent({ bot, repository, content, websiteUrl, 
   return { sent, failed, skipped };
 }
 
-async function publishDraft(ctx, bot, repository, config) {
+export async function publishDraft(ctx, bot, repository, config) {
   const session = await repository.findSession(chatId(ctx), userId(ctx));
   if (!session) {
-    await ctx.reply('There is no active draft. Start one from /panel first.');
-    return;
+    const error = 'There is no active draft. Start one from /panel first.';
+    await ctx.reply(error);
+    return { content: null, error };
   }
   if (!session.title) {
-    await ctx.reply('Please send a title before publishing.');
-    return;
+    const error = 'Please send a title before publishing.';
+    await ctx.reply(error);
+    return { content: null, error };
   }
   if (!session.files?.length) {
-    await ctx.reply('Add at least one document, video, audio file, animation, or image before using /done.');
-    return;
+    const error = 'Add at least one document, video, audio file, animation, or image before using /done.';
+    await ctx.reply(error);
+    return { content: null, error };
   }
   if (!config.telegram.botUsername) {
-    await ctx.reply('TELEGRAM_BOT_USERNAME is not configured on the server, so I cannot create a shareable delivery link yet.');
-    return;
+    const error = 'TELEGRAM_BOT_USERNAME is not configured on the server, so I cannot create a shareable delivery link yet.';
+    await ctx.reply(error);
+    return { content: null, error };
   }
 
   await ctx.reply('Publishing your draft. I am mirroring the poster to ImgBB now…');
@@ -869,6 +955,9 @@ async function publishDraft(ctx, bot, repository, config) {
       metadataProvider: metadata.provider,
       tmdbId: metadata.tmdbId,
       art: { tone: categoryDetails(session.category).tone },
+      // A persistent normalized source title lets later storage bursts append
+      // files to this post without another catalog card or announcement.
+      automationKey: session.workflow === 'automation' ? session.auto?.groupKey : null,
       files: session.files
     });
     await repository.deleteSession(chatId(ctx), userId(ctx));
@@ -924,12 +1013,14 @@ async function publishDraft(ctx, bot, repository, config) {
       ].filter((line) => line !== null).join('\n'),
       publicationKeyboard(websiteUrl, url)
     );
+    return { content, metadata, posterResult, announcements, websiteUrl, deliveryUrl: url };
   } catch (error) {
     const message = error instanceof PosterHostingError
       ? error.message
       : 'Publishing could not be completed. Your draft is still safe; please try /done again.';
     console.error('[telegram] publish failed:', error?.name || 'Error', error?.message || 'Unknown error');
     await ctx.reply(`Could not publish this draft. ${message}`);
+    return { content: null, error: message, cause: error };
   }
 }
 
@@ -940,78 +1031,272 @@ function isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds) {
   return Boolean(bot?.botInfo?.id && String(message?.from?.id || '') === String(bot.botInfo.id));
 }
 
-export async function autoPublishStoragePost(ctx, bot, repository, config, ignoredStorageMessageIds, inFlightStorageMessageIds, publish = publishDraft) {
+export function automationGroupKey(title, storageMessageId) {
+  const key = slugify(title);
+  // inferBatchTitle normally prevents a generic file name from becoming a title.
+  // Keep unidentified uploads isolated so unrelated files can never merge.
+  return key && key !== 'untitled-release' ? key : `storage-media-${storageMessageId}`;
+}
+
+function automationTiming(options = {}) {
+  const idleMs = Number(options?.idleMs);
+  const maxWaitMs = Number(options?.maxWaitMs);
+  return {
+    idleMs: Number.isFinite(idleMs) && idleMs >= 1_000 ? idleMs : AUTO_COLLECTION_IDLE_MS,
+    maxWaitMs: Number.isFinite(maxWaitMs) && maxWaitMs >= 5_000 ? maxWaitMs : AUTO_COLLECTION_MAX_WAIT_MS
+  };
+}
+
+function earlierAutomationDeadline(first, second) {
+  return String(first) <= String(second) ? String(first) : String(second);
+}
+
+function automationReplyContext(session) {
+  const label = cleanText(session?.title, 100) || session?.auto?.groupKey || 'storage group';
+  return {
+    chat: { id: session.chatId },
+    from: { id: session.ownerId },
+    // Never reply in the storage channel. publishDraft can retain its normal
+    // success/error path while the worker sends a separate admin notification.
+    reply: async (text) => {
+      console.info(`[telegram] automation ${label}: ${cleanText(text, 360)}`);
+    }
+  };
+}
+
+function automationDiagnostic(error) {
+  return cleanText(error?.description || error?.message || error || 'Unknown automation error', 300);
+}
+
+async function notifyAutomationPublisher(bot, settings, { state, content, session, websiteUrl, deliveryUrl, error }) {
+  const destination = settings?.notifyChatId || settings?.updatedBy;
+  if (!destination || !bot?.telegram?.sendMessage) return false;
+
+  const fileCount = content?.filesCount || session?.files?.length || 0;
+  const title = content?.title || session?.title || 'Untitled storage release';
+  const message = state === 'published'
+    ? [
+      '✅ <b>Storage automation published</b>',
+      '',
+      `<b>${escapeHtml(title)}</b>`,
+      `Files collected: ${fileCount}`,
+      `Post ID: <code>${escapeHtml(content.adminId)}</code>`,
+      `Delete if needed: <code>/delete ${escapeHtml(content.adminId)}</code>`,
+      websiteUrl ? `Catalog page: ${escapeHtml(websiteUrl)}` : null
+    ].filter(Boolean).join('\n')
+    : state === 'merged'
+      ? [
+        '✅ <b>Storage automation updated an existing post</b>',
+        '',
+        `<b>${escapeHtml(title)}</b>`,
+        `Added ${session?.files?.length || 0} collected file${session?.files?.length === 1 ? '' : 's'} · total ${fileCount}.`,
+        `Post ID: <code>${escapeHtml(content.adminId)}</code>`,
+        'No second announcement was sent.'
+      ].join('\n')
+      : [
+        '⚠️ <b>Storage automation needs attention</b>',
+        '',
+        `<b>${escapeHtml(title)}</b>`,
+        `Collected files: ${fileCount}`,
+        `Reason: ${escapeHtml(error || 'Unknown automation error')}`,
+        'The database channel was left clean. The retained group can be retried by uploading another matching file after fixing the issue.'
+      ].join('\n');
+
+  try {
+    await bot.telegram.sendMessage(destination, message, {
+      parse_mode: 'HTML',
+      ...(state === 'published' ? publicationKeyboard(websiteUrl, deliveryUrl) : {})
+    });
+    return true;
+  } catch (notificationError) {
+    console.error('[telegram] could not notify the automation publisher:', automationDiagnostic(notificationError));
+    return false;
+  }
+}
+
+/**
+ * Persist a direct-storage upload in a normalized release group. It deliberately
+ * does not publish: the queue worker flushes after a quiet period, surviving
+ * Koyeb restarts because its deadline and files live in MongoDB.
+ */
+export async function autoPublishStoragePost(ctx, bot, repository, config, ignoredStorageMessageIds, inFlightStorageMessageIds, options = {}) {
   const message = ctx.channelPost || ctx.update?.channel_post;
-  if (!message || String(message.chat?.id) !== String(config.telegram.storageChannelId || '')) return;
-  if (!isMediaMessage(message)) return;
-  if (isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds)) return;
+  if (!message || String(message.chat?.id) !== String(config.telegram.storageChannelId || '')) return { queued: false, reason: 'not-storage-media' };
+  if (!isMediaMessage(message)) return { queued: false, reason: 'not-supported-media' };
+  if (isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds)) return { queued: false, reason: 'bot-generated' };
 
   const storageMessageId = message.message_id;
   const inFlightKey = String(storageMessageId);
-  if (inFlightStorageMessageIds.has(inFlightKey)) return;
+  if (inFlightStorageMessageIds?.has(inFlightKey)) return { queued: false, reason: 'already-processing' };
 
   const settings = await repository.getAutoPublishSettings();
-  if (!settings?.enabled) return;
+  if (!settings?.enabled) return { queued: false, reason: 'disabled' };
 
   const enabledAt = Date.parse(settings.enabledAt || '');
   const messageTimestamp = Number(message.date) * 1000;
   if (Number.isFinite(enabledAt) && Number.isFinite(messageTimestamp) && messageTimestamp < enabledAt - 5_000) {
     console.info(`[telegram] ignored storage message ${storageMessageId}; it predates the current auto-publish activation.`);
-    return;
+    return { queued: false, reason: 'predates-enable' };
   }
 
   const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
   if (pendingDraft) {
     console.info(`[telegram] ignored storage message ${storageMessageId}; it is already attached to an active ${pendingDraft.workflow || 'upload'} draft.`);
-    return;
+    return { queued: false, reason: 'active-draft' };
   }
 
   const existing = await repository.findContentByStorageMessageId(storageMessageId);
   if (existing) {
     console.info(`[telegram] ignored already-published auto storage message ${storageMessageId} (${existing.adminId || existing.title || 'existing post'}).`);
-    return;
+    return { queued: false, reason: 'already-published' };
   }
 
-  inFlightStorageMessageIds.add(inFlightKey);
+  inFlightStorageMessageIds?.add(inFlightKey);
   try {
+    if (typeof repository.queueAutomationSession !== 'function') {
+      throw new Error('The catalog repository does not support persistent automation groups.');
+    }
     const file = fileFromMessage(message, storageMessageId, 'direct-storage');
     const title = inferBatchTitle([file]) || `Storage media ${storageMessageId}`;
     const category = inferBatchCategory({ title, files: [file] });
-    const ownerId = `${AUTO_PUBLISH_OWNER_PREFIX}${storageMessageId}`;
-    await repository.startSession({
+    const groupKey = automationGroupKey(title, storageMessageId);
+    const timing = automationTiming(typeof options === 'function' ? {} : options);
+    const receivedAt = new Date().toISOString();
+    const primaryOwnerId = `${AUTO_PUBLISH_OWNER_PREFIX}${groupKey}`;
+    const primarySession = await repository.findSession(message.chat.id, primaryOwnerId);
+    const isPublishing = primarySession?.workflow === 'automation' && primarySession.auto?.status === 'publishing';
+    const ownerId = isPublishing
+      ? `${AUTO_PUBLISH_LATE_OWNER_PREFIX}${groupKey}-${storageMessageId}`
+      : primaryOwnerId;
+    const activeSession = isPublishing ? null : primarySession;
+    const restartingFailedGroup = activeSession?.auto?.status === 'failed';
+    const firstReceivedAt = restartingFailedGroup
+      ? receivedAt
+      : activeSession?.auto?.firstReceivedAt || receivedAt;
+    const maxWaitAt = restartingFailedGroup
+      ? new Date(Date.parse(receivedAt) + timing.maxWaitMs).toISOString()
+      : activeSession?.auto?.maxWaitAt || new Date(Date.parse(firstReceivedAt) + timing.maxWaitMs).toISOString();
+    const quietDeadline = new Date(Date.parse(receivedAt) + timing.idleMs).toISOString();
+    const scheduledAt = earlierAutomationDeadline(quietDeadline, maxWaitAt);
+
+    let queued = await repository.queueAutomationSession({
       chatId: message.chat.id,
       ownerId,
-      category,
-      title
+      category: activeSession?.category || category,
+      title: activeSession?.title || title,
+      file,
+      groupKey,
+      scheduledAt,
+      maxWaitAt,
+      firstReceivedAt,
+      receivedAt
     });
-    await repository.updateSession(message.chat.id, ownerId, {
-      workflow: 'automation',
-      auto: {
-        storageChannelId: String(message.chat.id),
-        storageMessageId,
-        receivedAt: new Date().toISOString()
-      }
-    });
-    const preparedSession = await repository.appendSessionFile(message.chat.id, ownerId, file);
-    if (!preparedSession?.files?.length) throw new Error('The auto-publish draft could not retain the storage file.');
 
-    // publishDraft owns the normal metadata, ImgBB, post-ID, and announcement
-    // path. This reply shim deliberately keeps operator chatter out of the
-    // private database channel while preserving its error handling/logging.
-    const automationContext = {
-      chat: { id: message.chat.id },
-      from: { id: ownerId },
-      reply: async (text) => {
-        console.info(`[telegram] auto-publish ${storageMessageId}: ${cleanText(text, 360)}`);
-      }
-    };
-    console.info(`[telegram] auto-publishing storage message ${storageMessageId} as ${category}: ${title}`);
-    await publish(automationContext, bot, repository, config);
+    // In the tiny race between findSession and the atomic queue update, a worker
+    // may claim the primary group. Preserve the upload in a late group instead
+    // of mutating/deleting a snapshot that is being published.
+    if (queued?.auto?.status === 'publishing' && ownerId === primaryOwnerId) {
+      const lateOwnerId = `${AUTO_PUBLISH_LATE_OWNER_PREFIX}${groupKey}-${storageMessageId}`;
+      const lateMaxWaitAt = new Date(Date.parse(receivedAt) + timing.maxWaitMs).toISOString();
+      queued = await repository.queueAutomationSession({
+        chatId: message.chat.id,
+        ownerId: lateOwnerId,
+        category,
+        title,
+        file,
+        groupKey,
+        scheduledAt: earlierAutomationDeadline(quietDeadline, lateMaxWaitAt),
+        maxWaitAt: lateMaxWaitAt,
+        firstReceivedAt: receivedAt,
+        receivedAt
+      });
+    }
+    if (!queued?.files?.length) throw new Error('The persistent automation group could not retain the storage file.');
+
+    console.info(`[telegram] queued storage message ${storageMessageId} in ${groupKey} (${queued.files.length} file${queued.files.length === 1 ? '' : 's'}; flush ${queued.auto?.scheduledAt || 'pending'}).`);
+    return { queued: true, groupKey, ownerId: queued.ownerId || ownerId, session: queued };
   } catch (error) {
-    console.error('[telegram] auto-publish failed:', storageMessageId, error?.message || 'Unknown error');
+    console.error('[telegram] auto-publish queue failed:', storageMessageId, automationDiagnostic(error));
+    // The global channel handler and bot.catch also suppress replies here; the
+    // storage database should never receive a generic error message.
+    return { queued: false, reason: 'queue-error', error: automationDiagnostic(error) };
   } finally {
-    inFlightStorageMessageIds.delete(inFlightKey);
+    inFlightStorageMessageIds?.delete(inFlightKey);
   }
+}
+
+/** Flush due persistent auto-upload groups. Exported for deterministic tests. */
+export async function processQueuedAutomationSessions({ bot, repository, config, publish = publishDraft, now = new Date().toISOString(), limit = 20 } = {}) {
+  const settings = await repository.getAutoPublishSettings();
+  if (!settings?.enabled || typeof repository.listDueAutomationSessions !== 'function') return [];
+
+  const dueSessions = await repository.listDueAutomationSessions({ limit, now });
+  const results = [];
+  for (const dueSession of dueSessions) {
+    let session;
+    try {
+      session = await repository.claimAutomationSession(dueSession.chatId, dueSession.ownerId, { now });
+    } catch (error) {
+      console.error('[telegram] could not claim automation group:', dueSession.ownerId, automationDiagnostic(error));
+      continue;
+    }
+    if (!session?.files?.length) continue;
+
+    const groupKey = session.auto?.groupKey || automationGroupKey(session.title, session.files[0]?.storageMessageId || session.ownerId);
+    try {
+      const existing = await repository.findContentByMergeKey(groupKey);
+      if (existing) {
+        const content = await repository.appendFilesToContentByMergeKey(groupKey, session.files);
+        if (!content) throw new Error('The existing same-title post could not be updated.');
+        await repository.deleteSession(session.chatId, session.ownerId);
+        const websiteUrl = getContentPageUrl(config, content);
+        const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
+        await notifyAutomationPublisher(bot, settings, {
+          state: 'merged',
+          content,
+          session,
+          websiteUrl,
+          deliveryUrl
+        });
+        console.info(`[telegram] merged ${session.files.length} auto file(s) into ${content.adminId || content.title}.`);
+        results.push({ state: 'merged', content, session });
+        continue;
+      }
+
+      console.info(`[telegram] publishing queued storage group ${groupKey} as ${session.category}: ${session.title} (${session.files.length} file(s)).`);
+      const result = await publish(automationReplyContext(session), bot, repository, config);
+      if (!result?.content) {
+        // publishDraft keeps manual-chat wording friendly, but the authorized
+        // publisher needs the concrete underlying failure in the private
+        // automation report (for example an ImgBB or MongoDB configuration error).
+        throw result?.cause instanceof Error
+          ? result.cause
+          : new Error(result?.error || 'The automation publisher returned no catalog post.');
+      }
+      // publishDraft deletes its own session; custom publishers in tests and
+      // future workers may not, so make the successful cleanup idempotent.
+      await repository.deleteSession(session.chatId, session.ownerId);
+      await notifyAutomationPublisher(bot, settings, {
+        state: 'published',
+        content: result.content,
+        session,
+        websiteUrl: result.websiteUrl || getContentPageUrl(config, result.content),
+        deliveryUrl: result.deliveryUrl || getTelegramDeliveryUrl(config, result.content.shareCode)
+      });
+      results.push({ state: 'published', content: result.content, session });
+    } catch (error) {
+      const diagnostic = automationDiagnostic(error);
+      console.error('[telegram] queued auto-publish failed:', session.ownerId, diagnostic);
+      try {
+        await repository.markAutomationSessionFailed(session.chatId, session.ownerId, { error: diagnostic });
+      } catch (saveError) {
+        console.error('[telegram] could not save automation failure state:', automationDiagnostic(saveError));
+      }
+      await notifyAutomationPublisher(bot, settings, { state: 'failed', session, error: diagnostic });
+      results.push({ state: 'failed', error: diagnostic, session });
+    }
+  }
+  return results;
 }
 
 async function deliverContent(ctx, delivery, repository, config) {
@@ -1103,6 +1388,19 @@ export async function launchTelegramBot({ config, repository }) {
   const bot = new Telegraf(config.telegram.botToken);
   const ignoredAutoStorageMessageIds = new Set();
   const autoPublishInFlightMessageIds = new Set();
+  let automationQueuePromise = null;
+  const runAutomationQueue = () => {
+    if (automationQueuePromise) return automationQueuePromise;
+    automationQueuePromise = processQueuedAutomationSessions({ bot, repository, config })
+      .catch((error) => {
+        console.error('[telegram] persistent automation worker failed:', automationDiagnostic(error));
+        return [];
+      })
+      .finally(() => {
+        automationQueuePromise = null;
+      });
+    return automationQueuePromise;
+  };
   const ignoreAutoStorageMessage = (messageId) => {
     const key = String(messageId);
     ignoredAutoStorageMessageIds.add(key);
@@ -1112,7 +1410,10 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.on('channel_post', async (ctx) => {
     try {
-      await autoPublishStoragePost(ctx, bot, repository, config, ignoredAutoStorageMessageIds, autoPublishInFlightMessageIds);
+      const queued = await autoPublishStoragePost(ctx, bot, repository, config, ignoredAutoStorageMessageIds, autoPublishInFlightMessageIds);
+      // Also inspect an overdue group on incoming traffic; the interval below is
+      // still the durable primary scheduler after quiet uploads and restarts.
+      if (queued?.queued) void runAutomationQueue();
     } catch (error) {
       // This handler must never reply into the private database channel.
       console.error('[telegram] storage-channel automation handler failed:', error?.message || 'Unknown error');
@@ -1179,9 +1480,9 @@ export async function launchTelegramBot({ config, repository }) {
           '',
           'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
           'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
-          'Automation: /auto opens persistent ON/OFF controls for new media posted directly in the configured database channel.',
+          'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
-          'Management: /status · /teststorage · /cancel · /delete POST_ID · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Management: /status · /teststorage · /cancel · /posts 50 · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -1330,19 +1631,48 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('delete', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const adminId = parseCommandArgument(ctx.message.text).toUpperCase();
-    if (!/^SB-[A-F0-9]{10}$/.test(adminId)) {
-      await ctx.reply('Usage: /delete SB-0123ABCDEF\nUse the Post ID shown when the release was published.');
+    const adminIds = postIdsFromCommand(ctx.message.text);
+    if (!adminIds.length) {
+      await ctx.reply('Usage: /delete SB-0123ABCDEF\nYou can remove several unwanted cards at once: /delete SB-0123ABCDEF, SB-FEDCBA3210\nUse /posts 50 to list recent post IDs.');
       return;
     }
-    const removed = await repository.deleteContentByAdminId(adminId);
-    if (!removed) {
-      await ctx.reply('No published post was found with that ID.');
+
+    const removed = [];
+    const missing = [];
+    for (const adminId of adminIds) {
+      const content = await repository.deleteContentByAdminId(adminId);
+      if (content) removed.push(content);
+      else missing.push(adminId);
+    }
+    if (!removed.length) {
+      await ctx.reply(`No published post was found for ${missing.join(', ')}.`);
       return;
     }
-    await ctx.reply(
-      `Deleted “${removed.title}” from the public catalog. Its delivery link no longer resolves. The original files remain in the private storage channel so you can manage them separately.`
-    );
+    await ctx.reply([
+      `Deleted ${removed.length} catalog post${removed.length === 1 ? '' : 's'}: ${removed.map((content) => content.adminId).join(', ')}.`,
+      'Their delivery links no longer resolve. The original files remain in the private storage channel so you can manage them separately.',
+      missing.length ? `Not found: ${missing.join(', ')}.` : null
+    ].filter(Boolean).join('\n'));
+  });
+
+  bot.command('posts', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedLimit = Number.parseInt(parseCommandArgument(ctx.message.text), 10);
+    const limit = Number.isInteger(suppliedLimit) ? Math.max(1, Math.min(suppliedLimit, 50)) : 25;
+    const posts = await repository.listAdminContent(limit);
+    if (!posts.length) {
+      await ctx.reply('There are no catalog posts yet.');
+      return;
+    }
+    await replyBatchDiagnostics(ctx, [
+      `Recent catalog posts (${posts.length}) — copy an ID into /delete.`,
+      ...posts.map((post, index) => {
+        const episodes = post.episodeCount ? ` · ${post.episodeCount} episode${post.episodeCount === 1 ? '' : 's'}` : '';
+        return `${index + 1}. ${post.adminId} · ${cleanText(post.title, 74)} — ${categoryDetails(post.category).shortLabel} · ${post.filesCount || 0} file${post.filesCount === 1 ? '' : 's'}${episodes}`;
+      }),
+      '',
+      'Tip: /delete accepts multiple IDs in one message.'
+    ]);
   });
 
   bot.command('addchannel', async (ctx) => {
@@ -1418,7 +1748,13 @@ export async function launchTelegramBot({ config, repository }) {
     }
 
     const settings = action === 'on' || action === 'off'
-      ? await repository.setAutoPublishSettings({ enabled: action === 'on', updatedBy: userId(ctx) })
+      ? await repository.setAutoPublishSettings({
+        enabled: action === 'on',
+        updatedBy: userId(ctx),
+        // Completion/error reports must go to the authorized publisher, never
+        // back into the private database channel.
+        notifyChatId: ctx.chat?.type === 'private' ? chatId(ctx) : undefined
+      })
       : await repository.getAutoPublishSettings();
     await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
   });
@@ -1545,7 +1881,27 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   bot.catch(async (error, ctx) => {
-    console.error('[telegram] unhandled update error:', error?.message || error);
+    const diagnostic = automationDiagnostic(error);
+    const channelPost = ctx?.channelPost || ctx?.update?.channel_post;
+    if (channelPost) {
+      // Never put a fallback reply into the database channel. Those generic
+      // replies were themselves channel posts and made real upload failures
+      // look like a growing series of broken catalog messages.
+      console.error('[telegram] unhandled channel-post error (reply suppressed):', diagnostic);
+      try {
+        const settings = await repository.getAutoPublishSettings();
+        await notifyAutomationPublisher(bot, settings, {
+          state: 'failed',
+          session: { title: 'Storage channel update', files: [] },
+          error: diagnostic
+        });
+      } catch (notificationError) {
+        console.error('[telegram] could not report suppressed channel error:', automationDiagnostic(notificationError));
+      }
+      return;
+    }
+
+    console.error('[telegram] unhandled update error:', diagnostic);
     try {
       await ctx.reply('Something went wrong while handling that request. Please try again.');
     } catch {
@@ -1561,6 +1917,18 @@ export async function launchTelegramBot({ config, repository }) {
     console.warn('[telegram] Could not register bot commands:', error?.message || 'Unknown error');
   }
 
+  // A process can stop while an ImgBB/metadata request is in flight. Release
+  // its durable claim before polling begins so that group is retried instead of
+  // stranded or routed into a late-arrival group during startup.
+  if (typeof repository.releaseAutomationClaims === 'function') {
+    try {
+      const released = await repository.releaseAutomationClaims();
+      if (released) console.warn(`[telegram] released ${released} interrupted automation claim${released === 1 ? '' : 's'} for retry.`);
+    } catch (error) {
+      console.error('[telegram] could not recover interrupted automation claims:', automationDiagnostic(error));
+    }
+  }
+
   await bot.launch({ dropPendingUpdates: false }, () => {
     const deliveryBot = synchronizeDeliveryBotUsername(config, bot.botInfo);
     if (deliveryBot.changed) {
@@ -1571,6 +1939,19 @@ export async function launchTelegramBot({ config, repository }) {
       console.info(`[telegram] Delivery links are using @${deliveryBot.username || 'an unconfigured bot'}.`);
     }
   });
+
+  // Process any group whose persisted deadline elapsed while Koyeb restarted,
+  // then continue checking at a modest interval. There is no in-memory-only
+  // debounce state, so a restart cannot split a 100-file upload into cards.
+  await runAutomationQueue();
+  const automationTimer = setInterval(() => { void runAutomationQueue(); }, AUTO_QUEUE_INTERVAL_MS);
+  automationTimer.unref?.();
+  const originalStop = bot.stop.bind(bot);
+  bot.stop = (reason) => {
+    clearInterval(automationTimer);
+    return originalStop(reason);
+  };
+
   console.info('[telegram] Long polling started. Keep this service at one replica.');
   return bot;
 }

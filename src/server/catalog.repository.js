@@ -1,7 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { summarizeEpisodes } from './services/episode-service.js';
+import { summarizeEpisodes, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 
@@ -67,6 +67,62 @@ function sortByPublishedAt(items) {
   );
 }
 
+function normalizedMergeKey(value) {
+  return slugify(cleanText(value, 180));
+}
+
+function uniqueFiles(existingFiles = [], additionalFiles = []) {
+  const files = [];
+  const storageIds = new Set();
+  for (const file of [...existingFiles, ...additionalFiles]) {
+    if (!file || typeof file !== 'object') continue;
+    const storageId = file.storageMessageId === null || file.storageMessageId === undefined
+      ? ''
+      : String(file.storageMessageId);
+    // Direct-storage deliveries must have unique storage IDs. Preserve files
+    // without one for backwards-compatible manual records.
+    if (storageId && storageIds.has(storageId)) continue;
+    if (storageId) storageIds.add(storageId);
+    files.push(file);
+  }
+  return files;
+}
+
+function contentFileAppendPatch(content, additionalFiles) {
+  const files = uniqueFiles(content?.files || [], additionalFiles);
+  const episodeSummary = summarizeEpisodes(files);
+  const uploadLanguages = summarizeUploadLanguages(files);
+  const now = new Date().toISOString();
+  const languages = content?.languageSource === 'manual' && Array.isArray(content?.languages) && content.languages.length
+    ? content.languages
+    : uploadLanguages.length
+      ? uploadLanguages
+      : content?.languages || [];
+  const releaseLabel = episodeSummary.releaseLabel
+    || content?.releaseLabel
+    || (files.length === 1 ? 'Feature' : `${files.length} files`);
+
+  return {
+    files,
+    filesCount: files.length,
+    hasDelivery: files.length > 0,
+    episodeGroups: episodeSummary.groups,
+    episodeCount: episodeSummary.count,
+    releaseLabel,
+    languages,
+    languageSource: content?.languageSource === 'manual'
+      ? 'manual'
+      : uploadLanguages.length
+        ? 'upload'
+        : content?.languageSource || null,
+    searchText: [content?.title, content?.description, content?.category, ...languages, ...(content?.genres || [])]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase(),
+    updatedAt: now
+  };
+}
+
 function normalizeContent(input) {
   const now = new Date().toISOString();
   const title = cleanText(input.title, 180) || 'Untitled release';
@@ -114,6 +170,10 @@ function normalizeContent(input) {
     metadataProvider: cleanText(input.metadataProvider, 30) || null,
     tmdbId: input.tmdbId || null,
     art: input.art || null,
+    // titleKey makes same-title merging work for manual, batch, and older
+    // records. automationKey is intentionally only set for auto groups.
+    titleKey: normalizedMergeKey(title),
+    automationKey: input.automationKey ? normalizedMergeKey(input.automationKey) : null,
     files,
     filesCount,
     hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
@@ -149,7 +209,7 @@ export class MemoryCatalogRepository {
     this.adminSessions = new Map();
     this.requests = new Map();
     this.announcementChannels = new Map();
-    this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null };
+    this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
   }
 
   async init() {}
@@ -180,6 +240,39 @@ export class MemoryCatalogRepository {
       Array.isArray(entry.files) && entry.files.some((file) => String(file.storageMessageId) === needle)
     );
     return item ? clone(item) : null;
+  }
+
+  async findContentByMergeKey(mergeKey) {
+    const normalizedKey = normalizedMergeKey(mergeKey);
+    const item = [...this.contents.values()].find((entry) =>
+      entry.published !== false && (entry.automationKey === normalizedKey || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
+    );
+    return item ? clone(item) : null;
+  }
+
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles) {
+    const item = await this.findContentByMergeKey(mergeKey);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    Object.assign(saved, contentFileAppendPatch(saved, additionalFiles), {
+      automationKey: saved.automationKey || normalizedMergeKey(mergeKey)
+    });
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  async listAdminContent(limit = 25) {
+    return sortByPublishedAt([...this.contents.values()])
+      .slice(0, Math.max(1, Math.min(Number(limit) || 25, 50)))
+      .map((item) => clone({
+        adminId: item.adminId,
+        title: item.title,
+        category: item.category,
+        filesCount: item.filesCount || item.files?.length || 0,
+        episodeCount: item.episodeCount || 0,
+        publishedAt: item.publishedAt,
+        updatedAt: item.updatedAt
+      }));
   }
 
   async findContentByAdminId(adminId) {
@@ -276,6 +369,109 @@ export class MemoryCatalogRepository {
     return clone(item);
   }
 
+  async queueAutomationSession({ chatId, ownerId, category, title, file, groupKey, scheduledAt, maxWaitAt, firstReceivedAt, receivedAt = new Date().toISOString() }) {
+    const key = sessionKey(chatId, ownerId);
+    const existing = this.sessions.get(key);
+    if (existing && new Date(existing.expiresAt).getTime() <= Date.now()) this.sessions.delete(key);
+    const current = this.sessions.get(key);
+    // A publisher is claiming the group. The caller creates a short-lived late
+    // group instead of modifying a snapshot that is about to be published.
+    if (current?.auto?.status === 'publishing') return clone(current);
+
+    const item = current || {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      category: CATEGORY_IDS.has(category) ? category : 'movie',
+      title: cleanText(title, 180),
+      workflow: 'automation',
+      batch: null,
+      auto: null,
+      overrides: null,
+      metadata: null,
+      posterOriginalUrl: null,
+      files: [],
+      createdAt: receivedAt,
+      updatedAt: receivedAt,
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+    };
+    const safeGroupKey = normalizedMergeKey(groupKey);
+    const deadline = String(maxWaitAt || scheduledAt) < String(scheduledAt)
+      ? String(maxWaitAt || scheduledAt)
+      : String(scheduledAt);
+    item.category = item.category || (CATEGORY_IDS.has(category) ? category : 'movie');
+    item.title = item.title || cleanText(title, 180);
+    item.workflow = 'automation';
+    item.auto = {
+      ...(item.auto || {}),
+      groupKey: safeGroupKey,
+      status: 'collecting',
+      firstReceivedAt: item.auto?.firstReceivedAt || firstReceivedAt || receivedAt,
+      lastReceivedAt: receivedAt,
+      maxWaitAt: item.auto?.maxWaitAt || maxWaitAt || scheduledAt,
+      scheduledAt: deadline,
+      lastError: null
+    };
+    item.files = uniqueFiles(item.files, [file]);
+    item.updatedAt = receivedAt;
+    item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    this.sessions.set(key, item);
+    return clone(item);
+  }
+
+  async listDueAutomationSessions({ limit = 20, now = new Date().toISOString() } = {}) {
+    return [...this.sessions.values()]
+      .filter((session) => new Date(session.expiresAt).getTime() > Date.now())
+      .filter((session) => session.workflow === 'automation' && session.auto?.status === 'collecting')
+      .filter((session) => String(session.auto?.scheduledAt || '') <= String(now))
+      .sort((first, second) => String(first.auto?.scheduledAt || '').localeCompare(String(second.auto?.scheduledAt || '')))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 20, 50)))
+      .map(clone);
+  }
+
+  async claimAutomationSession(chatId, ownerId, { now = new Date().toISOString() } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.sessions.get(key);
+    if (!session || new Date(session.expiresAt).getTime() <= Date.now()) return null;
+    if (session.workflow !== 'automation' || session.auto?.status !== 'collecting' || String(session.auto?.scheduledAt || '') > String(now)) return null;
+    session.auto = { ...session.auto, status: 'publishing', claimedAt: now, lastError: null };
+    session.updatedAt = now;
+    this.sessions.set(key, session);
+    return clone(session);
+  }
+
+  async markAutomationSessionFailed(chatId, ownerId, { error, failedAt = new Date().toISOString() } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.sessions.get(key);
+    if (!session) return null;
+    session.auto = {
+      ...(session.auto || {}),
+      status: 'failed',
+      failedAt,
+      scheduledAt: null,
+      lastError: cleanText(error, 300) || 'Unknown automation error'
+    };
+    session.updatedAt = failedAt;
+    this.sessions.set(key, session);
+    return clone(session);
+  }
+
+  async releaseAutomationClaims({ now = new Date().toISOString() } = {}) {
+    let released = 0;
+    for (const [key, session] of this.sessions.entries()) {
+      if (session.workflow !== 'automation' || session.auto?.status !== 'publishing') continue;
+      session.auto = {
+        ...session.auto,
+        status: 'collecting',
+        scheduledAt: now,
+        releasedAt: now
+      };
+      session.updatedAt = now;
+      this.sessions.set(key, session);
+      released += 1;
+    }
+    return released;
+  }
+
   async findSessionByStorageMessageId(storageMessageId) {
     const needle = String(storageMessageId);
     for (const [key, session] of this.sessions.entries()) {
@@ -370,13 +566,16 @@ export class MemoryCatalogRepository {
     return clone(this.autoPublishSettings);
   }
 
-  async setAutoPublishSettings({ enabled, updatedBy = null }) {
+  async setAutoPublishSettings({ enabled, updatedBy = null, notifyChatId = undefined }) {
     const now = new Date().toISOString();
     this.autoPublishSettings = {
       enabled: Boolean(enabled),
       enabledAt: enabled ? now : null,
       updatedAt: now,
-      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy),
+      notifyChatId: notifyChatId === undefined
+        ? this.autoPublishSettings.notifyChatId || null
+        : notifyChatId === null || notifyChatId === '' ? null : String(notifyChatId)
     };
     return clone(this.autoPublishSettings);
   }
@@ -406,8 +605,11 @@ export class MongoCatalogRepository {
       this.contents.createIndex({ publishedAt: -1 }),
       this.contents.createIndex({ category: 1, publishedAt: -1 }),
       this.contents.createIndex({ 'files.storageMessageId': 1 }),
+      this.contents.createIndex({ automationKey: 1 }),
+      this.contents.createIndex({ titleKey: 1 }),
       this.sessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.sessions.createIndex({ 'files.storageMessageId': 1 }),
+      this.sessions.createIndex({ workflow: 1, 'auto.status': 1, 'auto.scheduledAt': 1 }),
       this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.adminSessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.adminSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
@@ -468,6 +670,55 @@ export class MongoCatalogRepository {
       { 'files.storageMessageId': { $in: values } },
       { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1 } }
     );
+  }
+
+  async findContentByMergeKey(mergeKey) {
+    const normalizedKey = normalizedMergeKey(mergeKey);
+    return this.contents.findOne({
+      published: { $ne: false },
+      $or: [
+        { automationKey: normalizedKey },
+        { titleKey: normalizedKey },
+        // Old records predate titleKey; their first slug remains a useful
+        // backwards-compatible same-title match.
+        { slug: normalizedKey }
+      ]
+    });
+  }
+
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles) {
+    const content = await this.findContentByMergeKey(mergeKey);
+    if (!content) return null;
+    const patch = {
+      ...contentFileAppendPatch(content, additionalFiles),
+      automationKey: content.automationKey || normalizedMergeKey(mergeKey)
+    };
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async listAdminContent(limit = 25) {
+    return this.contents
+      .find(
+        { published: { $ne: false } },
+        {
+          projection: {
+            adminId: 1,
+            title: 1,
+            category: 1,
+            filesCount: 1,
+            episodeCount: 1,
+            publishedAt: 1,
+            updatedAt: 1
+          }
+        }
+      )
+      .sort({ publishedAt: -1 })
+      .limit(Math.max(1, Math.min(Number(limit) || 25, 50)))
+      .toArray();
   }
 
   async findContentByAdminId(adminId) {
@@ -539,7 +790,11 @@ export class MongoCatalogRepository {
   }
 
   async findSession(chatId, ownerId) {
-    return this.sessions.findOne({ chatId: String(chatId), ownerId: String(ownerId) });
+    return this.sessions.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
   }
 
   async updateSession(chatId, ownerId, patch) {
@@ -576,6 +831,129 @@ export class MongoCatalogRepository {
     // rather than a findOneAndUpdate metadata wrapper.
     if (update.matchedCount !== 1) return null;
     return this.sessions.findOne(filter);
+  }
+
+  async queueAutomationSession({ chatId, ownerId, category, title, file, groupKey, scheduledAt, maxWaitAt, firstReceivedAt, receivedAt = new Date().toISOString() }) {
+    const filter = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      'auto.status': { $ne: 'publishing' }
+    };
+    const safeGroupKey = normalizedMergeKey(groupKey);
+    const safeCategory = CATEGORY_IDS.has(category) ? category : 'movie';
+    const auto = {
+      groupKey: safeGroupKey,
+      status: 'collecting',
+      firstReceivedAt: firstReceivedAt || receivedAt,
+      lastReceivedAt: receivedAt,
+      maxWaitAt: String(maxWaitAt || scheduledAt),
+      scheduledAt: String(maxWaitAt || scheduledAt) < String(scheduledAt)
+        ? String(maxWaitAt || scheduledAt)
+        : String(scheduledAt),
+      lastError: null
+    };
+
+    try {
+      return await this.sessions.findOneAndUpdate(
+        filter,
+        {
+          $set: {
+            category: safeCategory,
+            title: cleanText(title, 180),
+            workflow: 'automation',
+            batch: null,
+            auto,
+            overrides: null,
+            metadata: null,
+            posterOriginalUrl: null,
+            updatedAt: receivedAt,
+            expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+          },
+          $setOnInsert: {
+            chatId: String(chatId),
+            ownerId: String(ownerId),
+            createdAt: receivedAt
+          },
+          // Telegram can retry an update. Equal saved file objects are kept once.
+          $addToSet: { files: file }
+        },
+        { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+      );
+    } catch (error) {
+      // A group claimed by the worker no longer matches the filter. Its unique
+      // session index may make the attempted upsert collide; return the current
+      // record so the caller can route the file into a late-arrival group.
+      if (error?.code === 11000) return this.findSession(chatId, ownerId);
+      throw error;
+    }
+  }
+
+  async listDueAutomationSessions({ limit = 20, now = new Date().toISOString() } = {}) {
+    return this.sessions
+      .find({
+        workflow: 'automation',
+        'auto.status': 'collecting',
+        'auto.scheduledAt': { $lte: String(now) },
+        expiresAt: { $gt: new Date() }
+      })
+      .sort({ 'auto.scheduledAt': 1 })
+      .limit(Math.max(1, Math.min(Number(limit) || 20, 50)))
+      .toArray();
+  }
+
+  async claimAutomationSession(chatId, ownerId, { now = new Date().toISOString() } = {}) {
+    return this.sessions.findOneAndUpdate(
+      {
+        chatId: String(chatId),
+        ownerId: String(ownerId),
+        workflow: 'automation',
+        'auto.status': 'collecting',
+        'auto.scheduledAt': { $lte: String(now) },
+        expiresAt: { $gt: new Date() }
+      },
+      {
+        $set: {
+          'auto.status': 'publishing',
+          'auto.claimedAt': now,
+          'auto.lastError': null,
+          updatedAt: now
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async markAutomationSessionFailed(chatId, ownerId, { error, failedAt = new Date().toISOString() } = {}) {
+    return this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId), workflow: 'automation' },
+      {
+        $set: {
+          'auto.status': 'failed',
+          'auto.failedAt': failedAt,
+          'auto.scheduledAt': null,
+          'auto.lastError': cleanText(error, 300) || 'Unknown automation error',
+          updatedAt: failedAt,
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async releaseAutomationClaims({ now = new Date().toISOString() } = {}) {
+    const result = await this.sessions.updateMany(
+      { workflow: 'automation', 'auto.status': 'publishing' },
+      {
+        $set: {
+          'auto.status': 'collecting',
+          'auto.scheduledAt': String(now),
+          'auto.releasedAt': String(now),
+          updatedAt: String(now),
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      }
+    );
+    return result.modifiedCount || 0;
   }
 
   async findSessionByStorageMessageId(storageMessageId) {
@@ -680,17 +1058,22 @@ export class MongoCatalogRepository {
       enabled: false,
       enabledAt: null,
       updatedAt: null,
-      updatedBy: null
+      updatedBy: null,
+      notifyChatId: null
     };
   }
 
-  async setAutoPublishSettings({ enabled, updatedBy = null }) {
+  async setAutoPublishSettings({ enabled, updatedBy = null, notifyChatId = undefined }) {
     const now = new Date().toISOString();
+    const previous = await this.getAutoPublishSettings();
     const settings = {
       enabled: Boolean(enabled),
       enabledAt: enabled ? now : null,
       updatedAt: now,
-      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy),
+      notifyChatId: notifyChatId === undefined
+        ? previous.notifyChatId || null
+        : notifyChatId === null || notifyChatId === '' ? null : String(notifyChatId)
     };
     await this.automationSettings.updateOne(
       { _id: 'auto-publish' },

@@ -50,6 +50,66 @@ test('every uploaded file has a separate public Telegram choice', async () => {
   assert.equal(JSON.stringify(publicPost).includes('private-101'), false);
 });
 
+test('memory repository persists and atomically claims due automation groups', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const receivedAt = new Date().toISOString();
+  const scheduledAt = new Date(Date.now() + 1_000).toISOString();
+  const maxWaitAt = new Date(Date.now() + 5_000).toISOString();
+  // A direct channel burst is not capped at the 100-message /batch safety
+  // limit: all matching uploads persist in one auto group.
+  for (let index = 1; index <= 101; index += 1) {
+    await repository.queueAutomationSession({
+      chatId: '-100123',
+      ownerId: 'auto-storage-group-raakh',
+      category: 'web-series',
+      title: 'Raakh',
+      file: {
+        storageMessageId: 700 + index,
+        name: `Raakh.S01E${String(index).padStart(2, '0')}.mkv`,
+        episode: { start: index, end: index }
+      },
+      groupKey: 'raakh',
+      scheduledAt,
+      maxWaitAt,
+      firstReceivedAt: receivedAt,
+      receivedAt
+    });
+  }
+
+  const due = await repository.listDueAutomationSessions({ now: new Date(Date.now() + 2_000).toISOString() });
+  assert.equal(due.length, 1);
+  assert.equal(due[0].files.length, 101);
+  assert.equal(due[0].auto.groupKey, 'raakh');
+  const claimed = await repository.claimAutomationSession('-100123', 'auto-storage-group-raakh', { now: new Date(Date.now() + 2_000).toISOString() });
+  assert.equal(claimed.auto.status, 'publishing');
+  assert.equal(await repository.claimAutomationSession('-100123', 'auto-storage-group-raakh', { now: new Date(Date.now() + 2_000).toISOString() }), null);
+  const released = await repository.releaseAutomationClaims();
+  assert.equal(released, 1);
+  assert.equal((await repository.findSession('-100123', 'auto-storage-group-raakh')).auto.status, 'collecting');
+  const reclaimed = await repository.claimAutomationSession('-100123', 'auto-storage-group-raakh', { now: new Date(Date.now() + 2_000).toISOString() });
+  assert.equal(reclaimed.auto.status, 'publishing');
+  await repository.markAutomationSessionFailed('-100123', 'auto-storage-group-raakh', { error: 'ImgBB unavailable' });
+  assert.equal((await repository.findSession('-100123', 'auto-storage-group-raakh')).auto.lastError, 'ImgBB unavailable');
+});
+
+test('memory repository merges later files into a same-title content record without duplicates', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Cocktail 2',
+    category: 'movie',
+    files: [{ storageMessageId: 1, name: 'Cocktail.2.1080p.mkv' }],
+    automationKey: 'cocktail-2'
+  });
+  const merged = await repository.appendFilesToContentByMergeKey('cocktail-2', [
+    { storageMessageId: 1, name: 'Cocktail.2.1080p.mkv' },
+    { storageMessageId: 2, name: 'Cocktail.2.720p.mkv' }
+  ]);
+  assert.equal(merged.adminId, created.adminId);
+  assert.equal(merged.filesCount, 2);
+  assert.deepEqual(merged.files.map((file) => file.storageMessageId), [1, 2]);
+  assert.equal(merged.automationKey, 'cocktail-2');
+});
+
 test('memory repository persists login sessions, requests, announcement destinations, and auto-publish settings for its process lifetime', async () => {
   const repository = new MemoryCatalogRepository([]);
   const expiresAt = new Date(Date.now() + 60_000);

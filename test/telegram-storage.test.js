@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { automationGroupKey, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, processQueuedAutomationSessions, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
   const calls = [];
@@ -60,6 +61,17 @@ test('batch title and category inference prefer cleaned file descriptions', () =
   assert.equal(inferBatchTitle([{ displayName: 'Episode 02', name: 'Moonlit.Archive.S01E02.720p.mkv' }]), 'Moonlit Archive');
   assert.equal(inferBatchCategory({ files: [{ displayName: 'Lingwu Continent Episode 204 Chinese', episode: { start: 204, end: 204 } }] }), 'donghua');
   assert.equal(inferBatchCategory({ title: 'A new Donghua release', files: [] }), 'donghua');
+  const cocktail = {
+    name: 'Cocktail.2.2026.1080p.NF.WEB-DL.Hindi.DDP5.1.H.265~[C_B].mkv'
+  };
+  assert.equal(inferBatchTitle([cocktail]), 'Cocktail 2');
+  const raakh = {
+    name: 'Raakh.S01E03.1080p.AMZN.mkv',
+    episode: { start: 3, end: 3 }
+  };
+  assert.equal(inferBatchTitle([raakh]), 'Raakh');
+  assert.equal(inferBatchCategory({ files: [raakh], title: 'Raakh' }), 'web-series');
+  assert.equal(inferBatchTitle([{ name: 'Sora.Test.S02.1080p.NF.[t.is](http://t.is).mkv' }]), 'Sora Test');
 });
 
 test('batch import inspects every message in an inclusive private-storage range and keeps original IDs', async () => {
@@ -125,44 +137,175 @@ test('batch import inspects every message in an inclusive private-storage range 
   assert.match(replies.at(-1), /Imported 2 new files/);
 });
 
-test('enabled storage automation builds an isolated draft and ignores its own reply channel', async () => {
-  const calls = [];
-  let published;
+test('batch import enumerates already-published, active-draft, non-media, and inaccessible message IDs', async () => {
+  const replies = [];
+  const session = {
+    title: '',
+    category: 'movie',
+    files: [],
+    batch: { firstMessageId: 20, sourceChannelId: '-1002617067511', categoryOverride: null }
+  };
   const repository = {
-    async getAutoPublishSettings() { return { enabled: true }; },
-    async findSessionByStorageMessageId() { return null; },
-    async findContentByStorageMessageId() { return null; },
-    async startSession(input) { calls.push({ type: 'start', input }); },
-    async updateSession(chat, owner, patch) { calls.push({ type: 'update', chat, owner, patch }); return patch; },
-    async appendSessionFile(chat, owner, file) { calls.push({ type: 'append', chat, owner, file }); return { files: [file] }; }
+    async findContentByStorageMessageId(id) { return id === 20 ? { adminId: 'SB-0123ABCDEF' } : null; },
+    async findSessionByStorageMessageId(id) { return id === 21 ? { workflow: 'automation' } : null; },
+    async appendSessionFile() { throw new Error('must not append a non-media range'); },
+    async findSession() { return session; },
+    async updateSession(_chat, _owner, patch) { Object.assign(session, patch); return session; }
   };
   const ctx = {
-    channelPost: {
-      message_id: 71,
-      chat: { id: -1002617067511 },
-      caption: 'Perfect World Episode 178 Hindi 1080p',
-      document: { file_id: 'stored-file', file_name: 'Perfect.World.S01E178.1080p.mkv', file_size: 123 }
-    }
+    chat: { id: 200 },
+    from: { id: 300 },
+    telegram: {
+      async forwardMessage(_destination, _source, id) {
+        if (id === 22) return { message_id: 800, text: 'A note between releases' };
+        throw { description: 'Bad Request: message to forward not found' };
+      },
+      async deleteMessage() {}
+    },
+    async reply(text) { replies.push(text); }
   };
 
-  await autoPublishStoragePost(
+  await importStorageRange(
     ctx,
-    { botInfo: { id: 999 } },
+    session,
+    { channelId: '-1002617067511', messageId: 23 },
+    {},
     repository,
-    { telegram: { storageChannelId: '-1002617067511', botUsername: 'DeliveryBot' } },
-    new Set(),
-    new Set(),
-    async (automationContext) => { published = automationContext; }
+    { telegram: { storageChannelId: '-1002617067511' } }
   );
 
-  assert.equal(calls[0].type, 'start');
-  assert.equal(calls[0].input.title, 'Perfect World');
-  assert.equal(calls[0].input.category, 'web-series');
-  assert.equal(calls[1].patch.workflow, 'automation');
-  assert.equal(calls[2].type, 'append');
-  assert.equal(calls[2].file.storageMessageId, 71);
-  assert.equal(published.from.id, 'auto-storage-message-71');
-  await published.reply('kept out of the database channel');
+  const diagnostic = replies.join('\n');
+  assert.match(diagnostic, /Already linked to a catalog post \(1\): 20 \(SB-0123ABCDEF\)/);
+  assert.match(diagnostic, /Already attached to an active draft \(1\): 21 \(automation\)/);
+  assert.match(diagnostic, /Not supported media \/ text-only \(1\): 22/);
+  assert.match(diagnostic, /Could not inspect .*23 \(Bad Request: message to forward not found\)/);
+  assert.equal(session.batch.skipReasons.alreadyPublished, 1);
+  assert.equal(session.batch.failureCount, 1);
+});
+
+test('storage automation persistently groups matching direct uploads, then publishes once and silently appends later files', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.setAutoPublishSettings({ enabled: true, updatedBy: 300, notifyChatId: 300 });
+  const notifications = [];
+  const bot = {
+    botInfo: { id: 999 },
+    telegram: { async sendMessage(_destination, text) { notifications.push(text); } }
+  };
+  const config = { telegram: { storageChannelId: '-1002617067511', botUsername: 'DeliveryBot' } };
+  const makeContext = (messageId, filename) => ({
+    channelPost: {
+      message_id: messageId,
+      chat: { id: -1002617067511 },
+      document: { file_id: `stored-file-${messageId}`, file_name: filename, file_size: 123 }
+    }
+  });
+
+  const first = await autoPublishStoragePost(
+    makeContext(71, 'Cocktail.2.2026.1080p.NF.WEB-DL.Hindi.DDP5.1.H.265~[C_B].mkv'),
+    bot,
+    repository,
+    config,
+    new Set(),
+    new Set(),
+    { idleMs: 1_000, maxWaitMs: 5_000 }
+  );
+  const second = await autoPublishStoragePost(
+    makeContext(72, 'Cocktail.2.2026.720p.NF.WEB-DL.Hindi.AAC2.0.x264~[C_B].mkv'),
+    bot,
+    repository,
+    config,
+    new Set(),
+    new Set(),
+    { idleMs: 1_000, maxWaitMs: 5_000 }
+  );
+
+  assert.equal(first.groupKey, 'cocktail-2');
+  assert.equal(second.groupKey, 'cocktail-2');
+  const queued = await repository.findSession(-1002617067511, 'auto-storage-group-cocktail-2');
+  assert.equal(queued.title, 'Cocktail 2');
+  assert.equal(queued.category, 'movie');
+  assert.equal(queued.files.length, 2);
+  assert.equal(queued.auto.status, 'collecting');
+  assert.ok(queued.auto.scheduledAt);
+
+  let publicationCalls = 0;
+  const publish = async (automationContext, _bot, activeRepository) => {
+    publicationCalls += 1;
+    const active = await activeRepository.findSession(automationContext.chat.id, automationContext.from.id);
+    return {
+      content: await activeRepository.createContent({
+        title: active.title,
+        category: active.category,
+        files: active.files,
+        automationKey: active.auto.groupKey
+      })
+    };
+  };
+  await processQueuedAutomationSessions({
+    bot,
+    repository,
+    config,
+    publish,
+    now: new Date(Date.now() + 2_000).toISOString()
+  });
+  assert.equal(publicationCalls, 1);
+  let content = await repository.findContentByMergeKey('cocktail-2');
+  assert.equal(content.files.length, 2);
+  assert.match(notifications.at(-1), /Post ID:/);
+
+  await autoPublishStoragePost(
+    makeContext(73, 'Cocktail.2.2026.480p.NF.WEB-DL.Hindi.mkv'),
+    bot,
+    repository,
+    config,
+    new Set(),
+    new Set(),
+    { idleMs: 1_000, maxWaitMs: 5_000 }
+  );
+  await processQueuedAutomationSessions({
+    bot,
+    repository,
+    config,
+    publish,
+    now: new Date(Date.now() + 2_000).toISOString()
+  });
+  content = await repository.findContentByMergeKey('cocktail-2');
+  assert.equal(publicationCalls, 1);
+  assert.equal(content.files.length, 3);
+  assert.match(notifications.at(-1), /No second announcement was sent/);
+  assert.equal(automationGroupKey('Cocktail 2', 73), 'cocktail-2');
+});
+
+test('queued automation keeps errors out of storage and sends an actionable report only to the publisher', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.setAutoPublishSettings({ enabled: true, updatedBy: 700, notifyChatId: 700 });
+  const now = new Date().toISOString();
+  await repository.queueAutomationSession({
+    chatId: '-1002617067511',
+    ownerId: 'auto-storage-group-broken-release',
+    category: 'movie',
+    title: 'Broken release',
+    file: { storageMessageId: 88, name: 'Broken.Release.1080p.mkv' },
+    groupKey: 'broken-release',
+    scheduledAt: now,
+    maxWaitAt: now,
+    firstReceivedAt: now,
+    receivedAt: now
+  });
+  const sent = [];
+  const result = await processQueuedAutomationSessions({
+    bot: { telegram: { async sendMessage(destination, text) { sent.push({ destination, text }); } } },
+    repository,
+    config: { telegram: { botUsername: 'DeliveryBot' } },
+    publish: async () => ({ content: null, error: 'ImgBB is unavailable' }),
+    now: new Date(Date.now() + 1_000).toISOString()
+  });
+
+  assert.equal(result[0].state, 'failed');
+  assert.equal((await repository.findSession('-1002617067511', 'auto-storage-group-broken-release')).auto.status, 'failed');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].destination, '700');
+  assert.match(sent[0].text, /ImgBB is unavailable/);
 });
 
 test('storage automation ignores bot-originated media before it can create a loop', async () => {
