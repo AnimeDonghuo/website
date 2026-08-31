@@ -244,6 +244,56 @@ function SearchPage() {
   );
 }
 
+function formatEpisodeNumber(value) {
+  return String(value).padStart(2, '0');
+}
+
+function episodePagePath(item, group) {
+  const range = group.start === group.end ? String(group.start) : `${group.start}-${group.end}`;
+  return `/${item.category}/${item.slug}/episode/${range}`;
+}
+
+function parseEpisodeRoute(value) {
+  const match = String(value || '').match(/^(\d{1,3})(?:-(\d{1,3}))?$/);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2] || match[1]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) return null;
+  return {
+    start,
+    end,
+    label: start === end ? `Episode ${formatEpisodeNumber(start)}` : `Episodes ${formatEpisodeNumber(start)}–${formatEpisodeNumber(end)}`
+  };
+}
+
+function FileChoiceList({ item, choices, onGetFiles }) {
+  return <div className="file-choice-list">
+    {choices.map((file) => {
+      const heading = file.episode?.label || file.label || `Delivery file ${file.position}`;
+      const hasDistinctLabel = file.episode?.label && file.label && file.label.toLowerCase() !== file.episode.label.toLowerCase();
+      const episodeIndex = file.episode
+        ? file.episode.start === file.episode.end
+          ? `EP ${formatEpisodeNumber(file.episode.start)}`
+          : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
+        : `FILE ${String(file.position).padStart(2, '0')}`;
+      return <article className="file-choice" key={file.id}>
+        <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
+        <div className="file-choice__details">
+          <strong>{heading}</strong>
+          {hasDistinctLabel ? <span className="file-choice__label">{file.label}</span> : null}
+          <div className="file-choice__meta">
+            {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
+            {file.size ? <span>{file.size}</span> : null}
+            <span>{file.kind}</span>
+            {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
+          </div>
+        </div>
+        {file.deliveryReady ? <a className="file-choice__action" href={file.telegramUrl} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+      </article>;
+    })}
+  </div>;
+}
+
 function DetailPage({ onGetFiles }) {
   const { slug } = useParams();
   const release = useRemote(() => getContentBySlug(slug), [slug]);
@@ -310,31 +360,7 @@ function DetailPage({ onGetFiles }) {
           <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.</p></div>
           <button className="button button--secondary" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get all {item.filesCount} files</button>
         </div>
-        <div className="file-choice-list">
-          {item.fileChoices.map((file) => {
-            const heading = file.episode?.label || file.label || `Delivery file ${file.position}`;
-            const hasDistinctLabel = file.episode?.label && file.label && file.label.toLowerCase() !== file.episode.label.toLowerCase();
-            const episodeIndex = file.episode
-              ? file.episode.start === file.episode.end
-                ? `EP ${String(file.episode.start).padStart(2, '0')}`
-                : `EP ${String(file.episode.start).padStart(2, '0')}–${String(file.episode.end).padStart(2, '0')}`
-              : `FILE ${String(file.position).padStart(2, '0')}`;
-            return <article className="file-choice" key={file.id}>
-              <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
-              <div className="file-choice__details">
-                <strong>{heading}</strong>
-                {hasDistinctLabel ? <span className="file-choice__label">{file.label}</span> : null}
-                <div className="file-choice__meta">
-                  {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
-                  {file.size ? <span>{file.size}</span> : null}
-                  <span>{file.kind}</span>
-                  {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
-                </div>
-              </div>
-              {file.deliveryReady ? <a className="file-choice__action" href={file.telegramUrl} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
-            </article>;
-          })}
-        </div>
+        <FileChoiceList item={item} choices={item.fileChoices} onGetFiles={onGetFiles} />
       </section> : null}
 
       {item.episodeGroups?.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
@@ -343,20 +369,68 @@ function DetailPage({ onGetFiles }) {
           <span>{item.episodeCount || item.episodeGroups.length} indexed episode{(item.episodeCount || item.episodeGroups.length) === 1 ? '' : 's'}</span>
         </div>
         <div className="episode-grid">
-          {item.episodeGroups.map((group) => <div className="episode-card" key={`${group.start}-${group.end}`}>
-            <span className={`episode-card__number ${group.start === group.end ? '' : 'episode-card__number--range'}`}>{group.start === group.end ? `EP ${String(group.start).padStart(2, '0')}` : `${String(group.start).padStart(2, '0')}–${String(group.end).padStart(2, '0')}`}</span>
+          {item.episodeGroups.map((group) => <Link className="episode-card" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
+            <span className={`episode-card__number ${group.start === group.end ? '' : 'episode-card__number--range'}`}>{group.start === group.end ? `EP ${formatEpisodeNumber(group.start)}` : `${formatEpisodeNumber(group.start)}–${formatEpisodeNumber(group.end)}`}</span>
             <strong>{group.label}</strong>
             <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
-            <Icon name="telegram" size={15} />
-          </div>)}
+            <Icon name="arrow" size={15} />
+          </Link>)}
         </div>
-        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Choose an individual file above, or use the all-files delivery option.</p>
+        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Select an episode to open its own delivery page and compare every available file option.</p>
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">
         <div className="section-heading"><div><Eyebrow>MORE IN {item.categoryLabel.toUpperCase()}</Eyebrow><h2 id="related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
         <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
       </section> : null}
+    </PageShell>
+  );
+}
+
+function EpisodePage({ onGetFiles }) {
+  const { category, slug, episodeRange } = useParams();
+  const release = useRemote(() => getContentBySlug(slug), [slug]);
+  const item = release.data?.item;
+  const requestedEpisode = parseEpisodeRoute(episodeRange);
+  const matchingGroup = item?.episodeGroups?.find((group) => group.start === requestedEpisode?.start && group.end === requestedEpisode?.end);
+  const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
+  const choices = item && requestedEpisode
+    ? (item.fileChoices || []).filter((file) => file.episode && file.episode.start <= requestedEpisode.end && file.episode.end >= requestedEpisode.start)
+    : [];
+
+  if (release.loading) {
+    return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
+  }
+  if (release.error || !item || !requestedEpisode || item.category !== category) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>EPISODE NOT FOUND</Eyebrow><h1>That episode page is off the map.</h1><p>{release.error?.message || 'Return to the release and choose an available episode.'}</p><Link className="button button--primary" to={item ? `/${item.category}/${item.slug}` : '/browse'}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+
+  return (
+    <PageShell>
+      <section className={`detail-hero detail-hero--${item.tone} episode-page-hero`}>
+        <div className="detail-hero__glow" aria-hidden="true" />
+        <div className="detail-hero__backdrop" style={item.backdropUrl ? { backgroundImage: `url("${item.backdropUrl}")` } : undefined} aria-hidden="true" />
+        <div className="page-width detail-hero__inner episode-page-hero__inner">
+          <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
+          <div className="episode-page-hero__content">
+            <Eyebrow>EPISODE DELIVERY</Eyebrow>
+            <h1>{episodeLabel} <span>for</span> <em>{item.title}</em></h1>
+            <p>Choose one version below. Each Telegram link delivers only that selected file, so you can pick the quality or upload that suits you.</p>
+            <div className="episode-page-hero__facts">
+              <span><Icon name="layers" size={15} /> {choices.length} file option{choices.length === 1 ? '' : 's'}</span>
+              {item.languages.length ? <span><Icon name="check" size={15} /> {item.languages.join(' · ')}</span> : null}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="file-choice-section file-choice-section--episode page-width" aria-labelledby="episode-file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>FILES FOR {episodeLabel.toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
+          <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> All release files</Link>
+        </div>
+        {choices.length ? <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} /> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
+      </section>
     </PageShell>
   );
 }
@@ -375,6 +449,7 @@ export default function App() {
         <Route path="/browse" element={<BrowsePage />} />
         <Route path="/browse/:category" element={<BrowsePage />} />
         <Route path="/search" element={<SearchPage />} />
+        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={setDeliveryItem} />} />
         <Route path="/:category/:slug" element={<DetailPage onGetFiles={setDeliveryItem} />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>

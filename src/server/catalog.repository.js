@@ -74,6 +74,7 @@ function normalizeContent(input) {
     category,
     year: Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5 ? parsedYear : null,
     languages,
+    languageSource: ['manual', 'upload', 'metadata'].includes(input.languageSource) ? input.languageSource : null,
     genres,
     description,
     status: cleanText(input.status, 60) || 'New release',

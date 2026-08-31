@@ -12,7 +12,8 @@ test('public serialization creates a deep link and hides storage file metadata',
   const created = await repository.createContent({
     title: 'Private release',
     category: 'movie',
-    files: [{ storageMessageId: 33, telegramFileId: 'very-private-file-id', name: 'clip.mp4' }]
+    languages: ['Multi language'],
+    files: [{ storageMessageId: 33, telegramFileId: 'very-private-file-id', name: 'clip.Multi.Hindi.Malayalam.mp4' }]
   });
   const publicRecord = toPublicContent(created, config);
 
@@ -21,6 +22,7 @@ test('public serialization creates a deep link and hides storage file metadata',
   assert.equal(publicRecord.telegramFileId, undefined);
   assert.equal(publicRecord.adminId, undefined);
   assert.equal(publicRecord.filesCount, 1);
+  assert.deepEqual(publicRecord.languages, ['Hindi', 'Malayalam']);
   assert.equal(publicRecord.fileChoices.length, 1);
   assert.match(publicRecord.fileChoices[0].telegramUrl, /^https:\/\/t\.me\/ExampleDeliveryBot\?start=file-/);
   assert.equal(publicRecord.fileChoices[0].storageMessageId, undefined);

@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { cleanMediaName, detectMediaQuality } from './services/episode-service.js';
+import { cleanMediaName, detectMediaQuality, summarizeUploadLanguages } from './services/episode-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,6 +29,26 @@ function publicEpisodeGroups(value) {
       fileCount: Math.max(1, Number(group?.fileCount) || 1)
     }))
     .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label);
+}
+
+function publicLanguages(content) {
+  const savedLanguages = Array.isArray(content?.languages)
+    ? content.languages
+      .map((language) => cleanText(language, 40))
+      .filter((language) => language && !/^multi(?:\s+language)?$/i.test(language))
+    : [];
+  const uploadLanguages = content?.languageSource === 'manual' ? [] : summarizeUploadLanguages(content?.files || []);
+  const languages = uploadLanguages.length ? uploadLanguages : savedLanguages;
+  const uniqueLanguages = [];
+  const seen = new Set();
+  for (const language of languages) {
+    const key = language.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueLanguages.push(language);
+    if (uniqueLanguages.length === 8) break;
+  }
+  return uniqueLanguages;
 }
 
 function publicFileChoices(files, config, shareCode) {
@@ -71,7 +91,7 @@ export function toPublicContent(content, config) {
     tone: content.art?.tone || category.tone,
     art: content.art || { tone: category.tone },
     year: content.year || null,
-    languages: Array.isArray(content.languages) ? content.languages : [],
+    languages: publicLanguages(content),
     genres: Array.isArray(content.genres) ? content.genres : [],
     description: content.description || '',
     status: content.status || 'New release',
@@ -127,6 +147,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       catalogStore: repository.kind,
       persistent: repository.persistent,
       telegramPolling: Boolean(config.telegram.botToken && config.telegram.mode === 'polling'),
+      deliveryBotUsername: config.telegram.botUsername || null,
       announcementSiteUrl: config.siteUrl || null,
       now: new Date().toISOString()
     });

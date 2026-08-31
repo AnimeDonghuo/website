@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fileFromMessage, parseDeliveryPayload, storageErrorHint, storeMediaInChannel } from '../src/server/services/telegram-bot.js';
+import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
+import { fileFromMessage, parseDeliveryPayload, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
   const calls = [];
@@ -33,11 +34,27 @@ test('single-file deep-link payload preserves hyphens in the share code', () => 
   assert.equal(parseDeliveryPayload('file-not-valid'), null);
 });
 
+test('a replacement bot token updates runtime delivery links to its detected username', () => {
+  const config = { telegram: { botUsername: 'RetiredDeliveryBot' } };
+  const result = synchronizeDeliveryBotUsername(config, { username: 'ReplacementDeliveryBot' });
+
+  assert.deepEqual(result, {
+    username: 'ReplacementDeliveryBot',
+    previousUsername: 'RetiredDeliveryBot',
+    changed: true
+  });
+  assert.equal(config.telegram.botUsername, 'ReplacementDeliveryBot');
+  assert.equal(
+    getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 1),
+    'https://t.me/ReplacementDeliveryBot?start=file-aB-cD_ef-1'
+  );
+});
+
 test('stored file record keeps the returned storage message ID', () => {
   const file = fileFromMessage(
     {
       message_id: 12,
-      caption: 'Lingwu Continent @sourcechannel Episode 204 English Sub',
+      caption: 'Lingwu Continent @sourcechannel Episode 204 Hindi + Malayalam 1080p',
       video: {
         file_id: 'telegram-file-id',
         file_name: 'Lingwu.Continent.Episode.204.English.Sub.mkv',
@@ -52,6 +69,8 @@ test('stored file record keeps the returned storage message ID', () => {
   assert.equal(file.storageMessageId, 987);
   assert.equal(file.episode.start, 204);
   assert.equal(file.episode.source, 'caption');
+  assert.deepEqual(file.languages, ['Hindi', 'Malayalam']);
+  assert.equal(file.quality, '1080P');
 });
 
 test('storage troubleshooting distinguishes protected content and wrong channel IDs', () => {

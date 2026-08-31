@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectMediaQuality, detectUploadEpisode, stripTelegramAttribution, summarizeEpisodes } from '../src/server/services/episode-service.js';
+import { detectMediaQuality, detectUploadEpisode, detectUploadLanguages, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -31,6 +31,27 @@ test('quality is detected from a cleaned caption before the filename fallback', 
     '4K'
   );
   assert.equal(detectMediaQuality({ caption: 'Perfect World', filename: 'Perfect.World.720p.mkv' }), '720P');
+});
+
+test('file descriptions resolve explicit multi-audio labels instead of a generic Multi label', () => {
+  assert.deepEqual(
+    detectUploadLanguages({
+      caption: 'Evil Dead Burn Multi (Hindi + Malayalam) @release_source 1080p',
+      filename: 'Evil.Dead.Burn.English.720p.mkv'
+    }),
+    ['Hindi', 'Malayalam']
+  );
+  assert.deepEqual(
+    detectUploadLanguages({ caption: 'Multi Audio', filename: 'Evil_Dead_Burn_Hindi_Malayalam_1080p.mkv' }),
+    ['Hindi', 'Malayalam']
+  );
+  assert.deepEqual(
+    summarizeUploadLanguages([
+      { languages: ['Hindi', 'Malayalam'] },
+      { languages: ['Malayalam', 'Tamil'] }
+    ]),
+    ['Hindi', 'Malayalam', 'Tamil']
+  );
 });
 
 test('episode summary creates an ordered public-friendly index', () => {

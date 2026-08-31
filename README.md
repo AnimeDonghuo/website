@@ -19,7 +19,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
 - Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, a smart episode index, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog
+- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog
 - Search that supports multi-word title, genre, and language matching
 - Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
@@ -39,7 +39,8 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Server-side poster download validation, then permanent ImgBB upload during publishing
 - A generated PNG fallback poster is also uploaded to ImgBB if no provider has suitable artwork
 - Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
-- Post pages show a safe, public episode index while storage message IDs remain private
+- Upload captions/file names also resolve explicit language labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label
+- Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel
@@ -145,6 +146,12 @@ TELEGRAM_MODE=polling
 
 `ADMIN_LOGIN_CODE` is required to unlock publishing. A logged-in publisher session expires automatically after the configured number of hours. `TELEGRAM_ADMIN_IDS` is an optional additional safety layer: when it is populated, only those numeric Telegram user IDs can log in even if somebody knows the passcode. When it is empty, the passcode itself controls access.
 
+#### Bot-token rotation and replacement recovery
+
+Delivery URLs are **not stored with a bot username** in MongoDB. The website creates them from the currently running bot at request time. When a token is rotated, deploy the new `TELEGRAM_BOT_TOKEN`; at launch, the service asks Telegram which `@username` owns that token and uses it for all catalog and per-file links automatically. This also handles a replacement bot with a different username — update the token, redeploy, and add the replacement bot as an administrator of the existing private storage channel so it can copy the saved messages.
+
+Check `/api/health` after deployment: `deliveryBotUsername` must be the replacement bot. Existing catalog pages and website-first announcement buttons will then generate links to it. A previously copied external `t.me/OldBot?...` URL cannot be rewritten after the old bot is banned; share the stable catalog page rather than old direct links when recovering.
+
 #### Storage-channel troubleshooting
 
 Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel.
@@ -235,13 +242,13 @@ Useful commands:
 | `/channels` / `/removechannel ID` | View or remove announcement destinations |
 | `/requests` | Review the latest open user requests |
 
-When publishing succeeds, the bot replies with a URL like:
+When `PUBLIC_SITE_URL` is configured, publishing returns the stable catalog detail-page URL as the recommended share link, plus a private all-files Telegram button for the publisher. Without a website URL, it falls back to a direct link like:
 
 ```text
 https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 ```
 
-The public site automatically builds this URL behind the **Get all files on Telegram** button from the record's short delivery code, and the bot resolves it privately. It also creates a separate `file-…` deep link for every uploaded file. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
+The public site automatically builds that all-files URL and a separate `file-…` deep link for every uploaded file from the record's short delivery code. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
 
 ### Automatic announcement channels
 
@@ -306,7 +313,7 @@ All public API routes are same-origin and read-only:
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /api/health` | Deployment health and non-sensitive store status |
+| `GET /api/health` | Deployment health, non-sensitive store status, active delivery-bot username, and normalized announcement URL |
 | `GET /api/config` | Public category/configuration flags |
 | `GET /api/categories` | Category labels and current counts |
 | `GET /api/content` | Latest catalog records |

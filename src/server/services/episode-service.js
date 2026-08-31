@@ -3,6 +3,35 @@ import { cleanText } from '../lib/strings.js';
 const MAX_EPISODE = 999;
 const MAX_RANGE_WIDTH = 300;
 
+// These are intentionally display labels rather than a generic "Multi" tag.
+// Upload captions such as "Multi (Hindi + Malayalam)" should tell visitors
+// exactly which languages are included on the actual release.
+const LANGUAGE_PATTERNS = [
+  ['Hindi', /\b(?:hindi|hin)\b/i],
+  ['Malayalam', /\b(?:malayalam|mal)\b/i],
+  ['Tamil', /\b(?:tamil|tam)\b/i],
+  ['Telugu', /\b(?:telugu|tel)\b/i],
+  ['Kannada', /\b(?:kannada|kan)\b/i],
+  ['Bengali', /\b(?:bengali|bangla)\b/i],
+  ['Marathi', /\bmarathi\b/i],
+  ['Punjabi', /\bpunjabi\b/i],
+  ['Gujarati', /\bgujarati\b/i],
+  ['Urdu', /\burdu\b/i],
+  ['English', /\b(?:english|eng)\b/i],
+  ['Japanese', /\b(?:japanese|jpn)\b/i],
+  ['Korean', /\b(?:korean|kor)\b/i],
+  ['Chinese', /\b(?:chinese|mandarin|cantonese)\b/i],
+  ['Indonesian', /\b(?:indonesian|indo)\b/i],
+  ['Thai', /\bthai\b/i],
+  ['Vietnamese', /\bvietnamese\b/i],
+  ['Spanish', /\bspanish\b/i],
+  ['French', /\bfrench\b/i],
+  ['German', /\bgerman\b/i],
+  ['Portuguese', /\bportuguese\b/i],
+  ['Arabic', /\barabic\b/i],
+  ['Russian', /\brussian\b/i]
+];
+
 function validEpisode(value) {
   return Number.isInteger(value) && value >= 1 && value <= MAX_EPISODE;
 }
@@ -79,6 +108,47 @@ export function detectMediaQuality({ caption, filename }) {
     if (match) return match[1].toUpperCase();
   }
   return null;
+}
+
+function detectedLanguagesIn(value) {
+  const text = stripTelegramAttribution(value).replace(/[_.+/]+/g, ' ');
+  if (!text) return [];
+  return LANGUAGE_PATTERNS
+    .filter(([, pattern]) => pattern.test(text))
+    .map(([label]) => label);
+}
+
+// Captions are more intentional than filenames. If a caption names languages,
+// use only that set; otherwise inspect the filename as a fallback. In
+// particular, the word "Multi" alone is never emitted as a public language.
+export function detectUploadLanguages({ caption, filename }) {
+  const captionLanguages = detectedLanguagesIn(caption);
+  if (captionLanguages.length) return captionLanguages;
+  return detectedLanguagesIn(filename);
+}
+
+export function summarizeUploadLanguages(files = []) {
+  const languages = [];
+  const seen = new Set();
+  for (const file of files) {
+    const savedLanguages = Array.isArray(file?.languages)
+      ? file.languages
+        .map((language) => cleanText(language, 40))
+        .filter((language) => language && !/^(?:multi(?:\s+language)?|dual\s+audio)$/i.test(language))
+      : [];
+    const detected = savedLanguages.length
+      ? savedLanguages
+      : detectUploadLanguages({ caption: file?.displayName, filename: file?.name });
+    for (const language of detected) {
+      const cleanLanguage = cleanText(language, 40);
+      const key = cleanLanguage.toLowerCase();
+      if (!cleanLanguage || /^(?:multi(?:\s+language)?|dual\s+audio)$/i.test(cleanLanguage) || seen.has(key)) continue;
+      seen.add(key);
+      languages.push(cleanLanguage);
+      if (languages.length === 8) return languages;
+    }
+  }
+  return languages;
 }
 
 export function detectUploadEpisode({ caption, filename }) {

@@ -3,8 +3,9 @@ import Artwork from './Artwork.jsx';
 import { Icon } from './Icons.jsx';
 
 function compactLanguages(languages = []) {
-  if (!languages.length) return 'Multi language';
-  return languages.slice(0, 2).join(' · ');
+  const explicitLanguages = languages.filter((language) => !/^multi(?:\s+language)?$/i.test(String(language || '')));
+  if (!explicitLanguages.length) return 'Language details';
+  return explicitLanguages.slice(0, 2).join(' · ');
 }
 
 export default function ReleaseCard({ item, index = 0, featured = false }) {

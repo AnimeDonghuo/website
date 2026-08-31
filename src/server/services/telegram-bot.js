@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
-import { summarizeEpisodes, detectMediaQuality, detectUploadEpisode } from './episode-service.js';
+import { summarizeEpisodes, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
@@ -44,6 +44,24 @@ function sameSecret(candidate, expected) {
   return candidateBytes.length === expectedBytes.length && crypto.timingSafeEqual(candidateBytes, expectedBytes);
 }
 
+// Delivery URLs are generated at request time rather than stored in MongoDB.
+// Resolving the username from the active token means rotating a token — or
+// switching to a replacement bot — updates every catalog-page link at once.
+export function synchronizeDeliveryBotUsername(config, botInfo) {
+  const username = cleanText(botInfo?.username, 64).replace(/^@/, '').replace(/\s+/g, '');
+  if (!/^[A-Za-z][A-Za-z0-9_]{4,63}$/.test(username)) {
+    return { username: config.telegram.botUsername || null, previousUsername: config.telegram.botUsername || null, changed: false };
+  }
+
+  const previousUsername = config.telegram.botUsername || null;
+  config.telegram.botUsername = username;
+  return {
+    username,
+    previousUsername,
+    changed: Boolean(previousUsername && previousUsername.toLowerCase() !== username.toLowerCase())
+  };
+}
+
 function panelKeyboard() {
   return Markup.inlineKeyboard([
     [
@@ -71,6 +89,13 @@ function deliveryKeyboard(url) {
   return url
     ? Markup.inlineKeyboard([[Markup.button.url('Open Telegram delivery', url)]])
     : undefined;
+}
+
+function publicationKeyboard(websiteUrl, deliveryUrl) {
+  if (!websiteUrl) return deliveryKeyboard(deliveryUrl);
+  const rows = [[Markup.button.url('✨ VIEW CATALOG PAGE', websiteUrl)]];
+  if (deliveryUrl) rows.push([Markup.button.url('Open all files in Telegram', deliveryUrl)]);
+  return Markup.inlineKeyboard(rows);
 }
 
 const VISITOR_COMMANDS = [
@@ -142,7 +167,12 @@ function displayDraft(session) {
   const title = session.title || 'Waiting for title';
   const files = session.files?.length || 0;
   const matched = session.metadata?.matched ? `${String(session.metadata.provider || 'metadata').toUpperCase()} match ready` : 'Fallback artwork ready';
-  const language = session.overrides?.languages?.length ? session.overrides.languages.join(', ') : 'Not set';
+  const detectedLanguages = summarizeUploadLanguages(session.files || []);
+  const language = session.overrides?.languages?.length
+    ? `${session.overrides.languages.join(', ')} (manual)`
+    : detectedLanguages.length
+      ? `${detectedLanguages.join(', ')} (from uploaded file details)`
+      : (session.metadata?.languages || []).filter((item) => !/^multi(?:\s+language)?$/i.test(String(item || ''))).join(', ') || 'Not set';
   const episodeSummary = summarizeEpisodes(session.files || []);
 
   return [
@@ -179,6 +209,7 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const episode = detectUploadEpisode({ caption: message.caption, filename });
   const quality = detectMediaQuality({ caption: message.caption, filename });
+  const languages = detectUploadLanguages({ caption: message.caption, filename });
 
   return {
     storageMessageId: storedMessageId,
@@ -187,6 +218,7 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
     name: cleanText(filename, 180),
     displayName: episode.displayName,
     quality,
+    languages,
     mimeType: cleanText(source?.mime_type || '', 80),
     size: Number(source?.file_size) || 0,
     kind,
@@ -464,6 +496,9 @@ async function publishDraft(ctx, bot, repository, config) {
     const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
     const overrides = session.overrides || {};
     const episodeSummary = summarizeEpisodes(session.files);
+    const uploadedLanguages = summarizeUploadLanguages(session.files);
+    const metadataLanguages = (metadata.languages || []).filter((language) => !/^multi(?:\s+language)?$/i.test(String(language || '')));
+    const releaseLanguages = overrides.languages?.length ? overrides.languages : uploadedLanguages.length ? uploadedLanguages : metadataLanguages;
     const posterResult = await mirrorPosterToImgBB({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
@@ -478,7 +513,10 @@ async function publishDraft(ctx, bot, repository, config) {
       title,
       category: session.category,
       year: overrides.year || metadata.year,
-      languages: overrides.languages || metadata.languages || [],
+      // Explicit /lang settings win. Otherwise the file caption/filename is
+      // the source of truth for release audio labels (e.g. Multi Hindi + Malayalam).
+      languages: releaseLanguages,
+      languageSource: overrides.languages?.length ? 'manual' : uploadedLanguages.length ? 'upload' : 'metadata',
       genres: overrides.genres || metadata.genres || [],
       description: overrides.description || metadata.description || '',
       status: overrides.status || metadata.status || 'New release',
@@ -536,10 +574,11 @@ async function publishDraft(ctx, bot, repository, config) {
         channelNote,
         websiteNote,
         '',
-        'Share this delivery link:',
-        url
-      ].join('\n'),
-      deliveryKeyboard(url)
+        websiteUrl ? 'Share this stable catalog page (recommended):' : 'Share this delivery link:',
+        websiteUrl || url,
+        websiteUrl ? 'It will always generate Telegram links for the active delivery bot.' : null
+      ].filter((line) => line !== null).join('\n'),
+      publicationKeyboard(websiteUrl, url)
     );
   } catch (error) {
     const message = error instanceof PosterHostingError
@@ -1032,7 +1071,16 @@ export async function launchTelegramBot({ config, repository }) {
     console.warn('[telegram] Could not register bot commands:', error?.message || 'Unknown error');
   }
 
-  await bot.launch({ dropPendingUpdates: false });
+  await bot.launch({ dropPendingUpdates: false }, () => {
+    const deliveryBot = synchronizeDeliveryBotUsername(config, bot.botInfo);
+    if (deliveryBot.changed) {
+      console.warn(
+        `[telegram] Token belongs to @${deliveryBot.username}, replacing configured @${deliveryBot.previousUsername} for dynamic delivery links.`
+      );
+    } else {
+      console.info(`[telegram] Delivery links are using @${deliveryBot.username || 'an unconfigured bot'}.`);
+    }
+  });
   console.info('[telegram] Long polling started. Keep this service at one replica.');
   return bot;
 }
