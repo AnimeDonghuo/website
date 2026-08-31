@@ -913,35 +913,56 @@ export async function launchTelegramBot({ config, repository }) {
         return;
       }
 
+      let stored;
       try {
-        const stored = await storeMediaInChannel(
+        stored = await storeMediaInChannel(
           ctx.telegram,
           config.telegram.storageChannelId,
           chatId(ctx),
           message
         );
-        const updated = await repository.appendSessionFile(
-          chatId(ctx),
-          userId(ctx),
-          fileFromMessage(message, stored.storageMessageId, stored.method)
-        );
-        const last = updated.files.at(-1);
-        const size = formatBytes(last.size);
-        const summary = summarizeEpisodes(updated.files);
-        const fallbackNote = stored.method === 'file-id-fallback' ? ' Stored with Telegram’s file-ID fallback.' : '';
-        await ctx.reply(
-          `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
-          uploadKeyboard()
-        );
       } catch (error) {
         console.error(
-          '[telegram] storage copy failed:',
+          '[telegram] storage transport failed:',
           error?.copyError?.description || error?.copyError?.message || error?.message || 'Unknown error',
           '| fallback:',
           error?.fallbackError?.description || error?.fallbackError?.message || 'not attempted'
         );
         await ctx.reply(`I could not store that file. ${storageErrorHint(error)}`);
+        return;
       }
+
+      let updated;
+      let last;
+      let summary;
+      try {
+        updated = await repository.appendSessionFile(
+          chatId(ctx),
+          userId(ctx),
+          fileFromMessage(message, stored.storageMessageId, stored.method)
+        );
+        if (!updated?.files?.length) {
+          throw new Error('The active draft was no longer available after the file reached Telegram storage.');
+        }
+        last = updated.files.at(-1);
+        summary = summarizeEpisodes(updated.files);
+      } catch (error) {
+        // A screenshot of the database channel can show the media in this case:
+        // Telegram storage succeeded, but MongoDB could not attach its message ID
+        // to the draft. Keep this separate from a channel-permission failure.
+        console.error('[telegram] draft record failed after storage success:', error?.message || 'Unknown error');
+        await ctx.reply(
+          'The file reached the storage channel, but I could not attach it to this upload draft. Please use /status. If it is not listed, start a new draft before uploading again; do not assume the channel copy is linked to the website.'
+        );
+        return;
+      }
+
+      const size = formatBytes(last.size);
+      const fallbackNote = stored.method === 'file-id-fallback' ? ' Stored with Telegram’s file-ID fallback.' : '';
+      await ctx.reply(
+        `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
+        uploadKeyboard()
+      );
       return;
     }
 
