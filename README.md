@@ -133,6 +133,10 @@ TELEGRAM_MODE=polling
 
 `ADMIN_LOGIN_CODE` is required to unlock publishing. A logged-in publisher session expires automatically after the configured number of hours. `TELEGRAM_ADMIN_IDS` is an optional additional safety layer: when it is populated, only those numeric Telegram user IDs can log in even if somebody knows the passcode. When it is empty, the passcode itself controls access.
 
+#### Storage-channel troubleshooting
+
+Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel.
+
 ### 4. Configure permanent ImgBB posters
 
 Set your ImgBB server API key as **`IMGBB_API_KEY`**. It is used only by server-side publishing code. Do **not** commit it, put it in a `VITE_` variable, or paste it into client code.
@@ -211,6 +215,7 @@ Useful commands:
 | `/description …` | Set a public synopsis |
 | `/poster https://…` | Override automatic artwork with a public HTTPS image |
 | `/status` | See the active draft state and detected episode index |
+| `/teststorage` | Send a harmless test message to verify the configured database channel |
 | `/cancel` | Discard the active draft |
 | `/done` | Mirror poster, create MongoDB record, announce to every configured channel, and return share + Post ID |
 | `/delete SB-0123ABCDEF` | Remove a published catalog record and disable its deep link |

@@ -90,6 +90,7 @@ const PUBLISHER_COMMANDS = [
   { command: 'series', description: 'New web series draft' },
   { command: 'done', description: 'Publish current draft' },
   { command: 'status', description: 'Show current draft' },
+  { command: 'teststorage', description: 'Check the storage channel connection' },
   { command: 'delete', description: 'Delete a post by post ID' },
   { command: 'addchannel', description: 'Add an announcement channel' },
   { command: 'channels', description: 'List announcement channels' },
@@ -157,7 +158,7 @@ function displayDraft(session) {
   ].join('\n');
 }
 
-function fileFromMessage(message, storedMessageId) {
+function mediaDescriptor(message) {
   const kind = message.document
     ? 'document'
     : message.video
@@ -170,11 +171,17 @@ function fileFromMessage(message, storedMessageId) {
             ? 'photo'
             : 'file';
   const source = message.document || message.video || message.audio || message.animation || message.photo?.at(-1);
+  return { kind, source };
+}
+
+function fileFromMessage(message, storedMessageId, storageMethod = 'copy') {
+  const { kind, source } = mediaDescriptor(message);
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const episode = detectUploadEpisode({ caption: message.caption, filename });
 
   return {
     storageMessageId,
+    storageMethod,
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),
     displayName: episode.displayName,
@@ -193,6 +200,68 @@ function fileFromMessage(message, storedMessageId) {
 
 function isMediaMessage(message) {
   return Boolean(message?.document || message?.video || message?.audio || message?.animation || message?.photo?.length);
+}
+
+function telegramErrorText(error) {
+  return String(error?.description || error?.response?.description || error?.message || '').toLowerCase();
+}
+
+export function storageErrorHint(error) {
+  const details = [error, error?.copyError, error?.fallbackError]
+    .map(telegramErrorText)
+    .filter(Boolean)
+    .join(' | ');
+
+  if (/chat not found|peer_id_invalid/.test(details)) {
+    return 'Telegram cannot find the storage channel. Use its numeric -100… channel ID, not an invite link, and restart the service after changing the Koyeb variable.';
+  }
+  if (/not enough rights|not allowed|administrator|write access|forbidden/.test(details)) {
+    return 'The bot can see the channel but cannot post there. In the channel admin settings enable Post Messages, then retry.';
+  }
+  if (/protected content|can.t be copied|can.t be forwarded|message can.t be copied/.test(details)) {
+    return 'Telegram marked the source as protected. Upload the original file directly to this bot instead of forwarding it from a protected channel.';
+  }
+  if (/file is too big|file.*too large|request entity too large/.test(details)) {
+    return 'Telegram rejected this file size for the bot API. Send a smaller file or use a Telegram-compatible size/account configuration.';
+  }
+  return 'Telegram could not store this item. Check that the configured channel ID is correct and that the bot has Post Messages permission.';
+}
+
+async function sendByFileId(telegram, destinationChatId, message) {
+  const { kind, source } = mediaDescriptor(message);
+  if (!source?.file_id) throw new Error('The received message did not include a reusable Telegram file ID.');
+  const extra = { disable_notification: true };
+  if (message.caption) extra.caption = message.caption;
+
+  if (kind === 'document') return telegram.sendDocument(destinationChatId, source.file_id, extra);
+  if (kind === 'video') return telegram.sendVideo(destinationChatId, source.file_id, extra);
+  if (kind === 'audio') return telegram.sendAudio(destinationChatId, source.file_id, extra);
+  if (kind === 'animation') return telegram.sendAnimation(destinationChatId, source.file_id, extra);
+  if (kind === 'photo') return telegram.sendPhoto(destinationChatId, source.file_id, extra);
+  throw new Error('This Telegram media type is not supported by the storage fallback.');
+}
+
+// copyMessage is fastest and preserves the original message. Some forwarded or
+// protected-origin items cannot be copied, however. In that case Telegram often
+// still lets a bot re-send the file it received by its file_id, so we attempt a
+// type-safe fallback before reporting a storage failure to the publisher.
+export async function storeMediaInChannel(telegram, destinationChatId, sourceChatId, message) {
+  try {
+    const copied = await telegram.copyMessage(destinationChatId, sourceChatId, message.message_id, {
+      disable_notification: true
+    });
+    return { storageMessageId: copied.message_id, method: 'copy' };
+  } catch (copyError) {
+    try {
+      const sent = await sendByFileId(telegram, destinationChatId, message);
+      return { storageMessageId: sent.message_id, method: 'file-id-fallback' };
+    } catch (fallbackError) {
+      const error = new Error('Telegram could not persist the uploaded media.');
+      error.copyError = copyError;
+      error.fallbackError = fallbackError;
+      throw error;
+    }
+  }
 }
 
 function parseDelimitedList(value) {
@@ -590,7 +659,7 @@ export async function launchTelegramBot({ config, repository }) {
           '',
           'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
           'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
-          'Management: /status · /cancel · /delete POST_ID · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Management: /status · /teststorage · /cancel · /delete POST_ID · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -694,6 +763,25 @@ export async function launchTelegramBot({ config, repository }) {
   bot.command('status', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     await showDraftStatus(ctx, repository);
+  });
+
+  bot.command('teststorage', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (!config.telegram.storageChannelId) {
+      await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is not configured. Add the private channel’s numeric -100… ID and restart the service.');
+      return;
+    }
+    try {
+      await ctx.telegram.sendMessage(
+        config.telegram.storageChannelId,
+        `SoraBox storage check · ${new Date().toISOString()}`,
+        { disable_notification: true }
+      );
+      await ctx.reply('Storage channel connection is working. If a particular upload still fails, it is likely protected/forwarded content; upload the original file directly to this bot so the file-ID fallback can store it.');
+    } catch (error) {
+      console.error('[telegram] storage check failed:', error?.description || error?.message || 'Unknown error');
+      await ctx.reply(`Storage channel test failed. ${storageErrorHint(error)}`);
+    }
   });
 
   bot.command('cancel', async (ctx) => {
@@ -826,27 +914,33 @@ export async function launchTelegramBot({ config, repository }) {
       }
 
       try {
-        const copied = await ctx.telegram.copyMessage(
+        const stored = await storeMediaInChannel(
+          ctx.telegram,
           config.telegram.storageChannelId,
           chatId(ctx),
-          message.message_id,
-          { disable_notification: true }
+          message
         );
         const updated = await repository.appendSessionFile(
           chatId(ctx),
           userId(ctx),
-          fileFromMessage(message, copied.message_id)
+          fileFromMessage(message, stored.storageMessageId, stored.method)
         );
         const last = updated.files.at(-1);
         const size = formatBytes(last.size);
         const summary = summarizeEpisodes(updated.files);
+        const fallbackNote = stored.method === 'file-id-fallback' ? ' Stored with Telegram’s file-ID fallback.' : '';
         await ctx.reply(
-          `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''} Use /done when the upload is complete.`,
+          `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
           uploadKeyboard()
         );
       } catch (error) {
-        console.error('[telegram] storage copy failed:', error?.description || error?.message || 'Unknown error');
-        await ctx.reply('I could not copy that file to the storage channel. Confirm that the bot is an administrator in the configured private channel, then try again.');
+        console.error(
+          '[telegram] storage copy failed:',
+          error?.copyError?.description || error?.copyError?.message || error?.message || 'Unknown error',
+          '| fallback:',
+          error?.fallbackError?.description || error?.fallbackError?.message || 'not attempted'
+        );
+        await ctx.reply(`I could not store that file. ${storageErrorHint(error)}`);
       }
       return;
     }
