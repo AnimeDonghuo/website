@@ -174,13 +174,13 @@ function mediaDescriptor(message) {
   return { kind, source };
 }
 
-function fileFromMessage(message, storedMessageId, storageMethod = 'copy') {
+export function fileFromMessage(message, storedMessageId, storageMethod = 'copy') {
   const { kind, source } = mediaDescriptor(message);
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const episode = detectUploadEpisode({ caption: message.caption, filename });
 
   return {
-    storageMessageId,
+    storageMessageId: storedMessageId,
     storageMethod,
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { storageErrorHint, storeMediaInChannel } from '../src/server/services/telegram-bot.js';
+import { fileFromMessage, storageErrorHint, storeMediaInChannel } from '../src/server/services/telegram-bot.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
   const calls = [];
@@ -25,6 +25,27 @@ test('storage uses a reusable Telegram file ID when copyMessage is refused', asy
     fileId: 'document-file-id',
     extra: { disable_notification: true, caption: 'Perfect World Ep 01' }
   });
+});
+
+test('stored file record keeps the returned storage message ID', () => {
+  const file = fileFromMessage(
+    {
+      message_id: 12,
+      caption: 'Lingwu Continent @sourcechannel Episode 204 English Sub',
+      video: {
+        file_id: 'telegram-file-id',
+        file_name: 'Lingwu.Continent.Episode.204.English.Sub.mkv',
+        mime_type: 'video/x-matroska',
+        file_size: 72_100_000
+      }
+    },
+    987,
+    'copy'
+  );
+
+  assert.equal(file.storageMessageId, 987);
+  assert.equal(file.episode.start, 204);
+  assert.equal(file.episode.source, 'caption');
 });
 
 test('storage troubleshooting distinguishes protected content and wrong channel IDs', () => {
