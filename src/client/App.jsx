@@ -333,7 +333,9 @@ function DetailPage({ onGetFiles }) {
               {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
               <div className="tag-list">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div>
               <div className="detail-actions">
-                <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>
+                {item.episodeGroups?.length
+                  ? <a className="button button--telegram" href="#episode-guide-title"><Icon name="layers" size={20} /> Browse episode guide</a>
+                  : <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>}
                 <Link className="button button--ghost" to={`/browse/${item.category}`}>More {item.categoryLabel}</Link>
               </div>
               <p className="detail-layout__delivery-note"><Icon name="shield" size={15} /> No file is hosted on this website. Telegram delivers a copy from the private storage channel.</p>
@@ -342,21 +344,16 @@ function DetailPage({ onGetFiles }) {
         </div>
       </section>
 
-      <section className="detail-info page-width">
+      <section className="detail-info detail-info--single page-width">
         <div className="detail-info__languages">
           <Eyebrow>AVAILABLE LABELS</Eyebrow>
           <h2>Language & <em>release details.</em></h2>
           <div className="language-tags">{item.languages.length ? item.languages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>) : <span><Icon name="check" size={14} /> Check Telegram delivery</span>}</div>
-        </div>
-        <div className="delivery-card">
-          <span className="delivery-card__icon"><Icon name="telegram" size={22} /></span>
-          <div><p className="eyebrow">HOW IT WORKS</p><h3>One link. Your private delivery.</h3></div>
-          <p>Tap the delivery button, start the bot, and it copies the catalog files into your Telegram chat.</p>
-          <button className="text-link" type="button" onClick={() => onGetFiles(item)}>Open delivery guide <Icon name="arrow" size={16} /></button>
+          {item.episodeGroups?.length ? <p className="detail-info__episode-hint"><Icon name="arrow" size={15} /> Select an episode below to see its available files and qualities.</p> : null}
         </div>
       </section>
 
-      {item.fileChoices?.length ? <section className="file-choice-section page-width" aria-labelledby="file-choice-title">
+      {item.fileChoices?.length && !item.episodeGroups?.length ? <section className="file-choice-section page-width" aria-labelledby="file-choice-title">
         <div className="file-choice-section__heading">
           <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.</p></div>
           <button className="button button--secondary" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get all {item.filesCount} files</button>
@@ -428,7 +425,7 @@ function EpisodePage({ onGetFiles }) {
       <section className="file-choice-section file-choice-section--episode page-width" aria-labelledby="episode-file-choice-title">
         <div className="file-choice-section__heading">
           <div><Eyebrow>FILES FOR {episodeLabel.toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
-          <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> All release files</Link>
+          <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> Episode guide</Link>
         </div>
         {choices.length ? <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} /> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
       </section>

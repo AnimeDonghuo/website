@@ -149,6 +149,7 @@ export class MemoryCatalogRepository {
     this.adminSessions = new Map();
     this.requests = new Map();
     this.announcementChannels = new Map();
+    this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null };
   }
 
   async init() {}
@@ -170,6 +171,14 @@ export class MemoryCatalogRepository {
 
   async findContentByShareCode(shareCode) {
     const item = [...this.contents.values()].find((entry) => entry.shareCode === shareCode);
+    return item ? clone(item) : null;
+  }
+
+  async findContentByStorageMessageId(storageMessageId) {
+    const needle = String(storageMessageId);
+    const item = [...this.contents.values()].find((entry) =>
+      Array.isArray(entry.files) && entry.files.some((file) => String(file.storageMessageId) === needle)
+    );
     return item ? clone(item) : null;
   }
 
@@ -220,6 +229,10 @@ export class MemoryCatalogRepository {
       ownerId: String(ownerId),
       category: CATEGORY_IDS.has(category) ? category : 'movie',
       title: cleanText(title, 180),
+      workflow: 'manual',
+      batch: null,
+      auto: null,
+      overrides: null,
       metadata: null,
       posterOriginalUrl: null,
       files: [],
@@ -261,6 +274,20 @@ export class MemoryCatalogRepository {
     item.updatedAt = new Date().toISOString();
     item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
     return clone(item);
+  }
+
+  async findSessionByStorageMessageId(storageMessageId) {
+    const needle = String(storageMessageId);
+    for (const [key, session] of this.sessions.entries()) {
+      if (new Date(session.expiresAt).getTime() <= Date.now()) {
+        this.sessions.delete(key);
+        continue;
+      }
+      if (Array.isArray(session.files) && session.files.some((file) => String(file.storageMessageId) === needle)) {
+        return clone(session);
+      }
+    }
+    return null;
   }
 
   async deleteSession(chatId, ownerId) {
@@ -339,6 +366,21 @@ export class MemoryCatalogRepository {
     return channel ? clone(channel) : null;
   }
 
+  async getAutoPublishSettings() {
+    return clone(this.autoPublishSettings);
+  }
+
+  async setAutoPublishSettings({ enabled, updatedBy = null }) {
+    const now = new Date().toISOString();
+    this.autoPublishSettings = {
+      enabled: Boolean(enabled),
+      enabledAt: enabled ? now : null,
+      updatedAt: now,
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    return clone(this.autoPublishSettings);
+  }
+
   async close() {}
 }
 
@@ -353,6 +395,7 @@ export class MongoCatalogRepository {
     this.adminSessions = db.collection('admin_sessions');
     this.requests = db.collection('requests');
     this.announcementChannels = db.collection('announcement_channels');
+    this.automationSettings = db.collection('automation_settings');
   }
 
   async init() {
@@ -362,7 +405,9 @@ export class MongoCatalogRepository {
       this.contents.createIndex({ adminId: 1 }, { unique: true }),
       this.contents.createIndex({ publishedAt: -1 }),
       this.contents.createIndex({ category: 1, publishedAt: -1 }),
+      this.contents.createIndex({ 'files.storageMessageId': 1 }),
       this.sessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.sessions.createIndex({ 'files.storageMessageId': 1 }),
       this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.adminSessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.adminSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
@@ -416,6 +461,15 @@ export class MongoCatalogRepository {
     return this.contents.findOne({ shareCode, published: true });
   }
 
+  async findContentByStorageMessageId(storageMessageId) {
+    const asNumber = Number(storageMessageId);
+    const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    return this.contents.findOne(
+      { 'files.storageMessageId': { $in: values } },
+      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1 } }
+    );
+  }
+
   async findContentByAdminId(adminId) {
     return this.contents.findOne({ adminId: String(adminId).toUpperCase() });
   }
@@ -463,6 +517,10 @@ export class MongoCatalogRepository {
         $set: {
           category: CATEGORY_IDS.has(category) ? category : 'movie',
           title: cleanText(title, 180),
+          workflow: 'manual',
+          batch: null,
+          auto: null,
+          overrides: null,
           metadata: null,
           posterOriginalUrl: null,
           files: [],
@@ -518,6 +576,15 @@ export class MongoCatalogRepository {
     // rather than a findOneAndUpdate metadata wrapper.
     if (update.matchedCount !== 1) return null;
     return this.sessions.findOne(filter);
+  }
+
+  async findSessionByStorageMessageId(storageMessageId) {
+    const asNumber = Number(storageMessageId);
+    const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    return this.sessions.findOne(
+      { 'files.storageMessageId': { $in: values }, expiresAt: { $gt: new Date() } },
+      { projection: { chatId: 1, ownerId: 1, workflow: 1 } }
+    );
   }
 
   async deleteSession(chatId, ownerId) {
@@ -606,6 +673,31 @@ export class MongoCatalogRepository {
       { channelId: String(channelId) },
       { includeResultMetadata: false }
     );
+  }
+
+  async getAutoPublishSettings() {
+    return (await this.automationSettings.findOne({ _id: 'auto-publish' })) || {
+      enabled: false,
+      enabledAt: null,
+      updatedAt: null,
+      updatedBy: null
+    };
+  }
+
+  async setAutoPublishSettings({ enabled, updatedBy = null }) {
+    const now = new Date().toISOString();
+    const settings = {
+      enabled: Boolean(enabled),
+      enabledAt: enabled ? now : null,
+      updatedAt: now,
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    await this.automationSettings.updateOne(
+      { _id: 'auto-publish' },
+      { $set: settings },
+      { upsert: true }
+    );
+    return settings;
   }
 
   async close() {

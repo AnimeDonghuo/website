@@ -2,11 +2,13 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
-import { summarizeEpisodes, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages } from './episode-service.js';
+import { cleanMediaName, summarizeEpisodes, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
+const MAX_BATCH_MESSAGE_COUNT = 100;
+const AUTO_PUBLISH_OWNER_PREFIX = 'auto-storage-message-';
 
 function userId(ctx) {
   return ctx.from?.id;
@@ -113,6 +115,8 @@ const PUBLISHER_COMMANDS = [
   { command: 'donghua', description: 'New donghua draft' },
   { command: 'kdrama', description: 'New K-Drama draft' },
   { command: 'series', description: 'New web series draft' },
+  { command: 'batch', description: 'Import a private storage range' },
+  { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'done', description: 'Publish current draft' },
   { command: 'status', description: 'Show current draft' },
   { command: 'teststorage', description: 'Check the storage channel connection' },
@@ -177,6 +181,7 @@ function displayDraft(session) {
 
   return [
     `Draft · ${category}`,
+    `Mode: ${session.workflow === 'batch' ? 'Batch import' : session.workflow === 'automation' ? 'Storage auto-publish' : 'Manual upload'}`,
     `Title: ${title}`,
     `Files: ${files}`,
     `Episodes: ${episodeSummary.releaseLabel || 'No episode labels detected yet'}`,
@@ -184,7 +189,9 @@ function displayDraft(session) {
     `Languages: ${language}`,
     '',
     'Caption episode labels are checked before filenames. Telegram @channel names are removed automatically.',
-    'Upload more files, then use /done to publish.'
+    session.workflow === 'batch'
+      ? `Batch stage: ${session.batch?.stage || 'waiting'}. Send the required private storage link, or use /cancel.`
+      : 'Upload more files, then use /done to publish.'
   ].join('\n');
 }
 
@@ -306,6 +313,119 @@ function parseDelimitedList(value) {
     .slice(0, 8);
 }
 
+// A t.me/c link contains Telegram's private-channel internal ID, rather than
+// the normal -100… chat ID used by the Bot API. Keeping this parser narrow
+// avoids accidentally importing a public link or a link from another channel.
+export function parsePrivateStorageMessageLink(value) {
+  const match = String(value || '').match(/(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d{5,20})\/(\d{1,12})(?:[/?#][^\s)]*)?/i);
+  if (!match) return null;
+
+  const messageId = Number(match[2]);
+  if (!Number.isSafeInteger(messageId) || messageId < 1) return null;
+  return {
+    channelId: `-100${match[1]}`,
+    messageId,
+    url: `https://t.me/c/${match[1]}/${messageId}`
+  };
+}
+
+function parseBatchArgument(value) {
+  const supplied = cleanText(value, 180);
+  if (!supplied) return { title: '', category: null };
+
+  // An optional category prefix lets a publisher override automatic detection
+  // without adding a separate, more fragile batch command syntax.
+  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series)\s*(?:\||:)\s*(.+)$/i);
+  if (!prefixed) return { title: supplied, category: null };
+
+  const rawCategory = prefixed[1].toLowerCase().replace(/[\s-]/g, '');
+  const category = rawCategory === 'kdrama'
+    ? 'kdrama'
+    : rawCategory === 'webseries'
+      ? 'web-series'
+      : rawCategory;
+  return {
+    title: cleanText(prefixed[2], 180),
+    category: PUBLISH_CATEGORIES.includes(category) ? category : null
+  };
+}
+
+export function inferBatchTitle(files = []) {
+  for (const file of files) {
+    // A caption may contain only an episode label while the filename carries
+    // the actual title, so try each independently instead of treating the
+    // caption as an unconditional replacement for the filename.
+    for (const value of [file?.displayName, file?.name]) {
+      const source = cleanText(value, 180);
+      if (!source) continue;
+
+      const candidate = cleanMediaName(source)
+        .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:ISODE)?)?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\b(?:EPISODES?|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|eng|indo|cc)\b/gi, ' ')
+        .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|indonesian|thai|vietnamese|spanish|french|german|portuguese|arabic|russian)\b/gi, ' ')
+        .replace(/\b(?:360|480|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
+        .replace(/[+]+/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .replace(/^[\s\-–—|:/.]+|[\s\-–—|:/.]+$/g, '')
+        .trim();
+
+      if (candidate.length >= 2 && /[a-z]/i.test(candidate) && !/^(?:document|video|file|upload)(?:\s+\d+)?$/i.test(candidate)) {
+        return cleanText(candidate, 180);
+      }
+    }
+  }
+  return '';
+}
+
+export function inferBatchCategory({ title = '', files = [] } = {}) {
+  const signals = [title, ...files.flatMap((file) => [file?.displayName, file?.name])]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (/\b(?:donghua|manhua|xianxia|cultivation|chinese\s+anime)\b/.test(signals)) return 'donghua';
+  if (/\b(?:k[\s-]?drama|korean\s+drama)\b/.test(signals)) return 'kdrama';
+  if (/\b(?:cartoon|animated\s+(?:series|show)|kids\s+animation)\b/.test(signals)) return 'cartoon';
+  if (/\b(?:anime|japanese\s+anime)\b/.test(signals)) return 'anime';
+  if (/\b(?:web[\s-]?series|webseries)\b/.test(signals)) return 'web-series';
+
+  // Caption language labels are useful category signals when an uploader has
+  // not written an explicit category word. Apply them only to an episode-based
+  // release so a Chinese/Japanese feature film remains a movie by default.
+  if (summarizeEpisodes(files).count) {
+    if (/\b(?:chinese|mandarin|cantonese)\b/.test(signals)) return 'donghua';
+    if (/\b(?:japanese|jpn)\b/.test(signals)) return 'anime';
+    if (/\b(?:korean|kor)\b/.test(signals)) return 'kdrama';
+    return 'web-series';
+  }
+  return 'movie';
+}
+
+function autoPublishKeyboard(enabled) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`Auto-publish: ${enabled ? 'ON' : 'OFF'}`, 'auto:status')],
+    [Markup.button.callback('Turn ON', 'auto:on'), Markup.button.callback('Turn OFF', 'auto:off')]
+  ]);
+}
+
+function autoPublishStatusText(settings, config) {
+  const enabled = Boolean(settings?.enabled);
+  return [
+    `Storage-channel auto-publish is ${enabled ? 'ON' : 'OFF'}.`,
+    '',
+    enabled
+      ? 'New supported media posted directly in the configured database channel will be classified, matched with metadata, mirrored to ImgBB, and published automatically.'
+      : 'Nothing posted in the database channel will be published automatically while this is OFF.',
+    '',
+    config.telegram.storageChannelId
+      ? `Database channel: ${config.telegram.storageChannelId}`
+      : 'TELEGRAM_STORAGE_CHANNEL_ID is not configured. Set it before turning automation on.',
+    'Bot-originated storage copies, active-draft files, and already-published storage messages are ignored to prevent loops and duplicates.',
+    'Use /batch to publish an existing inclusive range of storage-channel files.'
+  ].join('\n');
+}
+
 function parseStartPayload(ctx) {
   const text = ctx.message?.text || '';
   const [, payload] = text.split(/\s+/, 2);
@@ -386,6 +506,211 @@ async function beginDraft(ctx, category, suppliedTitle, repository, config) {
   );
 }
 
+async function beginBatch(ctx, suppliedArgument, repository, config) {
+  if (ctx.chat?.type && ctx.chat.type !== 'private') {
+    await ctx.reply('For privacy, start /batch in your private chat with this bot. It temporarily forwards each storage file there only to inspect its caption and media details.');
+    return;
+  }
+  if (!config.telegram.storageChannelId) {
+    await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is not configured. Add the private database channel’s numeric -100… ID before importing a batch.');
+    return;
+  }
+
+  const parsed = parseBatchArgument(suppliedArgument);
+  await repository.startSession({
+    chatId: chatId(ctx),
+    ownerId: userId(ctx),
+    category: parsed.category || 'movie',
+    title: parsed.title
+  });
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    workflow: 'batch',
+    batch: {
+      stage: 'awaiting-first-link',
+      sourceChannelId: null,
+      firstMessageId: null,
+      lastMessageId: null,
+      titleProvided: Boolean(parsed.title),
+      categoryOverride: parsed.category
+    }
+  });
+
+  await ctx.reply(
+    [
+      parsed.title ? `Batch import created for “${parsed.title}”.` : 'Untitled batch import created.',
+      '',
+      'Send the FIRST private database-channel link, then send the LAST link. Both links must look like:',
+      'https://t.me/c/1234567890/123',
+      '',
+      `Every media message in the inclusive range is imported (up to ${MAX_BATCH_MESSAGE_COUNT}). The bot briefly forwards each item only to inspect its file details, then removes that preview.`,
+      parsed.title
+        ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
+        : 'The title and category will be inferred from the imported file descriptions and names.'
+    ].join('\n')
+  );
+}
+
+async function removeBatchPreview(ctx, message) {
+  if (!message?.message_id) return;
+  try {
+    await ctx.telegram.deleteMessage(chatId(ctx), message.message_id);
+  } catch (error) {
+    // Removing a just-forwarded preview is best effort. It does not affect the
+    // original storage message or the catalog record.
+    console.warn('[telegram] could not remove batch inspection preview:', error?.description || error?.message || 'Unknown error');
+  }
+}
+
+export async function importStorageRange(ctx, session, lastLink, bot, repository, config, publish = publishDraft) {
+  const batch = session.batch || {};
+  const firstMessageId = Number(batch.firstMessageId);
+  const lastMessageId = Number(lastLink.messageId);
+  const imported = [];
+  const skipped = [];
+  const failures = [];
+
+  for (let storageMessageId = firstMessageId; storageMessageId <= lastMessageId; storageMessageId += 1) {
+    const existing = await repository.findContentByStorageMessageId(storageMessageId);
+    if (existing) {
+      skipped.push(`${storageMessageId} already belongs to ${existing.adminId || existing.title || 'a published post'}`);
+      continue;
+    }
+    const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
+    if (pendingDraft) {
+      skipped.push(`${storageMessageId} is already attached to an active ${pendingDraft.workflow || 'upload'} draft`);
+      continue;
+    }
+
+    let preview;
+    try {
+      // Bot API has no getMessage endpoint. Forwarding to the logged-in
+      // publisher is the safe way to inspect an existing channel message and
+      // obtain its caption/file metadata; the preview is deleted immediately.
+      preview = await ctx.telegram.forwardMessage(
+        chatId(ctx),
+        String(config.telegram.storageChannelId),
+        storageMessageId,
+        { disable_notification: true }
+      );
+      if (!isMediaMessage(preview)) {
+        skipped.push(`${storageMessageId} is not a supported media message`);
+        continue;
+      }
+
+      const file = fileFromMessage(preview, storageMessageId, 'existing-storage');
+      const updated = await repository.appendSessionFile(chatId(ctx), userId(ctx), file);
+      if (!updated?.files?.length) throw new Error('The batch session expired while importing files.');
+      imported.push(file);
+    } catch (error) {
+      const details = error?.description || error?.message || 'Unknown Telegram error';
+      failures.push(`${storageMessageId}: ${details}`);
+      console.error('[telegram] batch import message failed:', storageMessageId, details);
+    } finally {
+      await removeBatchPreview(ctx, preview);
+    }
+  }
+
+  const latestSession = await repository.findSession(chatId(ctx), userId(ctx));
+  if (!imported.length || !latestSession) {
+    await repository.updateSession(chatId(ctx), userId(ctx), {
+      batch: {
+        ...batch,
+        stage: 'import-failed',
+        lastMessageId,
+        importedCount: 0,
+        skippedCount: skipped.length,
+        failureCount: failures.length
+      }
+    });
+    await ctx.reply(
+      [
+        `No supported new media could be imported from messages ${firstMessageId}–${lastMessageId}.`,
+        skipped.length ? `${skipped.length} message${skipped.length === 1 ? ' was' : 's were'} skipped.` : null,
+        failures.length ? `Telegram could not access ${failures.length} message${failures.length === 1 ? '' : 's'}. Make sure the active bot is an administrator in this exact storage channel and that the files are not protected.` : null,
+        'No catalog post was created. Use /batch again after correcting the links or permissions.'
+      ].filter(Boolean).join('\n')
+    );
+    return;
+  }
+
+  const title = cleanText(session.title || inferBatchTitle(latestSession.files), 180) || `Storage import ${firstMessageId}–${lastMessageId}`;
+  const category = batch.categoryOverride || inferBatchCategory({ title, files: latestSession.files });
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    title,
+    category,
+    metadata: null,
+    batch: {
+      ...batch,
+      stage: 'ready',
+      lastMessageId,
+      importedCount: imported.length,
+      skippedCount: skipped.length,
+      failureCount: failures.length
+    }
+  });
+
+  const skippedNote = skipped.length ? ` ${skipped.length} non-media, already-published, or active-draft message${skipped.length === 1 ? ' was' : 's were'} skipped.` : '';
+  const failedNote = failures.length ? ` ${failures.length} inaccessible/protected message${failures.length === 1 ? ' was' : 's were'} skipped.` : '';
+  await ctx.reply(
+    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.${skippedNote}${failedNote} Matching metadata and publishing now…`
+  );
+  await publish(ctx, bot, repository, config);
+}
+
+async function handleBatchLink(ctx, session, bot, repository, config) {
+  const link = parsePrivateStorageMessageLink(ctx.message?.text);
+  if (!link) {
+    await ctx.reply('Please send a private storage link in the form https://t.me/c/<internal-channel-id>/<message-id>. Public @channel links cannot safely identify this database channel.');
+    return;
+  }
+  if (String(link.channelId) !== String(config.telegram.storageChannelId || '')) {
+    await ctx.reply(`That link is not from the configured database channel. This batch only accepts links whose internal ID maps to ${config.telegram.storageChannelId || 'the configured TELEGRAM_STORAGE_CHANNEL_ID'}.`);
+    return;
+  }
+
+  const batch = session.batch || {};
+  if (batch.stage === 'importing') {
+    await ctx.reply('This batch is already being imported. Please wait for its publishing result before sending another link.');
+    return;
+  }
+  if (batch.stage === 'ready') {
+    await ctx.reply('This batch has already been prepared. Use /done if publishing did not finish, or begin a new /batch import.');
+    return;
+  }
+  if (!batch.firstMessageId) {
+    await repository.updateSession(chatId(ctx), userId(ctx), {
+      batch: {
+        ...batch,
+        stage: 'awaiting-last-link',
+        sourceChannelId: link.channelId,
+        firstMessageId: link.messageId
+      }
+    });
+    await ctx.reply(`First storage message saved: ${link.messageId}. Now send the LAST link (the range is inclusive).`);
+    return;
+  }
+
+  if (String(batch.sourceChannelId) !== String(link.channelId)) {
+    await ctx.reply('The last link must be from the same private storage channel as the first link.');
+    return;
+  }
+  if (link.messageId < Number(batch.firstMessageId)) {
+    await ctx.reply(`The last message ID must be ${batch.firstMessageId} or higher. Send the last link again.`);
+    return;
+  }
+  const rangeCount = link.messageId - Number(batch.firstMessageId) + 1;
+  if (rangeCount > MAX_BATCH_MESSAGE_COUNT) {
+    await ctx.reply(`That range has ${rangeCount} messages. For reliable Telegram processing, import at most ${MAX_BATCH_MESSAGE_COUNT} at a time; split it into smaller inclusive ranges.`);
+    return;
+  }
+
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    batch: { ...batch, stage: 'importing', lastMessageId: link.messageId }
+  });
+  await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing the catalog post…`);
+  await importStorageRange(ctx, session, link, bot, repository, config);
+}
+
 async function requirePublisher(ctx, repository, config) {
   if (!hasAllowedPublisherId(ctx, config)) {
     await ctx.reply('This is a delivery bot. Open a catalog link to receive files, or use /request to send the catalog team a request.');
@@ -435,9 +760,14 @@ function announcementCaption(content) {
   ].filter((line) => line !== null).join('\n').slice(0, 1000);
 }
 
-async function announcePublishedContent({ bot, repository, content, websiteUrl }) {
+async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
   const channels = await repository.listAnnouncementChannels();
-  if (!channels.length) return { sent: 0, failed: 0 };
+  if (!channels.length) return { sent: 0, failed: 0, skipped: 0 };
+
+  // A database channel is deliberately not an announcement destination. Apart
+  // from keeping storage clean, this prevents an auto-published announcement
+  // photo from becoming another storage-channel automation event.
+  const normalizedStorageChannelId = storageChannelId === null || storageChannelId === undefined ? null : String(storageChannelId);
 
   // Announcement channels deliberately send users to the catalog page first.
   // The public page is where the user can review details and choose Telegram delivery.
@@ -445,8 +775,14 @@ async function announcePublishedContent({ bot, repository, content, websiteUrl }
   const caption = announcementCaption(content);
   let sent = 0;
   let failed = 0;
+  let skipped = 0;
 
   for (const channel of channels) {
+    if (normalizedStorageChannelId && String(channel.channelId) === normalizedStorageChannelId) {
+      skipped += 1;
+      console.warn('[telegram] skipped an announcement to the database storage channel to prevent an automation loop.');
+      continue;
+    }
     try {
       await bot.telegram.sendPhoto(channel.channelId, content.posterUrl, {
         caption,
@@ -468,7 +804,7 @@ async function announcePublishedContent({ bot, repository, content, websiteUrl }
     }
   }
 
-  return { sent, failed };
+  return { sent, failed, skipped };
 }
 
 async function publishDraft(ctx, bot, repository, config) {
@@ -539,26 +875,34 @@ async function publishDraft(ctx, bot, repository, config) {
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
     const websiteUrl = getContentPageUrl(config, content);
-    let announcements = { sent: 0, failed: 0, configured: false };
+    let announcements = { sent: 0, failed: 0, skipped: 0, configured: false };
     try {
       const configuredChannels = await repository.listAnnouncementChannels();
       announcements = {
-        ...(await announcePublishedContent({ bot, repository, content, websiteUrl })),
+        ...(await announcePublishedContent({
+          bot,
+          repository,
+          content,
+          websiteUrl,
+          storageChannelId: config.telegram.storageChannelId
+        })),
         configured: configuredChannels.length > 0
       };
     } catch (error) {
       console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
-      announcements = { sent: 0, failed: 1, configured: true };
+      announcements = { sent: 0, failed: 1, skipped: 0, configured: true };
     }
     const posterNote = posterResult.source === 'generated-fallback'
       ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
       : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
     const episodeNote = episodeSummary.releaseLabel ? `Episode index: ${episodeSummary.releaseLabel}.` : 'No episode labels were found; the post lists delivery files instead.';
     const channelNote = announcements.sent
-      ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}.`
-      : announcements.configured
-        ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
-        : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
+      ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}${announcements.skipped ? ' (database channel skipped)' : ''}.`
+      : announcements.skipped
+        ? 'The database channel was skipped for announcements to prevent an auto-publish loop. Add a separate announcement channel if you want release posts there.'
+        : announcements.configured
+          ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
+          : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
     const websiteNote = websiteUrl
       ? `Announcement website link: ${websiteUrl}`
       : 'PUBLIC_SITE_URL is not configured, so announcement posts were sent without a button. Add your Koyeb website URL and publish the next post.';
@@ -586,6 +930,87 @@ async function publishDraft(ctx, bot, repository, config) {
       : 'Publishing could not be completed. Your draft is still safe; please try /done again.';
     console.error('[telegram] publish failed:', error?.name || 'Error', error?.message || 'Unknown error');
     await ctx.reply(`Could not publish this draft. ${message}`);
+  }
+}
+
+function isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds) {
+  const messageId = String(message?.message_id || '');
+  if (messageId && ignoredStorageMessageIds?.delete(messageId)) return true;
+  if (message?.from?.is_bot) return true;
+  return Boolean(bot?.botInfo?.id && String(message?.from?.id || '') === String(bot.botInfo.id));
+}
+
+export async function autoPublishStoragePost(ctx, bot, repository, config, ignoredStorageMessageIds, inFlightStorageMessageIds, publish = publishDraft) {
+  const message = ctx.channelPost || ctx.update?.channel_post;
+  if (!message || String(message.chat?.id) !== String(config.telegram.storageChannelId || '')) return;
+  if (!isMediaMessage(message)) return;
+  if (isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds)) return;
+
+  const storageMessageId = message.message_id;
+  const inFlightKey = String(storageMessageId);
+  if (inFlightStorageMessageIds.has(inFlightKey)) return;
+
+  const settings = await repository.getAutoPublishSettings();
+  if (!settings?.enabled) return;
+
+  const enabledAt = Date.parse(settings.enabledAt || '');
+  const messageTimestamp = Number(message.date) * 1000;
+  if (Number.isFinite(enabledAt) && Number.isFinite(messageTimestamp) && messageTimestamp < enabledAt - 5_000) {
+    console.info(`[telegram] ignored storage message ${storageMessageId}; it predates the current auto-publish activation.`);
+    return;
+  }
+
+  const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
+  if (pendingDraft) {
+    console.info(`[telegram] ignored storage message ${storageMessageId}; it is already attached to an active ${pendingDraft.workflow || 'upload'} draft.`);
+    return;
+  }
+
+  const existing = await repository.findContentByStorageMessageId(storageMessageId);
+  if (existing) {
+    console.info(`[telegram] ignored already-published auto storage message ${storageMessageId} (${existing.adminId || existing.title || 'existing post'}).`);
+    return;
+  }
+
+  inFlightStorageMessageIds.add(inFlightKey);
+  try {
+    const file = fileFromMessage(message, storageMessageId, 'direct-storage');
+    const title = inferBatchTitle([file]) || `Storage media ${storageMessageId}`;
+    const category = inferBatchCategory({ title, files: [file] });
+    const ownerId = `${AUTO_PUBLISH_OWNER_PREFIX}${storageMessageId}`;
+    await repository.startSession({
+      chatId: message.chat.id,
+      ownerId,
+      category,
+      title
+    });
+    await repository.updateSession(message.chat.id, ownerId, {
+      workflow: 'automation',
+      auto: {
+        storageChannelId: String(message.chat.id),
+        storageMessageId,
+        receivedAt: new Date().toISOString()
+      }
+    });
+    const preparedSession = await repository.appendSessionFile(message.chat.id, ownerId, file);
+    if (!preparedSession?.files?.length) throw new Error('The auto-publish draft could not retain the storage file.');
+
+    // publishDraft owns the normal metadata, ImgBB, post-ID, and announcement
+    // path. This reply shim deliberately keeps operator chatter out of the
+    // private database channel while preserving its error handling/logging.
+    const automationContext = {
+      chat: { id: message.chat.id },
+      from: { id: ownerId },
+      reply: async (text) => {
+        console.info(`[telegram] auto-publish ${storageMessageId}: ${cleanText(text, 360)}`);
+      }
+    };
+    console.info(`[telegram] auto-publishing storage message ${storageMessageId} as ${category}: ${title}`);
+    await publish(automationContext, bot, repository, config);
+  } catch (error) {
+    console.error('[telegram] auto-publish failed:', storageMessageId, error?.message || 'Unknown error');
+  } finally {
+    inFlightStorageMessageIds.delete(inFlightKey);
   }
 }
 
@@ -676,6 +1101,23 @@ export async function launchTelegramBot({ config, repository }) {
   }
 
   const bot = new Telegraf(config.telegram.botToken);
+  const ignoredAutoStorageMessageIds = new Set();
+  const autoPublishInFlightMessageIds = new Set();
+  const ignoreAutoStorageMessage = (messageId) => {
+    const key = String(messageId);
+    ignoredAutoStorageMessageIds.add(key);
+    const timer = setTimeout(() => ignoredAutoStorageMessageIds.delete(key), 10 * 60 * 1000);
+    timer.unref?.();
+  };
+
+  bot.on('channel_post', async (ctx) => {
+    try {
+      await autoPublishStoragePost(ctx, bot, repository, config, ignoredAutoStorageMessageIds, autoPublishInFlightMessageIds);
+    } catch (error) {
+      // This handler must never reply into the private database channel.
+      console.error('[telegram] storage-channel automation handler failed:', error?.message || 'Unknown error');
+    }
+  });
 
   bot.start(async (ctx) => {
     const payload = parseStartPayload(ctx);
@@ -736,6 +1178,8 @@ export async function launchTelegramBot({ config, repository }) {
           '3. Use /done to create the catalog post, permanent ImgBB poster, delivery link, and channel announcements',
           '',
           'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
+          'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
+          'Automation: /auto opens persistent ON/OFF controls for new media posted directly in the configured database channel.',
           'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
           'Management: /status · /teststorage · /cancel · /delete POST_ID · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
@@ -758,6 +1202,17 @@ export async function launchTelegramBot({ config, repository }) {
       await beginDraft(ctx, category, parseCommandArgument(ctx.message.text), repository, config);
     });
   }
+
+  bot.command('batch', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config);
+  });
+
+  bot.command('auto', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const settings = await repository.getAutoPublishSettings();
+    await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
+  });
 
   bot.command('title', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
@@ -903,6 +1358,10 @@ export async function launchTelegramBot({ config, repository }) {
         await ctx.reply('That ID is not a Telegram channel. Add a channel ID (normally beginning with -100) or a public @channelusername.');
         return;
       }
+      if (String(chat.id) === String(config.telegram.storageChannelId || '')) {
+        await ctx.reply('The private database channel cannot be an announcement destination. Keeping it separate prevents auto-publish loops and keeps stored media uncluttered.');
+        return;
+      }
       const channel = await repository.addAnnouncementChannel({
         channelId: chat.id,
         title: chat.title || '',
@@ -947,6 +1406,23 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(['Latest open requests:', '', ...requests.map((request, index) => `${index + 1}. ${request.requestText}\n   ${request.id} · ${request.requester?.username ? `@${request.requester.username}` : request.requester?.name || 'Telegram user'}`)].join('\n'));
   });
 
+  bot.action(/^auto:(status|on|off)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+
+    const action = ctx.match[1];
+    if (action === 'on' && !config.telegram.storageChannelId) {
+      const settings = await repository.getAutoPublishSettings();
+      await ctx.reply('Auto-publish cannot be enabled until TELEGRAM_STORAGE_CHANNEL_ID is configured with the private database channel’s numeric -100… ID.', autoPublishKeyboard(Boolean(settings?.enabled)));
+      return;
+    }
+
+    const settings = action === 'on' || action === 'off'
+      ? await repository.setAutoPublishSettings({ enabled: action === 'on', updatedBy: userId(ctx) })
+      : await repository.getAutoPublishSettings();
+    await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
+  });
+
   bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series)$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (!(await requirePublisher(ctx, repository, config))) return;
@@ -978,6 +1454,10 @@ export async function launchTelegramBot({ config, repository }) {
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
     if (isMediaMessage(message)) {
+      if (session?.workflow === 'batch') {
+        await ctx.reply('This batch is waiting for private storage links, not new uploads. Send the first/last https://t.me/c/... links, or use /cancel and start a normal draft.');
+        return;
+      }
       if (!session) {
         await ctx.reply('Start a draft first with /panel, then upload files.');
         return;
@@ -1010,6 +1490,11 @@ export async function launchTelegramBot({ config, repository }) {
         return;
       }
 
+      // A publisher-uploaded copy is emitted back to the bot as a channel_post
+      // in many Telegram setups. Mark it before persistence so /auto never
+      // turns a normal draft file into a second, one-file catalog post.
+      ignoreAutoStorageMessage(stored.storageMessageId);
+
       let updated;
       let last;
       let summary;
@@ -1041,6 +1526,11 @@ export async function launchTelegramBot({ config, repository }) {
         `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
         uploadKeyboard()
       );
+      return;
+    }
+
+    if (message.text && !message.text.startsWith('/') && session?.workflow === 'batch') {
+      await handleBatchLink(ctx, session, bot, repository, config);
       return;
     }
 

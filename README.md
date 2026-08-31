@@ -19,7 +19,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
 - Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog
+- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker.
 - Search that supports multi-word title, genre, and language matching
 - Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
@@ -42,6 +42,8 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Upload captions/file names also resolve explicit language labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label
 - Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
+- `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel, preserving original storage message IDs while inferring title/category when no name is supplied
+- `/auto` presents persistent ON/OFF controls; when ON, newly posted supported media in the database channel is classified, matched, poster-mirrored, and published through the same safe workflow
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
@@ -126,9 +128,10 @@ The app creates its indexes automatically. `content` stores published catalog re
 
 1. Create a bot with **@BotFather** and save the token privately.
 2. Create a **private** Telegram channel to be your database channel.
-3. Add the bot to that channel as an administrator with permission to post messages. Do not turn on channel-level protections that prevent the bot from copying your own messages.
-4. Find the channel's numeric ID (usually starts with `-100`) and your own numeric Telegram user ID.
-5. Configure these server-only values:
+3. Add the bot to that channel as an administrator with permission to post messages. For `/batch`, it must also be able to forward existing messages from that exact channel. Do not turn on channel-level protections that prevent the bot from copying/forwarding your own messages.
+4. Keep the bot in that channel so Telegram can deliver `channel_post` updates when `/auto` is enabled; the same bot must own the configured token.
+5. Find the channel's numeric ID (usually starts with `-100`) and your own numeric Telegram user ID.
+6. Configure these server-only values:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=your_botfather_token
@@ -154,7 +157,7 @@ Check `/api/health` after deployment: `deliveryBotUsername` must be the replacem
 
 #### Storage-channel troubleshooting
 
-Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel.
+Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel. `/batch` only accepts a private `t.me/c/...` link whose internal ID maps exactly to `TELEGRAM_STORAGE_CHANNEL_ID`; it temporarily forwards each requested message into the logged-in publisher’s private chat to inspect it, then deletes that preview. Inaccessible, protected, non-media, already-published, and active-draft messages are skipped rather than linked incorrectly.
 
 ### 4. Configure permanent ImgBB posters
 
@@ -227,6 +230,8 @@ Useful commands:
 | `/login passcode` / `/logout` | Unlock or end the expiring publisher session |
 | `/panel` | Open category buttons and draft controls after login |
 | `/anime`, `/cartoon`, `/donghua`, `/kdrama`, `/movie`, `/series` | Start a category draft; title may follow the command |
+| `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category |
+| `/auto` | Show persistent ON/OFF controls for direct database-channel auto-publishing |
 | `/title Title` | Replace a draft title and re-run provider lookup |
 | `/lang Hindi, English` | Set public language labels |
 | `/year 2026` | Set the release year |
@@ -250,6 +255,34 @@ https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 
 The public site creates a stable all-files `/deliver/<code>` action and a separate `/deliver/<code>/file/<position>` action for every uploaded file. Each routes to the current bot's Telegram deep link only when clicked, so a bot replacement does not require a catalog migration. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
 
+### Import an existing private storage range
+
+Use this when the files are already in the configured private database channel and should not be copied into a second storage message:
+
+```text
+/batch Perfect World
+https://t.me/c/2617067511/9335
+https://t.me/c/2617067511/9342
+```
+
+The first and last links define an **inclusive** message-ID range. The bot validates that both links map to the configured `TELEGRAM_STORAGE_CHANNEL_ID`, examines up to 100 messages, preserves each original storage message ID, skips non-media/protected/inaccessible/already-published items, then performs the normal metadata, ImgBB poster, catalog, and announcement workflow. It never exposes the private-channel ID or raw file IDs on the public site.
+
+A name is optional:
+
+```text
+/batch
+https://t.me/c/2617067511/9335
+https://t.me/c/2617067511/9342
+```
+
+In that case, cleaned file captions/descriptions and names supply the title and category. Episode-detected ranges become Web Series by default; explicit title/file signals such as `Donghua`, `Anime`, `K-Drama`, or `Cartoon` choose their matching category, and Chinese/Japanese/Korean episode labels provide Donghua/Anime/K-Drama fallbacks. If a title needs a deterministic category, use an optional prefix such as `/batch donghua | Perfect World`.
+
+### Automatically publish direct database-channel uploads
+
+After logging in, run `/auto` and press **Turn ON**. The ON/OFF setting and its activation time are stored in MongoDB, so they survive Koyeb restarts. While enabled, a newly posted document, video, audio, animation, or photo in the configured database channel is inspected directly in that channel, given an inferred title/category, enriched with TMDB/OMDb/AniList metadata, mirrored to ImgBB, and published/announced without a draft conversation. Messages dated before the most recent ON activation are ignored.
+
+The automation ignores bot-originated storage copies, any message already attached to an active draft, and storage message IDs already present in a published catalog record. This prevents normal manual uploads and announcement activity from being duplicated or causing a loop. Keep the storage channel private and use `/auto` OFF before bulk housekeeping; use `/batch` for an intentional historical range.
+
 ### Automatic announcement channels
 
 After logging in, add every destination where you want polished new-release cards to appear:
@@ -260,7 +293,7 @@ After logging in, add every destination where you want polished new-release card
 /channels
 ```
 
-The bot verifies that the target is a Telegram channel it can access, stores it in MongoDB, and then sends every future published item to every saved channel. Each announcement includes the permanent ImgBB poster, category/title/metadata, episode or file summary, synopsis, and a **View on Website** button. Set `PUBLIC_SITE_URL` to your Koyeb domain so that button opens the public detail page rather than a direct Telegram file link. Use `/removechannel <channel_id>` to stop future announcements. The bot needs administrator rights in each destination channel.
+The bot verifies that the target is a Telegram channel it can access, stores it in MongoDB, and then sends every future published item to every saved channel. The private database channel itself is intentionally rejected as an announcement destination so `/auto` cannot loop on its own announcement poster. Each announcement includes the permanent ImgBB poster, category/title/metadata, episode or file summary, synopsis, and a **View on Website** button. Set `PUBLIC_SITE_URL` to your Koyeb domain so that button opens the public detail page rather than a direct Telegram file link. Use `/removechannel <channel_id>` to stop future announcements. The bot needs administrator rights in each destination channel.
 
 ---
 

@@ -25,6 +25,8 @@ test('catalog posts receive private admin IDs and safe episode index data', asyn
   assert.equal(publicPost.fileChoices[0].storageMessageId, undefined);
   assert.equal(publicPost.adminId, undefined);
   assert.equal(publicPost.files, undefined);
+  assert.equal((await repository.findContentByStorageMessageId(1)).slug, created.slug);
+  assert.equal(await repository.findContentByStorageMessageId(999), null);
 
   const removed = await repository.deleteContentByAdminId(created.adminId);
   assert.equal(removed.slug, created.slug);
@@ -48,7 +50,7 @@ test('every uploaded file has a separate public Telegram choice', async () => {
   assert.equal(JSON.stringify(publicPost).includes('private-101'), false);
 });
 
-test('memory repository persists login sessions, requests and announcement destinations for its process lifetime', async () => {
+test('memory repository persists login sessions, requests, announcement destinations, and auto-publish settings for its process lifetime', async () => {
   const repository = new MemoryCatalogRepository([]);
   const expiresAt = new Date(Date.now() + 60_000);
   await repository.createAdminSession({ chatId: 100, ownerId: 200, expiresAt });
@@ -64,6 +66,18 @@ test('memory repository persists login sessions, requests and announcement desti
   await repository.addAnnouncementChannel({ channelId: '-100123', title: 'Release notices', addedBy: 200 });
   assert.equal((await repository.listAnnouncementChannels()).length, 1);
   assert.equal((await repository.removeAnnouncementChannel('-100123')).title, 'Release notices');
+
+  assert.equal((await repository.getAutoPublishSettings()).enabled, false);
+  const autoPublish = await repository.setAutoPublishSettings({ enabled: true, updatedBy: 200 });
+  assert.equal(autoPublish.enabled, true);
+  assert.ok(autoPublish.enabledAt);
+  assert.equal(autoPublish.updatedBy, '200');
+  assert.equal((await repository.getAutoPublishSettings()).enabled, true);
+
+  await repository.startSession({ chatId: 100, ownerId: 200, category: 'movie', title: 'Draft' });
+  await repository.appendSessionFile(100, 200, { storageMessageId: 700 });
+  assert.equal((await repository.findSessionByStorageMessageId(700)).title, 'Draft');
+
   await repository.deleteAdminSession(100, 200);
   assert.equal(await repository.findAdminSession(100, 200), null);
 });
