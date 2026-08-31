@@ -102,16 +102,25 @@ function isShareCode(value) {
   return /^[A-Za-z0-9_-]{6,48}$/.test(String(value || ''));
 }
 
+export function getDeliveryRedirectPath(shareCode, filePosition = null) {
+  if (!isShareCode(shareCode)) return null;
+  if (filePosition === null || filePosition === undefined) return `/deliver/${shareCode}`;
+  const index = Number(filePosition);
+  // Six digits leaves room within Telegram's 64-character start payload even
+  // for a much longer legacy share code, while covering every practical release.
+  if (!Number.isInteger(index) || index < 1 || index > 999999) return null;
+  return `/deliver/${shareCode}/file/${index}`;
+}
+
 export function getTelegramDeliveryUrl(config, shareCode) {
-  if (!config.telegram.botUsername || !isShareCode(shareCode)) return null;
+  if (!config.telegram.botUsername || !getDeliveryRedirectPath(shareCode)) return null;
   return `https://t.me/${config.telegram.botUsername}?start=get-${shareCode}`;
 }
 
 export function getTelegramFileDeliveryUrl(config, shareCode, filePosition) {
   const index = Number(filePosition);
-  // Six digits leaves room within Telegram's 64-character start payload even
-  // for a much longer legacy share code, while covering every practical release.
-  if (!config.telegram.botUsername || !isShareCode(shareCode) || !Number.isInteger(index) || index < 1 || index > 999999) return null;
+  const redirectPath = getDeliveryRedirectPath(shareCode, index);
+  if (!config.telegram.botUsername || !redirectPath) return null;
   // `file-` is deliberately a separate deep-link payload from `get-` so a
   // base64url share code containing hyphens can never be parsed ambiguously.
   return `https://t.me/${config.telegram.botUsername}?start=file-${shareCode}-${index}`;

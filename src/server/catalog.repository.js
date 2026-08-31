@@ -5,6 +5,35 @@ import { summarizeEpisodes } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 
+// List cards only need safe display fields plus enough file-label information
+// to derive languages from older uploads. Storage message IDs and Telegram file
+// IDs are deliberately never selected for a public catalog listing.
+const LIST_CONTENT_PROJECTION = {
+  slug: 1,
+  title: 1,
+  category: 1,
+  art: 1,
+  year: 1,
+  languages: 1,
+  languageSource: 1,
+  genres: 1,
+  description: 1,
+  status: 1,
+  releaseLabel: 1,
+  posterUrl: 1,
+  backdropUrl: 1,
+  filesCount: 1,
+  episodeGroups: 1,
+  episodeCount: 1,
+  featured: 1,
+  publishedAt: 1,
+  shareCode: 1,
+  hasDelivery: 1,
+  'files.name': 1,
+  'files.displayName': 1,
+  'files.languages': 1
+};
+
 function clone(value) {
   return structuredClone(value);
 }
@@ -364,8 +393,10 @@ export class MongoCatalogRepository {
       });
     }
 
+    // The list serializer uses safe file labels to resolve legacy language tags
+    // such as "Multi (Hindi + Malayalam)". It never returns `files` to clients.
     return this.contents
-      .find(filter, { projection: { files: 0, 'poster.deleteUrl': 0 } })
+      .find(filter, { projection: LIST_CONTENT_PROJECTION })
       .sort({ featured: -1, publishedAt: -1 })
       .limit(Math.max(1, Math.min(Number(limit) || 60, 100)))
       .toArray();

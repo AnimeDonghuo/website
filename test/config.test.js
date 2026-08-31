@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getContentPageUrl, getTelegramFileDeliveryUrl, loadConfig } from '../src/server/config.js';
+import { getContentPageUrl, getDeliveryRedirectPath, getTelegramFileDeliveryUrl, loadConfig } from '../src/server/config.js';
 
 test('announcement URLs resolve to a public content detail page', () => {
   const config = loadConfig({
@@ -33,5 +33,6 @@ test('quoted hostnames and Koyeb-style site URL aliases normalize into an announ
     getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 12),
     'https://t.me/DeliveryBot?start=file-aB-cD_ef-12'
   );
+  assert.equal(getDeliveryRedirectPath('aB-cD_ef', 12), '/deliver/aB-cD_ef/file/12');
   assert.equal(getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 0), null);
 });

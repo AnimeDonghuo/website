@@ -276,6 +276,7 @@ function FileChoiceList({ item, choices, onGetFiles }) {
           ? `EP ${formatEpisodeNumber(file.episode.start)}`
           : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
         : `FILE ${String(file.position).padStart(2, '0')}`;
+      const deliveryHref = file.deliveryUrl || file.telegramUrl;
       return <article className="file-choice" key={file.id}>
         <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
         <div className="file-choice__details">
@@ -288,7 +289,7 @@ function FileChoiceList({ item, choices, onGetFiles }) {
             {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
           </div>
         </div>
-        {file.deliveryReady ? <a className="file-choice__action" href={file.telegramUrl} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+        {file.deliveryReady && deliveryHref ? <a className="file-choice__action" href={deliveryHref} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
       </article>;
     })}
   </div>;

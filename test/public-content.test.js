@@ -18,6 +18,7 @@ test('public serialization creates a deep link and hides storage file metadata',
   const publicRecord = toPublicContent(created, config);
 
   assert.match(publicRecord.telegramUrl, /^https:\/\/t\.me\/ExampleDeliveryBot\?start=get-/);
+  assert.match(publicRecord.deliveryUrl, /^\/deliver\//);
   assert.equal(publicRecord.files, undefined);
   assert.equal(publicRecord.telegramFileId, undefined);
   assert.equal(publicRecord.adminId, undefined);
@@ -25,6 +26,12 @@ test('public serialization creates a deep link and hides storage file metadata',
   assert.deepEqual(publicRecord.languages, ['Hindi', 'Malayalam']);
   assert.equal(publicRecord.fileChoices.length, 1);
   assert.match(publicRecord.fileChoices[0].telegramUrl, /^https:\/\/t\.me\/ExampleDeliveryBot\?start=file-/);
+  assert.match(publicRecord.fileChoices[0].deliveryUrl, /^\/deliver\/.*\/file\/1$/);
   assert.equal(publicRecord.fileChoices[0].storageMessageId, undefined);
   assert.equal(publicRecord.fileChoices[0].telegramFileId, undefined);
+
+  const listRecord = toPublicContent(created, config, { includeFileChoices: false });
+  assert.deepEqual(listRecord.languages, ['Hindi', 'Malayalam']);
+  assert.deepEqual(listRecord.fileChoices, []);
+  assert.equal(listRecord.files, undefined);
 });

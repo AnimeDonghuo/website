@@ -148,9 +148,9 @@ TELEGRAM_MODE=polling
 
 #### Bot-token rotation and replacement recovery
 
-Delivery URLs are **not stored with a bot username** in MongoDB. The website creates them from the currently running bot at request time. When a token is rotated, deploy the new `TELEGRAM_BOT_TOKEN`; at launch, the service asks Telegram which `@username` owns that token and uses it for all catalog and per-file links automatically. This also handles a replacement bot with a different username — update the token, redeploy, and add the replacement bot as an administrator of the existing private storage channel so it can copy the saved messages.
+Delivery URLs are **not stored with a bot username** in MongoDB. Catalog buttons use stable first-party `/deliver/...` URLs, which redirect to the currently active Telegram bot at click time. When a token is rotated, deploy the new `TELEGRAM_BOT_TOKEN`; at launch, the service asks Telegram which `@username` owns that token and uses it for all catalog and per-file links automatically. This also handles a replacement bot with a different username — update the token, redeploy, and add the replacement bot as an administrator of the existing private storage channel so it can copy the saved messages.
 
-Check `/api/health` after deployment: `deliveryBotUsername` must be the replacement bot. Existing catalog pages and website-first announcement buttons will then generate links to it. A previously copied external `t.me/OldBot?...` URL cannot be rewritten after the old bot is banned; share the stable catalog page rather than old direct links when recovering.
+Check `/api/health` after deployment: `deliveryBotUsername` must be the replacement bot. Existing catalog pages, their file buttons, and website-first announcement buttons will then resolve to it. A previously copied external `t.me/OldBot?...` URL cannot be rewritten after the old bot is banned; share the stable catalog page or its `/deliver/...` link rather than old direct links when recovering.
 
 #### Storage-channel troubleshooting
 
@@ -248,7 +248,7 @@ When `PUBLIC_SITE_URL` is configured, publishing returns the stable catalog deta
 https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 ```
 
-The public site automatically builds that all-files URL and a separate `file-…` deep link for every uploaded file from the record's short delivery code. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
+The public site creates a stable all-files `/deliver/<code>` action and a separate `/deliver/<code>/file/<position>` action for every uploaded file. Each routes to the current bot's Telegram deep link only when clicked, so a bot replacement does not require a catalog migration. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
 
 ### Automatic announcement channels
 
@@ -309,7 +309,7 @@ Koyeb's default route/port conventions also recognize port 8000, but setting it 
 
 ## API
 
-All public API routes are same-origin and read-only:
+All public API routes are same-origin and read-only. The two same-origin delivery routes below redirect to Telegram:
 
 | Endpoint | Description |
 | --- | --- |
@@ -321,6 +321,8 @@ All public API routes are same-origin and read-only:
 | `GET /api/content?q=title` | Search title, genres, or languages |
 | `GET /api/content/featured` | Current featured record |
 | `GET /api/content/:slug` | One public catalog record |
+| `GET /deliver/:shareCode` | Stable redirect to the active bot’s all-files Telegram delivery deep link |
+| `GET /deliver/:shareCode/file/:position` | Stable redirect to the active bot’s selected-file Telegram delivery deep link |
 
 The API intentionally omits `telegramFileId`, `storageMessageId`, channel ID, and any provider deletion URL.
 

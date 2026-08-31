@@ -3,7 +3,8 @@ import { Icon } from './Icons.jsx';
 
 export default function DeliveryDialog({ item, onClose }) {
   const [copied, setCopied] = useState(false);
-  const ready = Boolean(item?.deliveryReady && item?.telegramUrl);
+  const deliveryHref = item?.deliveryUrl || item?.telegramUrl;
+  const ready = Boolean(item?.deliveryReady && deliveryHref);
 
   useEffect(() => {
     function onKeydown(event) {
@@ -19,9 +20,10 @@ export default function DeliveryDialog({ item, onClose }) {
   }, [onClose]);
 
   async function copyLink() {
-    if (!item?.telegramUrl) return;
+    if (!deliveryHref) return;
+    const shareableLink = deliveryHref.startsWith('/') ? new URL(deliveryHref, window.location.origin).href : deliveryHref;
     try {
-      await navigator.clipboard.writeText(item.telegramUrl);
+      await navigator.clipboard.writeText(shareableLink);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1800);
     } catch {
@@ -48,7 +50,7 @@ export default function DeliveryDialog({ item, onClose }) {
 
         {ready ? (
           <>
-            <a className="button button--telegram button--wide" href={item.telegramUrl} target="_blank" rel="noreferrer">
+            <a className="button button--telegram button--wide" href={deliveryHref} target="_blank" rel="noreferrer">
               <Icon name="telegram" size={20} /> Open secure delivery <Icon name="external" size={16} />
             </a>
             <button className="copy-link" type="button" onClick={copyLink}>

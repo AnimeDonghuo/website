@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
-import { getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
+import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { cleanMediaName, detectMediaQuality, summarizeUploadLanguages } from './services/episode-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
@@ -60,6 +60,7 @@ function publicFileChoices(files, config, shareCode) {
     const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.displayName });
     const label = cleanMediaName(file?.displayName || file?.name) || `Delivery file ${index + 1}`;
     const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
+    const deliveryUrl = getDeliveryRedirectPath(shareCode, index + 1);
 
     return {
       id: `file-${index + 1}`,
@@ -70,17 +71,19 @@ function publicFileChoices(files, config, shareCode) {
       kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
       episode,
       telegramUrl,
-      deliveryReady: Boolean(telegramUrl)
+      deliveryUrl,
+      deliveryReady: Boolean(telegramUrl && deliveryUrl)
     };
   });
 }
 
-export function toPublicContent(content, config) {
+export function toPublicContent(content, config, { includeFileChoices = true } = {}) {
   if (!content) return null;
   const category = categoryDetails(content.category);
   const shareCode = content.shareCode || null;
-  const deliveryUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
-  const fileChoices = content.hasDelivery ? publicFileChoices(content.files, config, shareCode) : [];
+  const telegramUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
+  const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
+  const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode) : [];
 
   return {
     id: String(content._id || content.id || content.slug),
@@ -104,8 +107,9 @@ export function toPublicContent(content, config) {
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
     publishedAt: serializeDate(content.publishedAt),
-    telegramUrl: deliveryUrl,
-    deliveryReady: Boolean(deliveryUrl)
+    telegramUrl,
+    deliveryUrl,
+    deliveryReady: Boolean(telegramUrl && deliveryUrl)
   };
 }
 
@@ -188,7 +192,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       const items = await repository.listContent({ category, query, limit: 100 });
       response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
       response.json({
-        items: items.map((item) => toPublicContent(item, config)),
+        items: items.map((item) => toPublicContent(item, config, { includeFileChoices: false })),
         total: items.length
       });
     } catch (error) {
@@ -202,7 +206,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       const featured = items.find((item) => item.featured) || items[0] || null;
       if (!featured) return apiError(response, 404, 'No featured release is available.');
       response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
-      return response.json({ item: toPublicContent(featured, config) });
+      return response.json({ item: toPublicContent(featured, config, { includeFileChoices: false }) });
     } catch (error) {
       return next(error);
     }
@@ -219,6 +223,24 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       return next(error);
     }
   });
+
+  function redirectToCurrentDeliveryBot(request, response, filePosition = null) {
+    const shareCode = cleanText(request.params.shareCode, 48);
+    const redirectPath = getDeliveryRedirectPath(shareCode, filePosition);
+    if (!redirectPath) return response.status(404).type('text').send('That delivery link is invalid.');
+    const telegramUrl = filePosition === null
+      ? getTelegramDeliveryUrl(config, shareCode)
+      : getTelegramFileDeliveryUrl(config, shareCode, filePosition);
+    if (!telegramUrl) return response.status(503).type('text').send('Telegram delivery is being configured. Please try again shortly.');
+    response.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    return response.redirect(302, telegramUrl);
+  }
+
+  // These first-party URLs are intentionally stable. They redirect to the
+  // currently active Telegram bot at click time, so a replacement bot/token
+  // does not require rewriting every existing catalog page.
+  app.get('/deliver/:shareCode', (request, response) => redirectToCurrentDeliveryBot(request, response));
+  app.get('/deliver/:shareCode/file/:filePosition', (request, response) => redirectToCurrentDeliveryBot(request, response, request.params.filePosition));
 
   app.use('/api', (_request, response) => apiError(response, 404, 'API route not found.'));
 
