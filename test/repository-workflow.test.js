@@ -20,12 +20,32 @@ test('catalog posts receive private admin IDs and safe episode index data', asyn
   const publicPost = toPublicContent(created, config);
   assert.equal(publicPost.episodeCount, 10);
   assert.deepEqual(publicPost.episodeGroups.map((group) => group.label), ['Episodes 01–05', 'Episodes 06–10']);
+  assert.equal(publicPost.fileChoices.length, 2);
+  assert.match(publicPost.fileChoices[0].telegramUrl, /^https:\/\/t\.me\/DeliveryBot\?start=file-/);
+  assert.equal(publicPost.fileChoices[0].storageMessageId, undefined);
   assert.equal(publicPost.adminId, undefined);
   assert.equal(publicPost.files, undefined);
 
   const removed = await repository.deleteContentByAdminId(created.adminId);
   assert.equal(removed.slug, created.slug);
   assert.equal(await repository.findContentByShareCode(created.shareCode), null);
+});
+
+test('every uploaded file has a separate public Telegram choice', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const files = Array.from({ length: 101 }, (_, index) => ({
+    storageMessageId: index + 1,
+    telegramFileId: `private-${index + 1}`,
+    name: `Release.Episode.${index + 1}.720p.mkv`,
+    kind: 'video'
+  }));
+  const created = await repository.createContent({ title: 'Long release', category: 'anime', files });
+  const publicPost = toPublicContent(created, config);
+
+  assert.equal(publicPost.fileChoices.length, 101);
+  assert.equal(publicPost.fileChoices.at(-1).position, 101);
+  assert.match(publicPost.fileChoices.at(-1).telegramUrl, new RegExp(`file-${created.shareCode}-101$`));
+  assert.equal(JSON.stringify(publicPost).includes('private-101'), false);
 });
 
 test('memory repository persists login sessions, requests and announcement destinations for its process lifetime', async () => {

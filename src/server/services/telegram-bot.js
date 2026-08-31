@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
-import { summarizeEpisodes, detectUploadEpisode } from './episode-service.js';
+import { summarizeEpisodes, detectMediaQuality, detectUploadEpisode } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
@@ -178,6 +178,7 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
   const { kind, source } = mediaDescriptor(message);
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const episode = detectUploadEpisode({ caption: message.caption, filename });
+  const quality = detectMediaQuality({ caption: message.caption, filename });
 
   return {
     storageMessageId: storedMessageId,
@@ -185,6 +186,7 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),
     displayName: episode.displayName,
+    quality,
     mimeType: cleanText(source?.mime_type || '', 80),
     size: Number(source?.file_size) || 0,
     kind,
@@ -276,6 +278,20 @@ function parseStartPayload(ctx) {
   const text = ctx.message?.text || '';
   const [, payload] = text.split(/\s+/, 2);
   return payload || '';
+}
+
+export function parseDeliveryPayload(payload) {
+  const safePayload = String(payload || '').trim();
+  if (safePayload.startsWith('get-')) {
+    const shareCode = safePayload.slice(4);
+    return /^[A-Za-z0-9_-]{6,48}$/.test(shareCode) ? { shareCode, filePosition: null } : null;
+  }
+
+  // The final numeric segment is the 1-based file position. The share code can
+  // contain hyphens, so matching from the right avoids ambiguous split logic.
+  const singleFile = safePayload.match(/^file-([A-Za-z0-9_-]{6,48})-([1-9]\d{0,5})$/);
+  if (!singleFile) return null;
+  return { shareCode: singleFile[1], filePosition: Number.parseInt(singleFile[2], 10) };
 }
 
 function normalizeChannelId(value) {
@@ -534,14 +550,13 @@ async function publishDraft(ctx, bot, repository, config) {
   }
 }
 
-async function deliverContent(ctx, payload, repository, config) {
-  const shareCode = payload.replace(/^get-/, '').trim();
-  if (!shareCode || shareCode.length > 48) {
+async function deliverContent(ctx, delivery, repository, config) {
+  if (!delivery?.shareCode || delivery.shareCode.length > 48) {
     await ctx.reply('That delivery link is invalid.');
     return;
   }
 
-  const content = await repository.findContentByShareCode(shareCode);
+  const content = await repository.findContentByShareCode(delivery.shareCode);
   if (!content) {
     await ctx.reply('This release is unavailable or the link has expired.');
     return;
@@ -555,9 +570,21 @@ async function deliverContent(ctx, payload, repository, config) {
     return;
   }
 
-  await ctx.reply(`Preparing ${content.files.length} item${content.files.length === 1 ? '' : 's'} for “${content.title}”…`);
+  const files = delivery.filePosition
+    ? [content.files[delivery.filePosition - 1]].filter(Boolean)
+    : content.files;
+  if (!files.length) {
+    await ctx.reply('That file choice is no longer available for this release. Return to the website and choose another option.');
+    return;
+  }
+
+  await ctx.reply(
+    delivery.filePosition
+      ? `Preparing your selected file for “${content.title}”…`
+      : `Preparing ${files.length} item${files.length === 1 ? '' : 's'} for “${content.title}”…`
+  );
   let delivered = 0;
-  for (const file of content.files) {
+  for (const file of files) {
     try {
       await ctx.telegram.copyMessage(chatId(ctx), config.telegram.storageChannelId, file.storageMessageId);
       delivered += 1;
@@ -567,8 +594,12 @@ async function deliverContent(ctx, payload, repository, config) {
   }
 
   if (delivered) {
-    await repository.incrementDelivery(shareCode);
-    await ctx.reply(`Delivered ${delivered} of ${content.files.length} item${content.files.length === 1 ? '' : 's'}. Enjoy responsibly.`);
+    await repository.incrementDelivery(delivery.shareCode);
+    await ctx.reply(
+      delivery.filePosition
+        ? 'Your selected file has been delivered. Enjoy responsibly.'
+        : `Delivered ${delivered} of ${files.length} item${files.length === 1 ? '' : 's'}. Enjoy responsibly.`
+    );
   } else {
     await ctx.reply('I could not retrieve these files from the storage channel. Please let the catalog administrator know.');
   }
@@ -609,8 +640,9 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.start(async (ctx) => {
     const payload = parseStartPayload(ctx);
-    if (payload.startsWith('get-')) {
-      await deliverContent(ctx, payload, repository, config);
+    const delivery = parseDeliveryPayload(payload);
+    if (delivery) {
+      await deliverContent(ctx, delivery, repository, config);
       return;
     }
     const publisher = await isPublisher(ctx, repository, config);

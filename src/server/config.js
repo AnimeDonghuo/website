@@ -27,15 +27,41 @@ function normalizeBotUsername(value) {
 }
 
 function normalizeSiteUrl(value) {
-  const candidate = (value || '').trim().replace(/\/$/, '');
+  let candidate = (value || '').trim().replace(/^['"]|['"]$/g, '').trim().replace(/\/+$/, '');
   if (!candidate) return '';
+
+  // Koyeb's dashboard values are sometimes pasted without a scheme. Treat a
+  // plain hostname as HTTPS so both `catalog.koyeb.app` and the full URL work.
+  if (!/^https?:\/\//i.test(candidate) && /^[a-z0-9.-]+(?::\d+)?(?:\/.*)?$/i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
   try {
     const url = new URL(candidate);
-    if (!['https:', 'http:'].includes(url.protocol)) return '';
-    return `${url.origin}${url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '')}`;
+    if (!['https:', 'http:'].includes(url.protocol) || !url.hostname) return '';
+    return `${url.origin}${url.pathname === '/' ? '' : url.pathname.replace(/\/+$/, '')}`;
   } catch {
     return '';
   }
+}
+
+function resolveSiteUrl(env) {
+  // PUBLIC_SITE_URL is the documented variable. The aliases make a deployment
+  // resilient to common Koyeb/dashboard names and let a valid alias win if a
+  // stale primary value was left blank or malformed.
+  for (const candidate of [
+    env.PUBLIC_SITE_URL,
+    env.WEBSITE_URL,
+    env.SITE_URL,
+    env.APP_URL,
+    env.PUBLIC_URL,
+    env.VITE_PUBLIC_SITE_URL,
+    env.KOYEB_PUBLIC_DOMAIN
+  ]) {
+    const url = normalizeSiteUrl(candidate);
+    if (url) return url;
+  }
+  return '';
 }
 
 export function loadConfig(env = process.env) {
@@ -46,9 +72,7 @@ export function loadConfig(env = process.env) {
     port: asPort(env.PORT),
     // PUBLIC_SITE_URL is required for announcement buttons to open the catalog
     // page first instead of sending visitors straight to the Telegram deep link.
-    siteUrl: normalizeSiteUrl(
-      env.PUBLIC_SITE_URL || env.SITE_URL || (env.KOYEB_PUBLIC_DOMAIN ? `https://${env.KOYEB_PUBLIC_DOMAIN}` : '')
-    ),
+    siteUrl: resolveSiteUrl(env),
     mongodbUri: (env.MONGODB_URI || '').trim(),
     mongodbDb: (env.MONGODB_DB || 'sorabox').trim(),
     imgbbApiKey: (env.IMGBB_API_KEY || '').trim(),
@@ -74,9 +98,23 @@ export function isTelegramAdmin(config, telegramUserId) {
   return config.telegram.adminIds.size === 0 || config.telegram.adminIds.has(String(telegramUserId));
 }
 
+function isShareCode(value) {
+  return /^[A-Za-z0-9_-]{6,48}$/.test(String(value || ''));
+}
+
 export function getTelegramDeliveryUrl(config, shareCode) {
-  if (!config.telegram.botUsername || !shareCode) return null;
+  if (!config.telegram.botUsername || !isShareCode(shareCode)) return null;
   return `https://t.me/${config.telegram.botUsername}?start=get-${shareCode}`;
+}
+
+export function getTelegramFileDeliveryUrl(config, shareCode, filePosition) {
+  const index = Number(filePosition);
+  // Six digits leaves room within Telegram's 64-character start payload even
+  // for a much longer legacy share code, while covering every practical release.
+  if (!config.telegram.botUsername || !isShareCode(shareCode) || !Number.isInteger(index) || index < 1 || index > 999999) return null;
+  // `file-` is deliberately a separate deep-link payload from `get-` so a
+  // base64url share code containing hyphens can never be parsed ambiguously.
+  return `https://t.me/${config.telegram.botUsername}?start=file-${shareCode}-${index}`;
 }
 
 export function getContentPageUrl(config, content) {

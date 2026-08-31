@@ -65,11 +65,20 @@ export function cleanMediaName(value) {
   const withoutAttribution = stripTelegramAttribution(value)
     .replace(/\.(mkv|mp4|avi|webm|mov|m4v|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
     .replace(/[_.]+/g, ' ')
-    .replace(/\b(?:480|576|720|1080|1440|2160|4k)\s*p?\b/gi, ' ')
+    .replace(/\b(?:360|480|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
     .replace(/\b(?:web[- ]?dl|webrip|bluray|brrip|hdrip|x264|x265|hevc|aac|ddp|10bit)\b/gi, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return cleanText(withoutAttribution, 180);
+}
+
+export function detectMediaQuality({ caption, filename }) {
+  const candidates = [stripTelegramAttribution(caption), stripTelegramAttribution(filename)].filter(Boolean);
+  for (const candidate of candidates) {
+    const match = candidate.match(/\b(8k|4k|2160p|1440p|1080p|720p|576p|480p|360p)\b/i);
+    if (match) return match[1].toUpperCase();
+  }
+  return null;
 }
 
 export function detectUploadEpisode({ caption, filename }) {

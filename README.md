@@ -19,7 +19,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
 - Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, smart episode index, related releases, and a polished Telegram delivery dialog
+- Dedicated details pages with metadata, tags, availability labels, a smart episode index, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog
 - Search that supports multi-word title, genre, and language matching
 - Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
@@ -106,7 +106,9 @@ Set the externally reachable catalog URL before publishing announcement posts:
 PUBLIC_SITE_URL=https://your-catalog.koyeb.app
 ```
 
-Telegram announcement buttons use this URL and open `/<category>/<slug>` on your website. Visitors can review the title and episode guide there before tapping the site’s Telegram delivery button. The announcement channel never receives the direct Telegram file link.
+Telegram announcement buttons use this URL and open `/<category>/<slug>` on your website. Visitors can review the title, individual file/quality choices, and episode guide there before tapping a Telegram delivery button. The announcement channel never receives the direct Telegram file link.
+
+After changing a Koyeb environment value, redeploy the active service revision. Its startup log prints `Announcement site URL: …`, and `https://your-catalog.koyeb.app/api/health` exposes the non-sensitive `announcementSiteUrl` value. If it is `null`, the running revision did not receive a usable URL. The parser accepts a normal full URL, a quoted URL, or a bare Koyeb hostname, and also recognizes common aliases such as `WEBSITE_URL`, `SITE_URL`, and `KOYEB_PUBLIC_DOMAIN`; use `PUBLIC_SITE_URL` as the canonical setting. Previously sent Telegram posts cannot be changed retroactively.
 
 ### 2. Configure MongoDB
 
@@ -239,7 +241,7 @@ When publishing succeeds, the bot replies with a URL like:
 https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 ```
 
-The public site automatically builds this URL behind the **Get files on Telegram** button from the record's short delivery code, and the bot resolves it privately. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
+The public site automatically builds this URL behind the **Get all files on Telegram** button from the record's short delivery code, and the bot resolves it privately. It also creates a separate `file-…` deep link for every uploaded file. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
 
 ### Automatic announcement channels
 

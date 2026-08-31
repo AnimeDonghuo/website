@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fileFromMessage, storageErrorHint, storeMediaInChannel } from '../src/server/services/telegram-bot.js';
+import { fileFromMessage, parseDeliveryPayload, storageErrorHint, storeMediaInChannel } from '../src/server/services/telegram-bot.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
   const calls = [];
@@ -25,6 +25,12 @@ test('storage uses a reusable Telegram file ID when copyMessage is refused', asy
     fileId: 'document-file-id',
     extra: { disable_notification: true, caption: 'Perfect World Ep 01' }
   });
+});
+
+test('single-file deep-link payload preserves hyphens in the share code', () => {
+  assert.deepEqual(parseDeliveryPayload('file-aB-cD_ef-12'), { shareCode: 'aB-cD_ef', filePosition: 12 });
+  assert.deepEqual(parseDeliveryPayload('get-aB-cD_ef'), { shareCode: 'aB-cD_ef', filePosition: null });
+  assert.equal(parseDeliveryPayload('file-not-valid'), null);
 });
 
 test('stored file record keeps the returned storage message ID', () => {

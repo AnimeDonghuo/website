@@ -282,7 +282,7 @@ function DetailPage({ onGetFiles }) {
               {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
               <div className="tag-list">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div>
               <div className="detail-actions">
-                <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get files on Telegram</button>
+                <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>
                 <Link className="button button--ghost" to={`/browse/${item.category}`}>More {item.categoryLabel}</Link>
               </div>
               <p className="detail-layout__delivery-note"><Icon name="shield" size={15} /> No file is hosted on this website. Telegram delivers a copy from the private storage channel.</p>
@@ -305,6 +305,38 @@ function DetailPage({ onGetFiles }) {
         </div>
       </section>
 
+      {item.fileChoices?.length ? <section className="file-choice-section page-width" aria-labelledby="file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.</p></div>
+          <button className="button button--secondary" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get all {item.filesCount} files</button>
+        </div>
+        <div className="file-choice-list">
+          {item.fileChoices.map((file) => {
+            const heading = file.episode?.label || file.label || `Delivery file ${file.position}`;
+            const hasDistinctLabel = file.episode?.label && file.label && file.label.toLowerCase() !== file.episode.label.toLowerCase();
+            const episodeIndex = file.episode
+              ? file.episode.start === file.episode.end
+                ? `EP ${String(file.episode.start).padStart(2, '0')}`
+                : `EP ${String(file.episode.start).padStart(2, '0')}–${String(file.episode.end).padStart(2, '0')}`
+              : `FILE ${String(file.position).padStart(2, '0')}`;
+            return <article className="file-choice" key={file.id}>
+              <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
+              <div className="file-choice__details">
+                <strong>{heading}</strong>
+                {hasDistinctLabel ? <span className="file-choice__label">{file.label}</span> : null}
+                <div className="file-choice__meta">
+                  {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
+                  {file.size ? <span>{file.size}</span> : null}
+                  <span>{file.kind}</span>
+                  {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
+                </div>
+              </div>
+              {file.deliveryReady ? <a className="file-choice__action" href={file.telegramUrl} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+            </article>;
+          })}
+        </div>
+      </section> : null}
+
       {item.episodeGroups?.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
         <div className="episode-section__heading">
           <div><Eyebrow>SMART EPISODE INDEX</Eyebrow><h2 id="episode-guide-title">Episode <em>guide.</em></h2></div>
@@ -318,7 +350,7 @@ function DetailPage({ onGetFiles }) {
             <Icon name="telegram" size={15} />
           </div>)}
         </div>
-        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Open Telegram delivery to receive the listed files.</p>
+        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Choose an individual file above, or use the all-files delivery option.</p>
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">

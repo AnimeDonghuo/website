@@ -371,9 +371,12 @@ export class MongoCatalogRepository {
   }
 
   async findContentBySlug(slug) {
+    // Detail pages need the saved file labels/quality/episode information to
+    // create individual Telegram choices. The public serializer strips all
+    // raw Telegram IDs and storage message IDs before returning this record.
     return this.contents.findOne(
       { slug, published: true },
-      { projection: { files: 0, 'poster.deleteUrl': 0 } }
+      { projection: { 'poster.deleteUrl': 0 } }
     );
   }
 

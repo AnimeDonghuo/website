@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectUploadEpisode, stripTelegramAttribution, summarizeEpisodes } from '../src/server/services/episode-service.js';
+import { detectMediaQuality, detectUploadEpisode, stripTelegramAttribution, summarizeEpisodes } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -23,6 +23,14 @@ test('filename is used only when the caption has no episode number', () => {
   assert.equal(result.start, 6);
   assert.equal(result.end, 10);
   assert.equal(result.source, 'filename');
+});
+
+test('quality is detected from a cleaned caption before the filename fallback', () => {
+  assert.equal(
+    detectMediaQuality({ caption: 'Perfect World @release_source 4k WEB-DL', filename: 'Perfect.World.1080p.mkv' }),
+    '4K'
+  );
+  assert.equal(detectMediaQuality({ caption: 'Perfect World', filename: 'Perfect.World.720p.mkv' }), '720P');
 });
 
 test('episode summary creates an ordered public-friendly index', () => {

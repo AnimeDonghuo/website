@@ -5,8 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
-import { getTelegramDeliveryUrl, loadConfig } from './config.js';
-import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText } from './lib/strings.js';
+import { getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
+import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
+import { cleanMediaName, detectMediaQuality } from './services/episode-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,8 +28,31 @@ function publicEpisodeGroups(value) {
       label: cleanText(group?.label, 50),
       fileCount: Math.max(1, Number(group?.fileCount) || 1)
     }))
-    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
-    .slice(0, 100);
+    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label);
+}
+
+function publicFileChoices(files, config, shareCode) {
+  if (!Array.isArray(files)) return [];
+  // A published detail page intentionally lists every uploaded file: selecting
+  // one must never force a visitor to receive a different quality or episode.
+  return files.map((file, index) => {
+    const episode = publicEpisodeGroups([file?.episode])[0] || null;
+    const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.displayName });
+    const label = cleanMediaName(file?.displayName || file?.name) || `Delivery file ${index + 1}`;
+    const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
+
+    return {
+      id: `file-${index + 1}`,
+      position: index + 1,
+      label,
+      quality: quality || null,
+      size: formatBytes(Number(file?.size) || 0),
+      kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
+      episode,
+      telegramUrl,
+      deliveryReady: Boolean(telegramUrl)
+    };
+  });
 }
 
 export function toPublicContent(content, config) {
@@ -36,6 +60,7 @@ export function toPublicContent(content, config) {
   const category = categoryDetails(content.category);
   const shareCode = content.shareCode || null;
   const deliveryUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
+  const fileChoices = content.hasDelivery ? publicFileChoices(content.files, config, shareCode) : [];
 
   return {
     id: String(content._id || content.id || content.slug),
@@ -54,6 +79,7 @@ export function toPublicContent(content, config) {
     posterUrl: content.posterUrl || null,
     backdropUrl: content.backdropUrl || content.posterUrl || null,
     filesCount: Number(content.filesCount) || 0,
+    fileChoices,
     episodeGroups: publicEpisodeGroups(content.episodeGroups),
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
@@ -101,6 +127,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       catalogStore: repository.kind,
       persistent: repository.persistent,
       telegramPolling: Boolean(config.telegram.botToken && config.telegram.mode === 'polling'),
+      announcementSiteUrl: config.siteUrl || null,
       now: new Date().toISOString()
     });
   });
@@ -111,6 +138,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       catalogName: 'SoraBox',
       categories: CATEGORIES,
       deliveryConfigured: Boolean(config.telegram.botUsername),
+      announcementSiteConfigured: Boolean(config.siteUrl),
       demoMode: !repository.persistent
     });
   });
@@ -212,6 +240,7 @@ export async function startServer() {
   const app = createApp({ config, repository });
   const server = app.listen(config.port, '0.0.0.0', () => {
     console.info(`[server] SoraBox listening on 0.0.0.0:${config.port} (${repository.kind} catalog)`);
+    console.info(`[server] Announcement site URL: ${config.siteUrl || 'not configured'}`);
     if (!repository.persistent) {
       console.warn('[server] MongoDB is not configured: using non-persistent demo content.');
     }
