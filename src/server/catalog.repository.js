@@ -466,18 +466,23 @@ export class MongoCatalogRepository {
   }
 
   async appendSessionFile(chatId, ownerId, file) {
-    const result = await this.sessions.findOneAndUpdate(
-      { chatId: String(chatId), ownerId: String(ownerId) },
+    const filter = { chatId: String(chatId), ownerId: String(ownerId) };
+    const update = await this.sessions.updateOne(
+      filter,
       {
         $push: { files: file },
         $set: {
           updatedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + SESSION_TTL_MS)
         }
-      },
-      { returnDocument: 'after', includeResultMetadata: false }
+      }
     );
-    return result;
+
+    // updateOne gives an unambiguous matchedCount across MongoDB driver versions.
+    // Fetching afterward also means callers always receive the actual saved draft,
+    // rather than a findOneAndUpdate metadata wrapper.
+    if (update.matchedCount !== 1) return null;
+    return this.sessions.findOne(filter);
   }
 
   async deleteSession(chatId, ownerId) {
