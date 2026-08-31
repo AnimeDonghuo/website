@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
-import { getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
+import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument } from '../lib/strings.js';
 import { summarizeEpisodes, detectUploadEpisode } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
@@ -383,15 +383,17 @@ function announcementCaption(content) {
     synopsis ? '' : null,
     synopsis ? escapeHtml(synopsis) : null,
     '',
-    'Tap the button below for private Telegram delivery.'
+    'Tap the button below for full details, episode guide, and Telegram delivery.'
   ].filter((line) => line !== null).join('\n').slice(0, 1000);
 }
 
-async function announcePublishedContent({ bot, repository, content, config, deliveryUrl }) {
+async function announcePublishedContent({ bot, repository, content, websiteUrl }) {
   const channels = await repository.listAnnouncementChannels();
   if (!channels.length) return { sent: 0, failed: 0 };
 
-  const keyboard = deliveryUrl ? Markup.inlineKeyboard([[Markup.button.url('📦 GET FILES', deliveryUrl)]]) : undefined;
+  // Announcement channels deliberately send users to the catalog page first.
+  // The public page is where the user can review details and choose Telegram delivery.
+  const keyboard = websiteUrl ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', websiteUrl)]]) : undefined;
   const caption = announcementCaption(content);
   let sent = 0;
   let failed = 0;
@@ -482,11 +484,12 @@ async function publishDraft(ctx, bot, repository, config) {
     await repository.deleteSession(chatId(ctx), userId(ctx));
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
+    const websiteUrl = getContentPageUrl(config, content);
     let announcements = { sent: 0, failed: 0, configured: false };
     try {
       const configuredChannels = await repository.listAnnouncementChannels();
       announcements = {
-        ...(await announcePublishedContent({ bot, repository, content, config, deliveryUrl: url })),
+        ...(await announcePublishedContent({ bot, repository, content, websiteUrl })),
         configured: configuredChannels.length > 0
       };
     } catch (error) {
@@ -502,6 +505,9 @@ async function publishDraft(ctx, bot, repository, config) {
       : announcements.configured
         ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
         : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
+    const websiteNote = websiteUrl
+      ? `Announcement website link: ${websiteUrl}`
+      : 'PUBLIC_SITE_URL is not configured, so announcement posts were sent without a button. Add your Koyeb website URL and publish the next post.';
 
     await ctx.reply(
       [
@@ -512,6 +518,7 @@ async function publishDraft(ctx, bot, repository, config) {
         episodeNote,
         posterNote,
         channelNote,
+        websiteNote,
         '',
         'Share this delivery link:',
         url

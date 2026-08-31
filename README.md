@@ -43,7 +43,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel
-- Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and delivery button
+- Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
 - Every post receives a private `SB-…` Post ID which a logged-in publisher can remove with `/delete SB-…`
 - Draft/login sessions survive restarts when MongoDB is configured and expire automatically
 
@@ -97,6 +97,16 @@ Health check:
 ```bash
 curl http://localhost:8000/api/health
 ```
+
+### Public website URL for Telegram announcements
+
+Set the externally reachable catalog URL before publishing announcement posts:
+
+```dotenv
+PUBLIC_SITE_URL=https://your-catalog.koyeb.app
+```
+
+Telegram announcement buttons use this URL and open `/<category>/<slug>` on your website. Visitors can review the title and episode guide there before tapping the site’s Telegram delivery button. The announcement channel never receives the direct Telegram file link.
 
 ### 2. Configure MongoDB
 
@@ -241,7 +251,7 @@ After logging in, add every destination where you want polished new-release card
 /channels
 ```
 
-The bot verifies that the target is a Telegram channel it can access, stores it in MongoDB, and then sends every future published item to every saved channel. Each announcement includes the permanent ImgBB poster, category/title/metadata, episode or file summary, synopsis, and a deep-link delivery button. Use `/removechannel <channel_id>` to stop future announcements. The bot needs administrator rights in each destination channel.
+The bot verifies that the target is a Telegram channel it can access, stores it in MongoDB, and then sends every future published item to every saved channel. Each announcement includes the permanent ImgBB poster, category/title/metadata, episode or file summary, synopsis, and a **View on Website** button. Set `PUBLIC_SITE_URL` to your Koyeb domain so that button opens the public detail page rather than a direct Telegram file link. Use `/removechannel <channel_id>` to stop future announcements. The bot needs administrator rights in each destination channel.
 
 ---
 
@@ -261,6 +271,7 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | --- | --- | --- | --- |
 | `NODE_ENV` | Plaintext | Yes | `production` |
 | `PORT` | Plaintext | Yes | `8000` |
+| `PUBLIC_SITE_URL` | Plaintext | Yes | Your canonical Koyeb site URL; announcement buttons open the post page here |
 | `MONGODB_URI` | Secret | Yes | Mongo connection string |
 | `MONGODB_DB` | Plaintext | No | Defaults to `sorabox` |
 | `IMGBB_API_KEY` | Secret | Yes | Never expose it to the browser |

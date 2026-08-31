@@ -26,12 +26,29 @@ function normalizeBotUsername(value) {
   return (value || '').trim().replace(/^@/, '').replace(/\s+/g, '');
 }
 
+function normalizeSiteUrl(value) {
+  const candidate = (value || '').trim().replace(/\/$/, '');
+  if (!candidate) return '';
+  try {
+    const url = new URL(candidate);
+    if (!['https:', 'http:'].includes(url.protocol)) return '';
+    return `${url.origin}${url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '')}`;
+  } catch {
+    return '';
+  }
+}
+
 export function loadConfig(env = process.env) {
   const telegramMode = (env.TELEGRAM_MODE || 'polling').trim().toLowerCase();
 
   return {
     environment: env.NODE_ENV || 'development',
     port: asPort(env.PORT),
+    // PUBLIC_SITE_URL is required for announcement buttons to open the catalog
+    // page first instead of sending visitors straight to the Telegram deep link.
+    siteUrl: normalizeSiteUrl(
+      env.PUBLIC_SITE_URL || env.SITE_URL || (env.KOYEB_PUBLIC_DOMAIN ? `https://${env.KOYEB_PUBLIC_DOMAIN}` : '')
+    ),
     mongodbUri: (env.MONGODB_URI || '').trim(),
     mongodbDb: (env.MONGODB_DB || 'sorabox').trim(),
     imgbbApiKey: (env.IMGBB_API_KEY || '').trim(),
@@ -60,4 +77,9 @@ export function isTelegramAdmin(config, telegramUserId) {
 export function getTelegramDeliveryUrl(config, shareCode) {
   if (!config.telegram.botUsername || !shareCode) return null;
   return `https://t.me/${config.telegram.botUsername}?start=get-${shareCode}`;
+}
+
+export function getContentPageUrl(config, content) {
+  if (!config.siteUrl || !content?.category || !content?.slug) return null;
+  return `${config.siteUrl}/${encodeURIComponent(content.category)}/${encodeURIComponent(content.slug)}`;
 }
