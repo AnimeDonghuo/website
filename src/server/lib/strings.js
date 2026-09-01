@@ -6,7 +6,10 @@ export const CATEGORIES = [
   { id: 'donghua', label: 'Donghua', shortLabel: 'Donghua', tone: 'cyan' },
   { id: 'kdrama', label: 'K-Drama', shortLabel: 'K-Drama', tone: 'rose' },
   { id: 'movie', label: 'Movies', shortLabel: 'Movie', tone: 'lime' },
-  { id: 'web-series', label: 'Web Series', shortLabel: 'Series', tone: 'blue' }
+  { id: 'web-series', label: 'Web Series', shortLabel: 'Series', tone: 'blue' },
+  // Adult releases are intentionally a first-class category so their private
+  // storage source and public age gate can be enforced consistently.
+  { id: 'adult', label: '18+', shortLabel: '18+', tone: 'crimson' }
 ];
 
 export const CATEGORY_IDS = new Set(CATEGORIES.map((category) => category.id));

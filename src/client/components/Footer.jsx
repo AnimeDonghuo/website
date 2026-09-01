@@ -23,6 +23,7 @@ export default function Footer() {
           <p className="site-footer__heading">Catalog</p>
           <Link to="/browse/movie">Movies</Link>
           <Link to="/browse/web-series">Web Series</Link>
+          <Link to="/browse/adult">18+ access</Link>
           <Link to="/browse">All releases</Link>
           <Link to="/search?q=">Search</Link>
         </div>

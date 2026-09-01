@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
-import { getConfig, getContent, getContentBySlug } from './api.js';
+import { confirmAdultAccess, getConfig, getContent, getContentBySlug } from './api.js';
+import AdultGate from './components/AdultGate.jsx';
 import DeliveryDialog from './components/DeliveryDialog.jsx';
 import Footer from './components/Footer.jsx';
 import Header from './components/Header.jsx';
@@ -8,7 +9,7 @@ import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
 
-const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
+const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 const categoryCopy = {
   anime: { eyebrow: 'ANIMATED WORLDS', title: 'Anime worth crossing worlds for.', description: 'Fresh series, feature films and hand-picked adventures gathered in one focused collection.' },
   cartoon: { eyebrow: 'ALL-AGES ADVENTURES', title: 'Bright worlds. Big imagination.', description: 'A playful corner of the catalog for family animation, classic characters and original adventures.' },
@@ -16,6 +17,7 @@ const categoryCopy = {
   kdrama: { eyebrow: 'STORIES WITH A PULSE', title: 'One more episode energy.', description: 'Romance, mystery, comedy and high-stakes drama, organized for your next late-night watch.' },
   movie: { eyebrow: 'FEATURE PRESENTATION', title: 'Make tonight a movie night.', description: 'A curated shelf of features, from edge-of-your-seat thrillers to big-hearted adventures.' },
   'web-series': { eyebrow: 'BINGE-READY SERIES', title: 'The next tab-open-worthy series.', description: 'Smartly organized seasons and new episodes for your watchlist.' },
+  adult: { eyebrow: 'AGE-RESTRICTED ACCESS', title: 'A private 18+ collection.', description: 'This area is available only after you confirm that you are 18 or older.' },
   all: { eyebrow: 'EVERYTHING TO EXPLORE', title: 'A world of stories, neatly cataloged.', description: 'Browse every release across the SoraBox catalog.' }
 };
 
@@ -135,8 +137,8 @@ function HomePage({ onGetFiles }) {
         </div>
         <div className="category-rail__items">
           {categoryOrder.map((category, index) => {
-            const label = category === 'web-series' ? 'Web Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
-            const icons = ['✦', '☺', '◇', '♡', '▶', '▣'];
+            const label = category === 'adult' ? '18+' : category === 'web-series' ? 'Web Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+            const icons = ['✦', '☺', '◇', '♡', '▶', '▣', '18+'];
             return <Link className={`category-tile category-tile--${category}`} key={category} to={`/browse/${category}`}>
               <span className="category-tile__number">0{index + 1}</span>
               <span className="category-tile__icon" aria-hidden="true">{icons[index]}</span>
@@ -187,17 +189,28 @@ function CategoryNav({ activeCategory }) {
   return <nav className="browse-category-nav" aria-label="Catalog categories">
     <Link className={active === 'all' ? 'is-active' : ''} to="/browse">All</Link>
     {categoryOrder.map((category) => {
-      const label = category === 'web-series' ? 'Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+      const label = category === 'adult' ? '18+' : category === 'web-series' ? 'Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
       return <Link key={category} className={active === category ? 'is-active' : ''} to={`/browse/${category}`}>{label}</Link>;
     })}
   </nav>;
 }
 
-function BrowsePage() {
+function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category: requestedCategory } = useParams();
   const category = categoryOrder.includes(requestedCategory) ? requestedCategory : undefined;
   const copy = categoryCopy[category || 'all'];
-  const catalog = useRemote(() => getContent({ category }), [category]);
+  const requestedAdultCategory = category === 'adult';
+  // The adult endpoint is never requested before the visitor confirms. This
+  // avoids rendering, preloading, or even receiving adult cards behind a UI
+  // overlay; the server independently enforces the same cookie gate.
+  const catalog = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [], total: 0 }) : getContent({ category }),
+    [category, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  // A sessionStorage marker can outlive the HTTP-only server cookie. A denied
+  // request returns to the same confirmation safely rather than presenting an
+  // error or stale restricted data.
+  const adultLocked = requestedAdultCategory && (!adultAccess || catalog.error?.status === 403);
   const [filterOpen, setFilterOpen] = useState(false);
 
   return (
@@ -210,13 +223,15 @@ function BrowsePage() {
           <CategoryNav activeCategory={category} />
         </div>
       </section>
-      <section className="browse-results page-width">
-        <div className="browse-results__top">
-          <p><strong>{catalog.loading ? '…' : catalog.data?.total || 0}</strong> release{catalog.data?.total === 1 ? '' : 's'} {category ? `in ${categoryCopy[category].title.split('.')[0]}` : 'to explore'}</p>
-          <button type="button" className="filter-button" onClick={() => setFilterOpen((current) => !current)}><Icon name="filter" size={17} /> Collections <Icon name="chevron" size={15} /></button>
-          <div className={`browse-filter-popover ${filterOpen ? 'browse-filter-popover--open' : ''}`}><CategoryNav activeCategory={category} /></div>
-        </div>
-        {catalog.loading ? <LoadingGrid count={8} /> : catalog.error ? <ErrorBlock error={catalog.error} /> : catalog.data?.items?.length ? <div className="release-grid">{catalog.data.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div> : <EmptyState category={category} />}
+      <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`}>
+        {adultLocked ? <AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /> : <>
+          <div className="browse-results__top">
+            <p><strong>{catalog.loading ? '…' : catalog.data?.total || 0}</strong> release{catalog.data?.total === 1 ? '' : 's'} {category ? `in ${categoryCopy[category].title.split('.')[0]}` : 'to explore'}</p>
+            <button type="button" className="filter-button" onClick={() => setFilterOpen((current) => !current)}><Icon name="filter" size={17} /> Collections <Icon name="chevron" size={15} /></button>
+            <div className={`browse-filter-popover ${filterOpen ? 'browse-filter-popover--open' : ''}`}><CategoryNav activeCategory={category} /></div>
+          </div>
+          {catalog.loading || (requestedAdultCategory && adultAccess && !catalog.data && !catalog.error) ? <LoadingGrid count={8} /> : catalog.error ? <ErrorBlock error={catalog.error} /> : catalog.data?.items?.length ? <div className="release-grid">{catalog.data.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div> : <EmptyState category={category} />}
+        </>}
       </section>
     </PageShell>
   );
@@ -299,17 +314,28 @@ function FileChoiceList({ item, choices, onGetFiles }) {
   </div>;
 }
 
-function DetailPage({ onGetFiles }) {
-  const { slug } = useParams();
-  const release = useRemote(() => getContentBySlug(slug), [slug]);
-  const related = useRemote(() => getContent(), []);
+function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
+  const { category, slug } = useParams();
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const related = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [] }) : getContent({ category: requestedAdultCategory ? 'adult' : undefined }),
+    [requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
   const item = release.data?.item;
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
   const relatedItems = useMemo(() => {
     if (!item) return [];
     return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
   }, [item, related.data]);
 
-  if (release.loading) {
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
     return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
   }
   if (release.error || !item) {
@@ -392,10 +418,19 @@ function DetailPage({ onGetFiles }) {
   );
 }
 
-function EpisodePage({ onGetFiles }) {
+function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category, slug, episodeRange } = useParams();
-  const release = useRemote(() => getContentBySlug(slug), [slug]);
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
   const item = release.data?.item;
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
+
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
   const requestedEpisode = parseEpisodeRoute(episodeRange);
   const matchingGroup = item?.episodeGroups?.find((group) => group.start === requestedEpisode?.start && group.end === requestedEpisode?.end);
   const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
@@ -403,7 +438,7 @@ function EpisodePage({ onGetFiles }) {
     ? (item.fileChoices || []).filter((file) => file.episode && file.episode.start <= requestedEpisode.end && file.episode.end >= requestedEpisode.start)
     : [];
 
-  if (release.loading) {
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
     return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
   }
   if (release.error || !item || !requestedEpisode || item.category !== category) {
@@ -441,11 +476,19 @@ function EpisodePage({ onGetFiles }) {
   );
 }
 
-function WatchPage({ onGetFiles }) {
+function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category, slug } = useParams();
-  const release = useRemote(() => getContentBySlug(slug), [slug]);
-  const related = useRemote(() => getContent(), []);
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const related = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [] }) : getContent({ category: requestedAdultCategory ? 'adult' : undefined }),
+    [requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
   const item = release.data?.item;
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
   const entries = item?.stream?.entries || [];
   const [selectedId, setSelectedId] = useState(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
@@ -458,7 +501,10 @@ function WatchPage({ onGetFiles }) {
     setSelectedId(entries[0]?.id || null);
   }, [slug, item?.stream?.updatedAt]);
 
-  if (release.loading) {
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
     return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
   }
   if (release.error || !item || item.category !== category) {
@@ -528,17 +574,58 @@ function NotFoundPage() {
 
 export default function App() {
   const [deliveryItem, setDeliveryItem] = useState(null);
+  const [adultAccess, setAdultAccess] = useState(() => {
+    try {
+      return window.sessionStorage.getItem('sorabox_adult_access') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [confirmingAdult, setConfirmingAdult] = useState(false);
+  const [adultAccessError, setAdultAccessError] = useState(null);
+  const [adultAccessVersion, setAdultAccessVersion] = useState(0);
+
+  async function handleAdultConfirmation() {
+    if (confirmingAdult) return;
+    setConfirmingAdult(true);
+    setAdultAccessError(null);
+    try {
+      await confirmAdultAccess();
+      try {
+        window.sessionStorage.setItem('sorabox_adult_access', '1');
+      } catch {
+        // The server cookie still keeps this route available when storage is
+        // disabled by a privacy mode or embedded browser.
+      }
+      setAdultAccess(true);
+      // Retry a protected endpoint after renewed consent even if a restored
+      // tab already held `adultAccess: true` while its server cookie expired.
+      setAdultAccessVersion((version) => version + 1);
+    } catch (error) {
+      setAdultAccessError(error?.message || 'We could not confirm access. Please try again.');
+    } finally {
+      setConfirmingAdult(false);
+    }
+  }
+
+  const adultGateProps = {
+    adultAccess,
+    adultAccessVersion,
+    onConfirmAdult: handleAdultConfirmation,
+    adultAccessError,
+    confirmingAdult
+  };
 
   return (
     <>
       <Routes>
         <Route path="/" element={<HomePage onGetFiles={setDeliveryItem} />} />
-        <Route path="/browse" element={<BrowsePage />} />
-        <Route path="/browse/:category" element={<BrowsePage />} />
+        <Route path="/browse" element={<BrowsePage {...adultGateProps} />} />
+        <Route path="/browse/:category" element={<BrowsePage {...adultGateProps} />} />
         <Route path="/search" element={<SearchPage />} />
-        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={setDeliveryItem} />} />
-        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={setDeliveryItem} />} />
-        <Route path="/:category/:slug" element={<DetailPage onGetFiles={setDeliveryItem} />} />
+        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
+        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
+        <Route path="/:category/:slug" element={<DetailPage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
       {deliveryItem ? <DeliveryDialog item={deliveryItem} onClose={() => setDeliveryItem(null)} /> : null}

@@ -16,6 +16,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultDistPath = path.resolve(__dirname, '../../dist');
 const VISITOR_COOKIE_NAME = 'sorabox_visitor';
 const VISITOR_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 365;
+const ADULT_ACCESS_COOKIE_NAME = 'sorabox_adult_access';
+// Consent is intentionally short-lived and browser-local. This is an age gate,
+// not an identity system; users are prompted again in a later browser session.
+const ADULT_ACCESS_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 12;
 
 function cookieValue(request, name) {
   const cookieHeader = String(request.headers.cookie || '');
@@ -46,6 +50,24 @@ function anonymousVisitorId(request, response, config) {
     path: '/'
   });
   return visitorId;
+}
+
+function hasAdultAccess(request) {
+  return cookieValue(request, ADULT_ACCESS_COOKIE_NAME) === '1';
+}
+
+function grantAdultAccess(response, config) {
+  response.cookie(ADULT_ACCESS_COOKIE_NAME, '1', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.environment === 'production',
+    maxAge: ADULT_ACCESS_COOKIE_MAX_AGE_MS,
+    path: '/'
+  });
+}
+
+function isAdultContent(item) {
+  return item?.category === 'adult';
 }
 
 function isTrackableSiteVisit(request) {
@@ -286,16 +308,30 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
     });
   });
 
-  app.get('/api/categories', async (_request, response, next) => {
+  app.post('/api/adult-access', (request, response) => {
+    if (request.body?.confirmed !== true) return apiError(response, 400, 'Age confirmation is required before opening the 18+ catalog.');
+    grantAdultAccess(response, config);
+    response.set('Cache-Control', 'no-store');
+    return response.json({ allowed: true });
+  });
+
+  app.get('/api/categories', async (request, response, next) => {
     try {
       const items = await repository.listContent({ limit: 100 });
       const counts = items.reduce((result, item) => {
         result[item.category] = (result[item.category] || 0) + 1;
         return result;
       }, {});
-      response.set('Cache-Control', 'public, max-age=60, s-maxage=120');
+      const adultAccess = hasAdultAccess(request);
+      // Cookie-aware category data must not be shared by a CDN/cache. The
+      // category itself remains visible, but its catalog count stays private
+      // until the visitor has confirmed their age.
+      response.set('Cache-Control', 'private, no-store');
       response.json({
-        categories: CATEGORIES.map((category) => ({ ...category, count: counts[category.id] || 0 }))
+        categories: CATEGORIES.map((category) => ({
+          ...category,
+          count: category.id === 'adult' && !adultAccess ? 0 : counts[category.id] || 0
+        }))
       });
     } catch (error) {
       next(error);
@@ -307,20 +343,26 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       const rawCategory = cleanText(request.query.category, 40);
       const category = CATEGORY_IDS.has(rawCategory) ? rawCategory : undefined;
       const query = cleanText(request.query.q, 100);
-      const items = await repository.listContent({ category, query, limit: 100 });
-      response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
-      response.json({
+      if (category === 'adult' && !hasAdultAccess(request)) {
+        return apiError(response, 403, 'Confirm that you are 18 or older to open this category.');
+      }
+      const listed = await repository.listContent({ category, query, limit: 100 });
+      // Adult cards never appear in home, all-catalog, or search responses.
+      // They are available only from the explicit age-confirmed 18+ category.
+      const items = category === 'adult' ? listed : listed.filter((item) => !isAdultContent(item));
+      response.set('Cache-Control', category === 'adult' ? 'private, no-store' : 'public, max-age=45, s-maxage=90');
+      return response.json({
         items: items.map((item) => toPublicContent(item, config, { includeFileChoices: false })),
         total: items.length
       });
     } catch (error) {
-      next(error);
+      return next(error);
     }
   });
 
   app.get('/api/content/featured', async (_request, response, next) => {
     try {
-      const items = await repository.listContent({ limit: 100 });
+      const items = (await repository.listContent({ limit: 100 })).filter((item) => !isAdultContent(item));
       const featured = items.find((item) => item.featured) || items[0] || null;
       if (!featured) return apiError(response, 404, 'No featured release is available.');
       response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
@@ -335,17 +377,28 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       const slug = cleanText(request.params.slug, 80);
       const item = await repository.findContentBySlug(slug);
       if (!item) return apiError(response, 404, 'This release is unavailable.');
-      response.set('Cache-Control', 'public, max-age=60, s-maxage=120');
+      if (isAdultContent(item) && !hasAdultAccess(request)) {
+        return apiError(response, 403, 'Confirm that you are 18 or older to open this release.');
+      }
+      response.set('Cache-Control', isAdultContent(item) ? 'private, no-store' : 'public, max-age=60, s-maxage=120');
       return response.json({ item: toPublicContent(item, config) });
     } catch (error) {
       return next(error);
     }
   });
 
-  function redirectToCurrentDeliveryBot(request, response, filePosition = null) {
+  async function redirectToCurrentDeliveryBot(request, response, filePosition = null) {
     const shareCode = cleanText(request.params.shareCode, 48);
     const redirectPath = getDeliveryRedirectPath(shareCode, filePosition);
     if (!redirectPath) return response.status(404).type('text').send('That delivery link is invalid.');
+    const content = await repository.findContentByShareCode(shareCode);
+    // Keep legacy delivery redirects stable even when a catalog record has
+    // since been deleted; the active bot remains the authority for that old
+    // payload. When a record is available, however, its adult category cannot
+    // bypass the website age confirmation.
+    if (isAdultContent(content) && !hasAdultAccess(request)) {
+      return response.status(403).type('text').send('This 18+ delivery link requires age confirmation. Return to the 18+ catalog and confirm your age first.');
+    }
     const telegramUrl = filePosition === null
       ? getTelegramDeliveryUrl(config, shareCode)
       : getTelegramFileDeliveryUrl(config, shareCode, filePosition);
@@ -357,8 +410,12 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
   // These first-party URLs are intentionally stable. They redirect to the
   // currently active Telegram bot at click time, so a replacement bot/token
   // does not require rewriting every existing catalog page.
-  app.get('/deliver/:shareCode', (request, response) => redirectToCurrentDeliveryBot(request, response));
-  app.get('/deliver/:shareCode/file/:filePosition', (request, response) => redirectToCurrentDeliveryBot(request, response, request.params.filePosition));
+  app.get('/deliver/:shareCode', (request, response, next) => {
+    redirectToCurrentDeliveryBot(request, response).catch(next);
+  });
+  app.get('/deliver/:shareCode/file/:filePosition', (request, response, next) => {
+    redirectToCurrentDeliveryBot(request, response, request.params.filePosition).catch(next);
+  });
 
   app.use('/api', (_request, response) => apiError(response, 404, 'API route not found.'));
 

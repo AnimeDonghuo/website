@@ -1,7 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -123,6 +123,22 @@ function normalizedMergeKey(value) {
   return slugify(cleanText(value, 180));
 }
 
+function looseTitleMergeKey(value) {
+  // `cleanMediaName` intentionally preserves language words for display-like
+  // labels. A merge alias must also tolerate movie re-encodes titled with only
+  // their audio list, such as "RRR (2022) Hindi 1080p".
+  const cleaned = cleanMediaName(value)
+    .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|arabic|spanish|french|german|italian)\b/gi, ' ');
+  return normalizedMergeKey(cleaned);
+}
+
+function isStandaloneReleaseTitle(value) {
+  // Do not use a loose title key for distinct seasons/episodes of a series.
+  // Compact Telegram names such as S01E01 need the same protection as
+  // human-readable "Season 1" and "Episode 1" labels.
+  return !/\b(?:s(?:eason)?\s*\d{1,2}(?:\s*e(?:p(?:isode)?)?\s*\d{1,3})?|e(?:p(?:isode)?)?\s*\d{1,3}|\d{1,2}\s*x\s*\d{1,3})\b/i.test(String(value || ''));
+}
+
 function safeDateTime(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -186,18 +202,57 @@ function uniqueActiveIds(records, dateKey, threshold, idKey) {
     .filter(Boolean)).size;
 }
 
+function storageReferenceChannel(value) {
+  return cleanText(value, 80);
+}
+
+function sanitizeStoredFileRecord(file) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) return file;
+  const sourceLabel = cleanText(stripTelegramAttribution(file.sourceLabel, 500), 500);
+  const displayName = cleanText(stripTelegramAttribution(file.displayName, 180), 180);
+  const name = cleanText(stripTelegramAttribution(file.name, 180), 180);
+  return {
+    ...file,
+    // Keep a blank caption blank when it contained only a promotion. Public
+    // delivery labels will safely fall back to the filename/display name.
+    ...(file.sourceLabel === undefined ? {} : { sourceLabel }),
+    ...(file.displayName === undefined ? {} : { displayName }),
+    ...(file.name === undefined ? {} : { name }),
+    ...(file.storageChannelId === undefined ? {} : { storageChannelId: storageReferenceChannel(file.storageChannelId) || null })
+  };
+}
+
+function storageReferenceMatches(file, storageMessageId, storageChannelId = null, includeLegacy = true) {
+  const fileId = file?.storageMessageId === null || file?.storageMessageId === undefined
+    ? ''
+    : String(file.storageMessageId);
+  if (!fileId || fileId !== String(storageMessageId)) return false;
+  const requestedChannel = storageReferenceChannel(storageChannelId);
+  if (!requestedChannel) return true;
+  const fileChannel = storageReferenceChannel(file?.storageChannelId);
+  // Records created before per-file source channels existed belong to the
+  // normal database channel only. Adult callers set includeLegacy=false so an
+  // equal message ID in the isolated 18+ channel can never be mistaken for an
+  // old normal-storage file.
+  return fileChannel ? fileChannel === requestedChannel : includeLegacy;
+}
+
 function uniqueFiles(existingFiles = [], additionalFiles = []) {
   const files = [];
-  const storageIds = new Set();
-  for (const file of [...existingFiles, ...additionalFiles]) {
-    if (!file || typeof file !== 'object') continue;
+  const storageReferences = new Set();
+  for (const rawFile of [...existingFiles, ...additionalFiles]) {
+    if (!rawFile || typeof rawFile !== 'object') continue;
+    const file = sanitizeStoredFileRecord(rawFile);
     const storageId = file.storageMessageId === null || file.storageMessageId === undefined
       ? ''
       : String(file.storageMessageId);
-    // Direct-storage deliveries must have unique storage IDs. Preserve files
-    // without one for backwards-compatible manual records.
-    if (storageId && storageIds.has(storageId)) continue;
-    if (storageId) storageIds.add(storageId);
+    const storageChannelId = storageReferenceChannel(file.storageChannelId);
+    // Telegram message IDs are scoped to their channel. Include the source
+    // channel in the dedupe key so normal and 18+ private stores may both have
+    // message 42 without losing a legitimate file during a merge.
+    const reference = storageId ? `${storageChannelId || 'legacy'}:${storageId}` : '';
+    if (reference && storageReferences.has(reference)) continue;
+    if (reference) storageReferences.add(reference);
     files.push(file);
   }
   return files;
@@ -285,6 +340,7 @@ function contentMetadataPatch(content, requested = {}) {
     ? (requested.posterUrl === undefined ? content.backdropUrl : posterUrl)
     : cleanText(requested.backdropUrl, 2_000) || posterUrl || null;
   const titleKey = normalizedMergeKey(title);
+  const looseTitleKey = isStandaloneReleaseTitle(title) ? looseTitleMergeKey(title) : null;
   return {
     title,
     category,
@@ -302,7 +358,7 @@ function contentMetadataPatch(content, requested = {}) {
     ...(requested.category === undefined ? {} : { art: { ...(content.art || {}), tone: categoryDetails(category).tone } }),
     ...(requested.poster === undefined ? {} : { poster: requested.poster || null }),
     titleKey,
-    automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey]),
+    automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey, looseTitleKey]),
     searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres]
       .filter(Boolean)
       .join(' ')
@@ -315,7 +371,7 @@ function normalizeContent(input) {
   const now = new Date().toISOString();
   const title = cleanText(input.title, 180) || 'Untitled release';
   const category = CATEGORY_IDS.has(input.category) ? input.category : 'movie';
-  const files = Array.isArray(input.files) ? input.files : [];
+  const files = Array.isArray(input.files) ? input.files.map(sanitizeStoredFileRecord).filter(Boolean) : [];
   const parsedYear = Number.parseInt(input.year, 10);
   const languages = Array.isArray(input.languages)
     ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
@@ -344,6 +400,11 @@ function normalizeContent(input) {
   const episodeCount = episodeSummary.count || (Number.isInteger(suppliedEpisodeCount) && suppliedEpisodeCount >= 0 ? suppliedEpisodeCount : 0);
   const suppliedFilesCount = Number.isInteger(Number(input.filesCount)) ? Number(input.filesCount) : 0;
   const filesCount = files.length || suppliedFilesCount;
+  const titleKey = normalizedMergeKey(title);
+  // A movie upload is often titled "RRR (2022) Hindi 1080p" on one day and
+  // simply "RRR" on another. Keep a cleaned alias for non-episodic releases
+  // while preserving explicit season/episode boundaries as distinct posts.
+  const looseTitleKey = isStandaloneReleaseTitle(title) ? looseTitleMergeKey(title) : null;
 
   return {
     title,
@@ -370,12 +431,14 @@ function normalizeContent(input) {
     // titleKey makes same-title merging work for manual, batch, and older
     // records. Automation keeps raw and internet-verified aliases so slightly
     // different upload labels still converge on one catalog record.
-    titleKey: normalizedMergeKey(title),
+    titleKey,
     automationKey: input.automationKey ? normalizedMergeKey(input.automationKey) : null,
     automationKeys: uniqueKeys([
       ...(Array.isArray(input.automationKeys) ? input.automationKeys : []),
       input.automationKey,
-      input.metadataKey
+      input.metadataKey,
+      titleKey,
+      looseTitleKey
     ]),
     files,
     filesCount,
@@ -444,10 +507,9 @@ export class MemoryCatalogRepository {
     return item ? clone(item) : null;
   }
 
-  async findContentByStorageMessageId(storageMessageId) {
-    const needle = String(storageMessageId);
+  async findContentByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
     const item = [...this.contents.values()].find((entry) =>
-      Array.isArray(entry.files) && entry.files.some((file) => String(file.storageMessageId) === needle)
+      Array.isArray(entry.files) && entry.files.some((file) => storageReferenceMatches(file, storageMessageId, storageChannelId, includeLegacy))
     );
     return item ? clone(item) : null;
   }
@@ -458,7 +520,10 @@ export class MemoryCatalogRepository {
     const item = [...this.contents.values()].find((entry) =>
       entry.published !== false &&
       (!normalizedCategory || entry.category === normalizedCategory) &&
-      (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
+      (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey
+        // Legacy cards may have only a noisy title/slug such as "RRR (2022)".
+        // Use the cleaned key only for a standalone release, never seasons.
+        || (isStandaloneReleaseTitle(entry.title) && looseTitleMergeKey(entry.title) === normalizedKey))
     );
     return item ? clone(item) : null;
   }
@@ -619,7 +684,7 @@ export class MemoryCatalogRepository {
     const key = sessionKey(chatId, ownerId);
     const item = this.sessions.get(key);
     if (!item) return null;
-    item.files.push(clone(file));
+    item.files.push(clone(sanitizeStoredFileRecord(file)));
     item.updatedAt = new Date().toISOString();
     item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
     return clone(item);
@@ -629,7 +694,7 @@ export class MemoryCatalogRepository {
     const key = sessionKey(chatId, ownerId);
     const item = this.sessions.get(key);
     if (!item) return null;
-    item.files = Array.isArray(files) ? clone(files) : item.files;
+    item.files = Array.isArray(files) ? clone(files.map(sanitizeStoredFileRecord).filter(Boolean)) : item.files;
     item.updatedAt = new Date().toISOString();
     item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
     this.sessions.set(key, item);
@@ -739,14 +804,13 @@ export class MemoryCatalogRepository {
     return released;
   }
 
-  async findSessionByStorageMessageId(storageMessageId) {
-    const needle = String(storageMessageId);
+  async findSessionByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
     for (const [key, session] of this.sessions.entries()) {
       if (new Date(session.expiresAt).getTime() <= Date.now()) {
         this.sessions.delete(key);
         continue;
       }
-      if (Array.isArray(session.files) && session.files.some((file) => String(file.storageMessageId) === needle)) {
+      if (Array.isArray(session.files) && session.files.some((file) => storageReferenceMatches(file, storageMessageId, storageChannelId, includeLegacy))) {
         return clone(session);
       }
     }
@@ -1263,21 +1327,33 @@ export class MongoCatalogRepository {
     return this.contents.findOne({ shareCode, published: true });
   }
 
-  async findContentByStorageMessageId(storageMessageId) {
+  async findContentByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
     const asNumber = Number(storageMessageId);
     const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    const sourceChannel = storageReferenceChannel(storageChannelId);
+    const fileMatch = sourceChannel
+      ? {
+        storageMessageId: { $in: values },
+        ...(includeLegacy
+          ? { $or: [{ storageChannelId: sourceChannel }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
+          : { storageChannelId: sourceChannel })
+      }
+      : { storageMessageId: { $in: values } };
     return this.contents.findOne(
-      { 'files.storageMessageId': { $in: values } },
-      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1 } }
+      { files: { $elemMatch: fileMatch } },
+      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1, category: 1 } }
     );
   }
 
   async findContentByMergeKey(mergeKey, category = null) {
     const normalizedKey = normalizedMergeKey(mergeKey);
     const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
-    return this.contents.findOne({
+    const scope = {
       published: { $ne: false },
-      ...(normalizedCategory ? { category: normalizedCategory } : {}),
+      ...(normalizedCategory ? { category: normalizedCategory } : {})
+    };
+    const exact = await this.contents.findOne({
+      ...scope,
       $or: [
         { metadataKey: normalizedKey },
         { automationKey: normalizedKey },
@@ -1288,6 +1364,23 @@ export class MongoCatalogRepository {
         { slug: normalizedKey }
       ]
     });
+    if (exact) return exact;
+
+    // Migration-safe fallback for old noisy standalone movie titles, e.g.
+    // `RRR (2022)` before title aliases existed. The indexed/direct keys above
+    // remain the normal path; validate the cleaned key after a narrow title
+    // prefix query so this never loosely joins different named releases.
+    const titlePattern = normalizedKey
+      .split('-')
+      .filter(Boolean)
+      .map(escapeRegex)
+      .join('[\\s._-]+');
+    if (!titlePattern) return null;
+    const candidates = await this.contents.find({
+      ...scope,
+      title: new RegExp(`^\\s*${titlePattern}(?:\\s|\\(|\\[|\\.|_|-|$)`, 'i')
+    }, { projection: { title: 1, category: 1 } }).limit(20).toArray();
+    return candidates.find((entry) => isStandaloneReleaseTitle(entry.title) && looseTitleMergeKey(entry.title) === normalizedKey) || null;
   }
 
   async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = [], category = null) {
@@ -1467,7 +1560,7 @@ export class MongoCatalogRepository {
     const update = await this.sessions.updateOne(
       filter,
       {
-        $push: { files: file },
+        $push: { files: sanitizeStoredFileRecord(file) },
         $set: {
           updatedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + SESSION_TTL_MS)
@@ -1487,7 +1580,7 @@ export class MongoCatalogRepository {
       { chatId: String(chatId), ownerId: String(ownerId) },
       {
         $set: {
-          files: Array.isArray(files) ? files : [],
+          files: Array.isArray(files) ? files.map(sanitizeStoredFileRecord).filter(Boolean) : [],
           updatedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + SESSION_TTL_MS)
         }
@@ -1538,7 +1631,7 @@ export class MongoCatalogRepository {
             createdAt: receivedAt
           },
           // Telegram can retry an update. Equal saved file objects are kept once.
-          $addToSet: { files: file }
+          $addToSet: { files: sanitizeStoredFileRecord(file) }
         },
         { upsert: true, returnDocument: 'after', includeResultMetadata: false }
       );
@@ -1619,12 +1712,21 @@ export class MongoCatalogRepository {
     return result.modifiedCount || 0;
   }
 
-  async findSessionByStorageMessageId(storageMessageId) {
+  async findSessionByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
     const asNumber = Number(storageMessageId);
     const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    const sourceChannel = storageReferenceChannel(storageChannelId);
+    const fileMatch = sourceChannel
+      ? {
+        storageMessageId: { $in: values },
+        ...(includeLegacy
+          ? { $or: [{ storageChannelId: sourceChannel }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
+          : { storageChannelId: sourceChannel })
+      }
+      : { storageMessageId: { $in: values } };
     return this.sessions.findOne(
-      { 'files.storageMessageId': { $in: values }, expiresAt: { $gt: new Date() } },
-      { projection: { chatId: 1, ownerId: 1, workflow: 1 } }
+      { files: { $elemMatch: fileMatch }, expiresAt: { $gt: new Date() } },
+      { projection: { chatId: 1, ownerId: 1, workflow: 1, category: 1 } }
     );
   }
 

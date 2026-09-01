@@ -38,6 +38,30 @@ test('public serialization creates a deep link and hides storage file metadata',
   assert.equal(listRecord.files, undefined);
 });
 
+
+test('stored file labels and public delivery output never retain Telegram source attribution', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Clean release',
+    category: 'movie',
+    files: [{
+      storageMessageId: 91,
+      storageChannelId: '-100normal',
+      name: 'Clean.Release.1080p.mkv @promotion_source',
+      displayName: 'Clean Release @promotion_source',
+      sourceLabel: 'Clean Release Hindi 1080p @promotion_source https://t.me/promotion_source',
+      kind: 'video'
+    }]
+  });
+  const publicRecord = toPublicContent(created, config);
+
+  assert.equal(created.files[0].sourceLabel.includes('@promotion_source'), false);
+  assert.equal(created.files[0].sourceLabel.includes('t.me/promotion_source'), false);
+  assert.equal(JSON.stringify(publicRecord).includes('promotion_source'), false);
+  // The useful language label remains, but no source-channel attribution does.
+  assert.equal(publicRecord.fileChoices[0].label, 'Clean Release Hindi');
+});
+
 test('public serialization exposes only approved manual player links for the in-site Watch page', () => {
   const record = toPublicContent({
     id: 'watch-release', slug: 'watch-release', title: 'Watch release', category: 'web-series',

@@ -37,6 +37,14 @@ export async function getFeatured() {
   return request('/content/featured');
 }
 
+export async function confirmAdultAccess() {
+  return request('/adult-access', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirmed: true })
+  });
+}
+
 export async function getContentBySlug(slug) {
   return request(`/content/${encodeURIComponent(slug)}`);
 }

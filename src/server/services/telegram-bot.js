@@ -2,14 +2,15 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
-import { cleanMediaName, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, needsMediaTrackInspection } from './episode-service.js';
+import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { inferStreamManifestFormat, mergeStreamingEntries, parseStreamingManifest, safeStreamingUrl } from './streaming-service.js';
 
-const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
+const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
+const ADULT_CATEGORY = 'adult';
 const BATCH_PROGRESS_INTERVAL = 25;
 const BATCH_MAX_FORWARD_RETRIES = 8;
 // Storage channel uploads can arrive as a burst of hundreds of separate
@@ -30,7 +31,59 @@ function chatId(ctx) {
 }
 
 function categoryCommandLabel(category) {
-  return category === 'web-series' ? 'series' : category;
+  if (category === 'web-series') return 'series';
+  // Telegram command menus use a conservative letter-first command for the
+  // adult category. The requested /18db alias is registered separately below.
+  if (category === ADULT_CATEGORY) return 'adultdb';
+  return category;
+}
+
+function isAdultCategory(category) {
+  return category === ADULT_CATEGORY;
+}
+
+function storageChannelForCategory(config, category) {
+  return isAdultCategory(category)
+    ? config?.telegram?.adultStorageChannelId || ''
+    : config?.telegram?.storageChannelId || '';
+}
+
+function hasDedicatedAdultStorage(config) {
+  const adultStorage = String(config?.telegram?.adultStorageChannelId || '').trim();
+  const normalStorage = String(config?.telegram?.storageChannelId || '').trim();
+  return Boolean(adultStorage) && adultStorage !== normalStorage;
+}
+
+function adultStorageConfigurationHint(config) {
+  if (!storageChannelForCategory(config, ADULT_CATEGORY)) {
+    return 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID is required. Add the bot as an admin in a separate private 18+ database channel and configure its numeric -100… ID.';
+  }
+  return 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID must be different from TELEGRAM_STORAGE_CHANNEL_ID so 18+ files remain isolated.';
+}
+
+function storageEnvironmentName(category) {
+  return isAdultCategory(category) ? 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID' : 'TELEGRAM_STORAGE_CHANNEL_ID';
+}
+
+function storageChannelDescription(category) {
+  return isAdultCategory(category) ? 'private 18+ database channel' : 'private database channel';
+}
+
+function emptyPrivateCategoryMetadata(title) {
+  return {
+    matched: false,
+    title: cleanText(title, 180),
+    year: null,
+    languages: [],
+    genres: [],
+    description: '',
+    status: 'New release',
+    releaseLabel: null,
+    posterOriginalUrl: null,
+    provider: 'private',
+    metadataKey: null,
+    tmdbId: null
+  };
 }
 
 function escapeHtml(value) {
@@ -87,6 +140,7 @@ function panelKeyboard() {
       Markup.button.callback('▶ Movie', 'new:movie'),
       Markup.button.callback('▣ Web series', 'new:web-series')
     ],
+    [Markup.button.callback('🔞 18+ private', 'new:adult')],
     [Markup.button.callback('Draft status', 'draft:status'), Markup.button.callback('Discard draft', 'draft:cancel')]
   ]);
 }
@@ -126,6 +180,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'donghua', description: 'New donghua draft' },
   { command: 'kdrama', description: 'New K-Drama draft' },
   { command: 'series', description: 'New web series draft' },
+  { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
@@ -261,22 +316,34 @@ function mediaDescriptor(message) {
   return { kind, source };
 }
 
-export function fileFromMessage(message, storedMessageId, storageMethod = 'copy') {
+// Use the same attribution cleaner for parsing, catalog metadata, and the
+// caption written into Telegram storage. Keeping one boundary prevents a raw
+// @channel promotion from surviving in a copied message while its public label
+// looks clean.
+export function cleanStorageCaption(value) {
+  return cleanText(stripTelegramAttribution(value, 1_024), 1_024);
+}
+
+export function fileFromMessage(message, storedMessageId, storageMethod = 'copy', storageChannelId = null) {
   const { kind, source } = mediaDescriptor(message);
   const filename = source?.file_name || `${kind}-${message.message_id}`;
-  const episode = detectUploadEpisode({ caption: message.caption, filename });
-  const quality = detectMediaQuality({ caption: message.caption, filename });
-  const audioLanguages = detectUploadLanguages({ caption: message.caption, filename });
-  const subtitleLanguages = detectUploadSubtitleLanguages({ caption: message.caption, filename });
+  const caption = cleanStorageCaption(message.caption);
+  const episode = detectUploadEpisode({ caption, filename });
+  const quality = detectMediaQuality({ caption, filename });
+  const audioLanguages = detectUploadLanguages({ caption, filename });
+  const subtitleLanguages = detectUploadSubtitleLanguages({ caption, filename });
   const file = {
     storageMessageId: storedMessageId,
+    // Message IDs are unique only within a channel. Persist the source channel
+    // so the normal and isolated 18+ stores can safely use the same ID.
+    storageChannelId: cleanText(storageChannelId, 80) || null,
     storageMethod,
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),
-    // Keep a private source label so native Telegram video uploads (which do
-    // not provide file_name) can still render their meaningful caption later.
-    // The public API only exposes a cleaned label derived from this value.
-    sourceLabel: cleanText(message.caption || filename, 500),
+    // Native Telegram video uploads may have no file_name, so retain a useful
+    // sanitized caption as the display source. Raw Telegram promotion handles
+    // are never persisted in a catalog file record.
+    sourceLabel: cleanText(caption || filename, 500),
     displayName: episode.displayName,
     quality,
     // `languages` stays as a compatibility alias for existing catalog records.
@@ -297,9 +364,9 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
   const trackCapable = isInspectableMediaFile(file);
   const needsInspection = trackCapable && needsMediaTrackInspection({
     ...file,
-    // Keep the raw caption for the trigger check; displayName deliberately
-    // strips release tags such as "Dual Audio" from public file labels.
-    displayName: message.caption || filename
+    // This is sanitized too. The detector still sees useful Dual/Multi,
+    // quality, language, season, and episode labels without source promotion.
+    displayName: caption || filename
   });
   return {
     ...file,
@@ -354,7 +421,12 @@ async function sendByFileId(telegram, destinationChatId, message) {
   const { kind, source } = mediaDescriptor(message);
   if (!source?.file_id) throw new Error('The received message did not include a reusable Telegram file ID.');
   const extra = { disable_notification: true };
-  if (message.caption) extra.caption = message.caption;
+  // A file-id resend creates a fresh Telegram message, so omitting an empty
+  // sanitized caption is enough to remove an attribution-only original.
+  if (message.caption) {
+    const caption = cleanStorageCaption(message.caption);
+    if (caption) extra.caption = caption;
+  }
 
   if (kind === 'document') return telegram.sendDocument(destinationChatId, source.file_id, extra);
   if (kind === 'video') return telegram.sendVideo(destinationChatId, source.file_id, extra);
@@ -364,20 +436,36 @@ async function sendByFileId(telegram, destinationChatId, message) {
   throw new Error('This Telegram media type is not supported by the storage fallback.');
 }
 
+function copiedCaptionOptions(message) {
+  const originalCaption = typeof message?.caption === 'string' ? message.caption : '';
+  if (!originalCaption) return { disable_notification: true };
+  const original = cleanText(originalCaption, 1_024);
+  const caption = cleanStorageCaption(originalCaption);
+  // `copyMessage` otherwise retains the original caption. Explicitly pass an
+  // empty string too, so a caption containing only @promotion data is scrubbed
+  // rather than silently copied into the private database channel.
+  return caption === original
+    ? { disable_notification: true }
+    : { disable_notification: true, caption };
+}
+
 // copyMessage is fastest and preserves the original message. Some forwarded or
 // protected-origin items cannot be copied, however. In that case Telegram often
 // still lets a bot re-send the file it received by its file_id, so we attempt a
 // type-safe fallback before reporting a storage failure to the publisher.
 export async function storeMediaInChannel(telegram, destinationChatId, sourceChatId, message) {
   try {
-    const copied = await telegram.copyMessage(destinationChatId, sourceChatId, message.message_id, {
-      disable_notification: true
-    });
-    return { storageMessageId: copied.message_id, method: 'copy' };
+    const copied = await telegram.copyMessage(
+      destinationChatId,
+      sourceChatId,
+      message.message_id,
+      copiedCaptionOptions(message)
+    );
+    return { storageMessageId: copied.message_id, storageChannelId: String(destinationChatId), method: 'copy' };
   } catch (copyError) {
     try {
       const sent = await sendByFileId(telegram, destinationChatId, message);
-      return { storageMessageId: sent.message_id, method: 'file-id-fallback' };
+      return { storageMessageId: sent.message_id, storageChannelId: String(destinationChatId), method: 'file-id-fallback' };
     } catch (fallbackError) {
       const error = new Error('Telegram could not persist the uploaded media.');
       error.copyError = copyError;
@@ -448,7 +536,7 @@ function parseBatchArgument(value) {
 
   // An optional category prefix lets a publisher override automatic detection
   // without adding a separate, more fragile batch command syntax.
-  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series)\s*(?:\||:)\s*(.+)$/i);
+  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series|adult|18\+?)\s*(?:\||:)\s*(.+)$/i);
   if (!prefixed) return { title: supplied, category: null };
 
   const rawCategory = prefixed[1].toLowerCase().replace(/[\s-]/g, '');
@@ -456,7 +544,9 @@ function parseBatchArgument(value) {
     ? 'kdrama'
     : rawCategory === 'webseries'
       ? 'web-series'
-      : rawCategory;
+      : rawCategory === 'adult' || rawCategory === '18+' || rawCategory === '18'
+        ? ADULT_CATEGORY
+        : rawCategory;
   return {
     title: cleanText(prefixed[2], 180),
     category: PUBLISH_CATEGORIES.includes(category) ? category : null
@@ -586,13 +676,19 @@ function episodeUploadNote(file) {
 async function updateTitleAndMetadata({ ctx, repository, config, title }) {
   const current = await repository.findSession(chatId(ctx), userId(ctx));
   if (!current) return null;
-  const metadata = await findMetadata(title, current.category, config);
+  // Adult titles remain in the publisher/private storage flow and are not sent
+  // to external metadata search providers as part of title entry.
+  const metadata = isAdultCategory(current.category)
+    ? emptyPrivateCategoryMetadata(title)
+    : await findMetadata(title, current.category, config);
   const updated = await repository.updateSession(chatId(ctx), userId(ctx), {
     title: cleanText(title, 180),
     metadata
   });
 
-  if (metadata.matched) {
+  if (isAdultCategory(current.category)) {
+    await ctx.reply('Title saved. This 18+ draft stays private, uses the separate 18+ storage channel, and will never be sent to announcement channels. Upload files whenever you are ready.', uploadKeyboard());
+  } else if (metadata.matched) {
     await ctx.reply(
       `Title saved. ${String(metadata.provider || 'metadata').toUpperCase()} found “${metadata.title}” (${metadata.year || 'year unavailable'}). Upload files whenever you are ready.`,
       uploadKeyboard()
@@ -607,6 +703,10 @@ async function updateTitleAndMetadata({ ctx, repository, config, title }) {
 }
 
 async function beginDraft(ctx, category, suppliedTitle, repository, config) {
+  if (isAdultCategory(category) && !hasDedicatedAdultStorage(config)) {
+    await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before starting /18db.`);
+    return null;
+  }
   await repository.startSession({
     chatId: chatId(ctx),
     ownerId: userId(ctx),
@@ -624,7 +724,9 @@ async function beginDraft(ctx, category, suppliedTitle, repository, config) {
       `New ${categoryDetails(category).shortLabel} draft created.`,
       '',
       'Send the title next. After that, upload files directly to this chat and finish with /done.',
-      'Episode detection checks the clean caption first, strips @channel tags, then checks the filename.',
+      isAdultCategory(category)
+        ? 'This 18+ draft uses the isolated private storage channel and is never announced to public Telegram channels.'
+        : 'Episode detection checks the clean caption first, strips @channel tags, then checks the filename.',
       'Optional: /lang Hindi, English · /year 2026 · /poster https://image.example/poster.jpg'
     ].join('\n'),
     uploadKeyboard()
@@ -636,16 +738,23 @@ async function beginBatch(ctx, suppliedArgument, repository, config) {
     await ctx.reply('For privacy, start /batch in your private chat with this bot. It temporarily forwards each storage file there only to inspect its caption and media details.');
     return;
   }
-  if (!config.telegram.storageChannelId) {
-    await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is not configured. Add the private database channel’s numeric -100… ID before importing a batch.');
+
+  const parsed = parseBatchArgument(suppliedArgument);
+  const category = parsed.category || 'movie';
+  const storageChannelId = storageChannelForCategory(config, category);
+  if (!storageChannelId) {
+    await ctx.reply(`${storageEnvironmentName(category)} is not configured. Add the ${storageChannelDescription(category)} numeric -100… ID before importing a batch.`);
+    return;
+  }
+  if (isAdultCategory(category) && !hasDedicatedAdultStorage(config)) {
+    await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before importing an 18+ batch.`);
     return;
   }
 
-  const parsed = parseBatchArgument(suppliedArgument);
   await repository.startSession({
     chatId: chatId(ctx),
     ownerId: userId(ctx),
-    category: parsed.category || 'movie',
+    category,
     title: parsed.title
   });
   await repository.updateSession(chatId(ctx), userId(ctx), {
@@ -668,9 +777,11 @@ async function beginBatch(ctx, suppliedArgument, repository, config) {
       'https://t.me/c/1234567890/123',
       '',
       'Every supported media message in the inclusive range is imported as one release. Large episode ranges are processed patiently with progress updates; the bot briefly forwards each item only to inspect its file details, then removes that preview.',
-      parsed.title
-        ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
-        : 'The title and category will be inferred from the imported file descriptions and names.'
+      isAdultCategory(category)
+        ? 'This 18+ batch reads only the separate adult storage channel and will never create a public Telegram announcement.'
+        : parsed.title
+          ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
+          : 'The title and category will be inferred from the imported file descriptions and names. Use /batch adult | Your title for the isolated 18+ storage channel.'
     ].join('\n')
   );
 }
@@ -683,6 +794,24 @@ async function removeBatchPreview(ctx, message) {
     // Removing a just-forwarded preview is best effort. It does not affect the
     // original storage message or the catalog record.
     console.warn('[telegram] could not remove batch inspection preview:', error?.description || error?.message || 'Unknown error');
+  }
+}
+
+async function scrubExistingStorageCaption(ctx, storageChannelId, storageMessageId, message) {
+  const originalCaption = typeof message?.caption === 'string' ? message.caption : '';
+  if (!originalCaption || typeof ctx?.telegram?.editMessageCaption !== 'function') return false;
+  const original = cleanText(originalCaption, 1_024);
+  const caption = cleanStorageCaption(originalCaption);
+  if (caption === original) return false;
+  try {
+    // /batch may inspect messages written by a human or a different bot. Bot
+    // API only allows editing messages owned by this bot, so this is best
+    // effort; regardless of ownership, the catalog file record is sanitized.
+    await ctx.telegram.editMessageCaption(String(storageChannelId), storageMessageId, undefined, caption);
+    return true;
+  } catch (error) {
+    console.info(`[telegram] batch kept an externally owned storage caption ${storageMessageId}; its catalog label is still sanitized.`);
+    return false;
   }
 }
 
@@ -773,6 +902,8 @@ async function reportBatchProgress(ctx, { processed, total, imported, skipped, f
 
 export async function importStorageRange(ctx, session, lastLink, bot, repository, config, publish = publishDraft) {
   const batch = session.batch || {};
+  const sourceStorageChannelId = batch.sourceChannelId || storageChannelForCategory(config, session.category || batch.categoryOverride);
+  const includeLegacyStorageReferences = !isAdultCategory(session.category || batch.categoryOverride);
   const firstMessageId = Number(batch.firstMessageId);
   const lastMessageId = Number(lastLink.messageId);
   const imported = [];
@@ -789,7 +920,11 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
     processedMessages += 1;
     let preview;
     try {
-      const existing = await repository.findContentByStorageMessageId(storageMessageId);
+      const existing = await repository.findContentByStorageMessageId(
+        storageMessageId,
+        sourceStorageChannelId,
+        { includeLegacy: includeLegacyStorageReferences }
+      );
       if (existing) {
         skippedByReason.alreadyPublished.push({
           messageId: storageMessageId,
@@ -797,7 +932,11 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
         });
         continue;
       }
-      const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
+      const pendingDraft = await repository.findSessionByStorageMessageId(
+        storageMessageId,
+        sourceStorageChannelId,
+        { includeLegacy: includeLegacyStorageReferences }
+      );
       if (pendingDraft) {
         skippedByReason.activeDraft.push({
           messageId: storageMessageId,
@@ -811,7 +950,7 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
       // obtain its caption/file metadata; the preview is deleted immediately.
       preview = await forwardStorageMessageWithRetry(
         ctx,
-        config.telegram.storageChannelId,
+        sourceStorageChannelId,
         storageMessageId
       );
       if (!isMediaMessage(preview)) {
@@ -819,7 +958,8 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
         continue;
       }
 
-      const file = fileFromMessage(preview, storageMessageId, 'existing-storage');
+      const file = fileFromMessage(preview, storageMessageId, 'existing-storage', sourceStorageChannelId);
+      await scrubExistingStorageCaption(ctx, sourceStorageChannelId, storageMessageId, preview);
       const updated = await repository.appendSessionFile(chatId(ctx), userId(ctx), file);
       if (!updated?.files?.length) throw new Error('The batch session expired while importing files.');
       imported.push(file);
@@ -911,8 +1051,10 @@ async function handleBatchLink(ctx, session, bot, repository, config) {
     await ctx.reply('Please send a private storage link in the form https://t.me/c/<internal-channel-id>/<message-id>. Public @channel links cannot safely identify this database channel.');
     return;
   }
-  if (String(link.channelId) !== String(config.telegram.storageChannelId || '')) {
-    await ctx.reply(`That link is not from the configured database channel. This batch only accepts links whose internal ID maps to ${config.telegram.storageChannelId || 'the configured TELEGRAM_STORAGE_CHANNEL_ID'}.`);
+  const category = session.category || session.batch?.categoryOverride || 'movie';
+  const storageChannelId = storageChannelForCategory(config, category);
+  if (String(link.channelId) !== String(storageChannelId || '')) {
+    await ctx.reply(`That link is not from the configured ${isAdultCategory(category) ? '18+ ' : ''}database channel. This batch only accepts links whose internal ID maps to ${storageChannelId || `the configured ${storageEnvironmentName(category)}`}.`);
     return;
   }
 
@@ -1005,7 +1147,11 @@ function announcementCaption(content) {
   ].filter((line) => line !== null).join('\n').slice(0, 1000);
 }
 
-async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
+export async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
+  // 18+ releases are intentionally never broadcast, even when normal
+  // announcement destinations are configured. Their access route is the
+  // age-confirmed category page only.
+  if (isAdultCategory(content?.category)) return { sent: 0, failed: 0, skipped: 0, suppressed: true };
   const channels = await repository.listAnnouncementChannels();
   if (!channels.length) return { sent: 0, failed: 0, skipped: 0 };
 
@@ -1092,6 +1238,11 @@ export async function publishDraft(ctx, bot, repository, config) {
     await ctx.reply(error);
     return { content: null, error };
   }
+  if (isAdultCategory(session.category) && !hasDedicatedAdultStorage(config)) {
+    const error = adultStorageConfigurationHint(config);
+    await ctx.reply(error);
+    return { content: null, error };
+  }
   if (!config.telegram.botUsername) {
     const error = 'TELEGRAM_BOT_USERNAME is not configured on the server, so I cannot create a shareable delivery link yet.';
     await ctx.reply(error);
@@ -1109,7 +1260,9 @@ export async function publishDraft(ctx, bot, repository, config) {
   await ctx.reply(`Preparing your draft for publication…${inspectionNote}`);
 
   try {
-    const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
+    const metadata = session.metadata || (isAdultCategory(session.category)
+      ? emptyPrivateCategoryMetadata(session.title)
+      : await findMetadata(session.title, session.category, config));
     const mergeKeys = releaseMergeKeys(session, metadata);
     // This final guard applies to manual uploads, /batch imports, and storage
     // automation. A later upload for the same category/title or verified
@@ -1189,37 +1342,46 @@ export async function publishDraft(ctx, bot, repository, config) {
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
     const websiteUrl = getContentPageUrl(config, content);
-    let announcements = { sent: 0, failed: 0, skipped: 0, configured: false };
-    try {
-      const configuredChannels = await repository.listAnnouncementChannels();
-      announcements = {
-        ...(await announcePublishedContent({
-          bot,
-          repository,
-          content,
-          websiteUrl,
-          storageChannelId: config.telegram.storageChannelId
-        })),
-        configured: configuredChannels.length > 0
-      };
-    } catch (error) {
-      console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
-      announcements = { sent: 0, failed: 1, skipped: 0, configured: true };
+    const privateAdultPost = isAdultCategory(content.category);
+    let announcements = { sent: 0, failed: 0, skipped: 0, configured: false, suppressed: privateAdultPost };
+    // Do not even resolve public announcement destinations for an 18+ post.
+    // This keeps the isolated publishing path independent of public channels.
+    if (!privateAdultPost) {
+      try {
+        const configuredChannels = await repository.listAnnouncementChannels();
+        announcements = {
+          ...(await announcePublishedContent({
+            bot,
+            repository,
+            content,
+            websiteUrl,
+            storageChannelId: storageChannelForCategory(config, session.category)
+          })),
+          configured: configuredChannels.length > 0
+        };
+      } catch (error) {
+        console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
+        announcements = { sent: 0, failed: 1, skipped: 0, configured: true };
+      }
     }
     const posterNote = posterResult.source === 'generated-fallback'
       ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
       : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
     const episodeNote = episodeSummary.releaseLabel ? `Episode index: ${episodeSummary.releaseLabel}.` : 'No episode labels were found; the post lists delivery files instead.';
-    const channelNote = announcements.sent
-      ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}${announcements.skipped ? ' (database channel skipped)' : ''}.`
-      : announcements.skipped
-        ? 'The database channel was skipped for announcements to prevent an auto-publish loop. Add a separate announcement channel if you want release posts there.'
-        : announcements.configured
-          ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
-          : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
-    const websiteNote = websiteUrl
-      ? `Announcement website link: ${websiteUrl}`
-      : 'PUBLIC_SITE_URL is not configured, so announcement posts were sent without a button. Add your Koyeb website URL and publish the next post.';
+    const channelNote = privateAdultPost
+      ? 'This 18+ post was not announced to any Telegram channel.'
+      : announcements.sent
+        ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}${announcements.skipped ? ' (database channel skipped)' : ''}.`
+        : announcements.skipped
+          ? 'The database channel was skipped for announcements to prevent an auto-publish loop. Add a separate announcement channel if you want release posts there.'
+          : announcements.configured
+            ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
+            : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
+    const websiteNote = privateAdultPost
+      ? (websiteUrl ? `Private 18+ catalog page: ${websiteUrl}` : 'PUBLIC_SITE_URL is not configured, so the age-confirmed catalog page cannot be shared yet.')
+      : websiteUrl
+        ? `Announcement website link: ${websiteUrl}`
+        : 'PUBLIC_SITE_URL is not configured, so announcement posts were sent without a button. Add your Koyeb website URL and publish the next post.';
 
     await ctx.reply(
       [
@@ -1263,6 +1425,17 @@ export function automationGroupKey(title, storageMessageId) {
   return key && key !== 'untitled-release' ? key : `storage-media-${storageMessageId}`;
 }
 
+function standaloneReleaseMergeAlias(value) {
+  const raw = cleanText(value, 180);
+  // Series seasons and individual episodes must retain their own release key.
+  // This deliberately covers compact upload names such as S01E01 too, not
+  // only spaced "Season 1" or "Episode 1" labels.
+  if (!raw || /\b(?:s(?:eason)?\s*\d{1,2}(?:\s*e(?:p(?:isode)?)?\s*\d{1,3})?|e(?:p(?:isode)?)?\s*\d{1,3}|\d{1,2}\s*x\s*\d{1,3})\b/i.test(raw)) return null;
+  const inferred = inferBatchTitle([{ displayName: raw, name: '' }]);
+  const key = slugify(cleanText(inferred, 180));
+  return key && key !== 'untitled-release' ? key : null;
+}
+
 /**
  * Save both the upload-derived and provider-verified identities. A channel may
  * label the same show as "Raakh S01" on one day and "Raakh" on another; the
@@ -1273,14 +1446,21 @@ export function automationGroupKey(title, storageMessageId) {
  * should extend its existing delivery page—not create a duplicate card.
  */
 export function releaseMergeKeys(session, metadata = {}) {
-  return [...new Set([
+  const rawValues = [
     // Prefer the verified provider identity over a collision-prone upload name.
     metadata?.metadataKey,
     metadata?.title,
     session?.auto?.groupKey,
     session?.title
-  ].map((value) => slugify(cleanText(value, 180)))
-    .filter((key) => key && key !== 'untitled-release'))];
+  ];
+  return [...new Set([
+    ...rawValues.map((value) => slugify(cleanText(value, 180))),
+    // Preserve a title-only alias for noisy standalone movie/release labels
+    // such as "RRR (2022) Hindi 1080p". This is deliberately not generated
+    // for explicit season/episode labels.
+    standaloneReleaseMergeAlias(metadata?.title),
+    standaloneReleaseMergeAlias(session?.title)
+  ].filter((key) => key && key !== 'untitled-release'))];
 }
 
 // Kept as the public name used by existing automation tests/integrations.
@@ -1405,13 +1585,21 @@ export async function autoPublishStoragePost(ctx, bot, repository, config, ignor
     return { queued: false, reason: 'predates-enable' };
   }
 
-  const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
+  const pendingDraft = await repository.findSessionByStorageMessageId(
+    storageMessageId,
+    config.telegram.storageChannelId,
+    { includeLegacy: true }
+  );
   if (pendingDraft) {
     console.info(`[telegram] ignored storage message ${storageMessageId}; it is already attached to an active ${pendingDraft.workflow || 'upload'} draft.`);
     return { queued: false, reason: 'active-draft' };
   }
 
-  const existing = await repository.findContentByStorageMessageId(storageMessageId);
+  const existing = await repository.findContentByStorageMessageId(
+    storageMessageId,
+    config.telegram.storageChannelId,
+    { includeLegacy: true }
+  );
   if (existing) {
     console.info(`[telegram] ignored already-published auto storage message ${storageMessageId} (${existing.adminId || existing.title || 'existing post'}).`);
     return { queued: false, reason: 'already-published' };
@@ -1422,7 +1610,8 @@ export async function autoPublishStoragePost(ctx, bot, repository, config, ignor
     if (typeof repository.queueAutomationSession !== 'function') {
       throw new Error('The catalog repository does not support persistent automation groups.');
     }
-    const file = fileFromMessage(message, storageMessageId, 'direct-storage');
+    const file = fileFromMessage(message, storageMessageId, 'direct-storage', config.telegram.storageChannelId);
+    await scrubExistingStorageCaption(ctx, config.telegram.storageChannelId, storageMessageId, message);
     const title = inferBatchTitle([file]) || `Storage media ${storageMessageId}`;
     const category = inferBatchCategory({ title, files: [file] });
     const groupKey = automationGroupKey(title, storageMessageId);
@@ -1579,7 +1768,7 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
   return results;
 }
 
-async function deliverContent(ctx, delivery, repository, config) {
+export async function deliverContent(ctx, delivery, repository, config) {
   if (!delivery?.shareCode || delivery.shareCode.length > 48) {
     await ctx.reply('That delivery link is invalid.');
     return;
@@ -1590,8 +1779,11 @@ async function deliverContent(ctx, delivery, repository, config) {
     await ctx.reply('This release is unavailable or the link has expired.');
     return;
   }
-  if (!config.telegram.storageChannelId) {
-    await ctx.reply('File delivery is being configured. Please try again later.');
+  const defaultStorageChannelId = storageChannelForCategory(config, content.category);
+  if (!defaultStorageChannelId || (isAdultCategory(content.category) && !hasDedicatedAdultStorage(config))) {
+    await ctx.reply(isAdultCategory(content.category)
+      ? '18+ file delivery is being configured with its separate private storage. Please try again later.'
+      : 'File delivery is being configured. Please try again later.');
     return;
   }
   if (!content.files?.length) {
@@ -1615,7 +1807,12 @@ async function deliverContent(ctx, delivery, repository, config) {
   let delivered = 0;
   for (const file of files) {
     try {
-      await ctx.telegram.copyMessage(chatId(ctx), config.telegram.storageChannelId, file.storageMessageId);
+      // New records retain their source channel; old normal records fall back
+      // to TELEGRAM_STORAGE_CHANNEL_ID for backwards-compatible delivery.
+      const sourceChannelId = isAdultCategory(content.category)
+        ? defaultStorageChannelId
+        : cleanText(file?.storageChannelId, 80) || defaultStorageChannelId;
+      await ctx.telegram.copyMessage(chatId(ctx), sourceChannelId, file.storageMessageId);
       delivered += 1;
     } catch (error) {
       console.error('[telegram] delivery copy failed:', error?.description || error?.message || 'Unknown error');
@@ -2281,12 +2478,13 @@ export async function launchTelegramBot({ config, repository }) {
       await ctx.reply(
         [
           'Publisher quick guide',
-          '1. /movie Title, /anime Title, /cartoon Title, /donghua Title, /kdrama Title, or /series Title',
+          '1. /movie Title, /anime Title, /cartoon Title, /donghua Title, /kdrama Title, /series Title, or /18db Title',
           '2. Upload your files to this private chat',
           '3. Use /done to create the catalog post, permanent ImgBB poster, delivery link, and channel announcements',
           '',
           'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
           'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
+          '18+ publishing: /18db Title (or /adultdb Title) stores files only in TELEGRAM_ADULT_STORAGE_CHANNEL_ID. Use /batch adult | Your title for an existing adult-storage range. These releases are never sent to announcement channels and use the website age gate.',
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
@@ -2312,6 +2510,13 @@ export async function launchTelegramBot({ config, repository }) {
       await beginDraft(ctx, category, parseCommandArgument(ctx.message.text), repository, config);
     });
   }
+
+  // The letter-first /adultdb name is listed in Telegram's command menu, while
+  // /18db is the short publisher alias requested for the isolated category.
+  bot.command('18db', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginDraft(ctx, ADULT_CATEGORY, parseCommandArgument(ctx.message.text), repository, config);
+  });
 
   bot.command('batch', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
@@ -2541,9 +2746,16 @@ export async function launchTelegramBot({ config, repository }) {
       ? 'web-series'
       : rawCategory === 'k-drama' || rawCategory === 'kdrama'
         ? 'kdrama'
-        : rawCategory;
+        : rawCategory === '18+' || rawCategory === '18'
+          ? ADULT_CATEGORY
+          : rawCategory;
     if (!target || !PUBLISH_CATEGORIES.includes(category)) {
-      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series');
+      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, adult');
+      return;
+    }
+    const existing = await repository.findContentByAdminId?.(target.adminId);
+    if (existing && isAdultCategory(existing.category) !== isAdultCategory(category)) {
+      await ctx.reply('Category changes into or out of 18+ are blocked to keep its private storage and age gate isolated. Create the 18+ release through /18db instead.');
       return;
     }
     await updatePublishedPost({ ctx, repository, argument, field: 'category', value: category, fieldLabel: 'Category' });
@@ -2928,7 +3140,7 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
   });
 
-  bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series)$/, async (ctx) => {
+  bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series|adult)$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (!(await requirePublisher(ctx, repository, config))) return;
     await beginDraft(ctx, ctx.match[1], '', repository, config);
@@ -2973,8 +3185,13 @@ export async function launchTelegramBot({ config, repository }) {
         await ctx.reply('Send the release title before uploading files.');
         return;
       }
-      if (!config.telegram.storageChannelId) {
-        await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is not configured. Add the bot as an admin to a private channel, configure its ID, then try again.');
+      const storageChannelId = storageChannelForCategory(config, session.category);
+      if (!storageChannelId) {
+        await ctx.reply(`${storageEnvironmentName(session.category)} is not configured. Add the bot as an admin to the ${storageChannelDescription(session.category)}, configure its ID, then try again.`);
+        return;
+      }
+      if (isAdultCategory(session.category) && !hasDedicatedAdultStorage(config)) {
+        await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before uploading to this 18+ draft.`);
         return;
       }
 
@@ -2982,7 +3199,7 @@ export async function launchTelegramBot({ config, repository }) {
       try {
         stored = await storeMediaInChannel(
           ctx.telegram,
-          config.telegram.storageChannelId,
+          storageChannelId,
           chatId(ctx),
           message
         );
@@ -3009,7 +3226,7 @@ export async function launchTelegramBot({ config, repository }) {
         updated = await repository.appendSessionFile(
           chatId(ctx),
           userId(ctx),
-          fileFromMessage(message, stored.storageMessageId, stored.method)
+          fileFromMessage(message, stored.storageMessageId, stored.method, stored.storageChannelId || storageChannelId)
         );
         if (!updated?.files?.length) {
           throw new Error('The active draft was no longer available after the file reached Telegram storage.');

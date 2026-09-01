@@ -109,7 +109,7 @@ export function formatEpisodeLabel(start, end = start) {
 // Captions are checked first because uploaders often put the clean title and
 // episode range there. Telegram handles and t.me links are removed before any
 // parsing, so @channel names never become part of a release/episode label.
-export function stripTelegramAttribution(value) {
+export function stripTelegramAttribution(value, maxLength = 500) {
   return cleanText(
     String(value || '')
       // Publisher captions frequently append a Markdown attribution such as
@@ -122,7 +122,7 @@ export function stripTelegramAttribution(value) {
       // label such as [C_B], rather than leaving its inner letters behind.
       .replace(/[{}]/g, ' ')
       .replace(/\s{2,}/g, ' '),
-    500
+    maxLength
   );
 }
 

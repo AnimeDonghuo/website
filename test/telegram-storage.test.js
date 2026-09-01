@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { PUBLISHER_COMMANDS, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
@@ -18,16 +18,47 @@ test('storage uses a reusable Telegram file ID when copyMessage is refused', asy
   };
   const stored = await storeMediaInChannel(telegram, '-100123', 999, {
     message_id: 12,
-    caption: 'Perfect World Ep 01',
+    caption: 'Perfect World Ep 01 Hindi 1080p @release_source',
     document: { file_id: 'document-file-id', file_name: 'perfect-world.mkv' }
   });
 
-  assert.deepEqual(stored, { storageMessageId: 456, method: 'file-id-fallback' });
+  assert.deepEqual(stored, { storageMessageId: 456, storageChannelId: '-100123', method: 'file-id-fallback' });
   assert.deepEqual(calls[0], {
     destination: '-100123',
     fileId: 'document-file-id',
-    extra: { disable_notification: true, caption: 'Perfect World Ep 01' }
+    extra: { disable_notification: true, caption: 'Perfect World Ep 01 Hindi 1080p' }
   });
+});
+
+
+test('copied storage captions and persisted source labels remove Telegram promotion handles', async () => {
+  const calls = [];
+  const message = {
+    message_id: 16,
+    caption: 'RRR (2022) Dual Audio Hindi + English 1080p @Doraemon_Movies_Hindi1 https://t.me/example',
+    document: { file_id: 'rrr-file-id', file_name: 'RRR.2022.1080p.mkv' }
+  };
+  const telegram = {
+    async copyMessage(destination, source, messageId, extra) {
+      calls.push({ destination, source, messageId, extra });
+      return { message_id: 321 };
+    }
+  };
+
+  const stored = await storeMediaInChannel(telegram, '-100private', 501, message);
+  const file = fileFromMessage(message, stored.storageMessageId, stored.method, stored.storageChannelId);
+
+  assert.equal(cleanStorageCaption(message.caption), 'RRR (2022) Dual Audio Hindi + English 1080p');
+  assert.deepEqual(calls, [{
+    destination: '-100private',
+    source: 501,
+    messageId: 16,
+    extra: { disable_notification: true, caption: 'RRR (2022) Dual Audio Hindi + English 1080p' }
+  }]);
+  assert.equal(file.sourceLabel.includes('@Doraemon_Movies_Hindi1'), false);
+  assert.equal(file.sourceLabel.includes('https://t.me'), false);
+  assert.deepEqual(file.audioLanguages, ['Hindi', 'English']);
+  assert.equal(file.storageChannelId, '-100private');
 });
 
 test('single-file deep-link payload preserves hyphens in the share code', () => {
@@ -58,7 +89,7 @@ test('request management starts with Select requests and Back buttons, while pos
 
 test('publisher menu exposes post management, backup, and compatible metadata commands', () => {
   const commands = PUBLISHER_COMMANDS.map((entry) => entry.command);
-  for (const command of ['posts', 'postid', 'lang', 'lan', 'lam', 'year', 'cmd', 'backup', 'recover']) {
+  for (const command of ['posts', 'postid', 'lang', 'lan', 'lam', 'year', 'cmd', 'backup', 'recover', 'adultdb']) {
     assert.ok(commands.includes(command), `${command} should be available to publisher command scopes`);
   }
   assert.deepEqual(parsePublishedPostEdit('SB-a1b2c3d4e5 Hindi, English'), {
@@ -71,6 +102,66 @@ test('publisher menu exposes post management, backup, and compatible metadata co
     adminId: 'SB-A1B2C3D4E5', value: ''
   });
   assert.equal(parsePublishedPostEdit('Hindi, English'), null);
+});
+
+
+test('18+ posts never dispatch a Telegram announcement', async () => {
+  let listed = 0;
+  let sent = 0;
+  const result = await announcePublishedContent({
+    bot: { telegram: { sendMessage: async () => { sent += 1; } } },
+    repository: { listAnnouncementChannels: async () => { listed += 1; return [{ channelId: '-100public' }]; } },
+    content: { category: 'adult', title: 'Restricted release' },
+    websiteUrl: 'https://catalog.example/adult/restricted-release',
+    storageChannelId: '-100adult'
+  });
+  assert.deepEqual(result, { sent: 0, failed: 0, skipped: 0, suppressed: true });
+  assert.equal(listed, 0);
+  assert.equal(sent, 0);
+});
+
+
+test('18+ delivery always reads the isolated adult storage channel, never a saved normal source', async () => {
+  const copied = [];
+  const replies = [];
+  await deliverContent(
+    {
+      chat: { id: 400 },
+      telegram: { copyMessage: async (...args) => { copied.push(args); } },
+      reply: async (text) => { replies.push(text); }
+    },
+    { shareCode: 'adult-share-code', filePosition: null },
+    {
+      findContentByShareCode: async () => ({
+        title: 'Restricted release',
+        category: 'adult',
+        files: [{ storageMessageId: 42, storageChannelId: '-100normal' }]
+      }),
+      incrementDelivery: async () => {}
+    },
+    { telegram: { storageChannelId: '-100normal', adultStorageChannelId: '-100adult' } }
+  );
+
+  assert.deepEqual(copied, [[400, '-100adult', 42]]);
+  assert.match(replies.at(-1), /Delivered 1 of 1/);
+});
+
+test('18+ publishing rejects a missing or shared storage configuration before any post is created', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.startSession({ chatId: 88, ownerId: 88, category: 'adult', title: 'Restricted release' });
+  await repository.appendSessionFile(88, 88, { storageMessageId: 1, storageChannelId: '-100normal', name: 'restricted.mkv' });
+  const replies = [];
+  const result = await publishDraft(
+    { chat: { id: 88 }, from: { id: 88 }, reply: async (text) => { replies.push(text); } },
+    { telegram: {} },
+    repository,
+    { telegram: { botUsername: 'DeliveryBot', storageChannelId: '-100normal', adultStorageChannelId: '-100normal' }, mediaInfo: { enabled: false } }
+  );
+
+  assert.equal(result.content, null);
+  assert.match(result.error, /must be different/);
+  assert.match(replies.at(-1), /must be different/);
+  assert.equal((await repository.listContent({ category: 'adult', limit: 10 })).length, 0);
 });
 
 test('a later manual upload for the same release appends files instead of creating a duplicate post', async () => {
@@ -103,6 +194,43 @@ test('a later manual upload for the same release appends files instead of creati
   assert.equal(await repository.findSession(501, 501), null);
   assert.ok(replies.some((text) => /Added 1 new file to the existing catalog post/.test(text)));
   assert.deepEqual(releaseMergeKeys({ title: 'The Gentlemen' }, { title: 'The Gentlemen' }), ['the-gentlemen']);
+});
+
+
+test('a later noisy RRR batch release merges into the original movie rather than creating a second card', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const original = await repository.createContent({
+    title: 'RRR (2022) Hindi 1080p',
+    category: 'movie',
+    files: [{ storageMessageId: 10, storageChannelId: '-100normal', name: 'RRR.2022.1080p.mkv' }]
+  });
+  await repository.startSession({ chatId: 502, ownerId: 502, category: 'movie', title: 'RRR' });
+  await repository.updateSession(502, 502, {
+    workflow: 'batch',
+    metadata: { matched: false, title: 'RRR', languages: [], genres: [], description: '', status: 'New release', releaseLabel: null }
+  });
+  await repository.appendSessionFile(502, 502, {
+    storageMessageId: 11,
+    storageChannelId: '-100normal',
+    name: 'RRR.2022.720p.mkv',
+    sourceLabel: 'RRR (2022) Hindi 720p @Doraemon_Movies_Hindi1',
+    kind: 'video'
+  });
+
+  const result = await publishDraft(
+    { chat: { id: 502 }, from: { id: 502 }, reply: async () => {} },
+    { telegram: {} },
+    repository,
+    { telegram: { botUsername: 'DeliveryBot' }, mediaInfo: { enabled: false } }
+  );
+
+  assert.equal(result.merged, true);
+  assert.equal(result.content.adminId, original.adminId);
+  assert.equal(result.content.filesCount, 2);
+  assert.equal((await repository.listContent({ category: 'movie', limit: 10 })).length, 1);
+  assert.equal(result.content.files.at(-1).sourceLabel.includes('@Doraemon_Movies_Hindi1'), false);
+  assert.ok(releaseMergeKeys({ category: 'movie', title: 'RRR' }, {}).includes('rrr'));
+  assert.equal(releaseMergeKeys({ category: 'web-series', title: 'RRR S01E01 1080p' }, {}).includes('rrr'), false);
 });
 
 test('manual /cmd manifests attach Watch players to existing posts without publishing or announcing again', async () => {
@@ -201,6 +329,7 @@ test('batch title and category inference prefer cleaned file descriptions', () =
 test('batch import inspects every message in an inclusive private-storage range and keeps original IDs', async () => {
   const forwarded = [];
   const removed = [];
+  const captionEdits = [];
   const replies = [];
   const session = {
     title: '',
@@ -211,13 +340,13 @@ test('batch import inspects every message in an inclusive private-storage range 
   const previews = {
     10: {
       message_id: 501,
-      caption: 'Perfect World Episode 01 Hindi 1080p',
+      caption: 'Perfect World Episode 01 Hindi 1080p @release_source',
       document: { file_id: 'first', file_name: 'Perfect.World.S01E01.1080p.mkv' }
     },
     11: { message_id: 502, text: 'A note between files' },
     12: {
       message_id: 503,
-      caption: 'Perfect World Episode 02 Hindi 720p',
+      caption: 'Perfect World Episode 02 Hindi 720p @release_source',
       video: { file_id: 'last', file_name: 'Perfect.World.S01E02.720p.mkv' }
     }
   };
@@ -236,7 +365,8 @@ test('batch import inspects every message in an inclusive private-storage range 
         forwarded.push({ destination, source, messageId });
         return previews[messageId];
       },
-      async deleteMessage(destination, messageId) { removed.push({ destination, messageId }); }
+      async deleteMessage(destination, messageId) { removed.push({ destination, messageId }); },
+      async editMessageCaption(destination, messageId, _inlineMessageId, caption) { captionEdits.push({ destination, messageId, caption }); }
     },
     async reply(text) { replies.push(text); }
   };
@@ -254,6 +384,11 @@ test('batch import inspects every message in an inclusive private-storage range 
 
   assert.deepEqual(forwarded.map((entry) => entry.messageId), [10, 11, 12]);
   assert.deepEqual(session.files.map((file) => file.storageMessageId), [10, 12]);
+  assert.deepEqual(session.files.map((file) => file.storageChannelId), ['-1002617067511', '-1002617067511']);
+  assert.deepEqual(captionEdits, [
+    { destination: '-1002617067511', messageId: 10, caption: 'Perfect World Episode 01 Hindi 1080p' },
+    { destination: '-1002617067511', messageId: 12, caption: 'Perfect World Episode 02 Hindi 720p' }
+  ]);
   assert.deepEqual(removed.map((entry) => entry.messageId), [501, 502, 503]);
   assert.equal(session.title, 'Perfect World');
   assert.equal(session.category, 'web-series');

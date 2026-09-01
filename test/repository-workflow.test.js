@@ -171,6 +171,31 @@ test('category-scoped merge keys append to the matching same-title catalog card 
   assert.equal((await repository.findContentBySlug(series.slug)).filesCount, 2);
 });
 
+
+test('per-file storage channel identity keeps normal and 18+ Telegram message IDs isolated', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const normal = await repository.createContent({
+    title: 'Normal release',
+    category: 'movie',
+    files: [{ storageMessageId: 42, storageChannelId: '-100normal', name: 'normal.mkv' }]
+  });
+  const adult = await repository.createContent({
+    title: 'Restricted release',
+    category: 'adult',
+    files: [{ storageMessageId: 42, storageChannelId: '-100adult', name: 'restricted.mkv' }]
+  });
+
+  assert.equal((await repository.findContentByStorageMessageId(42, '-100normal')).adminId, normal.adminId);
+  assert.equal((await repository.findContentByStorageMessageId(42, '-100adult', { includeLegacy: false })).adminId, adult.adminId);
+  assert.equal(await repository.findContentByStorageMessageId(42, '-100other', { includeLegacy: false }), null);
+
+  await repository.startSession({ chatId: 900, ownerId: 900, category: 'adult', title: 'Draft' });
+  await repository.appendSessionFile(900, 900, { storageMessageId: 42, storageChannelId: '-100adult', sourceLabel: 'Draft @promotion_source' });
+  assert.equal((await repository.findSessionByStorageMessageId(42, '-100adult', { includeLegacy: false })).category, 'adult');
+  assert.equal(await repository.findSessionByStorageMessageId(42, '-100normal', { includeLegacy: false }), null);
+  assert.equal((await repository.findSession(900, 900)).files[0].sourceLabel.includes('@promotion_source'), false);
+});
+
 test('memory repository persists login sessions, requests, announcement destinations, and auto-publish settings for its process lifetime', async () => {
   const repository = new MemoryCatalogRepository([]);
   const expiresAt = new Date(Date.now() + 60_000);

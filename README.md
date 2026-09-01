@@ -17,7 +17,8 @@ A production-minded, responsive catalog for **media you are authorized to distri
 ### Public catalog
 
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
-- Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
+- Categories for Anime, Cartoons, Donghua, K-Drama, Movies, Web Series, and a visible **18+** area
+- The 18+ area displays an explicit age-confirmation prompt before the browser requests any restricted cards, details, Watch pages, episode pages, or Telegram delivery redirect; ordinary home, search, featured, and all-catalog APIs never include restricted records
 - Search by title, genre, and language labels
 - Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. When a publisher manually attaches an approved provider player, the existing card also gains a **Watch** button leading to an in-site embedded Watch page with episode/source choices and related titles from the same category. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker.
 - Search that supports multi-word title, genre, and language matching
@@ -33,7 +34,8 @@ A production-minded, responsive catalog for **media you are authorized to distri
   - `/kdrama Title`
   - `/movie Title`
   - `/series Title`
-- Start a draft, send the title, upload files in the same private bot chat, then use `/done`
+  - `/adultdb Title` (or the requested `/18db Title` alias) for a private 18+ draft
+- Start a draft, send the title, upload files in the same private bot chat, then use `/done`. The adult command requires its own private storage channel, skips metadata-provider lookup, and never creates a public Telegram announcement
 - Optional draft metadata commands: `/lang`, `/subtitles`, `/year`, `/genres`, `/description`, and `/poster`; the same metadata can be corrected on an existing private `SB-…` post ID
 - Category-aware metadata fallback chain: AniList for Anime/Donghua, TMDB, then OMDb when configured
 - Server-side poster download validation, then permanent ImgBB upload during publishing
@@ -41,7 +43,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
 - Upload captions/file names resolve explicit audio and subtitle labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label. Dual/Multi or unlabeled media is inspected with MediaInfo only after the entire manual, batch, or auto release has collected; candidates are downloaded and parsed one at a time with byte, timeout, and file-count caps, so a failed/unavailable scan safely retains caption/filename fallback labels
 - Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
-- Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
+- Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot. Fresh copied/resend captions and saved file labels automatically remove Telegram `@channel`, `t.me`, and promotional attribution while preserving title, quality, language, season, and episode information
 - `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel as **one release**, including long runs such as 448 episode messages. It preserves original storage message IDs, retries Telegram rate limits, reports progress, infers title/category when no name is supplied, and enumerates every already-published, active-draft, non-media, inaccessible, or protected message ID instead of reporting a vague skip count
 - `/auto` presents persistent ON/OFF controls; when ON, direct database-channel media is collected by normalized release title for 90 seconds of quiet (15-minute maximum), then classified, provider-verified, poster-mirrored, and published as one combined post. Provider identity and cleaned aliases are retained so later noisy title variants append to the same post without a duplicate announcement
 - Auto completion/failure reports are delivered to the authorized publisher's bot chat, including the private `SB-…` ID, while database-channel error replies are suppressed
@@ -142,6 +144,9 @@ The app creates its indexes automatically. `content` stores published catalog re
 TELEGRAM_BOT_TOKEN=your_botfather_token
 TELEGRAM_BOT_USERNAME=YourBotUsernameWithoutTheAtSign
 TELEGRAM_STORAGE_CHANNEL_ID=-1001234567890
+# Required before /adultdb, /18db, or /batch adult | Title. This must be a
+# different private channel; adult files are never mixed with normal storage.
+TELEGRAM_ADULT_STORAGE_CHANNEL_ID=-1009876543210
 # Optional separate private channel for user requests; otherwise storage channel is used.
 TELEGRAM_REQUEST_CHANNEL_ID=-1001234567890
 # Optional allowlist. If set, only these IDs may successfully use /login.
@@ -155,6 +160,12 @@ TELEGRAM_MODE=polling
 ```
 
 `ADMIN_LOGIN_CODE` is required to unlock publishing. A logged-in publisher session expires automatically after the configured number of hours. `TELEGRAM_ADMIN_IDS` is an optional additional safety layer: when it is populated, only those numeric Telegram user IDs can log in even if somebody knows the passcode. When it is empty, the passcode itself controls access.
+
+#### Private 18+ storage and access
+
+Create a **second**, private Telegram database channel for 18+ files, add the same bot as an administrator, and configure its numeric ID as `TELEGRAM_ADULT_STORAGE_CHANNEL_ID`. It must not equal `TELEGRAM_STORAGE_CHANNEL_ID`; the bot rejects a shared/missing configuration before an 18+ draft, batch, publish, or delivery can use it. Start restricted uploads with `/adultdb Title` or `/18db Title`. Existing adult-channel ranges use `/batch adult | Title`; normal `/auto` remains restricted to the normal database channel. Adult drafts skip external metadata lookup, retain their per-file source channel, and never announce to configured public Telegram channels.
+
+The website intentionally shows the 18+ navigation destination without its catalog data. Selecting it opens a confirmation dialog; **No** returns to the regular catalog, while **I am 18+** grants the current browser access. The server independently requires its short-lived HTTP-only consent cookie for adult category/detail/episode/Watch APIs and first-party `/deliver/...` redirects, so an overlay or a guessed site API URL cannot expose restricted data before confirmation.
 
 #### Bot-token rotation and replacement recovery
 
@@ -273,8 +284,9 @@ Useful commands:
 | `/request Perfect World Hindi` | Public command: send a request to MongoDB and the private request/database channel |
 | `/login passcode` / `/logout` | Unlock or end the expiring publisher session |
 | `/panel` | Open category buttons and draft controls after login |
-| `/anime`, `/cartoon`, `/donghua`, `/kdrama`, `/movie`, `/series` | Start a category draft; title may follow the command |
-| `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category |
+| `/anime`, `/cartoon`, `/donghua`, `/kdrama`, `/movie`, `/series` | Start a normal category draft; title may follow the command |
+| `/adultdb Title` / `/18db Title` | Start an isolated 18+ draft; requires a distinct `TELEGRAM_ADULT_STORAGE_CHANNEL_ID` and never announces publicly |
+| `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category (for example, `/batch adult \| Title` for the isolated adult store) |
 | `/auto` | Show persistent ON/OFF controls for direct database-channel auto-publishing |
 | `/title Title` | Replace a draft title and re-run provider lookup; `/title SB-… Corrected title` edits an existing card without changing its delivery identity |
 | `/lang Hindi, English` | Set draft audio labels; `/lang SB-… Hindi, English` edits an existing card (`/lan` and `/lam` are compatible aliases) |
@@ -417,7 +429,8 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `IMGBB_API_KEY` | Secret | Yes | Never expose it to the browser |
 | `TELEGRAM_BOT_TOKEN` | Secret | Yes | BotFather token |
 | `TELEGRAM_BOT_USERNAME` | Plaintext | Yes | No leading `@` |
-| `TELEGRAM_STORAGE_CHANNEL_ID` | Secret or plaintext | Yes | Private channel numeric ID |
+| `TELEGRAM_STORAGE_CHANNEL_ID` | Secret or plaintext | Yes | Normal private channel numeric ID |
+| `TELEGRAM_ADULT_STORAGE_CHANNEL_ID` | Secret or plaintext | Required for 18+ publishing | A different private channel numeric ID for `/adultdb`, `/18db`, and `/batch adult \| …`; no public announcements are sent for these posts |
 | `TELEGRAM_REQUEST_CHANNEL_ID` | Secret or plaintext | No | Separate private request channel; defaults to storage channel |
 | `ADMIN_LOGIN_CODE` | Secret | Yes | Publisher passcode; use your chosen value, not a client variable |
 | `ADMIN_SESSION_HOURS` | Plaintext | No | Defaults to `24` |

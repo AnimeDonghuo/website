@@ -133,6 +133,11 @@ export function loadConfig(env = process.env) {
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),
       botUsername: normalizeBotUsername(env.TELEGRAM_BOT_USERNAME),
       storageChannelId: (env.TELEGRAM_STORAGE_CHANNEL_ID || '').trim(),
+      // 18+ media must never share the normal private delivery source. This
+      // channel is deliberately separate from the catalog MongoDB collection:
+      // file records retain their source channel so overlapping Telegram
+      // message IDs can still be delivered safely.
+      adultStorageChannelId: (env.TELEGRAM_ADULT_STORAGE_CHANNEL_ID || env.TELEGRAM_18_STORAGE_CHANNEL_ID || '').trim(),
       requestChannelId: (env.TELEGRAM_REQUEST_CHANNEL_ID || '').trim(),
       adminIds: csvNumbers(env.TELEGRAM_ADMIN_IDS),
       mode: telegramMode === 'polling' ? 'polling' : 'disabled'

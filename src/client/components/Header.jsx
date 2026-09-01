@@ -2,11 +2,26 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { Icon } from './Icons.jsx';
 
-const primaryLinks = [
+const desktopLinks = [
   { label: 'Discover', to: '/' },
   { label: 'Anime', to: '/browse/anime' },
   { label: 'Cartoons', to: '/browse/cartoon' },
   { label: 'K-Drama', to: '/browse/kdrama' },
+  { label: 'Browse all', to: '/browse' }
+];
+
+// Keep the compact desktop header, but never hide catalog categories in the
+// mobile drawer. The 18+ destination itself presents its consent prompt before
+// requesting any restricted catalog records.
+const mobileLinks = [
+  { label: 'Discover', to: '/' },
+  { label: 'Anime', to: '/browse/anime' },
+  { label: 'Cartoons', to: '/browse/cartoon' },
+  { label: 'Donghua', to: '/browse/donghua' },
+  { label: 'K-Drama', to: '/browse/kdrama' },
+  { label: 'Movies', to: '/browse/movie' },
+  { label: 'Web Series', to: '/browse/web-series' },
+  { label: '18+', to: '/browse/adult' },
   { label: 'Browse all', to: '/browse' }
 ];
 
@@ -48,7 +63,7 @@ export default function Header() {
         </Link>
 
         <nav className="desktop-nav" aria-label="Primary navigation">
-          {primaryLinks.map((link) => (
+          {desktopLinks.map((link) => (
             <NavLink key={link.to} to={link.to} end={link.to === '/'} className={({ isActive }) => `desktop-nav__link ${isActive ? 'is-active' : ''}`}>
               {link.label}
             </NavLink>
@@ -83,7 +98,7 @@ export default function Header() {
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search titles, genres, languages" aria-label="Search the catalog" />
         </form>
         <nav aria-label="Mobile navigation">
-          {primaryLinks.map((link) => (
+          {mobileLinks.map((link) => (
             <NavLink key={link.to} to={link.to} end={link.to === '/'} className="mobile-menu__link">
               <span>{link.label}</span><Icon name="chevron" size={18} />
             </NavLink>
