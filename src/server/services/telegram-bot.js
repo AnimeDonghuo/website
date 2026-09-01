@@ -1104,29 +1104,31 @@ export async function publishDraft(ctx, bot, repository, config) {
   const inspectionNote = mediaTrackWork.inspection?.scanned
     ? ` I verified tracks for ${mediaTrackWork.inspection.scanned} eligible file${mediaTrackWork.inspection.scanned === 1 ? '' : 's'} before publication.`
     : '';
-  await ctx.reply(`Publishing your draft. I am mirroring the poster to ImgBB now…${inspectionNote}`);
+  await ctx.reply(`Preparing your draft for publication…${inspectionNote}`);
 
   try {
     const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
-    const automationKeys = session.workflow === 'automation' ? automationMergeKeys(session, metadata) : [];
-    // This is deliberately repeated here as a race-safe final guard. The queue
-    // normally checks aliases before poster work, but two noisy source labels
-    // can become due at the same moment.
-    if (session.workflow === 'automation' && automationKeys.length) {
-      const existingMatch = await findAutomationContentByKeys(repository, automationKeys);
+    const mergeKeys = releaseMergeKeys(session, metadata);
+    // This final guard applies to manual uploads, /batch imports, and storage
+    // automation. A later upload for the same category/title or verified
+    // provider identity extends the existing post instead of making a second
+    // catalog card and second delivery link.
+    if (mergeKeys.length && typeof repository.appendFilesToContentByMergeKey === 'function') {
+      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, session.category);
       if (existingMatch) {
-        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys);
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys);
         if (!content) throw new Error('The existing same-title post could not be updated.');
         await repository.deleteSession(chatId(ctx), userId(ctx));
         const websiteUrl = getContentPageUrl(config, content);
         const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
         await ctx.reply(
-          `Updated existing catalog post “${content.title}” with ${session.files.length} new file${session.files.length === 1 ? '' : 's'}. Post ID: ${content.adminId}.`,
+          `Added ${session.files.length} new file${session.files.length === 1 ? '' : 's'} to the existing catalog post “${content.title}”. It now has ${content.filesCount} file${content.filesCount === 1 ? '' : 's'} and keeps Post ID ${content.adminId}.`,
           publicationKeyboard(websiteUrl, deliveryUrl)
         );
         return { content, metadata, merged: true, websiteUrl, deliveryUrl };
       }
     }
+    await ctx.reply('Creating a new catalog post and mirroring its poster to ImgBB now…');
     const overrides = session.overrides || {};
     const episodeSummary = summarizeEpisodes(session.files);
     const uploadedLanguages = summarizeUploadLanguages(session.files);
@@ -1169,12 +1171,16 @@ export async function publishDraft(ctx, bot, repository, config) {
       },
       metadataProvider: metadata.provider,
       tmdbId: metadata.tmdbId,
-      metadataKey: session.workflow === 'automation' ? metadata.metadataKey : null,
+      // Store a verified provider identity for every publishing workflow, not
+      // just automatic storage posts, so an authorized later upload can find
+      // and extend this exact release without relying only on a loose title.
+      metadataKey: metadata.metadataKey || null,
       art: { tone: categoryDetails(session.category).tone },
       // A persistent normalized source title plus internet-verified aliases
-      // lets later storage bursts append without another catalog card.
+      // lets later manual, batch, or automatic uploads append without another
+      // catalog card.
       automationKey: session.workflow === 'automation' ? session.auto?.groupKey : null,
-      automationKeys,
+      automationKeys: mergeKeys,
       files: session.files
     });
     await repository.deleteSession(chatId(ctx), userId(ctx));
@@ -1259,8 +1265,12 @@ export function automationGroupKey(title, storageMessageId) {
  * Save both the upload-derived and provider-verified identities. A channel may
  * label the same show as "Raakh S01" on one day and "Raakh" on another; the
  * metadata identity is the durable bridge that prevents a second card.
+ *
+ * The same keys are also used for a later manual or /batch upload. Once a
+ * publisher has created a post, sending more files for that same release
+ * should extend its existing delivery page—not create a duplicate card.
  */
-export function automationMergeKeys(session, metadata = {}) {
+export function releaseMergeKeys(session, metadata = {}) {
   return [...new Set([
     // Prefer the verified provider identity over a collision-prone upload name.
     metadata?.metadataKey,
@@ -1271,12 +1281,25 @@ export function automationMergeKeys(session, metadata = {}) {
     .filter((key) => key && key !== 'untitled-release'))];
 }
 
-async function findAutomationContentByKeys(repository, keys) {
+// Kept as the public name used by existing automation tests/integrations.
+export function automationMergeKeys(session, metadata = {}) {
+  return releaseMergeKeys(session, metadata);
+}
+
+async function findContentByMergeKeys(repository, keys, category = null) {
+  if (typeof repository?.findContentByMergeKey !== 'function') return null;
   for (const key of keys) {
     const content = await repository.findContentByMergeKey(key);
-    if (content) return { content, key };
+    // A title such as "Avatar" can legitimately exist in multiple categories.
+    // Do not append a movie upload to an anime or series card merely because a
+    // loose title happened to match.
+    if (content && (!category || content.category === category)) return { content, key };
   }
   return null;
+}
+
+async function findAutomationContentByKeys(repository, keys, category = null) {
+  return findContentByMergeKeys(repository, keys, category);
 }
 
 function automationTiming(options = {}) {
@@ -1494,7 +1517,7 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
       // producing a fresh post just because their raw group keys differ.
       const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
       const automationKeys = automationMergeKeys(session, metadata);
-      const existingMatch = await findAutomationContentByKeys(repository, automationKeys.length ? automationKeys : [groupKey]);
+      const existingMatch = await findAutomationContentByKeys(repository, automationKeys.length ? automationKeys : [groupKey], session.category);
       if (existingMatch) {
         const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys);
         if (!content) throw new Error('The existing same-title post could not be updated.');

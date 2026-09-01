@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { PUBLISHER_COMMANDS, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { PUBLISHER_COMMANDS, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
@@ -70,6 +70,38 @@ test('publisher menu exposes post management, backup, and compatible metadata co
     adminId: 'SB-A1B2C3D4E5', value: ''
   });
   assert.equal(parsePublishedPostEdit('Hindi, English'), null);
+});
+
+test('a later manual upload for the same release appends files instead of creating a duplicate post', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const existing = await repository.createContent({
+    title: 'The Gentlemen',
+    category: 'web-series',
+    files: [{ storageMessageId: 40, name: 'The.Gentlemen.S01.480p.mkv', languages: ['Hindi'] }]
+  });
+  await repository.startSession({ chatId: 501, ownerId: 501, category: 'web-series', title: 'The Gentlemen' });
+  await repository.appendSessionFile(501, 501, {
+    storageMessageId: 41,
+    name: 'The.Gentlemen.S01.720p.mkv',
+    languages: ['Hindi'],
+    audioLanguages: ['Hindi'],
+    kind: 'video'
+  });
+  const replies = [];
+  const result = await publishDraft(
+    { chat: { id: 501 }, from: { id: 501 }, reply: async (text) => { replies.push(text); } },
+    { telegram: {} },
+    repository,
+    { telegram: { botUsername: 'DeliveryBot' }, mediaInfo: { enabled: false } }
+  );
+
+  assert.equal(result.merged, true);
+  assert.equal(result.content.adminId, existing.adminId);
+  assert.equal(result.content.filesCount, 2);
+  assert.deepEqual(result.content.files.map((file) => file.storageMessageId), [40, 41]);
+  assert.equal(await repository.findSession(501, 501), null);
+  assert.ok(replies.some((text) => /Added 1 new file to the existing catalog post/.test(text)));
+  assert.deepEqual(releaseMergeKeys({ title: 'The Gentlemen' }, { title: 'The Gentlemen' }), ['the-gentlemen']);
 });
 
 test('post ID time windows use India calendar boundaries for publisher filters', () => {
