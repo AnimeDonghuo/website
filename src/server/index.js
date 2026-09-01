@@ -9,6 +9,7 @@ import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { cleanDeliveryFileName, cleanMediaName, detectMediaQuality, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -199,6 +200,9 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
     backdropUrl: content.backdropUrl || content.posterUrl || null,
     filesCount: Number(content.filesCount) || 0,
     fileChoices,
+    // This contains only previously validated provider URLs. It deliberately
+    // has no upload token, dashboard URL, or private storage data.
+    stream: publicStreamingData(content.stream, config.streaming || {}),
     episodeGroups: publicEpisodeGroups(content.episodeGroups),
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
@@ -231,6 +235,10 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
           scriptSrc: ["'self'"],
           styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
           connectSrc: ["'self'"],
+          // /watch embeds only approved HTTPS player hosts. Koyeb serves the
+          // page; the video itself remains at the provider and never transits
+          // this process.
+          frameSrc: ["'self'", ...streamingFrameSources(config.streaming || {})],
           frameAncestors: null,
           upgradeInsecureRequests: config.environment === 'production' ? [] : null
         }

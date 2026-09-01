@@ -6,6 +6,7 @@ import { summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
 const BACKUP_RECOVERY_TTL_MS = 1000 * 60 * 15;
+const STREAM_IMPORT_TTL_MS = 1000 * 60 * 15;
 const MAX_ADMIN_CONTENT_RESULTS = 100;
 const MAX_REQUEST_RESULTS = 200;
 const BACKUP_COLLECTION_NAMES = [
@@ -47,6 +48,7 @@ const LIST_CONTENT_PROJECTION = {
   publishedAt: 1,
   shareCode: 1,
   hasDelivery: 1,
+  stream: 1,
   'files.name': 1,
   'files.displayName': 1,
   'files.languages': 1,
@@ -362,6 +364,9 @@ function normalizeContent(input) {
     tmdbId: input.tmdbId || null,
     metadataKey: input.metadataKey ? normalizedMergeKey(input.metadataKey) : null,
     art: input.art || null,
+    // Manually imported player links are normalized/validated by the streaming
+    // service before persistence. No media bytes are held by this field.
+    stream: input.stream && typeof input.stream === 'object' ? clone(input.stream) : null,
     // titleKey makes same-title merging work for manual, batch, and older
     // records. Automation keeps raw and internet-verified aliases so slightly
     // different upload labels still converge on one catalog record.
@@ -408,6 +413,7 @@ export class MemoryCatalogRepository {
     this.requests = new Map();
     this.requestSelections = new Map();
     this.backupRecoveries = new Map();
+    this.streamImports = new Map();
     this.botUsers = new Map();
     this.siteVisitors = new Map();
     this.siteVisits = [];
@@ -496,9 +502,29 @@ export class MemoryCatalogRepository {
       }));
   }
 
+  async findContentByTitle(title, { category = null, limit = 3 } = {}) {
+    const titleKey = normalizedMergeKey(title);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    return [...this.contents.values()]
+      .filter((entry) => entry.published !== false && (entry.titleKey === titleKey || entry.slug === titleKey) && (!normalizedCategory || entry.category === normalizedCategory))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 3, 10)))
+      .map(clone);
+  }
+
   async findContentByAdminId(adminId) {
     const item = [...this.contents.values()].find((entry) => entry.adminId === String(adminId).toUpperCase());
     return item ? clone(item) : null;
+  }
+
+  async updateContentStreamByAdminId(adminId, stream) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    saved.stream = stream && typeof stream === 'object' ? clone(stream) : null;
+    saved.updatedAt = new Date().toISOString();
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
   }
 
   async deleteContentByAdminId(adminId) {
@@ -874,6 +900,35 @@ export class MemoryCatalogRepository {
     this.backupRecoveries.delete(sessionKey(chatId, ownerId));
   }
 
+  async startStreamImport({ chatId, ownerId, targetAdminId = null, expiresAt = new Date(Date.now() + STREAM_IMPORT_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + STREAM_IMPORT_TTL_MS).toISOString()
+    };
+    this.streamImports.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findStreamImport(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.streamImports.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.streamImports.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteStreamImport(chatId, ownerId) {
+    this.streamImports.delete(sessionKey(chatId, ownerId));
+  }
+
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
     if (!['completed', 'rejected'].includes(status)) return [];
     const ids = safeRequestIds(requestIds);
@@ -1034,6 +1089,10 @@ export class MemoryCatalogRepository {
 
   async restoreBackupData(data) {
     const collections = safeBackupCollections(data);
+    // Stream imports are short-lived prompts, not recoverable application data.
+    // Clear any pre-recovery prompt so it cannot attach a stale manifest to a
+    // restored catalog.
+    this.streamImports.clear();
     this.contents = new Map(collections.content.map((item) => [String(item.slug), clone(item)]));
     this.sessions = new Map(collections.upload_sessions.map((item) => [sessionKey(item.chatId, item.ownerId), clone(item)]));
     this.requests = new Map(collections.requests.map((item) => [String(item.id), clone(item)]));
@@ -1115,6 +1174,7 @@ export class MongoCatalogRepository {
     this.requests = db.collection('requests');
     this.requestSelections = db.collection('request_selections');
     this.backupRecoveries = db.collection('backup_recoveries');
+    this.streamImports = db.collection('stream_imports');
     this.botUsers = db.collection('bot_users');
     this.siteVisitors = db.collection('site_visitors');
     this.siteVisits = db.collection('site_visits');
@@ -1147,6 +1207,8 @@ export class MongoCatalogRepository {
       this.requestSelections.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.backupRecoveries.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.backupRecoveries.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.streamImports.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.streamImports.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.botUsers.createIndex({ id: 1 }, { unique: true }),
       this.botUsers.createIndex({ lastSeenAt: -1 }),
       this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
@@ -1273,8 +1335,33 @@ export class MongoCatalogRepository {
       .toArray();
   }
 
+  async findContentByTitle(title, { category = null, limit = 3 } = {}) {
+    const titleKey = normalizedMergeKey(title);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    return this.contents.find({
+      published: { $ne: false },
+      // Old records may predate titleKey, so retain their stable original slug
+      // as the exact-title fallback for a manual provider export.
+      $or: [{ titleKey }, { slug: titleKey }],
+      ...(normalizedCategory ? { category: normalizedCategory } : {})
+    }).limit(Math.max(1, Math.min(Number(limit) || 3, 10))).toArray();
+  }
+
   async findContentByAdminId(adminId) {
     return this.contents.findOne({ adminId: String(adminId).toUpperCase() });
+  }
+
+  async updateContentStreamByAdminId(adminId, stream) {
+    return this.contents.findOneAndUpdate(
+      { adminId: String(adminId).toUpperCase(), published: { $ne: false } },
+      {
+        $set: {
+          stream: stream && typeof stream === 'object' ? stream : null,
+          updatedAt: new Date().toISOString()
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
   }
 
   async deleteContentByAdminId(adminId) {
@@ -1698,6 +1785,34 @@ export class MongoCatalogRepository {
     await this.backupRecoveries.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
   }
 
+  async startStreamImport({ chatId, ownerId, targetAdminId = null, expiresAt = new Date(Date.now() + STREAM_IMPORT_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.streamImports.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + STREAM_IMPORT_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findStreamImport(chatId, ownerId) {
+    return this.streamImports.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteStreamImport(chatId, ownerId) {
+    await this.streamImports.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
     if (!['completed', 'rejected'].includes(status)) return [];
     const ids = safeRequestIds(requestIds);
@@ -1923,6 +2038,10 @@ export class MongoCatalogRepository {
       await session.endSession();
     }
     if (!completed) await replaceAll();
+    // Stream imports are ephemeral prompts and intentionally are not present in
+    // signed backups. Clear them so an old pending manifest cannot be applied
+    // to the recovered catalog.
+    await this.streamImports.deleteMany({});
     await this.init();
     return Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name].length]));
   }

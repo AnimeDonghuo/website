@@ -253,6 +253,10 @@ function episodePagePath(item, group) {
   return `/${item.category}/${item.slug}/episode/${range}`;
 }
 
+function watchPagePath(item) {
+  return `/${item.category}/${item.slug}/watch`;
+}
+
 function parseEpisodeRoute(value) {
   const match = String(value || '').match(/^(\d{1,3})(?:-(\d{1,3}))?$/);
   if (!match) return null;
@@ -333,6 +337,7 @@ function DetailPage({ onGetFiles }) {
               {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
               <div className="tag-list">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div>
               <div className="detail-actions">
+                {item.stream?.available ? <Link className="button button--watch" to={watchPagePath(item)}><Icon name="play" size={19} /> Watch</Link> : null}
                 {item.episodeGroups?.length
                   ? <a className="button button--telegram" href="#episode-guide-title"><Icon name="layers" size={20} /> Browse episode guide</a>
                   : <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>}
@@ -436,6 +441,87 @@ function EpisodePage({ onGetFiles }) {
   );
 }
 
+function WatchPage({ onGetFiles }) {
+  const { category, slug } = useParams();
+  const release = useRemote(() => getContentBySlug(slug), [slug]);
+  const related = useRemote(() => getContent(), []);
+  const item = release.data?.item;
+  const entries = item?.stream?.entries || [];
+  const [selectedId, setSelectedId] = useState(null);
+  const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
+  const relatedItems = useMemo(() => {
+    if (!item) return [];
+    return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
+  }, [item, related.data]);
+
+  useEffect(() => {
+    setSelectedId(entries[0]?.id || null);
+  }, [slug, item?.stream?.updatedAt]);
+
+  if (release.loading) {
+    return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
+  }
+  if (release.error || !item || item.category !== category) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>WATCH NOT FOUND</Eyebrow><h1>This player page is off the map.</h1><p>{release.error?.message || 'Return to the release and choose an available Watch option.'}</p><Link className="button button--primary" to={item ? `/${item.category}/${item.slug}` : '/browse'}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+  if (!item.stream?.available || !selected) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized provider player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+
+  const selectedTitle = selected.episode?.label || selected.label || 'Main player';
+  return (
+    <PageShell>
+      <section className={`watch-hero detail-hero--${item.tone}`}>
+        <div className="watch-hero__glow" aria-hidden="true" />
+        <div className="page-width watch-hero__inner">
+          <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
+          <div className="watch-hero__heading">
+            <div>
+              <Eyebrow><Icon name="play" size={13} /> WATCH {item.categoryLabel.toUpperCase()}</Eyebrow>
+              <h1>{item.title}</h1>
+              <p>{selectedTitle} · hosted by {selected.provider || item.stream.provider || 'an approved provider'}.</p>
+            </div>
+            <div className="watch-hero__actions">
+              {selected.watchUrl ? <a className="button button--ghost" href={selected.watchUrl} target="_blank" rel="noreferrer"><Icon name="external" size={17} /> Open source</a> : null}
+              {item.deliveryReady ? <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get files</button> : null}
+            </div>
+          </div>
+          <div className="watch-player-shell">
+            {selected.embedUrl ? <iframe
+              key={selected.id}
+              className="watch-player-shell__frame"
+              src={selected.embedUrl}
+              title={`${item.title} — ${selectedTitle}`}
+              allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+              referrerPolicy="strict-origin-when-cross-origin"
+              allowFullScreen
+            /> : <div className="watch-player-shell__fallback"><Icon name="external" size={24} /><strong>This provider supplied an external Watch link.</strong><p>Open the approved source to play this option.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Open player <Icon name="external" size={16} /></a> : null}</div>}
+          </div>
+        </div>
+      </section>
+
+      {entries.length > 1 ? <section className="watch-choices page-width" aria-labelledby="watch-choices-title">
+        <div className="watch-choices__heading"><div><Eyebrow>PLAYER & EPISODE OPTIONS</Eyebrow><h2 id="watch-choices-title">Choose your <em>Watch option.</em></h2></div><span>{entries.length} approved source{entries.length === 1 ? '' : 's'}</span></div>
+        <div className="watch-choices__grid">
+          {entries.map((entry) => {
+            const label = entry.episode?.label || entry.label || 'Main player';
+            return <button className={`watch-choice ${entry.id === selected.id ? 'watch-choice--active' : ''}`} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}>
+              <span className="watch-choice__play"><Icon name="play" size={15} /></span>
+              <span><strong>{label}</strong><small>{entry.provider || 'Approved provider'}{entry.embedUrl ? ' · embedded player' : ' · external player'}</small></span>
+              <Icon name="arrow" size={16} />
+            </button>;
+          })}
+        </div>
+      </section> : null}
+
+      {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="watch-related-title">
+        <div className="section-heading"><div><Eyebrow>MORE IN {item.categoryLabel.toUpperCase()}</Eyebrow><h2 id="watch-related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
+        <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
+      </section> : null}
+    </PageShell>
+  );
+}
+
 function NotFoundPage() {
   return <PageShell><section className="page-width not-found"><span><Icon name="spark" size={28} /></span><Eyebrow>404</Eyebrow><h1>That page is off the map.</h1><p>Return to the catalog and find something worth opening next.</p><Link className="button button--primary" to="/browse">Explore catalog <Icon name="arrow" size={18} /></Link></section></PageShell>;
 }
@@ -450,6 +536,7 @@ export default function App() {
         <Route path="/browse" element={<BrowsePage />} />
         <Route path="/browse/:category" element={<BrowsePage />} />
         <Route path="/search" element={<SearchPage />} />
+        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={setDeliveryItem} />} />
         <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={setDeliveryItem} />} />
         <Route path="/:category/:slug" element={<DetailPage onGetFiles={setDeliveryItem} />} />
         <Route path="*" element={<NotFoundPage />} />

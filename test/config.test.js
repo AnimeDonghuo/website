@@ -9,7 +9,10 @@ test('MediaInfo and signed backup safety settings have bounded production defaul
     MEDIAINFO_TIMEOUT_MS: '5000',
     MEDIAINFO_MAX_FILES: '44',
     BACKUP_MAX_BYTES: '23456',
-    BACKUP_MONTHLY_ENABLED: 'false'
+    BACKUP_MONTHLY_ENABLED: 'false',
+    STREAMING_ALLOWED_HOSTS: 'media.example.com, player.example.com',
+    STREAMING_MANIFEST_MAX_BYTES: '123456',
+    STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS: '3210'
   });
   assert.equal(config.mediaInfo.maxDownloadBytes, 12345);
   assert.equal(config.mediaInfo.timeoutMs, 5000);
@@ -17,6 +20,9 @@ test('MediaInfo and signed backup safety settings have bounded production defaul
   assert.equal(config.backup.signingSecret, 'long-enough-admin-code');
   assert.equal(config.backup.maxBytes, 23456);
   assert.equal(config.backup.monthlyEnabled, false);
+  assert.deepEqual(config.streaming.allowedHosts, ['media.example.com', 'player.example.com']);
+  assert.equal(config.streaming.manifestMaxBytes, 123456);
+  assert.equal(config.streaming.downloadTimeoutMs, 3210);
 });
 
 test('announcement URLs resolve to a public content detail page', () => {

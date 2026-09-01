@@ -177,6 +177,10 @@ test('memory repository persists login sessions, requests, announcement destinat
   await repository.createAdminSession({ chatId: 100, ownerId: 200, expiresAt });
   assert.ok(await repository.findAdminSession(100, 200));
   assert.deepEqual((await repository.listActiveAdminSessions()).map((session) => session.chatId), ['100']);
+  await repository.startStreamImport({ chatId: 100, ownerId: 200, targetAdminId: 'SB-0123ABCDEF', expiresAt });
+  assert.equal((await repository.findStreamImport(100, 200)).targetAdminId, 'SB-0123ABCDEF');
+  await repository.deleteStreamImport(100, 200);
+  assert.equal(await repository.findStreamImport(100, 200), null);
 
   const request = await repository.createRequest({
     requestText: 'A requested series',

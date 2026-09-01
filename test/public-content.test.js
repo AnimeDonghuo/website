@@ -38,6 +38,26 @@ test('public serialization creates a deep link and hides storage file metadata',
   assert.equal(listRecord.files, undefined);
 });
 
+test('public serialization exposes only approved manual player links for the in-site Watch page', () => {
+  const record = toPublicContent({
+    id: 'watch-release', slug: 'watch-release', title: 'Watch release', category: 'web-series',
+    hasDelivery: false,
+    stream: {
+      provider: 'SeekStreaming',
+      privateDashboardToken: 'never-public',
+      entries: [
+        { label: 'Episode 01', episode: { start: 1, end: 1, label: 'Episode 01' }, embedUrl: 'https://soraboxs.embedseek.com/#58yvk', watchUrl: null },
+        { label: 'Blocked', embedUrl: 'https://untrusted.example/embed/x' }
+      ]
+    }
+  }, config);
+  assert.equal(record.stream.available, true);
+  assert.equal(record.stream.entries.length, 1);
+  assert.equal(record.stream.entries[0].embedUrl, 'https://soraboxs.embedseek.com/#58yvk');
+  assert.equal(record.stream.privateDashboardToken, undefined);
+  assert.equal(record.adminId, undefined);
+});
+
 test('legacy “English Sub” labels are shown as subtitles rather than audio', () => {
   const record = toPublicContent({
     id: 'legacy', slug: 'legacy', title: 'Legacy release', category: 'anime',

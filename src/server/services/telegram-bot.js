@@ -7,6 +7,7 @@ import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
+import { inferStreamManifestFormat, mergeStreamingEntries, parseStreamingManifest, safeStreamingUrl } from './streaming-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
 const BATCH_PROGRESS_INTERVAL = 25;
@@ -147,6 +148,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
   { command: 'stats', description: 'View publisher analytics' },
+  { command: 'cmd', description: 'Import manual Watch player links (JSON/CSV)' },
   { command: 'backup', description: 'Send a signed private data backup' },
   { command: 'recover', description: 'Restore a signed backup file' },
   { command: 'addchannel', description: 'Add an announcement channel' },
@@ -1916,6 +1918,216 @@ export async function runMonthlyBackup({ bot, repository, config, now = new Date
   }
 }
 
+function streamingOptionsFromConfig(config) {
+  return { allowedHosts: config?.streaming?.allowedHosts || [] };
+}
+
+function streamingDownloadOptionsFromConfig(config) {
+  const maxBytes = Number(config?.streaming?.manifestMaxBytes) || 512 * 1024;
+  return {
+    maxBytes,
+    // This importer reads plain JSON/CSV only, but the shared Telegram download
+    // helper has an uncompressed bound as well. Keep both bounds tiny so a
+    // malformed document cannot consume a free Koyeb instance.
+    maxUncompressedBytes: maxBytes,
+    timeoutMs: Number(config?.streaming?.downloadTimeoutMs) || 15_000
+  };
+}
+
+function watchPageUrl(config, content) {
+  const detailUrl = getContentPageUrl(config, content);
+  return detailUrl ? `${detailUrl}/watch` : null;
+}
+
+function streamImportInstructions(targetAdminId = null) {
+  const target = targetAdminId
+    ? `Every valid row in the next manifest will be attached to ${targetAdminId}.`
+    : 'Each row needs a Post ID, or a Title that exactly matches one existing SoraBox release.';
+  return [
+    'Manual Watch-link import is armed for 15 minutes.',
+    target,
+    '',
+    'Send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
+    'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL.',
+    '',
+    'Recommended CSV columns: postId, episode, label, embedUrl, watchUrl',
+    'or use /cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#your-video for one direct player link.',
+    'Use /cmd cancel to stop this import.'
+  ].join('\n');
+}
+
+function streamImportIssueText(rejected = []) {
+  if (!rejected.length) return '';
+  const examples = rejected.slice(0, 5)
+    .map((issue) => `Entry ${issue.row || '?'}: ${cleanText(issue.error, 180)}`)
+    .join('\n');
+  return `\nSkipped ${rejected.length} invalid or unresolved entr${rejected.length === 1 ? 'y' : 'ies'}:\n${examples}${rejected.length > 5 ? '\n…' : ''}`;
+}
+
+async function resolveStreamImportContent(repository, entry, targetAdminId = null) {
+  if (targetAdminId) {
+    if (entry.postId && entry.postId !== targetAdminId) {
+      return { error: `belongs to ${entry.postId}, but this import was armed for ${targetAdminId}` };
+    }
+    const content = await repository.findContentByAdminId?.(targetAdminId);
+    if (!content) return { error: `could not find target post ${targetAdminId}` };
+    if (entry.category && entry.category !== content.category) {
+      return { error: `uses category ${entry.category}, but ${targetAdminId} is in ${content.category}` };
+    }
+    return { content };
+  }
+
+  if (entry.postId) {
+    const content = await repository.findContentByAdminId?.(entry.postId);
+    return content ? { content } : { error: `could not find published post ${entry.postId}` };
+  }
+  if (!entry.sourceTitle || typeof repository.findContentByTitle !== 'function') {
+    return { error: 'needs a Post ID or an exact existing catalog Title' };
+  }
+  const candidates = await repository.findContentByTitle(entry.sourceTitle, { category: entry.category, limit: 3 });
+  if (candidates.length === 1) return { content: candidates[0] };
+  if (candidates.length > 1) {
+    return { error: `Title “${entry.sourceTitle}” matches multiple catalog posts; use /cmd SB-… to select one` };
+  }
+  return { error: `could not find one existing catalog post with Title “${entry.sourceTitle}”` };
+}
+
+/**
+ * Attach validated provider links to existing posts only. This deliberately
+ * does not call publication/announcement functions: importing a player link
+ * must preserve the post and never create a Telegram announcement.
+ */
+export async function applyStreamingManifest({ repository, manifest, targetAdminId = null, config = {} } = {}) {
+  if (!repository?.updateContentStreamByAdminId || !repository?.findContentByAdminId) {
+    throw new Error('This catalog store cannot attach manual Watch links.');
+  }
+  const rejected = [...(manifest?.rejected || [])];
+  const groups = new Map();
+  for (const item of manifest?.entries || []) {
+    const resolved = await resolveStreamImportContent(repository, item, targetAdminId);
+    if (!resolved.content) {
+      rejected.push({ row: item.row, error: resolved.error || 'could not resolve a catalog post' });
+      continue;
+    }
+    const key = resolved.content.adminId;
+    const group = groups.get(key) || { content: resolved.content, entries: [], rows: 0 };
+    group.entries.push(item.entry);
+    group.rows += 1;
+    groups.set(key, group);
+  }
+
+  const updated = [];
+  for (const group of groups.values()) {
+    const stream = mergeStreamingEntries(group.content.stream, group.entries, streamingOptionsFromConfig(config));
+    if (!stream) {
+      rejected.push({ row: '?', error: `could not create a safe player entry for ${group.content.adminId}` });
+      continue;
+    }
+    const saved = await repository.updateContentStreamByAdminId(group.content.adminId, stream);
+    if (!saved) {
+      rejected.push({ row: '?', error: `could not update ${group.content.adminId}; it may have been removed` });
+      continue;
+    }
+    updated.push({ content: saved, rows: group.rows, stream });
+  }
+  return {
+    updated,
+    attachedRows: updated.reduce((total, item) => total + item.rows, 0),
+    rejected
+  };
+}
+
+function directStreamingManifest(targetAdminId, playerUrl) {
+  const provider = new URL(playerUrl).hostname.replace(/^www\./i, '');
+  return {
+    entries: [{
+      row: 1,
+      postId: targetAdminId,
+      sourceTitle: null,
+      category: null,
+      entry: { label: 'Main player', episode: null, provider, embedUrl: playerUrl, watchUrl: playerUrl }
+    }],
+    rejected: []
+  };
+}
+
+function streamImportResultText(result, config) {
+  const pages = result.updated
+    .map(({ content }) => watchPageUrl(config, content))
+    .filter(Boolean)
+    .slice(0, 4);
+  const success = result.updated.length
+    ? `✅ Saved ${result.attachedRows} manual player link${result.attachedRows === 1 ? '' : 's'} on ${result.updated.length} existing catalog post${result.updated.length === 1 ? '' : 's'}. No Telegram announcement was sent.`
+    : 'No Watch links were saved.';
+  return [
+    success,
+    pages.length ? `Watch page${pages.length === 1 ? '' : 's'}:\n${pages.join('\n')}` : result.updated.length ? 'The Watch button is now available on the existing release page. Set PUBLIC_SITE_URL on Koyeb if you also want the bot to return its direct Watch URL.' : null,
+    result.rejected.length ? streamImportIssueText(result.rejected).trimStart() : null
+  ].filter(Boolean).join('\n\n');
+}
+
+async function handleStreamImportUpload(ctx, repository, config) {
+  if (typeof repository?.findStreamImport !== 'function') return false;
+  const pending = await repository.findStreamImport(chatId(ctx), userId(ctx));
+  if (!pending) return false;
+  const document = ctx.message?.document;
+  if (!document) {
+    const playerUrl = pending.targetAdminId && ctx.message?.text
+      ? safeStreamingUrl(ctx.message.text, streamingOptionsFromConfig(config))
+      : null;
+    if (playerUrl) {
+      const result = await applyStreamingManifest({
+        repository,
+        targetAdminId: pending.targetAdminId,
+        config,
+        manifest: directStreamingManifest(pending.targetAdminId, playerUrl)
+      });
+      if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      await ctx.reply(streamImportResultText(result, config));
+      return true;
+    }
+    await ctx.reply(pending.targetAdminId
+      ? 'Watch-link import is waiting for a .json/.csv document or one approved player URL/iframe. Send it now, or use /cmd cancel.'
+      : 'Watch-link import is waiting for one .json or .csv document. To paste one player URL directly, start with /cmd SB-0123ABCDEF <player URL>.');
+    return true;
+  }
+  const format = inferStreamManifestFormat(document);
+  if (!format) {
+    await ctx.reply('This does not look like a .json or .csv Watch-link export. Send the provider export as a document, or use /cmd cancel.');
+    return true;
+  }
+  try {
+    await ctx.reply('Checking the manual player-link manifest…');
+    const archive = await downloadTelegramDocument({
+      document,
+      telegram: ctx.telegram,
+      options: streamingDownloadOptionsFromConfig(config),
+      label: 'streaming manifest'
+    });
+    const manifest = parseStreamingManifest(archive, {
+      format,
+      ...streamingOptionsFromConfig(config),
+      allowMissingTarget: Boolean(pending.targetAdminId)
+    });
+    const result = await applyStreamingManifest({
+      repository,
+      manifest,
+      targetAdminId: pending.targetAdminId || null,
+      config
+    });
+    if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+    await ctx.reply(streamImportResultText(result, config));
+    if (!result.updated.length) {
+      await ctx.reply('The import remains armed so you can correct the file and send it again, or use /cmd cancel.');
+    }
+  } catch (error) {
+    const message = cleanText(error?.message || 'The streaming manifest could not be imported.', 500);
+    console.error('[telegram] streaming manifest import failed:', message);
+    await ctx.reply(`No Watch links were changed. ${message}\nThe import remains armed; correct the export and try again, or use /cmd cancel.`);
+  }
+  return true;
+}
+
 async function handleBackupRecoveryUpload(ctx, repository, config) {
   if (typeof repository?.findBackupRecovery !== 'function') return false;
   const recovery = await repository.findBackupRecovery(chatId(ctx), userId(ctx));
@@ -2078,7 +2290,8 @@ export async function launchTelegramBot({ config, repository }) {
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
-          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Manual Watch pages: /cmd SB-0123ABCDEF <SeekStreaming Embed Link or iframe> saves one player immediately. Or use /cmd SB-0123ABCDEF then send the provider’s small JSON/CSV export. It updates only the existing post, never uploads media through Koyeb and never sends an announcement. /cmd without an ID can match an exact exported Title.',
+          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -2385,7 +2598,8 @@ export async function launchTelegramBot({ config, repository }) {
     if (!(await requirePublisher(ctx, repository, config))) return;
     await repository.deleteSession(chatId(ctx), userId(ctx));
     await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
-    await ctx.reply('Draft or pending backup recovery discarded. No catalog record was created.', panelKeyboard());
+    await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Draft, pending backup recovery, or manual Watch-link import discarded. No catalog record was created.', panelKeyboard());
   });
 
   bot.command('done', async (ctx) => {
@@ -2454,6 +2668,66 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(formatPublisherStats(stats));
   });
 
+  bot.command('cmd', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /cmd in your private publisher chat, then send the small JSON/CSV player-link export there.');
+      return;
+    }
+    if (typeof repository.startStreamImport !== 'function' || typeof repository.findContentByAdminId !== 'function') {
+      await ctx.reply('Manual Watch-link import is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 2_400);
+    if (/^(?:cancel|stop)$/i.test(argument)) {
+      await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      await ctx.reply('Manual Watch-link import cancelled. No player links were changed.', panelKeyboard());
+      return;
+    }
+    if (/^(?:help|example)$/i.test(argument)) {
+      await ctx.reply(streamImportInstructions());
+      return;
+    }
+    if (await repository.findBackupRecovery?.(chatId(ctx), userId(ctx))) {
+      await ctx.reply('A backup recovery is waiting for a document. Finish it or use /cancel first, then start /cmd.');
+      return;
+    }
+
+    const target = argument.match(/^(SB-[A-F0-9]{10})(?:\s+([\s\S]+))?$/i);
+    if (argument && !target) {
+      await ctx.reply('Usage: /cmd SB-0123ABCDEF <player URL or iframe>, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields.');
+      return;
+    }
+    const targetAdminId = target?.[1]?.toUpperCase() || null;
+    const directValue = cleanText(target?.[2] || '', 2_200);
+    if (targetAdminId) {
+      const content = await repository.findContentByAdminId(targetAdminId);
+      if (!content) {
+        await ctx.reply(`No published catalog post was found for ${targetAdminId}. Use /posts or /postid to find its private ID.`);
+        return;
+      }
+      if (directValue) {
+        const playerUrl = safeStreamingUrl(directValue, streamingOptionsFromConfig(config));
+        if (!playerUrl) {
+          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; add another trusted domain through STREAMING_ALLOWED_HOSTS.');
+          return;
+        }
+        const result = await applyStreamingManifest({
+          repository,
+          targetAdminId,
+          config,
+          manifest: directStreamingManifest(targetAdminId, playerUrl)
+        });
+        await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+        await ctx.reply(streamImportResultText(result, config));
+        return;
+      }
+    }
+
+    await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId });
+    await ctx.reply(streamImportInstructions(targetAdminId));
+  });
+
   bot.command('backup', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     if (!config.telegram.storageChannelId) {
@@ -2478,6 +2752,10 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('recover', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
+    if (await repository.findStreamImport?.(chatId(ctx), userId(ctx))) {
+      await ctx.reply('A manual Watch-link import is waiting for a document. Finish it or use /cmd cancel first, then start /recover.');
+      return;
+    }
     if (ctx.chat?.type && ctx.chat.type !== 'private') {
       await ctx.reply('For safety, run /recover in your private chat with this bot, then send the signed backup document there.');
       return;
@@ -2679,6 +2957,7 @@ export async function launchTelegramBot({ config, repository }) {
     if (!(await isPublisher(ctx, repository, config))) return;
     const message = ctx.message;
     if (await handleBackupRecoveryUpload(ctx, repository, config)) return;
+    if (await handleStreamImportUpload(ctx, repository, config)) return;
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
     if (isMediaMessage(message)) {

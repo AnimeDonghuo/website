@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { PUBLISHER_COMMANDS, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { PUBLISHER_COMMANDS, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
@@ -57,7 +58,7 @@ test('request management starts with Select requests and Back buttons, while pos
 
 test('publisher menu exposes post management, backup, and compatible metadata commands', () => {
   const commands = PUBLISHER_COMMANDS.map((entry) => entry.command);
-  for (const command of ['posts', 'postid', 'lang', 'lan', 'lam', 'year', 'backup', 'recover']) {
+  for (const command of ['posts', 'postid', 'lang', 'lan', 'lam', 'year', 'cmd', 'backup', 'recover']) {
     assert.ok(commands.includes(command), `${command} should be available to publisher command scopes`);
   }
   assert.deepEqual(parsePublishedPostEdit('SB-a1b2c3d4e5 Hindi, English'), {
@@ -102,6 +103,52 @@ test('a later manual upload for the same release appends files instead of creati
   assert.equal(await repository.findSession(501, 501), null);
   assert.ok(replies.some((text) => /Added 1 new file to the existing catalog post/.test(text)));
   assert.deepEqual(releaseMergeKeys({ title: 'The Gentlemen' }, { title: 'The Gentlemen' }), ['the-gentlemen']);
+});
+
+test('manual /cmd manifests attach Watch players to existing posts without publishing or announcing again', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'The Gentlemen Season 1',
+    category: 'web-series',
+    files: [{ storageMessageId: 90, name: 'The.Gentlemen.S01E01.mkv' }]
+  });
+  const manifest = parseStreamingManifest(JSON.stringify([{
+    Title: 'The Gentlemen Season 1',
+    Episode: '1',
+    'Embed Code': '<iframe src="https://soraboxs.embedseek.com/#58yvk" width="100%"></iframe>'
+  }]), { format: 'json' });
+
+  const result = await applyStreamingManifest({ repository, manifest, config: { streaming: {} } });
+  const updated = await repository.findContentByAdminId(created.adminId);
+
+  assert.equal(result.updated.length, 1);
+  assert.equal(result.attachedRows, 1);
+  assert.equal(updated.adminId, created.adminId);
+  assert.equal(updated.filesCount, 1);
+  assert.equal(updated.stream.entries[0].embedUrl, 'https://soraboxs.embedseek.com/#58yvk');
+  assert.equal((await repository.listContent({ limit: 10 })).length, 1);
+  // applyStreamingManifest only updates stream metadata: it has no Telegram
+  // bot/announcement dependency and cannot create a second post.
+  assert.equal(result.rejected.length, 0);
+});
+
+test('manual /cmd title matching refuses an ambiguous category until the manifest specifies one', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const movie = await repository.createContent({ title: 'Shared Watch Title', category: 'movie' });
+  const series = await repository.createContent({ title: 'Shared Watch Title', category: 'web-series' });
+  const ambiguous = parseStreamingManifest(JSON.stringify([{
+    Title: 'Shared Watch Title', 'Embed Link': 'https://soraboxs.embedseek.com/#ambiguous'
+  }]), { format: 'json' });
+  const rejected = await applyStreamingManifest({ repository, manifest: ambiguous, config: { streaming: {} } });
+  assert.equal(rejected.updated.length, 0);
+  assert.match(rejected.rejected[0].error, /multiple catalog posts/i);
+
+  const scoped = parseStreamingManifest(JSON.stringify([{
+    Title: 'Shared Watch Title', Category: 'web-series', 'Embed Link': 'https://soraboxs.embedseek.com/#series'
+  }]), { format: 'json' });
+  const attached = await applyStreamingManifest({ repository, manifest: scoped, config: { streaming: {} } });
+  assert.equal(attached.updated[0].content.adminId, series.adminId);
+  assert.equal((await repository.findContentByAdminId(movie.adminId)).stream, null);
 });
 
 test('post ID time windows use India calendar boundaries for publisher filters', () => {

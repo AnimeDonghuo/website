@@ -19,7 +19,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
 - Categories for Anime, Cartoons, Donghua, K-Drama, Movies, and Web Series
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker.
+- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. When a publisher manually attaches an approved provider player, the existing card also gains a **Watch** button leading to an in-site embedded Watch page with episode/source choices and related titles from the same category. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker.
 - Search that supports multi-word title, genre, and language matching
 - Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
@@ -45,6 +45,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel as **one release**, including long runs such as 448 episode messages. It preserves original storage message IDs, retries Telegram rate limits, reports progress, infers title/category when no name is supplied, and enumerates every already-published, active-draft, non-media, inaccessible, or protected message ID instead of reporting a vague skip count
 - `/auto` presents persistent ON/OFF controls; when ON, direct database-channel media is collected by normalized release title for 90 seconds of quiet (15-minute maximum), then classified, provider-verified, poster-mirrored, and published as one combined post. Provider identity and cleaned aliases are retained so later noisy title variants append to the same post without a duplicate announcement
 - Auto completion/failure reports are delivered to the authorized publisher's bot chat, including the private `SB-…` ID, while database-channel error replies are suppressed
+- `/cmd SB-… <Embed Link or iframe>` manually attaches an approved provider player to an **existing** post immediately; `/cmd SB-…` then accepts a small JSON/CSV provider export, and `/cmd` can exact-match an exported `Title` or per-row `postId`. SeekStreaming's `Embed Link`/`Embed Code` export fields work directly. This creates/updates the existing in-site Watch page only—no new catalog post, video transfer, transcoding, or Telegram announcement occurs. Approved SeekStreaming/embedseek, Dailymotion, and Rumble embeds are supported by default; `STREAMING_ALLOWED_HOSTS` can add another trusted host.
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel; `/requests` opens a multi-select publisher workflow that marks selected requests **Completed** or **Rejected** and immediately notifies each requester
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
@@ -289,6 +290,9 @@ Useful commands:
 | `/posts 50` | List recent private `SB-…` post IDs for cleanup or management |
 | `/postid` | Open Today, Yesterday, Week, and Month buttons to return uploaded post IDs with names for that period (IST) |
 | `/stats` | Show anonymous site-visitor/visit activity, private bot-user activity, catalog totals, and request status totals |
+| `/cmd SB-0123ABCDEF <Embed Link or iframe>` | Immediately attach one approved manual provider player to that existing post; no new post or announcement is created |
+| `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns |
+| `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
 | `/backup` | Create a signed compressed application-data snapshot and send it only to the private storage channel |
 | `/recover` | Arm a 15-minute private-chat prompt for one signed backup document; after signature verification it restores backed-up application data into the configured database |
 | `/delete SB-0123ABCDEF[, SB-FEDCBA3210]` | Remove one or several published catalog records and disable their deep links |
@@ -325,6 +329,41 @@ https://t.me/c/2617067511/9342
 ```
 
 In that case, cleaned file captions/descriptions and names supply the title and category. Episode-detected ranges become Web Series by default; explicit title/file signals such as `Donghua`, `Anime`, `K-Drama`, or `Cartoon` choose their matching category, and Chinese/Japanese/Korean episode labels provide Donghua/Anime/K-Drama fallbacks. If a title needs a deterministic category, use an optional prefix such as `/batch donghua | Perfect World`.
+
+### Attach a manual provider Watch page
+
+After an **existing** release has been published, upload authorized media through your provider's own dashboard. For the SeekStreaming export shown in the dashboard, use either the `Embed Link` such as `https://soraboxs.embedseek.com/#58yvk` or the full `iframe` Embed Code. SoraBox safely extracts and validates its `src` value; it does not log in to the provider, automate a browser, or upload the video through Koyeb.
+
+For one player, copy the Post ID returned by publishing and send either form in your private publisher chat:
+
+```text
+/cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#58yvk
+```
+
+```text
+/cmd SB-0123ABCDEF <iframe src="https://soraboxs.embedseek.com/#58yvk" width="100%" height="100%" frameborder="0" allowfullscreen></iframe>
+```
+
+For a provider export containing several episodes or sources, first target the existing post, then send the `.json` or `.csv` file as a **Telegram document** within 15 minutes:
+
+```text
+/cmd SB-0123ABCDEF
+```
+
+Recommended CSV form:
+
+```csv
+postId,episode,label,embedUrl,watchUrl
+SB-0123ABCDEF,1,Episode 01,https://soraboxs.embedseek.com/#episode-1,https://seekstreaming.com/#/video/episode-1
+SB-0123ABCDEF,2,Episode 02,https://www.dailymotion.com/embed/video/x123,
+SB-0123ABCDEF,2,Episode 02 · Rumble,https://rumble.com/embed/v123,
+```
+
+When a target Post ID is supplied, provider exports may omit `postId`; their `Title`, `Embed Link`, `Embed Code`, `VideoID`, `Download Link`, and `Size` fields can remain exactly as exported. With bare `/cmd`, each row must contain `postId`/`adminId`, or a `Title` that exactly matches one catalog post (ambiguous titles are rejected rather than choosing the wrong category). Re-importing the same provider + episode replaces that player entry, while another approved provider for the same episode remains available as an alternative on the Watch page.
+
+`/cmd` updates only `stream` metadata on the existing record. It preserves the `SB-…` ID, slug, delivery links, files, category, and announcement history, and **never sends an announcement**. The public release details page shows a **Watch** button above delivery actions. Its `/watch` page embeds the approved provider player, offers available episode/source choices beneath it, and shows related releases in the same category.
+
+By default only HTTPS hosts under `seekstreaming.com`, `embedseek.com`, `dailymotion.com`, `dai.ly`, and `rumble.com` are accepted and included in the site's iframe Content Security Policy. To intentionally approve another provider, add only its trusted hostname to Koyeb (for example `STREAMING_ALLOWED_HOSTS=player.example.com`) and redeploy. The document is capped at 512 KiB with a 15-second download timeout by default; `STREAMING_MANIFEST_MAX_BYTES` and `STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS` may be lowered or adjusted within their safe limits. No video byte passes through the SoraBox/Koyeb process.
 
 ### Manage requests, post IDs, and publisher analytics
 

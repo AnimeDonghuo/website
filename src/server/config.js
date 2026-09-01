@@ -32,6 +32,15 @@ function csvNumbers(value) {
   );
 }
 
+function csvValues(value) {
+  return [...new Set(
+    String(value || '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+  )];
+}
+
 function normalizeBotUsername(value) {
   return (value || '').trim().replace(/^@/, '').replace(/\s+/g, '');
 }
@@ -111,6 +120,14 @@ export function loadConfig(env = process.env) {
       maxUncompressedBytes: asBoundedInteger(env.BACKUP_MAX_UNCOMPRESSED_BYTES, 80 * 1024 * 1024, 16 * 1024, 500 * 1024 * 1024),
       timeoutMs: asBoundedInteger(env.BACKUP_DOWNLOAD_TIMEOUT_MS, 60_000, 1_000, 10 * 60_000),
       monthlyEnabled: asBoolean(env.BACKUP_MONTHLY_ENABLED, true)
+    },
+    // /cmd imports only compact JSON/CSV player-link manifests. The service
+    // never transfers video bytes to or from a streaming host, preserving the
+    // Koyeb instance for the catalog, bot, and safe manifest validation.
+    streaming: {
+      allowedHosts: csvValues(env.STREAMING_ALLOWED_HOSTS),
+      manifestMaxBytes: asBoundedInteger(env.STREAMING_MANIFEST_MAX_BYTES, 512 * 1024, 1_024, 2 * 1024 * 1024),
+      downloadTimeoutMs: asBoundedInteger(env.STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS, 15_000, 1_000, 60_000)
     },
     telegram: {
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),

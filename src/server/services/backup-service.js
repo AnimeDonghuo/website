@@ -15,6 +15,10 @@ function positiveInteger(value, fallback, { minimum = 1, maximum = Number.MAX_SA
   return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 
+function cleanTextLabel(value) {
+  return String(value || 'document').replace(/[^a-z0-9 -]/gi, '').trim().slice(0, 60) || 'document';
+}
+
 function backupOptions(options = {}) {
   return {
     maxBytes: positiveInteger(options.maxBytes, DEFAULT_MAX_ARCHIVE_BYTES, {
@@ -151,23 +155,27 @@ export async function downloadTelegramDocument({
   document,
   telegram,
   options = {},
+  // Reused for the small /cmd manifest import. Keeping the label explicit
+  // preserves accurate publisher-facing errors without changing backup logic.
+  label = 'backup',
   fetchImpl = globalThis.fetch,
   downloadFile = null
 } = {}) {
   const limits = backupOptions(options);
+  const documentLabel = cleanTextLabel(label);
   const knownSize = Number(document?.file_size || document?.fileSize || 0);
   if (Number.isFinite(knownSize) && knownSize > limits.maxBytes) {
-    throw new Error(`The selected backup is ${knownSize} bytes, above the ${limits.maxBytes}-byte safe recovery limit.`);
+    throw new Error(`The selected ${documentLabel} is ${knownSize} bytes, above the ${limits.maxBytes}-byte safe limit.`);
   }
   if (typeof downloadFile === 'function') {
     const downloaded = await downloadFile(document);
     const buffer = Buffer.isBuffer(downloaded) ? downloaded : Buffer.from(downloaded || '');
-    if (buffer.length > limits.maxBytes) throw new Error('The selected backup exceeds the configured safe recovery limit.');
+    if (buffer.length > limits.maxBytes) throw new Error(`The selected ${documentLabel} exceeds the configured safe limit.`);
     return buffer;
   }
   const fileId = String(document?.file_id || document?.fileId || '');
   if (!fileId || !telegram?.getFileLink || typeof fetchImpl !== 'function') {
-    throw new Error('Telegram could not download this backup document.');
+    throw new Error(`Telegram could not download this ${documentLabel} document.`);
   }
   const link = await telegram.getFileLink(fileId);
   const controller = new AbortController();
@@ -175,13 +183,13 @@ export async function downloadTelegramDocument({
   timer.unref?.();
   try {
     const response = await fetchImpl(String(link), { signal: controller.signal });
-    if (!response?.ok) throw new Error(`Telegram backup download returned HTTP ${response?.status || 'unknown'}.`);
+    if (!response?.ok) throw new Error(`Telegram ${documentLabel} download returned HTTP ${response?.status || 'unknown'}.`);
     const headerSize = Number(response.headers?.get?.('content-length'));
     if (Number.isFinite(headerSize) && headerSize > limits.maxBytes) {
-      throw new Error('Telegram reports a backup larger than the configured safe recovery limit.');
+      throw new Error(`Telegram reports a ${documentLabel} larger than the configured safe limit.`);
     }
     const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length > limits.maxBytes) throw new Error('The selected backup exceeds the configured safe recovery limit.');
+    if (buffer.length > limits.maxBytes) throw new Error(`The selected ${documentLabel} exceeds the configured safe limit.`);
     return buffer;
   } finally {
     clearTimeout(timer);
