@@ -1116,7 +1116,7 @@ export async function publishDraft(ctx, bot, repository, config) {
     if (mergeKeys.length && typeof repository.appendFilesToContentByMergeKey === 'function') {
       const existingMatch = await findContentByMergeKeys(repository, mergeKeys, session.category);
       if (existingMatch) {
-        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys);
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys, session.category);
         if (!content) throw new Error('The existing same-title post could not be updated.');
         await repository.deleteSession(chatId(ctx), userId(ctx));
         const websiteUrl = getContentPageUrl(config, content);
@@ -1289,7 +1289,7 @@ export function automationMergeKeys(session, metadata = {}) {
 async function findContentByMergeKeys(repository, keys, category = null) {
   if (typeof repository?.findContentByMergeKey !== 'function') return null;
   for (const key of keys) {
-    const content = await repository.findContentByMergeKey(key);
+    const content = await repository.findContentByMergeKey(key, category);
     // A title such as "Avatar" can legitimately exist in multiple categories.
     // Do not append a movie upload to an anime or series card merely because a
     // loose title happened to match.
@@ -1519,7 +1519,7 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
       const automationKeys = automationMergeKeys(session, metadata);
       const existingMatch = await findAutomationContentByKeys(repository, automationKeys.length ? automationKeys : [groupKey], session.category);
       if (existingMatch) {
-        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys);
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys, session.category);
         if (!content) throw new Error('The existing same-title post could not be updated.');
         await repository.deleteSession(session.chatId, session.ownerId);
         const websiteUrl = getContentPageUrl(config, content);

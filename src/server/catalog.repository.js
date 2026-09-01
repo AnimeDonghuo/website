@@ -446,18 +446,26 @@ export class MemoryCatalogRepository {
     return item ? clone(item) : null;
   }
 
-  async findContentByMergeKey(mergeKey) {
+  async findContentByMergeKey(mergeKey, category = null) {
     const normalizedKey = normalizedMergeKey(mergeKey);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
     const item = [...this.contents.values()].find((entry) =>
-      entry.published !== false && (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
+      entry.published !== false &&
+      (!normalizedCategory || entry.category === normalizedCategory) &&
+      (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
     );
     return item ? clone(item) : null;
   }
 
-  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = []) {
-    const item = await this.findContentByMergeKey(mergeKey);
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = [], category = null) {
+    const item = await this.findContentByMergeKey(mergeKey, category);
     if (!item) return null;
     const saved = this.contents.get(item.slug);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    // Keep the category check in the write path as well as the lookup. This
+    // guards against an administrator changing a category between the lookup
+    // and append, and prevents a shared title from crossing catalog sections.
+    if (!saved || (normalizedCategory && saved.category !== normalizedCategory)) return null;
     Object.assign(saved, contentFileAppendPatch(saved, additionalFiles), {
       automationKey: saved.automationKey || normalizedMergeKey(mergeKey),
       automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
@@ -1202,10 +1210,12 @@ export class MongoCatalogRepository {
     );
   }
 
-  async findContentByMergeKey(mergeKey) {
+  async findContentByMergeKey(mergeKey, category = null) {
     const normalizedKey = normalizedMergeKey(mergeKey);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
     return this.contents.findOne({
       published: { $ne: false },
+      ...(normalizedCategory ? { category: normalizedCategory } : {}),
       $or: [
         { metadataKey: normalizedKey },
         { automationKey: normalizedKey },
@@ -1218,16 +1228,17 @@ export class MongoCatalogRepository {
     });
   }
 
-  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = []) {
-    const content = await this.findContentByMergeKey(mergeKey);
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = [], category = null) {
+    const content = await this.findContentByMergeKey(mergeKey, category);
     if (!content) return null;
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
     const patch = {
       ...contentFileAppendPatch(content, additionalFiles),
       automationKey: content.automationKey || normalizedMergeKey(mergeKey),
       automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
     };
     return this.contents.findOneAndUpdate(
-      { _id: content._id },
+      { _id: content._id, ...(normalizedCategory ? { category: normalizedCategory } : {}) },
       { $set: patch },
       { returnDocument: 'after', includeResultMetadata: false }
     );

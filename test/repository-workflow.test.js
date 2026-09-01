@@ -143,6 +143,34 @@ test('memory repository merges later files into a same-title content record with
   assert.equal(merged.automationKey, 'cocktail-2');
 });
 
+test('category-scoped merge keys append to the matching same-title catalog card only', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const movie = await repository.createContent({
+    title: 'Shared Release',
+    category: 'movie',
+    files: [{ storageMessageId: 10, name: 'Shared.Release.movie.mkv' }]
+  });
+  const series = await repository.createContent({
+    title: 'Shared Release',
+    category: 'web-series',
+    files: [{ storageMessageId: 20, name: 'Shared.Release.S01E01.mkv' }]
+  });
+
+  const matchingSeries = await repository.findContentByMergeKey('shared-release', 'web-series');
+  assert.equal(matchingSeries.adminId, series.adminId);
+  const merged = await repository.appendFilesToContentByMergeKey(
+    'shared-release',
+    [{ storageMessageId: 21, name: 'Shared.Release.S01E02.mkv' }],
+    [],
+    'web-series'
+  );
+
+  assert.equal(merged.adminId, series.adminId);
+  assert.equal(merged.filesCount, 2);
+  assert.equal((await repository.findContentBySlug(movie.slug)).filesCount, 1);
+  assert.equal((await repository.findContentBySlug(series.slug)).filesCount, 2);
+});
+
 test('memory repository persists login sessions, requests, announcement destinations, and auto-publish settings for its process lifetime', async () => {
   const repository = new MemoryCatalogRepository([]);
   const expiresAt = new Date(Date.now() + 60_000);
