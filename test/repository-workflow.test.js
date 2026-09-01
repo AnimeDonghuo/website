@@ -55,8 +55,7 @@ test('memory repository persists and atomically claims due automation groups', a
   const receivedAt = new Date().toISOString();
   const scheduledAt = new Date(Date.now() + 1_000).toISOString();
   const maxWaitAt = new Date(Date.now() + 5_000).toISOString();
-  // A direct channel burst is not capped at the 100-message /batch safety
-  // limit: all matching uploads persist in one auto group.
+  // A direct channel burst can retain a large episode run in one auto group.
   for (let index = 1; index <= 101; index += 1) {
     await repository.queueAutomationSession({
       chatId: '-100123',
@@ -140,4 +139,69 @@ test('memory repository persists login sessions, requests, announcement destinat
 
   await repository.deleteAdminSession(100, 200);
   assert.equal(await repository.findAdminSession(100, 200), null);
+});
+
+test('request selections support multi-request completed and rejected status changes', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const first = await repository.createRequest({ requestText: 'Perfect World', requester: { id: 301, first_name: 'First' } });
+  const second = await repository.createRequest({ requestText: 'Soul Land', requester: { id: 302, first_name: 'Second' } });
+  const third = await repository.createRequest({ requestText: 'A movie', requester: { id: 303, first_name: 'Third' } });
+
+  await repository.startRequestSelection({ chatId: 100, ownerId: 200 });
+  await repository.toggleRequestSelection(100, 200, first.id);
+  await repository.toggleRequestSelection(100, 200, second.id);
+  assert.deepEqual((await repository.findRequestSelection(100, 200)).requestIds.sort(), [first.id, second.id].sort());
+
+  const completed = await repository.resolveRequests({
+    requestIds: (await repository.findRequestSelection(100, 200)).requestIds,
+    status: 'completed',
+    resolvedBy: 200,
+    resolvedAt: '2026-09-01T10:00:00.000Z'
+  });
+  assert.equal(completed.length, 2);
+  assert.ok(completed.every((request) => request.status === 'completed' && request.resolvedBy === '200'));
+  assert.deepEqual((await repository.listRequests()).map((request) => request.id), [third.id]);
+
+  const rejected = await repository.resolveRequests({ requestIds: [third.id], status: 'rejected', resolvedBy: 200 });
+  assert.equal(rejected[0].status, 'rejected');
+  assert.equal((await repository.listRequests({ status: 'completed', limit: 10 })).length, 2);
+  assert.equal((await repository.listRequests({ status: 'rejected', limit: 10 }))[0].id, third.id);
+});
+
+test('admin date windows and private analytics aggregate catalog, requests, bot users, and anonymous visits', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.createContent({
+    title: 'Yesterday post', category: 'movie', files: [{ storageMessageId: 1 }], publishedAt: '2026-08-31T10:00:00.000Z'
+  });
+  await repository.createContent({
+    title: 'Today post', category: 'donghua', files: [{ storageMessageId: 2, episode: { start: 1, end: 2 } }], publishedAt: '2026-09-01T10:00:00.000Z'
+  });
+  const today = await repository.listAdminContent({
+    startAt: '2026-09-01T00:00:00.000Z',
+    endAt: '2026-09-02T00:00:00.000Z',
+    limit: 100
+  });
+  assert.deepEqual(today.map((post) => post.title), ['Today post']);
+
+  const request = await repository.createRequest({ requestText: 'Requested title', requester: { id: 400 } });
+  await repository.resolveRequests({ requestIds: [request.id], status: 'completed', resolvedBy: 200 });
+  await repository.recordSiteVisit({ visitorId: 'anonymous-one', path: '/', visitedAt: '2026-09-01T11:00:00.000Z' });
+  await repository.recordSiteVisit({ visitorId: 'anonymous-one', path: '/content/today-post', visitedAt: '2026-09-01T11:30:00.000Z' });
+  await repository.recordSiteVisit({ visitorId: 'anonymous-two', path: '/', visitedAt: '2026-08-20T11:00:00.000Z' });
+  await repository.recordBotUser({ id: 500, username: 'active_user', first_name: 'Active' }, { seenAt: '2026-09-01T11:00:00.000Z' });
+  await repository.recordBotUser({ id: 501, username: 'older_user', first_name: 'Older' }, { seenAt: '2026-08-20T11:00:00.000Z' });
+
+  const stats = await repository.getPublisherStats({ now: '2026-09-01T12:00:00.000Z' });
+  assert.equal(stats.catalog.posts, 2);
+  assert.equal(stats.catalog.files, 2);
+  assert.equal(stats.catalog.episodes, 2);
+  assert.equal(stats.catalog.deliveries, 0);
+  assert.equal(stats.catalog.byCategory.donghua, 1);
+  assert.deepEqual(stats.requests, { total: 1, open: 0, completed: 1, rejected: 0 });
+  assert.equal(stats.site.visitors, 2);
+  assert.equal(stats.site.visits, 3);
+  assert.equal(stats.site.activeVisitors24h, 1);
+  assert.equal(stats.site.visits24h, 2);
+  assert.equal(stats.bot.users, 2);
+  assert.equal(stats.bot.activeUsers24h, 1);
 });

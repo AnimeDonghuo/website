@@ -16,6 +16,92 @@ const TV_GENRES = {
   10766: 'Soap', 10767: 'Talk', 10768: 'War & Politics', 37: 'Western'
 };
 
+const TITLE_NOISE = /\b(?:mkv|mp4|avi|webm|mov|m4v|ts|zip|rar|7z|season|series|episode|episodes|ep|e|part|volume|vol|complete|collection|web[ .-]?dl|web[ .-]?rip|blu[ .-]?ray|brrip|webrip|hdtv|amzn|nf|netflix|prime|dsnp|ddp(?:\d(?:\.\d)?)?|aac|x26[45]|hevc|av1|hdr|proper|repack|remux|dub(?:bed)?|sub(?:title)?s?|multi(?:\s+audio)?|dual\s+audio|hindi|english|japanese|korean|chinese)\b/gi;
+const TITLE_STOP_WORDS = new Set(['the', 'a', 'an']);
+const MIN_TITLE_MATCH_SCORE = 0.56;
+
+/**
+ * A provider search may return a popular but unrelated first result. Keep a
+ * small, shared canonical form for input names and provider candidates so the
+ * result we save (and its poster) demonstrably resembles the release name.
+ */
+export function canonicalMetadataTitle(value) {
+  return cleanText(value, 180)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, ' and ')
+    .replace(/[._~|]+/g, ' ')
+    // Remove package markers while their adjacent number is still visible;
+    // otherwise a "Season 1" upload would leave a misleading lone "1".
+    .replace(/\bS\d{1,2}\s*E\d{1,3}\b/gi, ' ')
+    .replace(/\bS(?:EASON)?\s*\d{1,2}\b/gi, ' ')
+    .replace(/\b(?:EPISODES?|EPS?|EP|E)\s*\d{1,3}\b/gi, ' ')
+    .replace(TITLE_NOISE, ' ')
+    .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
+    .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function titleTokens(value) {
+  return canonicalMetadataTitle(value)
+    .split(' ')
+    .filter((token) => token && !TITLE_STOP_WORDS.has(token));
+}
+
+function numberTokens(tokens) {
+  return tokens.filter((token) => /^\d+$/.test(token));
+}
+
+/**
+ * Returns a conservative 0..1 confidence score. Numeric sequel markers are
+ * intentionally significant: "Cocktail 2" must not silently become
+ * "Cocktail" simply because that older title has a poster.
+ */
+export function metadataTitleMatchScore(inputTitle, candidateTitle) {
+  const input = canonicalMetadataTitle(inputTitle);
+  const candidate = canonicalMetadataTitle(candidateTitle);
+  if (!input || !candidate) return 0;
+  if (input === candidate) return 1;
+
+  const inputTokens = titleTokens(input);
+  const candidateTokens = titleTokens(candidate);
+  if (!inputTokens.length || !candidateTokens.length) return 0;
+  const inputSet = new Set(inputTokens);
+  const candidateSet = new Set(candidateTokens);
+  const shared = [...inputSet].filter((token) => candidateSet.has(token)).length;
+  if (!shared) return 0;
+
+  const precision = shared / candidateSet.size;
+  const recall = shared / inputSet.size;
+  const f1 = (2 * precision * recall) / (precision + recall);
+  const isContained = input.includes(candidate) || candidate.includes(input);
+  let score = Math.max(f1, isContained ? 0.82 * recall + 0.12 : 0);
+
+  const wantedNumbers = numberTokens(inputTokens);
+  const candidateNumbers = numberTokens(candidateTokens);
+  if (wantedNumbers.length && wantedNumbers.some((number) => !candidateNumbers.includes(number))) score -= 0.42;
+  if (!wantedNumbers.length && candidateNumbers.length) score -= 0.08;
+  return Math.max(0, Math.min(1, score));
+}
+
+function bestTitleMatch(inputTitle, candidates = []) {
+  return candidates
+    .filter(Boolean)
+    .map((candidate) => ({ candidate: cleanText(candidate, 180), score: metadataTitleMatchScore(inputTitle, candidate) }))
+    .sort((first, second) => second.score - first.score || first.candidate.length - second.candidate.length)[0] || null;
+}
+
+function metadataKey(provider, id, type = '') {
+  const safeProvider = cleanText(provider, 20).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const safeType = cleanText(type, 20).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const safeId = cleanText(id, 80).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return safeProvider && safeId ? [safeProvider, safeType, safeId].filter(Boolean).join('-') : null;
+}
+
 function tmdbTypeForCategory(category) {
   return category === 'movie' ? 'movie' : 'tv';
 }
@@ -61,7 +147,9 @@ export function fallbackMetadata(title, category) {
     releaseLabel: categoryDetails(category).shortLabel,
     posterOriginalUrl: null,
     backdropOriginalUrl: null,
-    tmdbId: null
+    tmdbId: null,
+    metadataKey: null,
+    matchScore: 0
   };
 }
 
@@ -87,7 +175,24 @@ async function findTmdbMetadata(title, category, config) {
     return null;
   }
 
-  const result = payload?.results?.find((entry) => entry.poster_path) || payload?.results?.[0];
+  const scoredResults = (Array.isArray(payload?.results) ? payload.results : [])
+    .map((entry) => {
+      const titleMatch = bestTitleMatch(title, [entry?.title, entry?.name, entry?.original_title, entry?.original_name]);
+      return {
+        entry,
+        titleMatch,
+        // Popularity is only a tie-breaker after title similarity. It must not
+        // turn the first popular poster-bearing result into this release.
+        popularity: Number(entry?.popularity) || 0,
+        votes: Number(entry?.vote_count) || 0
+      };
+    })
+    .filter(({ titleMatch }) => titleMatch?.score >= MIN_TITLE_MATCH_SCORE)
+    .sort((first, second) => second.titleMatch.score - first.titleMatch.score
+      || second.popularity - first.popularity
+      || second.votes - first.votes);
+  const selected = scoredResults[0];
+  const result = selected?.entry;
   if (!result) return null;
 
   const genres = (result.genre_ids || [])
@@ -107,7 +212,9 @@ async function findTmdbMetadata(title, category, config) {
     releaseLabel: type === 'tv' ? 'Series' : 'Feature film',
     posterOriginalUrl: result.poster_path ? `${TMDB_IMAGE_BASE}${result.poster_path}` : null,
     backdropOriginalUrl: result.backdrop_path ? `${TMDB_IMAGE_BASE}${result.backdrop_path}` : null,
-    tmdbId: result.id ? String(result.id) : null
+    tmdbId: result.id ? String(result.id) : null,
+    metadataKey: result.id ? metadataKey('tmdb', result.id, type) : null,
+    matchScore: selected.titleMatch.score
   };
 }
 
@@ -135,6 +242,8 @@ async function findOmdbMetadata(title, category, config) {
     return null;
   }
   if (result?.Response !== 'True' || !result.Title) return null;
+  const titleMatch = bestTitleMatch(title, [result.Title]);
+  if (!titleMatch || titleMatch.score < MIN_TITLE_MATCH_SCORE) return null;
 
   const totalSeasons = Number.parseInt(result.totalSeasons, 10);
   const isSeries = result.Type === 'series';
@@ -150,22 +259,27 @@ async function findOmdbMetadata(title, category, config) {
     releaseLabel: Number.isInteger(totalSeasons) ? `${totalSeasons} season${totalSeasons === 1 ? '' : 's'}` : isSeries ? 'Series' : 'Feature film',
     posterOriginalUrl: result.Poster && result.Poster !== 'N/A' ? result.Poster : null,
     backdropOriginalUrl: null,
-    tmdbId: null
+    tmdbId: null,
+    metadataKey: result.imdbID ? metadataKey('omdb', result.imdbID, result.Type) : null,
+    matchScore: titleMatch.score
   };
 }
 
 const ANILIST_QUERY = `
   query ($search: String) {
-    Media(search: $search, type: ANIME) {
-      id
-      title { romaji english native }
-      description(asHtml: false)
-      genres
-      episodes
-      status
-      startDate { year }
-      coverImage { extraLarge large medium }
-      bannerImage
+    Page(page: 1, perPage: 10) {
+      media(search: $search, type: ANIME) {
+        id
+        title { romaji english native }
+        description(asHtml: false)
+        genres
+        episodes
+        status
+        popularity
+        startDate { year }
+        coverImage { extraLarge large medium }
+        bannerImage
+      }
     }
   }
 `;
@@ -196,7 +310,15 @@ async function findAniListMetadata(title, category = 'anime') {
   } catch {
     return null;
   }
-  const result = payload?.data?.Media;
+  const selected = (Array.isArray(payload?.data?.Page?.media) ? payload.data.Page.media : [])
+    .map((entry) => ({
+      entry,
+      titleMatch: bestTitleMatch(title, [entry?.title?.english, entry?.title?.romaji, entry?.title?.native])
+    }))
+    .filter(({ entry, titleMatch }) => entry?.id && titleMatch?.score >= MIN_TITLE_MATCH_SCORE)
+    .sort((first, second) => second.titleMatch.score - first.titleMatch.score
+      || Number(second.entry?.popularity || 0) - Number(first.entry?.popularity || 0))[0];
+  const result = selected?.entry;
   if (!result?.id) return null;
 
   const resolvedTitle = result.title?.english || result.title?.romaji || result.title?.native || title;
@@ -213,7 +335,9 @@ async function findAniListMetadata(title, category = 'anime') {
     releaseLabel: Number.isInteger(episodes) ? `${episodes} episode${episodes === 1 ? '' : 's'}` : 'Anime series',
     posterOriginalUrl: result.coverImage?.extraLarge || result.coverImage?.large || result.coverImage?.medium || null,
     backdropOriginalUrl: result.bannerImage || null,
-    tmdbId: null
+    tmdbId: null,
+    metadataKey: metadataKey('anilist', result.id, 'anime'),
+    matchScore: selected.titleMatch.score
   };
 }
 
@@ -223,21 +347,25 @@ async function findAniListMetadata(title, category = 'anime') {
 export async function findMetadata(title, category, config) {
   const fallback = fallbackMetadata(title, category);
   if (!title) return fallback;
+  // Use the same cleanup for provider lookup and verification. The original
+  // human-entered title remains the fallback display title if no match wins.
+  const lookupTitle = canonicalMetadataTitle(title) || cleanText(title, 180);
 
   const providers = ['anime', 'donghua'].includes(category)
-    ? [() => findAniListMetadata(title, category), () => findTmdbMetadata(title, category, config), () => findOmdbMetadata(title, category, config)]
+    ? [() => findAniListMetadata(lookupTitle, category), () => findTmdbMetadata(lookupTitle, category, config), () => findOmdbMetadata(lookupTitle, category, config)]
     : category === 'cartoon'
-      ? [() => findTmdbMetadata(title, category, config), () => findAniListMetadata(title, category), () => findOmdbMetadata(title, category, config)]
-      : [() => findTmdbMetadata(title, category, config), () => findOmdbMetadata(title, category, config)];
+      ? [() => findTmdbMetadata(lookupTitle, category, config), () => findAniListMetadata(lookupTitle, category), () => findOmdbMetadata(lookupTitle, category, config)]
+      : [() => findTmdbMetadata(lookupTitle, category, config), () => findOmdbMetadata(lookupTitle, category, config)];
 
-  let firstMatch = null;
+  const matches = [];
   for (const provider of providers) {
     const metadata = await provider();
     if (!metadata?.matched) continue;
-    // Keep metadata even if its artwork is unavailable, but continue through
-    // the provider chain so OMDb/TMDB/AniList can still supply a poster.
-    if (!firstMatch) firstMatch = metadata;
-    if (metadata.posterOriginalUrl) return metadata;
+    matches.push(metadata);
+    // An exact verified result cannot be improved by a later provider, so do
+    // not spend another network round-trip merely to replace its poster.
+    if (metadata.posterOriginalUrl && Number(metadata.matchScore) >= 0.99) return metadata;
   }
-  return firstMatch || fallback;
+  return matches.sort((first, second) => Number(second.matchScore || 0) - Number(first.matchScore || 0)
+    || Number(Boolean(second.posterOriginalUrl)) - Number(Boolean(first.posterOriginalUrl)))[0] || fallback;
 }

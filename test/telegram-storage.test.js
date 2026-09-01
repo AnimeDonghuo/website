@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { automationGroupKey, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, processQueuedAutomationSessions, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
@@ -46,6 +46,34 @@ test('private storage links map their internal channel ID to the Bot API channel
   );
   assert.equal(parsePrivateStorageMessageLink('https://t.me/publicchannel/9335'), null);
   assert.equal(parsePrivateStorageMessageLink('https://t.me/c/not-a-channel/9335'), null);
+});
+
+test('request management starts with Select requests and Back buttons, while post ID filters expose all periods', () => {
+  const requestButtons = requestManagerKeyboard().reply_markup.inline_keyboard.flat();
+  assert.deepEqual(requestButtons.map((button) => button.text), ['Select requests', 'Back']);
+  const postIdButtons = postIdKeyboard().reply_markup.inline_keyboard.flat();
+  assert.deepEqual(postIdButtons.map((button) => button.text), ['Today', 'Yesterday', 'Week', 'Month', 'Back']);
+});
+
+test('post ID time windows use India calendar boundaries for publisher filters', () => {
+  const now = new Date('2026-09-01T18:45:00.000Z'); // 2 September, 00:15 IST
+  const today = postIdTimeWindow('today', now);
+  const yesterday = postIdTimeWindow('yesterday', now);
+  const week = postIdTimeWindow('week', now);
+  const month = postIdTimeWindow('month', now);
+
+  assert.equal(today.startAt.toISOString(), '2026-09-01T18:30:00.000Z');
+  assert.equal(today.endAt.toISOString(), '2026-09-02T18:30:00.000Z');
+  assert.equal(yesterday.startAt.toISOString(), '2026-08-31T18:30:00.000Z');
+  assert.equal(week.startAt.toISOString(), '2026-08-26T18:30:00.000Z');
+  assert.equal(month.startAt.toISOString(), '2026-08-03T18:30:00.000Z');
+  assert.equal(postIdTimeWindow('unknown', now), null);
+});
+
+test('request resolution messages immediately explain completed and rejected statuses', () => {
+  const request = { requestText: 'Perfect World Hindi' };
+  assert.match(requestResolutionNotificationText(request, 'completed'), /completed\. Please kindly check the site\./);
+  assert.match(requestResolutionNotificationText(request, 'rejected'), /rejected due to issues\./);
 });
 
 test('batch title and category inference prefer cleaned file descriptions', () => {
@@ -135,6 +163,86 @@ test('batch import inspects every message in an inclusive private-storage range 
   assert.equal(session.category, 'web-series');
   assert.equal(published, true);
   assert.match(replies.at(-1), /Imported 2 new files/);
+});
+
+test('batch import accepts a 448-message inclusive range as one release with progress updates', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.startSession({ chatId: 200, ownerId: 300, category: 'web-series', title: 'Long Running Show' });
+  await repository.updateSession(200, 300, {
+    workflow: 'batch',
+    batch: { firstMessageId: 1, sourceChannelId: '-1002617067511', categoryOverride: 'web-series' }
+  });
+  const session = await repository.findSession(200, 300);
+  const forwarded = [];
+  const replies = [];
+  const ctx = {
+    chat: { id: 200 },
+    from: { id: 300 },
+    telegram: {
+      async forwardMessage(_destination, _source, messageId) {
+        forwarded.push(messageId);
+        return {
+          message_id: 10_000 + messageId,
+          document: {
+            file_id: `file-${messageId}`,
+            file_name: `Long.Running.Show.S01E${String(messageId).padStart(3, '0')}.1080p.mkv`
+          }
+        };
+      },
+      async deleteMessage() {}
+    },
+    async reply(text) { replies.push(text); }
+  };
+
+  const result = await importStorageRange(
+    ctx,
+    session,
+    { channelId: '-1002617067511', messageId: 448 },
+    {},
+    repository,
+    { telegram: { storageChannelId: '-1002617067511' } },
+    async () => ({ content: { title: 'Long Running Show' } })
+  );
+
+  assert.equal(result.imported, 448);
+  assert.equal(forwarded.length, 448);
+  assert.deepEqual([forwarded[0], forwarded.at(-1)], [1, 448]);
+  assert.equal((await repository.findSession(200, 300)).files.length, 448);
+  assert.ok(replies.some((text) => text.includes('Batch progress: 448/448')));
+  assert.ok(replies.some((text) => text.includes('Imported 448 new files')));
+});
+
+test('batch import retries a Telegram rate-limit response before recording a failure', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.startSession({ chatId: 200, ownerId: 300, category: 'movie', title: 'Retry release' });
+  await repository.updateSession(200, 300, {
+    workflow: 'batch',
+    batch: { firstMessageId: 44, sourceChannelId: '-1002617067511', categoryOverride: 'movie' }
+  });
+  let attempts = 0;
+  const ctx = {
+    chat: { id: 200 },
+    from: { id: 300 },
+    telegram: {
+      async forwardMessage() {
+        attempts += 1;
+        if (attempts === 1) throw { description: 'Too Many Requests', parameters: { retry_after: 0.001 } };
+        return { message_id: 500, document: { file_id: 'retry-file', file_name: 'Retry.Release.1080p.mkv' } };
+      },
+      async deleteMessage() {}
+    },
+    async reply() {}
+  };
+
+  const result = await importStorageRange(
+    ctx,
+    await repository.findSession(200, 300),
+    { channelId: '-1002617067511', messageId: 44 },
+    {}, repository, { telegram: { storageChannelId: '-1002617067511' } },
+    async () => ({ content: { title: 'Retry release' } })
+  );
+  assert.equal(attempts, 2);
+  assert.equal(result.imported, 1);
 });
 
 test('batch import enumerates already-published, active-draft, non-media, and inaccessible message IDs', async () => {
@@ -274,6 +382,78 @@ test('storage automation persistently groups matching direct uploads, then publi
   assert.equal(content.files.length, 3);
   assert.match(notifications.at(-1), /No second announcement was sent/);
   assert.equal(automationGroupKey('Cocktail 2', 73), 'cocktail-2');
+});
+
+test('provider-verified aliases merge noisy automatic titles into one catalog record', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const firstKeys = automationMergeKeys(
+    { title: 'Raakh', auto: { groupKey: 'raakh' } },
+    { title: 'Raakh', metadataKey: 'tmdb-tv-444' }
+  );
+  const first = await repository.createContent({
+    title: 'Raakh',
+    category: 'web-series',
+    metadataKey: 'tmdb-tv-444',
+    automationKey: 'raakh',
+    automationKeys: firstKeys,
+    files: [{ storageMessageId: 1, name: 'Raakh.S01E01.mkv' }]
+  });
+  const laterKeys = automationMergeKeys(
+    { title: 'Raakh S01', auto: { groupKey: 'raakh-s01' } },
+    { title: 'Raakh', metadataKey: 'tmdb-tv-444' }
+  );
+  assert.ok(laterKeys.includes('tmdb-tv-444'));
+  const matched = await repository.findContentByMergeKey('tmdb-tv-444');
+  assert.equal(matched.adminId, first.adminId);
+  const merged = await repository.appendFilesToContentByMergeKey('tmdb-tv-444', [{ storageMessageId: 2, name: 'Raakh.S01E02.mkv' }], laterKeys);
+  assert.equal(merged.adminId, first.adminId);
+  assert.equal(merged.filesCount, 2);
+  assert.ok(merged.automationKeys.includes('raakh-s01'));
+  assert.equal((await repository.listContent({ limit: 10 })).length, 1);
+});
+
+test('automatic publishing resolves a verified TMDB alias before it can create a duplicate post', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    results: [{ id: 444, name: 'Raakh', poster_path: '/raakh.jpg', popularity: 10 }]
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const repository = new MemoryCatalogRepository([]);
+  await repository.setAutoPublishSettings({ enabled: true, updatedBy: 700, notifyChatId: 700 });
+  const existing = await repository.createContent({
+    title: 'Raakh',
+    category: 'web-series',
+    metadataKey: 'tmdb-tv-444',
+    automationKey: 'raakh',
+    files: [{ storageMessageId: 1, name: 'Raakh.S01E01.mkv' }]
+  });
+  const now = new Date().toISOString();
+  await repository.queueAutomationSession({
+    chatId: '-1002617067511',
+    ownerId: 'auto-storage-group-raakh-season-01',
+    category: 'web-series',
+    title: 'Raakh Season 01',
+    groupKey: 'raakh-season-01',
+    file: { storageMessageId: 2, name: 'Raakh.S01E02.mkv' },
+    scheduledAt: now,
+    maxWaitAt: now,
+    firstReceivedAt: now,
+    receivedAt: now
+  });
+  let publishCalls = 0;
+  const results = await processQueuedAutomationSessions({
+    bot: { telegram: { async sendMessage() {} } },
+    repository,
+    config: { tmdbApiKey: 'test-key', telegram: { botUsername: 'DeliveryBot' } },
+    publish: async () => { publishCalls += 1; return { content: null }; },
+    now: new Date(Date.now() + 1_000).toISOString()
+  });
+
+  assert.equal(publishCalls, 0);
+  assert.equal(results[0].state, 'merged');
+  assert.equal((await repository.findContentByMergeKey('tmdb-tv-444')).adminId, existing.adminId);
+  assert.equal((await repository.findContentByMergeKey('tmdb-tv-444')).filesCount, 2);
 });
 
 test('queued automation keeps errors out of storage and sends an actionable report only to the publisher', async () => {

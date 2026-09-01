@@ -30,3 +30,27 @@ test('stable catalog delivery URLs redirect to the currently active bot', async 
   assert.equal(newBotResponse.status, 302);
   assert.equal(newBotResponse.headers.get('location'), 'https://t.me/ReplacementDeliveryBot?start=file-aB-cD_ef-2');
 });
+
+test('anonymous HTML visits are counted with a first-party random cookie, without API or static traffic', async (t) => {
+  const repository = new MemoryCatalogRepository([]);
+  const app = createApp({
+    config: { environment: 'test', telegram: { botUsername: 'DeliveryBot' } },
+    repository,
+    distPath: '/tmp/sorabox-no-static-files'
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const first = await fetch(`${url}/`, { headers: { accept: 'text/html' } });
+  const cookie = first.headers.get('set-cookie').split(';')[0];
+  await fetch(`${url}/`, { headers: { accept: 'text/html', cookie } });
+  await fetch(`${url}/api/health`, { headers: { accept: 'text/html', cookie } });
+  await fetch(`${url}/assets/app.js`, { headers: { accept: 'text/html', cookie } });
+
+  const stats = await repository.getPublisherStats();
+  assert.equal(stats.site.visitors, 1);
+  assert.equal(stats.site.visits, 2);
+  assert.equal(stats.site.activeVisitors24h, 1);
+});

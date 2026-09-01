@@ -4,6 +4,9 @@ import { CATEGORY_IDS, cleanText, makeReference, makeShareCode, slugify } from '
 import { summarizeEpisodes, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
+const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
+const MAX_ADMIN_CONTENT_RESULTS = 100;
+const MAX_REQUEST_RESULTS = 200;
 
 // List cards only need safe display fields plus enough file-label information
 // to derive languages from older uploads. Storage message IDs and Telegram file
@@ -69,6 +72,69 @@ function sortByPublishedAt(items) {
 
 function normalizedMergeKey(value) {
   return slugify(cleanText(value, 180));
+}
+
+function safeDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function adminContentListOptions(value) {
+  const supplied = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : { limit: value };
+  const limit = Math.max(1, Math.min(Number(supplied.limit) || 25, MAX_ADMIN_CONTENT_RESULTS));
+  const startAt = safeDateTime(supplied.startAt);
+  const endAt = safeDateTime(supplied.endAt);
+  return { limit, startAt, endAt };
+}
+
+function requestListOptions(value) {
+  const supplied = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : { limit: value };
+  const status = ['open', 'completed', 'rejected'].includes(supplied.status) ? supplied.status : 'open';
+  return {
+    status,
+    limit: Math.max(1, Math.min(Number(supplied.limit) || 12, MAX_REQUEST_RESULTS))
+  };
+}
+
+function safeRequestIds(requestIds) {
+  return [...new Set(
+    (Array.isArray(requestIds) ? requestIds : [])
+      .map((requestId) => String(requestId || '').toUpperCase())
+      .filter((requestId) => /^REQ-[A-F0-9]{10}$/.test(requestId))
+  )].slice(0, MAX_REQUEST_RESULTS);
+}
+
+function uniqueKeys(values = []) {
+  return [...new Set(values
+    .map((value) => normalizedMergeKey(value))
+    .filter((value) => value && value !== 'untitled-release'))]
+    .slice(0, 8);
+}
+
+function safeAnonymousId(value) {
+  return String(value || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 128);
+}
+
+function statisticNow(value) {
+  return safeDateTime(value) || new Date();
+}
+
+function activitySince(records, dateKey, threshold) {
+  return records.filter((record) => {
+    const value = safeDateTime(record?.[dateKey]);
+    return value && value >= threshold;
+  });
+}
+
+function uniqueActiveIds(records, dateKey, threshold, idKey) {
+  return new Set(activitySince(records, dateKey, threshold)
+    .map((record) => String(record?.[idKey] || ''))
+    .filter(Boolean)).size;
 }
 
 function uniqueFiles(existingFiles = [], additionalFiles = []) {
@@ -169,11 +235,18 @@ function normalizeContent(input) {
     poster: input.poster || null,
     metadataProvider: cleanText(input.metadataProvider, 30) || null,
     tmdbId: input.tmdbId || null,
+    metadataKey: input.metadataKey ? normalizedMergeKey(input.metadataKey) : null,
     art: input.art || null,
     // titleKey makes same-title merging work for manual, batch, and older
-    // records. automationKey is intentionally only set for auto groups.
+    // records. Automation keeps raw and internet-verified aliases so slightly
+    // different upload labels still converge on one catalog record.
     titleKey: normalizedMergeKey(title),
     automationKey: input.automationKey ? normalizedMergeKey(input.automationKey) : null,
+    automationKeys: uniqueKeys([
+      ...(Array.isArray(input.automationKeys) ? input.automationKeys : []),
+      input.automationKey,
+      input.metadataKey
+    ]),
     files,
     filesCount,
     hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
@@ -208,6 +281,10 @@ export class MemoryCatalogRepository {
     this.sessions = new Map();
     this.adminSessions = new Map();
     this.requests = new Map();
+    this.requestSelections = new Map();
+    this.botUsers = new Map();
+    this.siteVisitors = new Map();
+    this.siteVisits = [];
     this.announcementChannels = new Map();
     this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
   }
@@ -245,25 +322,34 @@ export class MemoryCatalogRepository {
   async findContentByMergeKey(mergeKey) {
     const normalizedKey = normalizedMergeKey(mergeKey);
     const item = [...this.contents.values()].find((entry) =>
-      entry.published !== false && (entry.automationKey === normalizedKey || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
+      entry.published !== false && (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey)
     );
     return item ? clone(item) : null;
   }
 
-  async appendFilesToContentByMergeKey(mergeKey, additionalFiles) {
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = []) {
     const item = await this.findContentByMergeKey(mergeKey);
     if (!item) return null;
     const saved = this.contents.get(item.slug);
     Object.assign(saved, contentFileAppendPatch(saved, additionalFiles), {
-      automationKey: saved.automationKey || normalizedMergeKey(mergeKey)
+      automationKey: saved.automationKey || normalizedMergeKey(mergeKey),
+      automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
     });
     this.contents.set(saved.slug, saved);
     return clone(saved);
   }
 
-  async listAdminContent(limit = 25) {
+  async listAdminContent(options = {}) {
+    const { limit, startAt, endAt } = adminContentListOptions(options);
     return sortByPublishedAt([...this.contents.values()])
-      .slice(0, Math.max(1, Math.min(Number(limit) || 25, 50)))
+      .filter((item) => item.published !== false)
+      .filter((item) => {
+        if (!startAt && !endAt) return true;
+        const publishedAt = safeDateTime(item.publishedAt);
+        if (!publishedAt) return false;
+        return (!startAt || publishedAt >= startAt) && (!endAt || publishedAt < endAt);
+      })
+      .slice(0, limit)
       .map((item) => clone({
         adminId: item.adminId,
         title: item.title,
@@ -517,6 +603,7 @@ export class MemoryCatalogRepository {
   }
 
   async createRequest({ requestText, requester }) {
+    const now = new Date().toISOString();
     const request = {
       id: makeReference('REQ'),
       requestText: cleanText(requestText, 500),
@@ -526,17 +613,174 @@ export class MemoryCatalogRepository {
         name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
       },
       status: 'open',
-      createdAt: new Date().toISOString()
+      createdAt: now,
+      statusUpdatedAt: now,
+      resolvedAt: null,
+      resolvedBy: null,
+      resolution: null
     };
     this.requests.set(request.id, request);
     return clone(request);
   }
 
-  async listRequests(limit = 12) {
+  async listRequests(options = {}) {
+    const { status, limit } = requestListOptions(options);
     return [...this.requests.values()]
+      .filter((request) => request.status === status)
       .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt))
-      .slice(0, Math.max(1, Math.min(Number(limit) || 12, 30)))
+      .slice(0, limit)
       .map(clone);
+  }
+
+  async startRequestSelection({ chatId, ownerId, expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const selection = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      requestIds: [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + REQUEST_SELECTION_TTL_MS).toISOString()
+    };
+    this.requestSelections.set(sessionKey(chatId, ownerId), selection);
+    return clone(selection);
+  }
+
+  async findRequestSelection(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const selection = this.requestSelections.get(key);
+    if (!selection) return null;
+    const expiresAt = safeDateTime(selection.expiresAt);
+    if (!expiresAt || expiresAt.getTime() <= Date.now()) {
+      this.requestSelections.delete(key);
+      return null;
+    }
+    return clone(selection);
+  }
+
+  async toggleRequestSelection(chatId, ownerId, requestId, { expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const selection = await this.findRequestSelection(chatId, ownerId);
+    const id = safeRequestIds([requestId])[0];
+    if (!selection || !id || this.requests.get(id)?.status !== 'open') return null;
+    const selected = new Set(selection.requestIds || []);
+    if (selected.has(id)) selected.delete(id);
+    else if (selected.size < MAX_REQUEST_RESULTS) selected.add(id);
+    const saved = {
+      ...selection,
+      requestIds: safeRequestIds([...selected]),
+      updatedAt: new Date().toISOString(),
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + REQUEST_SELECTION_TTL_MS).toISOString()
+    };
+    this.requestSelections.set(key, saved);
+    return clone(saved);
+  }
+
+  async deleteRequestSelection(chatId, ownerId) {
+    this.requestSelections.delete(sessionKey(chatId, ownerId));
+  }
+
+  async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
+    if (!['completed', 'rejected'].includes(status)) return [];
+    const ids = safeRequestIds(requestIds);
+    const now = safeDateTime(resolvedAt)?.toISOString() || new Date().toISOString();
+    const resolved = [];
+    for (const id of ids) {
+      const request = this.requests.get(id);
+      if (!request || request.status !== 'open') continue;
+      Object.assign(request, {
+        status,
+        statusUpdatedAt: now,
+        resolvedAt: now,
+        resolvedBy: resolvedBy === null || resolvedBy === undefined ? null : String(resolvedBy),
+        resolution: status
+      });
+      this.requests.set(id, request);
+      resolved.push(clone(request));
+    }
+    return resolved;
+  }
+
+  async recordBotUser(user, { seenAt = new Date().toISOString() } = {}) {
+    const id = String(user?.id || '');
+    if (!id) return null;
+    const now = safeDateTime(seenAt)?.toISOString() || new Date().toISOString();
+    const existing = this.botUsers.get(id);
+    const record = {
+      id,
+      username: cleanText(user?.username || existing?.username || '', 60),
+      name: cleanText([user?.first_name, user?.last_name].filter(Boolean).join(' ') || existing?.name || '', 100),
+      languageCode: cleanText(user?.language_code || existing?.languageCode || '', 20),
+      firstSeenAt: existing?.firstSeenAt || now,
+      lastSeenAt: now,
+      interactionCount: (existing?.interactionCount || 0) + 1
+    };
+    this.botUsers.set(id, record);
+    return clone(record);
+  }
+
+  async recordSiteVisit({ visitorId, path = '/', visitedAt = new Date().toISOString() } = {}) {
+    const id = safeAnonymousId(visitorId);
+    if (!id) return null;
+    const now = safeDateTime(visitedAt)?.toISOString() || new Date().toISOString();
+    const existing = this.siteVisitors.get(id);
+    const visitor = {
+      visitorId: id,
+      firstSeenAt: existing?.firstSeenAt || now,
+      lastSeenAt: now,
+      visitCount: (existing?.visitCount || 0) + 1
+    };
+    this.siteVisitors.set(id, visitor);
+    this.siteVisits.push({ visitorId: id, path: cleanText(path, 160) || '/', visitedAt: now });
+    // A demo/in-memory repository must not grow forever when used for a long
+    // local preview. Persistent deployments retain the complete analytics data.
+    if (this.siteVisits.length > 50_000) this.siteVisits.splice(0, this.siteVisits.length - 50_000);
+    return clone(visitor);
+  }
+
+  async getPublisherStats({ now = new Date() } = {}) {
+    const current = statisticNow(now);
+    const dayStart = new Date(current.getTime() - 24 * 60 * 60 * 1000);
+    const weekStart = new Date(current.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const catalog = [...this.contents.values()].filter((item) => item.published !== false);
+    const requests = [...this.requests.values()];
+    const visitors = [...this.siteVisitors.values()];
+    const visits = this.siteVisits;
+    const botUsers = [...this.botUsers.values()];
+    const byCategory = Object.fromEntries([...CATEGORY_IDS].map((category) => [category, 0]));
+    for (const item of catalog) byCategory[item.category] = (byCategory[item.category] || 0) + 1;
+    const requestByStatus = Object.fromEntries(['open', 'completed', 'rejected'].map((status) => [status, 0]));
+    for (const request of requests) requestByStatus[request.status] = (requestByStatus[request.status] || 0) + 1;
+    const latestVisit = visits.reduce((latest, visit) => !latest || String(visit.visitedAt) > String(latest) ? visit.visitedAt : latest, null);
+    const latestBotActivity = botUsers.reduce((latest, user) => !latest || String(user.lastSeenAt) > String(latest) ? user.lastSeenAt : latest, null);
+
+    return {
+      generatedAt: current.toISOString(),
+      catalog: {
+        posts: catalog.length,
+        files: catalog.reduce((total, item) => total + Number(item.filesCount || item.files?.length || 0), 0),
+        episodes: catalog.reduce((total, item) => total + Number(item.episodeCount || 0), 0),
+        deliveries: catalog.reduce((total, item) => total + Number(item.deliveryCount || 0), 0),
+        byCategory
+      },
+      requests: { total: requests.length, ...requestByStatus },
+      site: {
+        visitors: visitors.length,
+        visits: visits.length,
+        activeVisitors24h: uniqueActiveIds(visitors, 'lastSeenAt', dayStart, 'visitorId'),
+        activeVisitors7d: uniqueActiveIds(visitors, 'lastSeenAt', weekStart, 'visitorId'),
+        visits24h: activitySince(visits, 'visitedAt', dayStart).length,
+        visits7d: activitySince(visits, 'visitedAt', weekStart).length,
+        latestActivityAt: latestVisit
+      },
+      bot: {
+        users: botUsers.length,
+        interactions: botUsers.reduce((total, user) => total + Number(user.interactionCount || 0), 0),
+        activeUsers24h: activitySince(botUsers, 'lastSeenAt', dayStart).length,
+        activeUsers7d: activitySince(botUsers, 'lastSeenAt', weekStart).length,
+        latestActivityAt: latestBotActivity
+      }
+    };
   }
 
   async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {
@@ -593,6 +837,10 @@ export class MongoCatalogRepository {
     this.sessions = db.collection('upload_sessions');
     this.adminSessions = db.collection('admin_sessions');
     this.requests = db.collection('requests');
+    this.requestSelections = db.collection('request_selections');
+    this.botUsers = db.collection('bot_users');
+    this.siteVisitors = db.collection('site_visitors');
+    this.siteVisits = db.collection('site_visits');
     this.announcementChannels = db.collection('announcement_channels');
     this.automationSettings = db.collection('automation_settings');
   }
@@ -606,6 +854,8 @@ export class MongoCatalogRepository {
       this.contents.createIndex({ category: 1, publishedAt: -1 }),
       this.contents.createIndex({ 'files.storageMessageId': 1 }),
       this.contents.createIndex({ automationKey: 1 }),
+      this.contents.createIndex({ automationKeys: 1 }),
+      this.contents.createIndex({ metadataKey: 1 }),
       this.contents.createIndex({ titleKey: 1 }),
       this.sessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.sessions.createIndex({ 'files.storageMessageId': 1 }),
@@ -615,6 +865,14 @@ export class MongoCatalogRepository {
       this.adminSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.requests.createIndex({ id: 1 }, { unique: true }),
       this.requests.createIndex({ status: 1, createdAt: -1 }),
+      this.requestSelections.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.requestSelections.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.botUsers.createIndex({ id: 1 }, { unique: true }),
+      this.botUsers.createIndex({ lastSeenAt: -1 }),
+      this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
+      this.siteVisitors.createIndex({ lastSeenAt: -1 }),
+      this.siteVisits.createIndex({ visitedAt: -1 }),
+      this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
       this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
   }
@@ -677,7 +935,9 @@ export class MongoCatalogRepository {
     return this.contents.findOne({
       published: { $ne: false },
       $or: [
+        { metadataKey: normalizedKey },
         { automationKey: normalizedKey },
+        { automationKeys: normalizedKey },
         { titleKey: normalizedKey },
         // Old records predate titleKey; their first slug remains a useful
         // backwards-compatible same-title match.
@@ -686,12 +946,13 @@ export class MongoCatalogRepository {
     });
   }
 
-  async appendFilesToContentByMergeKey(mergeKey, additionalFiles) {
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = []) {
     const content = await this.findContentByMergeKey(mergeKey);
     if (!content) return null;
     const patch = {
       ...contentFileAppendPatch(content, additionalFiles),
-      automationKey: content.automationKey || normalizedMergeKey(mergeKey)
+      automationKey: content.automationKey || normalizedMergeKey(mergeKey),
+      automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
     };
     return this.contents.findOneAndUpdate(
       { _id: content._id },
@@ -700,10 +961,18 @@ export class MongoCatalogRepository {
     );
   }
 
-  async listAdminContent(limit = 25) {
+  async listAdminContent(options = {}) {
+    const { limit, startAt, endAt } = adminContentListOptions(options);
+    const filter = { published: { $ne: false } };
+    if (startAt || endAt) {
+      filter.publishedAt = {
+        ...(startAt ? { $gte: startAt.toISOString() } : {}),
+        ...(endAt ? { $lt: endAt.toISOString() } : {})
+      };
+    }
     return this.contents
       .find(
-        { published: { $ne: false } },
+        filter,
         {
           projection: {
             adminId: 1,
@@ -717,7 +986,7 @@ export class MongoCatalogRepository {
         }
       )
       .sort({ publishedAt: -1 })
-      .limit(Math.max(1, Math.min(Number(limit) || 25, 50)))
+      .limit(limit)
       .toArray();
   }
 
@@ -995,6 +1264,7 @@ export class MongoCatalogRepository {
   }
 
   async createRequest({ requestText, requester }) {
+    const now = new Date().toISOString();
     const document = {
       id: makeReference('REQ'),
       requestText: cleanText(requestText, 500),
@@ -1004,7 +1274,11 @@ export class MongoCatalogRepository {
         name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
       },
       status: 'open',
-      createdAt: new Date().toISOString()
+      createdAt: now,
+      statusUpdatedAt: now,
+      resolvedAt: null,
+      resolvedBy: null,
+      resolution: null
     };
     for (let attempt = 0; attempt < 8; attempt += 1) {
       try {
@@ -1018,12 +1292,185 @@ export class MongoCatalogRepository {
     throw new Error('Could not create a request ID.');
   }
 
-  async listRequests(limit = 12) {
+  async listRequests(options = {}) {
+    const { status, limit } = requestListOptions(options);
     return this.requests
-      .find({ status: 'open' })
+      .find({ status })
       .sort({ createdAt: -1 })
-      .limit(Math.max(1, Math.min(Number(limit) || 12, 30)))
+      .limit(limit)
       .toArray();
+  }
+
+  async startRequestSelection({ chatId, ownerId, expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const document = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      requestIds: [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + REQUEST_SELECTION_TTL_MS)
+    };
+    return this.requestSelections.findOneAndUpdate(
+      { chatId: document.chatId, ownerId: document.ownerId },
+      { $set: document },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findRequestSelection(chatId, ownerId) {
+    return this.requestSelections.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async toggleRequestSelection(chatId, ownerId, requestId, { expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const id = safeRequestIds([requestId])[0];
+    if (!id) return null;
+    const request = await this.requests.findOne({ id, status: 'open' }, { projection: { id: 1 } });
+    if (!request) return null;
+    const current = await this.findRequestSelection(chatId, ownerId);
+    if (!current) return null;
+    const selected = new Set(current.requestIds || []);
+    if (selected.has(id)) selected.delete(id);
+    else if (selected.size < MAX_REQUEST_RESULTS) selected.add(id);
+    return this.requestSelections.findOneAndUpdate(
+      {
+        chatId: String(chatId),
+        ownerId: String(ownerId),
+        expiresAt: { $gt: new Date() }
+      },
+      {
+        $set: {
+          requestIds: safeRequestIds([...selected]),
+          updatedAt: new Date().toISOString(),
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + REQUEST_SELECTION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async deleteRequestSelection(chatId, ownerId) {
+    await this.requestSelections.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
+    if (!['completed', 'rejected'].includes(status)) return [];
+    const ids = safeRequestIds(requestIds);
+    const now = safeDateTime(resolvedAt)?.toISOString() || new Date().toISOString();
+    const results = await Promise.all(ids.map((id) => this.requests.findOneAndUpdate(
+      { id, status: 'open' },
+      {
+        $set: {
+          status,
+          statusUpdatedAt: now,
+          resolvedAt: now,
+          resolvedBy: resolvedBy === null || resolvedBy === undefined ? null : String(resolvedBy),
+          resolution: status
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    )));
+    return results.filter(Boolean);
+  }
+
+  async recordBotUser(user, { seenAt = new Date() } = {}) {
+    const id = String(user?.id || '');
+    if (!id) return null;
+    const now = safeDateTime(seenAt) || new Date();
+    const result = await this.botUsers.findOneAndUpdate(
+      { id },
+      {
+        $set: {
+          username: cleanText(user?.username || '', 60),
+          name: cleanText([user?.first_name, user?.last_name].filter(Boolean).join(' '), 100),
+          languageCode: cleanText(user?.language_code || '', 20),
+          lastSeenAt: now
+        },
+        $setOnInsert: { id, firstSeenAt: now, interactionCount: 0 },
+        $inc: { interactionCount: 1 }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async recordSiteVisit({ visitorId, path = '/', visitedAt = new Date() } = {}) {
+    const id = safeAnonymousId(visitorId);
+    if (!id) return null;
+    const now = safeDateTime(visitedAt) || new Date();
+    const visitor = await this.siteVisitors.findOneAndUpdate(
+      { visitorId: id },
+      {
+        $set: { lastSeenAt: now },
+        $setOnInsert: { visitorId: id, firstSeenAt: now, visitCount: 0 },
+        $inc: { visitCount: 1 }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    await this.siteVisits.insertOne({ visitorId: id, path: cleanText(path, 160) || '/', visitedAt: now });
+    return visitor;
+  }
+
+  async getPublisherStats({ now = new Date() } = {}) {
+    const current = statisticNow(now);
+    const dayStart = new Date(current.getTime() - 24 * 60 * 60 * 1000);
+    const weekStart = new Date(current.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const [catalogRows, requestRows, visitorTotal, visitTotal, activeVisitors24h, activeVisitors7d, visits24h, visits7d, latestVisit, botRows, latestBotActivity] = await Promise.all([
+      this.contents.aggregate([
+        { $match: { published: { $ne: false } } },
+        { $group: { _id: '$category', posts: { $sum: 1 }, files: { $sum: { $ifNull: ['$filesCount', 0] } }, episodes: { $sum: { $ifNull: ['$episodeCount', 0] } }, deliveries: { $sum: { $ifNull: ['$deliveryCount', 0] } } } }
+      ]).toArray(),
+      this.requests.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]).toArray(),
+      this.siteVisitors.countDocuments({}),
+      this.siteVisits.countDocuments({}),
+      this.siteVisitors.countDocuments({ lastSeenAt: { $gte: dayStart } }),
+      this.siteVisitors.countDocuments({ lastSeenAt: { $gte: weekStart } }),
+      this.siteVisits.countDocuments({ visitedAt: { $gte: dayStart } }),
+      this.siteVisits.countDocuments({ visitedAt: { $gte: weekStart } }),
+      this.siteVisits.findOne({}, { sort: { visitedAt: -1 }, projection: { visitedAt: 1 } }),
+      this.botUsers.aggregate([{ $group: { _id: null, users: { $sum: 1 }, interactions: { $sum: { $ifNull: ['$interactionCount', 0] } }, activeUsers24h: { $sum: { $cond: [{ $gte: ['$lastSeenAt', dayStart] }, 1, 0] } }, activeUsers7d: { $sum: { $cond: [{ $gte: ['$lastSeenAt', weekStart] }, 1, 0] } } } }]).toArray(),
+      this.botUsers.findOne({}, { sort: { lastSeenAt: -1 }, projection: { lastSeenAt: 1 } })
+    ]);
+    const byCategory = Object.fromEntries([...CATEGORY_IDS].map((category) => [category, 0]));
+    const catalog = { posts: 0, files: 0, episodes: 0, deliveries: 0, byCategory };
+    for (const row of catalogRows) {
+      catalog.posts += Number(row.posts || 0);
+      catalog.files += Number(row.files || 0);
+      catalog.episodes += Number(row.episodes || 0);
+      catalog.deliveries += Number(row.deliveries || 0);
+      if (row._id) byCategory[row._id] = Number(row.posts || 0);
+    }
+    const requestCounts = Object.fromEntries(['open', 'completed', 'rejected'].map((status) => [status, 0]));
+    for (const row of requestRows) requestCounts[row._id] = Number(row.count || 0);
+    const bot = botRows[0] || {};
+    return {
+      generatedAt: current.toISOString(),
+      catalog,
+      requests: {
+        total: requestRows.reduce((total, row) => total + Number(row.count || 0), 0),
+        ...requestCounts
+      },
+      site: {
+        visitors: visitorTotal,
+        visits: visitTotal,
+        activeVisitors24h,
+        activeVisitors7d,
+        visits24h,
+        visits7d,
+        latestActivityAt: latestVisit?.visitedAt?.toISOString?.() || latestVisit?.visitedAt || null
+      },
+      bot: {
+        users: Number(bot.users || 0),
+        interactions: Number(bot.interactions || 0),
+        activeUsers24h: Number(bot.activeUsers24h || 0),
+        activeUsers7d: Number(bot.activeUsers7d || 0),
+        latestActivityAt: latestBotActivity?.lastSeenAt?.toISOString?.() || latestBotActivity?.lastSeenAt || null
+      }
+    };
   }
 
   async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {

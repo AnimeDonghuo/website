@@ -7,7 +7,8 @@ import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
-const MAX_BATCH_MESSAGE_COUNT = 100;
+const BATCH_PROGRESS_INTERVAL = 25;
+const BATCH_MAX_FORWARD_RETRIES = 8;
 // Storage channel uploads can arrive as a burst of hundreds of separate
 // channel posts. Persist a quiet-period deadline, rather than publishing each
 // event immediately, so one release becomes one catalog record.
@@ -129,10 +130,12 @@ const PUBLISHER_COMMANDS = [
   { command: 'teststorage', description: 'Check the storage channel connection' },
   { command: 'delete', description: 'Delete one or more post IDs' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
+  { command: 'postid', description: 'Find uploaded post IDs by time' },
+  { command: 'stats', description: 'View publisher analytics' },
   { command: 'addchannel', description: 'Add an announcement channel' },
   { command: 'channels', description: 'List announcement channels' },
   { command: 'removechannel', description: 'Remove an announcement channel' },
-  { command: 'requests', description: 'View open catalog requests' },
+  { command: 'requests', description: 'Manage catalog requests' },
   { command: 'logout', description: 'Lock publisher controls' }
 ];
 
@@ -562,7 +565,7 @@ async function beginBatch(ctx, suppliedArgument, repository, config) {
       'Send the FIRST private database-channel link, then send the LAST link. Both links must look like:',
       'https://t.me/c/1234567890/123',
       '',
-      `Every media message in the inclusive range is imported (up to ${MAX_BATCH_MESSAGE_COUNT}). The bot briefly forwards each item only to inspect its file details, then removes that preview.`,
+      'Every supported media message in the inclusive range is imported as one release. Large episode ranges are processed patiently with progress updates; the bot briefly forwards each item only to inspect its file details, then removes that preview.',
       parsed.title
         ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
         : 'The title and category will be inferred from the imported file descriptions and names.'
@@ -607,7 +610,7 @@ async function replyBatchDiagnostics(ctx, lines) {
     }
     if (chunk) await ctx.reply(chunk);
     // Details are compact, but Telegram's 4096-character limit should never
-    // hide why the final IDs in a 100-message range were skipped.
+    // hide why a long inclusive range had individual messages skipped.
     while (line.length > maximumLength) {
       await ctx.reply(line.slice(0, maximumLength));
       line = line.slice(maximumLength);
@@ -615,6 +618,55 @@ async function replyBatchDiagnostics(ctx, lines) {
     chunk = line;
   }
   if (chunk) await ctx.reply(chunk);
+}
+
+function telegramRetryAfterMilliseconds(error, attempt) {
+  const retryAfter = Number(
+    error?.parameters?.retry_after
+    || error?.response?.parameters?.retry_after
+    || error?.response?.body?.parameters?.retry_after
+  );
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1_000, 10 * 60_000);
+  const details = telegramErrorText(error);
+  if (/too many requests|flood|429/.test(details)) return Math.min(1_000 * (2 ** attempt), 30_000);
+  return 0;
+}
+
+function pause(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function forwardStorageMessageWithRetry(ctx, storageChannelId, storageMessageId) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= BATCH_MAX_FORWARD_RETRIES; attempt += 1) {
+    try {
+      return await ctx.telegram.forwardMessage(
+        chatId(ctx),
+        String(storageChannelId),
+        storageMessageId,
+        { disable_notification: true }
+      );
+    } catch (error) {
+      lastError = error;
+      const waitMilliseconds = telegramRetryAfterMilliseconds(error, attempt);
+      if (!waitMilliseconds || attempt === BATCH_MAX_FORWARD_RETRIES) throw error;
+      const waitLabel = waitMilliseconds >= 1_000 ? `${Math.ceil(waitMilliseconds / 1_000)}s` : `${waitMilliseconds}ms`;
+      console.warn(`[telegram] batch import rate limited at storage message ${storageMessageId}; retrying in ${waitLabel} (attempt ${attempt + 1}/${BATCH_MAX_FORWARD_RETRIES}).`);
+      await pause(waitMilliseconds);
+    }
+  }
+  throw lastError || new Error('Could not inspect the storage message.');
+}
+
+async function reportBatchProgress(ctx, { processed, total, imported, skipped, failed }) {
+  try {
+    await ctx.reply(
+      `Batch progress: ${processed}/${total} storage messages inspected · ${imported} media imported · ${skipped} skipped${failed ? ` · ${failed} could not be inspected` : ''}.`
+    );
+  } catch (error) {
+    // A progress update is helpful but must never interrupt a long release.
+    console.warn('[telegram] could not send batch progress:', automationDiagnostic(error));
+  }
 }
 
 export async function importStorageRange(ctx, session, lastLink, bot, repository, config, publish = publishDraft) {
@@ -628,35 +680,37 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
     nonMedia: []
   };
   const failures = [];
+  const totalMessages = lastMessageId - firstMessageId + 1;
+  let processedMessages = 0;
 
   for (let storageMessageId = firstMessageId; storageMessageId <= lastMessageId; storageMessageId += 1) {
-    const existing = await repository.findContentByStorageMessageId(storageMessageId);
-    if (existing) {
-      skippedByReason.alreadyPublished.push({
-        messageId: storageMessageId,
-        detail: existing.adminId || cleanText(existing.title, 70) || 'published post'
-      });
-      continue;
-    }
-    const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
-    if (pendingDraft) {
-      skippedByReason.activeDraft.push({
-        messageId: storageMessageId,
-        detail: pendingDraft.workflow || 'upload draft'
-      });
-      continue;
-    }
-
+    processedMessages += 1;
     let preview;
     try {
+      const existing = await repository.findContentByStorageMessageId(storageMessageId);
+      if (existing) {
+        skippedByReason.alreadyPublished.push({
+          messageId: storageMessageId,
+          detail: existing.adminId || cleanText(existing.title, 70) || 'published post'
+        });
+        continue;
+      }
+      const pendingDraft = await repository.findSessionByStorageMessageId(storageMessageId);
+      if (pendingDraft) {
+        skippedByReason.activeDraft.push({
+          messageId: storageMessageId,
+          detail: pendingDraft.workflow || 'upload draft'
+        });
+        continue;
+      }
+
       // Bot API has no getMessage endpoint. Forwarding to the logged-in
       // publisher is the safe way to inspect an existing channel message and
       // obtain its caption/file metadata; the preview is deleted immediately.
-      preview = await ctx.telegram.forwardMessage(
-        chatId(ctx),
-        String(config.telegram.storageChannelId),
-        storageMessageId,
-        { disable_notification: true }
+      preview = await forwardStorageMessageWithRetry(
+        ctx,
+        config.telegram.storageChannelId,
+        storageMessageId
       );
       if (!isMediaMessage(preview)) {
         skippedByReason.nonMedia.push({ messageId: storageMessageId });
@@ -673,6 +727,16 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
       console.error('[telegram] batch import message failed:', storageMessageId, details);
     } finally {
       await removeBatchPreview(ctx, preview);
+      if (processedMessages === totalMessages || processedMessages % BATCH_PROGRESS_INTERVAL === 0) {
+        const skipped = Object.values(skippedByReason).reduce((total, records) => total + records.length, 0);
+        await reportBatchProgress(ctx, {
+          processed: processedMessages,
+          total: totalMessages,
+          imported: imported.length,
+          skipped,
+          failed: failures.length
+        });
+      }
     }
   }
 
@@ -781,10 +845,6 @@ async function handleBatchLink(ctx, session, bot, repository, config) {
     return;
   }
   const rangeCount = link.messageId - Number(batch.firstMessageId) + 1;
-  if (rangeCount > MAX_BATCH_MESSAGE_COUNT) {
-    await ctx.reply(`That range has ${rangeCount} messages. For reliable Telegram processing, import at most ${MAX_BATCH_MESSAGE_COUNT} at a time; split it into smaller inclusive ranges.`);
-    return;
-  }
 
   await repository.updateSession(chatId(ctx), userId(ctx), {
     batch: { ...batch, stage: 'importing', lastMessageId: link.messageId }
@@ -916,6 +976,25 @@ export async function publishDraft(ctx, bot, repository, config) {
 
   try {
     const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
+    const automationKeys = session.workflow === 'automation' ? automationMergeKeys(session, metadata) : [];
+    // This is deliberately repeated here as a race-safe final guard. The queue
+    // normally checks aliases before poster work, but two noisy source labels
+    // can become due at the same moment.
+    if (session.workflow === 'automation' && automationKeys.length) {
+      const existingMatch = await findAutomationContentByKeys(repository, automationKeys);
+      if (existingMatch) {
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys);
+        if (!content) throw new Error('The existing same-title post could not be updated.');
+        await repository.deleteSession(chatId(ctx), userId(ctx));
+        const websiteUrl = getContentPageUrl(config, content);
+        const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
+        await ctx.reply(
+          `Updated existing catalog post “${content.title}” with ${session.files.length} new file${session.files.length === 1 ? '' : 's'}. Post ID: ${content.adminId}.`,
+          publicationKeyboard(websiteUrl, deliveryUrl)
+        );
+        return { content, metadata, merged: true, websiteUrl, deliveryUrl };
+      }
+    }
     const overrides = session.overrides || {};
     const episodeSummary = summarizeEpisodes(session.files);
     const uploadedLanguages = summarizeUploadLanguages(session.files);
@@ -954,10 +1033,12 @@ export async function publishDraft(ctx, bot, repository, config) {
       },
       metadataProvider: metadata.provider,
       tmdbId: metadata.tmdbId,
+      metadataKey: session.workflow === 'automation' ? metadata.metadataKey : null,
       art: { tone: categoryDetails(session.category).tone },
-      // A persistent normalized source title lets later storage bursts append
-      // files to this post without another catalog card or announcement.
+      // A persistent normalized source title plus internet-verified aliases
+      // lets later storage bursts append without another catalog card.
       automationKey: session.workflow === 'automation' ? session.auto?.groupKey : null,
+      automationKeys,
       files: session.files
     });
     await repository.deleteSession(chatId(ctx), userId(ctx));
@@ -1036,6 +1117,30 @@ export function automationGroupKey(title, storageMessageId) {
   // inferBatchTitle normally prevents a generic file name from becoming a title.
   // Keep unidentified uploads isolated so unrelated files can never merge.
   return key && key !== 'untitled-release' ? key : `storage-media-${storageMessageId}`;
+}
+
+/**
+ * Save both the upload-derived and provider-verified identities. A channel may
+ * label the same show as "Raakh S01" on one day and "Raakh" on another; the
+ * metadata identity is the durable bridge that prevents a second card.
+ */
+export function automationMergeKeys(session, metadata = {}) {
+  return [...new Set([
+    // Prefer the verified provider identity over a collision-prone upload name.
+    metadata?.metadataKey,
+    metadata?.title,
+    session?.auto?.groupKey,
+    session?.title
+  ].map((value) => slugify(cleanText(value, 180)))
+    .filter((key) => key && key !== 'untitled-release'))];
+}
+
+async function findAutomationContentByKeys(repository, keys) {
+  for (const key of keys) {
+    const content = await repository.findContentByMergeKey(key);
+    if (content) return { content, key };
+  }
+  return null;
 }
 
 function automationTiming(options = {}) {
@@ -1244,9 +1349,14 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
 
     const groupKey = session.auto?.groupKey || automationGroupKey(session.title, session.files[0]?.storageMessageId || session.ownerId);
     try {
-      const existing = await repository.findContentByMergeKey(groupKey);
-      if (existing) {
-        const content = await repository.appendFilesToContentByMergeKey(groupKey, session.files);
+      // Resolve a canonical provider identity before looking for an existing
+      // release. This makes aliases/noisy filenames converge instead of
+      // producing a fresh post just because their raw group keys differ.
+      const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
+      const automationKeys = automationMergeKeys(session, metadata);
+      const existingMatch = await findAutomationContentByKeys(repository, automationKeys.length ? automationKeys : [groupKey]);
+      if (existingMatch) {
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys);
         if (!content) throw new Error('The existing same-title post could not be updated.');
         await repository.deleteSession(session.chatId, session.ownerId);
         const websiteUrl = getContentPageUrl(config, content);
@@ -1263,6 +1373,10 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
         continue;
       }
 
+      // Store the preflight result so publishDraft uses the same verified
+      // canonical title/poster rather than performing a potentially different
+      // provider search a moment later.
+      session = await repository.updateSession(session.chatId, session.ownerId, { metadata }) || { ...session, metadata };
       console.info(`[telegram] publishing queued storage group ${groupKey} as ${session.category}: ${session.title} (${session.files.length} file(s)).`);
       const result = await publish(automationReplyContext(session), bot, repository, config);
       if (!result?.content) {
@@ -1276,14 +1390,15 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
       // publishDraft deletes its own session; custom publishers in tests and
       // future workers may not, so make the successful cleanup idempotent.
       await repository.deleteSession(session.chatId, session.ownerId);
+      const state = result.merged ? 'merged' : 'published';
       await notifyAutomationPublisher(bot, settings, {
-        state: 'published',
+        state,
         content: result.content,
         session,
         websiteUrl: result.websiteUrl || getContentPageUrl(config, result.content),
         deliveryUrl: result.deliveryUrl || getTelegramDeliveryUrl(config, result.content.shareCode)
       });
-      results.push({ state: 'published', content: result.content, session });
+      results.push({ state, content: result.content, session });
     } catch (error) {
       const diagnostic = automationDiagnostic(error);
       console.error('[telegram] queued auto-publish failed:', session.ownerId, diagnostic);
@@ -1379,6 +1494,209 @@ async function logRequestToChannel(ctx, request, config) {
   }
 }
 
+const REQUEST_SELECTION_PAGE_SIZE = 8;
+const INDIA_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+export function requestManagerKeyboard() {
+  // Keep the entry screen intentionally simple: publishers first choose to
+  // select open requests or leave the management workflow.
+  return Markup.inlineKeyboard([[
+    Markup.button.callback('Select requests', 'requests:select'),
+    Markup.button.callback('Back', 'requests:back')
+  ]]);
+}
+
+function requesterLabel(request) {
+  return request?.requester?.username
+    ? `@${request.requester.username}`
+    : cleanText(request?.requester?.name || '', 60) || 'Telegram user';
+}
+
+function requestManagerText(openRequestCount = 0) {
+  return [
+    'Request management',
+    '',
+    openRequestCount
+      ? `${openRequestCount} open request${openRequestCount === 1 ? '' : 's'} ready for review.`
+      : 'There are no open catalog requests right now.',
+    'Choose Select requests to mark one or several requests Completed or Rejected.'
+  ].join('\n');
+}
+
+async function replaceInteractiveMessage(ctx, text, keyboard) {
+  if (ctx.callbackQuery?.message && typeof ctx.editMessageText === 'function') {
+    try {
+      return await ctx.editMessageText(text, keyboard);
+    } catch (error) {
+      const details = telegramErrorText(error);
+      if (/message is not modified/.test(details)) return null;
+      console.warn('[telegram] could not update interactive publisher view:', automationDiagnostic(error));
+    }
+  }
+  return ctx.reply(text, keyboard);
+}
+
+function requestSelectionText(requests, selectedIds, page, totalPages) {
+  const start = page * REQUEST_SELECTION_PAGE_SIZE;
+  const visible = requests.slice(start, start + REQUEST_SELECTION_PAGE_SIZE);
+  return [
+    'Select open requests',
+    '',
+    `${selectedIds.size} selected · showing ${visible.length ? `${start + 1}–${start + visible.length}` : '0'} of ${requests.length} open request${requests.length === 1 ? '' : 's'} · page ${page + 1}/${totalPages}.`,
+    '',
+    ...visible.map((request, index) => {
+      const selected = selectedIds.has(request.id) ? '☑' : '☐';
+      return `${selected} ${start + index + 1}. ${cleanText(request.requestText, 180)}\n   ${request.id} · ${requesterLabel(request)}`;
+    }),
+    '',
+    'Tap requests to toggle them, then choose Completed or Rejected. Statuses update immediately.'
+  ].join('\n');
+}
+
+function requestSelectionKeyboard(requests, selectedIds, page, totalPages) {
+  const start = page * REQUEST_SELECTION_PAGE_SIZE;
+  const visible = requests.slice(start, start + REQUEST_SELECTION_PAGE_SIZE);
+  const rows = visible.map((request) => [Markup.button.callback(
+    `${selectedIds.has(request.id) ? '☑' : '☐'} ${request.id} · ${cleanText(request.requestText, 28)}`,
+    `requests:toggle:${request.id}:${page}`
+  )]);
+  if (totalPages > 1) {
+    const navigation = [];
+    if (page > 0) navigation.push(Markup.button.callback('‹ Previous', `requests:page:${page - 1}`));
+    if (page < totalPages - 1) navigation.push(Markup.button.callback('Next ›', `requests:page:${page + 1}`));
+    if (navigation.length) rows.push(navigation);
+  }
+  rows.push([
+    Markup.button.callback(`Completed (${selectedIds.size})`, 'requests:resolve:completed'),
+    Markup.button.callback(`Rejected (${selectedIds.size})`, 'requests:resolve:rejected')
+  ]);
+  rows.push([Markup.button.callback('Back', 'requests:back')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function renderRequestSelection(ctx, repository, page = 0) {
+  const requests = await repository.listRequests({ status: 'open', limit: 200 });
+  const selection = await repository.findRequestSelection(chatId(ctx), userId(ctx));
+  if (!selection) {
+    return replaceInteractiveMessage(ctx, 'Your request selection expired. Start it again when you are ready.', requestManagerKeyboard());
+  }
+  if (!requests.length) {
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    return replaceInteractiveMessage(ctx, requestManagerText(0), requestManagerKeyboard());
+  }
+  const openIds = new Set(requests.map((request) => request.id));
+  const selectedIds = new Set((selection.requestIds || []).filter((requestId) => openIds.has(requestId)));
+  const totalPages = Math.max(1, Math.ceil(requests.length / REQUEST_SELECTION_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  return replaceInteractiveMessage(
+    ctx,
+    requestSelectionText(requests, selectedIds, safePage, totalPages),
+    requestSelectionKeyboard(requests, selectedIds, safePage, totalPages)
+  );
+}
+
+export function requestResolutionNotificationText(request, status) {
+  return status === 'completed'
+    ? `✅ Your catalog request “${cleanText(request?.requestText, 180)}” has been completed. Please kindly check the site.`
+    : `⚠️ Your catalog request “${cleanText(request?.requestText, 180)}” was rejected due to issues.`;
+}
+
+async function notifyResolvedRequesters(bot, requests, status) {
+  let notified = 0;
+  let failed = 0;
+  for (const request of requests) {
+    const destination = String(request?.requester?.id || '');
+    if (!destination) {
+      failed += 1;
+      continue;
+    }
+    const text = requestResolutionNotificationText(request, status);
+    try {
+      await bot.telegram.sendMessage(destination, text);
+      notified += 1;
+    } catch (error) {
+      failed += 1;
+      console.warn('[telegram] could not notify request user:', destination, automationDiagnostic(error));
+    }
+  }
+  return { notified, failed };
+}
+
+function indiaDayStart(value = new Date(), daysAgo = 0) {
+  const instant = value instanceof Date ? value : new Date(value);
+  const shifted = new Date(instant.getTime() + INDIA_OFFSET_MS);
+  return new Date(Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate() - daysAgo
+  ) - INDIA_OFFSET_MS);
+}
+
+export function postIdTimeWindow(period, now = new Date()) {
+  const today = indiaDayStart(now);
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+  if (period === 'today') return { label: 'Today (IST)', startAt: today, endAt: tomorrow };
+  if (period === 'yesterday') return { label: 'Yesterday (IST)', startAt: indiaDayStart(now, 1), endAt: today };
+  if (period === 'week') return { label: 'Last 7 days (IST)', startAt: indiaDayStart(now, 6), endAt: tomorrow };
+  if (period === 'month') return { label: 'Last 30 days (IST)', startAt: indiaDayStart(now, 29), endAt: tomorrow };
+  return null;
+}
+
+export function postIdKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Today', 'postid:today'), Markup.button.callback('Yesterday', 'postid:yesterday')],
+    [Markup.button.callback('Week', 'postid:week'), Markup.button.callback('Month', 'postid:month')],
+    [Markup.button.callback('Back', 'postid:back')]
+  ]);
+}
+
+function formatPostIdResults(window, posts) {
+  if (!posts.length) return `No uploaded post IDs were found for ${window.label}.`;
+  return [
+    `Uploaded post IDs · ${window.label} (${posts.length}${posts.length === 100 ? '+' : ''})`,
+    '',
+    ...posts.map((post, index) => `${index + 1}. ${post.adminId} · ${cleanText(post.title, 130)} — ${categoryDetails(post.category).shortLabel}`),
+    '',
+    'Copy an ID into /delete if you need to remove a post.'
+  ].join('\n');
+}
+
+function formatAnalyticsTime(value) {
+  if (!value) return 'No activity recorded';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'No activity recorded';
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short'
+  }).format(date);
+}
+
+function formatPublisherStats(stats) {
+  const categories = Object.entries(stats.catalog?.byCategory || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([category, count]) => `${categoryDetails(category).shortLabel}: ${count}`)
+    .join(' · ') || 'No posts yet';
+  return [
+    'Publisher statistics',
+    '',
+    'Anonymous site activity',
+    `Visitors: ${stats.site?.visitors || 0} unique · Visits: ${stats.site?.visits || 0}`,
+    `Active: ${stats.site?.activeVisitors24h || 0} visitors / ${stats.site?.visits24h || 0} visits (24h) · ${stats.site?.activeVisitors7d || 0} visitors / ${stats.site?.visits7d || 0} visits (7d)`,
+    `Last site activity: ${formatAnalyticsTime(stats.site?.latestActivityAt)}`,
+    '',
+    'Private bot activity',
+    `Bot users: ${stats.bot?.users || 0} · Interactions: ${stats.bot?.interactions || 0}`,
+    `Active bot users: ${stats.bot?.activeUsers24h || 0} (24h) · ${stats.bot?.activeUsers7d || 0} (7d)`,
+    `Last bot activity: ${formatAnalyticsTime(stats.bot?.latestActivityAt)}`,
+    '',
+    'Catalog',
+    `Posts: ${stats.catalog?.posts || 0} · Files: ${stats.catalog?.files || 0} · Episodes: ${stats.catalog?.episodes || 0} · Telegram deliveries: ${stats.catalog?.deliveries || 0}`,
+    categories,
+    '',
+    'Requests',
+    `Total: ${stats.requests?.total || 0} · Open: ${stats.requests?.open || 0} · Completed: ${stats.requests?.completed || 0} · Rejected: ${stats.requests?.rejected || 0}`
+  ].join('\n');
+}
+
 export async function launchTelegramBot({ config, repository }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
@@ -1386,6 +1704,18 @@ export async function launchTelegramBot({ config, repository }) {
   }
 
   const bot = new Telegraf(config.telegram.botToken);
+  // Private Telegram activity is tracked only in the publisher-side repository
+  // for aggregate analytics; it is never exposed from the public site API.
+  bot.use(async (ctx, next) => {
+    if (ctx.from && !ctx.from.is_bot && typeof repository.recordBotUser === 'function') {
+      try {
+        await repository.recordBotUser(ctx.from);
+      } catch (error) {
+        console.warn('[telegram] could not record bot activity:', automationDiagnostic(error));
+      }
+    }
+    return next();
+  });
   const ignoredAutoStorageMessageIds = new Set();
   const autoPublishInFlightMessageIds = new Set();
   let automationQueuePromise = null;
@@ -1482,7 +1812,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
-          'Management: /status · /teststorage · /cancel · /posts 50 · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -1675,6 +2005,21 @@ export async function launchTelegramBot({ config, repository }) {
     ]);
   });
 
+  bot.command('postid', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await ctx.reply('Choose an upload period. I will return the post IDs and names uploaded in that time window.', postIdKeyboard());
+  });
+
+  bot.command('stats', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.getPublisherStats !== 'function') {
+      await ctx.reply('Publisher statistics are not available in this catalog store.');
+      return;
+    }
+    const stats = await repository.getPublisherStats();
+    await ctx.reply(formatPublisherStats(stats));
+  });
+
   bot.command('addchannel', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     const suppliedId = normalizeChannelId(parseCommandArgument(ctx.message.text));
@@ -1728,12 +2073,77 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('requests', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const requests = await repository.listRequests(12);
-    if (!requests.length) {
-      await ctx.reply('There are no open catalog requests.');
+    const requests = await repository.listRequests({ status: 'open', limit: 200 });
+    await ctx.reply(requestManagerText(requests.length), requestManagerKeyboard());
+  });
+
+  bot.action('requests:select', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.startRequestSelection({ chatId: chatId(ctx), ownerId: userId(ctx) });
+    await renderRequestSelection(ctx, repository, 0);
+  });
+
+  bot.action(/^requests:page:(\d{1,3})$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await renderRequestSelection(ctx, repository, Number(ctx.match[1]));
+  });
+
+  bot.action(/^requests:toggle:(REQ-[A-F0-9]{10}):(\d{1,3})$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const selection = await repository.toggleRequestSelection(chatId(ctx), userId(ctx), ctx.match[1]);
+    if (!selection) {
+      await replaceInteractiveMessage(ctx, 'That request is no longer open, or your selection expired. Start Select requests again.', requestManagerKeyboard());
       return;
     }
-    await ctx.reply(['Latest open requests:', '', ...requests.map((request, index) => `${index + 1}. ${request.requestText}\n   ${request.id} · ${request.requester?.username ? `@${request.requester.username}` : request.requester?.name || 'Telegram user'}`)].join('\n'));
+    await renderRequestSelection(ctx, repository, Number(ctx.match[2]));
+  });
+
+  bot.action(/^requests:resolve:(completed|rejected)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const selection = await repository.findRequestSelection(chatId(ctx), userId(ctx));
+    const requestIds = selection?.requestIds || [];
+    if (!requestIds.length) {
+      await replaceInteractiveMessage(ctx, 'Select at least one open request before choosing a status.', requestManagerKeyboard());
+      return;
+    }
+    // Persist the status first, then notify requesters. A delivery failure can
+    // never leave a request looking unresolved after the publisher acted.
+    const status = ctx.match[1];
+    const resolved = await repository.resolveRequests({ requestIds, status, resolvedBy: userId(ctx) });
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    const notifications = await notifyResolvedRequesters(bot, resolved, status);
+    const remaining = await repository.listRequests({ status: 'open', limit: 200 });
+    const label = status === 'completed' ? 'Completed' : 'Rejected';
+    await replaceInteractiveMessage(
+      ctx,
+      `${label} ${resolved.length} request${resolved.length === 1 ? '' : 's'} immediately. ${notifications.notified} requester${notifications.notified === 1 ? '' : 's'} notified${notifications.failed ? `; ${notifications.failed} notification${notifications.failed === 1 ? '' : 's'} could not be delivered` : ''}. ${remaining.length} open request${remaining.length === 1 ? '' : 's'} remain.`,
+      requestManagerKeyboard()
+    );
+  });
+
+  bot.action('requests:back', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    await replaceInteractiveMessage(ctx, 'Request management closed. Choose a publisher action below.', panelKeyboard());
+  });
+
+  bot.action(/^postid:(today|yesterday|week|month)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const window = postIdTimeWindow(ctx.match[1]);
+    const posts = await repository.listAdminContent({ startAt: window.startAt, endAt: window.endAt, limit: 100 });
+    await replyBatchDiagnostics(ctx, formatPostIdResults(window, posts).split('\n'));
+  });
+
+  bot.action('postid:back', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await replaceInteractiveMessage(ctx, 'Post-ID lookup closed. Choose a publisher action below.', panelKeyboard());
   });
 
   bot.action(/^auto:(status|on|off)$/, async (ctx) => {

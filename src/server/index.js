@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import compression from 'compression';
 import express from 'express';
 import helmet from 'helmet';
@@ -12,6 +13,46 @@ import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultDistPath = path.resolve(__dirname, '../../dist');
+const VISITOR_COOKIE_NAME = 'sorabox_visitor';
+const VISITOR_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 365;
+
+function cookieValue(request, name) {
+  const cookieHeader = String(request.headers.cookie || '');
+  const prefix = `${name}=`;
+  for (const item of cookieHeader.split(';')) {
+    const trimmed = item.trim();
+    if (!trimmed.startsWith(prefix)) continue;
+    try {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function anonymousVisitorId(request, response, config) {
+  const existing = cookieValue(request, VISITOR_COOKIE_NAME);
+  if (/^[A-Za-z0-9_-]{24,128}$/.test(existing || '')) return existing;
+  // A random first-party cookie counts returning visits without collecting an
+  // IP address, user agent, query string, or any public profile information.
+  const visitorId = crypto.randomBytes(24).toString('base64url');
+  response.cookie(VISITOR_COOKIE_NAME, visitorId, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.environment === 'production',
+    maxAge: VISITOR_COOKIE_MAX_AGE_MS,
+    path: '/'
+  });
+  return visitorId;
+}
+
+function isTrackableSiteVisit(request) {
+  if (request.method !== 'GET') return false;
+  if (request.path === '/api' || request.path.startsWith('/api/') || request.path === '/deliver' || request.path.startsWith('/deliver/')) return false;
+  if (/\.[A-Za-z0-9]{1,8}$/.test(request.path)) return false;
+  return String(request.headers.accept || '').includes('text/html');
+}
 
 function serializeDate(value) {
   if (!value) return null;
@@ -143,6 +184,20 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
   );
   app.use(compression());
   app.use(express.json({ limit: '32kb' }));
+  app.use(async (request, response, next) => {
+    if (!isTrackableSiteVisit(request) || typeof repository.recordSiteVisit !== 'function') return next();
+    try {
+      await repository.recordSiteVisit({
+        visitorId: anonymousVisitorId(request, response, config),
+        path: request.path
+      });
+    } catch (error) {
+      // Catalog browsing must remain available if optional analytics storage is
+      // temporarily unavailable.
+      console.warn('[server] anonymous visit was not recorded:', error?.message || 'Unknown error');
+    }
+    return next();
+  });
 
   app.get('/api/health', (_request, response) => {
     response.set('Cache-Control', 'no-store');
