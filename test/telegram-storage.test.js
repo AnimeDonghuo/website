@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
@@ -144,6 +144,74 @@ test('18+ delivery always reads the isolated adult storage channel, never a save
 
   assert.deepEqual(copied, [[400, '-100adult', 42]]);
   assert.match(replies.at(-1), /Delivered 1 of 1/);
+});
+
+
+test('bot delivery schedules every copied media message for deletion after five minutes', async () => {
+  const copied = [];
+  const scheduled = [];
+  const replies = [];
+  let deliveryIncrements = 0;
+  await deliverContent(
+    {
+      chat: { id: 555 },
+      telegram: {
+        copyMessage: async (...args) => {
+          copied.push(args);
+          return { message_id: 900 + copied.length };
+        }
+      },
+      reply: async (text) => { replies.push(text); }
+    },
+    { shareCode: 'normal-share-code', filePosition: null },
+    {
+      findContentByShareCode: async () => ({
+        title: 'Temporary delivery',
+        category: 'movie',
+        files: [{ storageMessageId: 42 }, { storageMessageId: 43 }]
+      }),
+      incrementDelivery: async () => { deliveryIncrements += 1; }
+    },
+    { telegram: { storageChannelId: '-100normal' } },
+    {
+      scheduleDeletion: (details) => {
+        scheduled.push(details);
+        return true;
+      }
+    }
+  );
+
+  assert.deepEqual(copied, [[555, '-100normal', 42], [555, '-100normal', 43]]);
+  assert.equal(deliveryIncrements, 1);
+  assert.deepEqual(scheduled.map(({ recipientChatId, messageId, deleteAfterMs }) => ({ recipientChatId, messageId, deleteAfterMs })), [
+    { recipientChatId: 555, messageId: 901, deleteAfterMs: DELIVERY_FILE_DELETE_AFTER_MS },
+    { recipientChatId: 555, messageId: 902, deleteAfterMs: DELIVERY_FILE_DELETE_AFTER_MS }
+  ]);
+  assert.match(replies.at(-1), /remove 2 delivered files from this chat in about 5 minutes/i);
+});
+
+test('scheduled cleanup removes a bot-delivered message without deleting anything from storage', async () => {
+  const deleted = [];
+  let resolveDeletion;
+  const didDelete = new Promise((resolve) => { resolveDeletion = resolve; });
+  const scheduled = scheduleDeliveredFileDeletion({
+    telegram: {
+      async deleteMessage(destination, messageId) {
+        deleted.push({ destination, messageId });
+        resolveDeletion();
+      }
+    },
+    recipientChatId: 777,
+    messageId: 55,
+    deleteAfterMs: 0
+  });
+  assert.equal(scheduled, true);
+  await Promise.race([
+    didDelete,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('delivery cleanup did not run')), 250))
+  ]);
+  assert.deepEqual(deleted, [{ destination: '777', messageId: 55 }]);
+  assert.equal(scheduleDeliveredFileDeletion({ telegram: {}, recipientChatId: 777, messageId: 55 }), false);
 });
 
 test('18+ publishing rejects a missing or shared storage configuration before any post is created', async () => {

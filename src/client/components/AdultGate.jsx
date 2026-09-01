@@ -16,7 +16,7 @@ export default function AdultGate({ onConfirm, confirming = false, error = null 
         <span className="adult-gate__badge" aria-hidden="true">18+</span>
         <p className="eyebrow"><span /> AGE CONFIRMATION</p>
         <h1 id="adult-gate-title">This collection is for <em>adults only.</em></h1>
-        <p id="adult-gate-copy">Please confirm that you are 18 years of age or older to enter the 18+ collection. Choosing No will take you back to the main catalog.</p>
+        <p id="adult-gate-copy">Do not continue unless you are 18 or older, or have reached the legal age of majority where you live. By selecting “I am 18+”, you confirm truthfully that access is lawful for you and accept responsibility for that declaration. Choosing No will take you back to the main catalog.</p>
         {error ? <p className="adult-gate__error" role="alert"><Icon name="info" size={16} /> {error}</p> : null}
         <div className="adult-gate__actions">
           <button className="button button--primary" type="button" onClick={onConfirm} disabled={confirming}>
@@ -26,7 +26,7 @@ export default function AdultGate({ onConfirm, confirming = false, error = null 
             No, go back
           </button>
         </div>
-        <p className="adult-gate__fine-print">Your confirmation is kept only for this browser session.</p>
+        <p className="adult-gate__fine-print">Your confirmation is kept only for this browser session. It is an age declaration, not proof of legal eligibility.</p>
       </div>
     </section>
   );

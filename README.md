@@ -4,7 +4,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 
 - **No media files live on Koyeb.** The bot copies uploads into a private Telegram database channel.
 - **Every published poster is mirrored once to ImgBB** and the permanent hosted URL is saved to MongoDB. The catalog never fetches a poster on every page view.
-- **Visitors get a Telegram deep link** (`https://t.me/<bot>?start=get-<code>`). After they tap **Start**, the bot copies that release's saved channel messages into their own chat.
+- **Visitors get a Telegram deep link** (`https://t.me/<bot>?start=get-<code>`). After they tap **Start**, the bot copies that release's saved channel messages into their own chat and schedules each bot-delivered file message for best-effort removal after five minutes. This removes the chat message only—it cannot recall a file the recipient has already downloaded, saved, or forwarded.
 - **MongoDB stores catalog metadata, file message references, delivery codes, in-progress publisher/request-selection drafts, and private aggregate analytics.** Sensitive channel and file references never leave the public API. Signed, compressed application backups can be sent to the private storage channel and restored into a replacement MongoDB database.
 - A single Node service serves the React site, API, and Telegram long-polling bot — deliberately small enough for a Koyeb free instance.
 
@@ -165,7 +165,7 @@ TELEGRAM_MODE=polling
 
 Create a **second**, private Telegram database channel for 18+ files, add the same bot as an administrator, and configure its numeric ID as `TELEGRAM_ADULT_STORAGE_CHANNEL_ID`. It must not equal `TELEGRAM_STORAGE_CHANNEL_ID`; the bot rejects a shared/missing configuration before an 18+ draft, batch, publish, or delivery can use it. Start restricted uploads with `/adultdb Title` or `/18db Title`. Existing adult-channel ranges use `/batch adult | Title`; normal `/auto` remains restricted to the normal database channel. Adult drafts skip external metadata lookup, retain their per-file source channel, and never announce to configured public Telegram channels.
 
-The website intentionally shows the 18+ navigation destination without its catalog data. Selecting it opens a confirmation dialog; **No** returns to the regular catalog, while **I am 18+** grants the current browser access. The server independently requires its short-lived HTTP-only consent cookie for adult category/detail/episode/Watch APIs and first-party `/deliver/...` redirects, so an overlay or a guessed site API URL cannot expose restricted data before confirmation.
+The website intentionally shows the 18+ navigation destination without its catalog data. Selecting it opens a confirmation dialog; **No** returns to the regular catalog, while **I am 18+** is a truthful declaration that the visitor is at least 18 (or their local age of majority) and legally permitted to access the category. It does not falsely claim to verify identity, monitor IP addresses, or share visitor data. The server independently requires its short-lived HTTP-only consent cookie for adult category/detail/episode/Watch APIs and first-party `/deliver/...` redirects, so an overlay or a guessed site API URL cannot expose restricted data before confirmation.
 
 #### Bot-token rotation and replacement recovery
 

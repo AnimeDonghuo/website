@@ -21,6 +21,12 @@ const AUTO_PUBLISH_LATE_OWNER_PREFIX = 'auto-storage-late-';
 const AUTO_COLLECTION_IDLE_MS = 90_000;
 const AUTO_COLLECTION_MAX_WAIT_MS = 15 * 60_000;
 const AUTO_QUEUE_INTERVAL_MS = 15_000;
+// Telegram lets a bot remove the messages it created in a private chat. Keep
+// delivered copies brief by default, while making the limitation explicit: a
+// bot cannot recall a file someone has already saved or forwarded elsewhere.
+export const DELIVERY_FILE_DELETE_AFTER_MS = 5 * 60_000;
+const DELIVERY_FILE_DELETE_SPACING_MS = 80;
+let deliveryDeletionQueue = Promise.resolve();
 
 function userId(ctx) {
   return ctx.from?.id;
@@ -865,6 +871,43 @@ function telegramRetryAfterMilliseconds(error, attempt) {
 
 function pause(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Schedule removal of one bot-delivered media message from the recipient chat.
+ * This is intentionally best effort: Telegram may reject a deletion after a
+ * user clears a chat or changes its availability, and it cannot erase a file
+ * that has already been downloaded, forwarded, or saved outside Telegram.
+ */
+export function scheduleDeliveredFileDeletion({ telegram, recipientChatId, messageId, deleteAfterMs = DELIVERY_FILE_DELETE_AFTER_MS } = {}) {
+  const destination = recipientChatId === null || recipientChatId === undefined ? '' : String(recipientChatId).trim();
+  const numericMessageId = Number(messageId);
+  if (!telegram || typeof telegram.deleteMessage !== 'function' || !destination || !Number.isSafeInteger(numericMessageId) || numericMessageId < 1) {
+    return false;
+  }
+  const requestedDelay = Number(deleteAfterMs);
+  const delay = Number.isFinite(requestedDelay) && requestedDelay >= 0
+    ? Math.min(requestedDelay, 24 * 60 * 60_000)
+    : DELIVERY_FILE_DELETE_AFTER_MS;
+  const timer = setTimeout(() => {
+    // Large releases can contain hundreds of copied files. Serialize removal
+    // requests with a small gap so the five-minute cleanup itself does not
+    // trigger Telegram's flood limit.
+    deliveryDeletionQueue = deliveryDeletionQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await telegram.deleteMessage(destination, numericMessageId);
+          console.info(`[telegram] automatically deleted delivered message ${numericMessageId} from chat ${destination}.`);
+        } catch (error) {
+          console.warn('[telegram] automatic delivery cleanup failed:', error?.description || error?.message || 'Unknown error');
+        }
+        if (DELIVERY_FILE_DELETE_SPACING_MS) await pause(DELIVERY_FILE_DELETE_SPACING_MS);
+      });
+  }, delay);
+  // Scheduled cleanup should not keep an otherwise idle Koyeb process alive.
+  timer.unref?.();
+  return true;
 }
 
 async function forwardStorageMessageWithRetry(ctx, storageChannelId, storageMessageId) {
@@ -1768,7 +1811,7 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
   return results;
 }
 
-export async function deliverContent(ctx, delivery, repository, config) {
+export async function deliverContent(ctx, delivery, repository, config, { scheduleDeletion = scheduleDeliveredFileDeletion } = {}) {
   if (!delivery?.shareCode || delivery.shareCode.length > 48) {
     await ctx.reply('That delivery link is invalid.');
     return;
@@ -1805,6 +1848,7 @@ export async function deliverContent(ctx, delivery, repository, config) {
       : `Preparing ${files.length} item${files.length === 1 ? '' : 's'} for “${content.title}”…`
   );
   let delivered = 0;
+  let cleanupScheduled = 0;
   for (const file of files) {
     try {
       // New records retain their source channel; old normal records fall back
@@ -1812,8 +1856,20 @@ export async function deliverContent(ctx, delivery, repository, config) {
       const sourceChannelId = isAdultCategory(content.category)
         ? defaultStorageChannelId
         : cleanText(file?.storageChannelId, 80) || defaultStorageChannelId;
-      await ctx.telegram.copyMessage(chatId(ctx), sourceChannelId, file.storageMessageId);
+      const copied = await ctx.telegram.copyMessage(chatId(ctx), sourceChannelId, file.storageMessageId);
       delivered += 1;
+      try {
+        if (scheduleDeletion({
+          telegram: ctx.telegram,
+          recipientChatId: chatId(ctx),
+          messageId: copied?.message_id,
+          deleteAfterMs: DELIVERY_FILE_DELETE_AFTER_MS
+        })) cleanupScheduled += 1;
+      } catch (cleanupError) {
+        // Delivery succeeded; a local scheduling problem must not be reported
+        // as though Telegram failed to copy the file.
+        console.warn('[telegram] could not schedule delivery cleanup:', cleanupError?.message || 'Unknown error');
+      }
     } catch (error) {
       console.error('[telegram] delivery copy failed:', error?.description || error?.message || 'Unknown error');
     }
@@ -1821,10 +1877,13 @@ export async function deliverContent(ctx, delivery, repository, config) {
 
   if (delivered) {
     await repository.incrementDelivery(delivery.shareCode);
+    const cleanupNote = cleanupScheduled
+      ? ` The bot will remove ${cleanupScheduled === 1 ? 'this delivered file' : `${cleanupScheduled} delivered files`} from this chat in about 5 minutes.`
+      : '';
     await ctx.reply(
       delivery.filePosition
-        ? 'Your selected file has been delivered. Enjoy responsibly.'
-        : `Delivered ${delivered} of ${files.length} item${files.length === 1 ? '' : 's'}. Enjoy responsibly.`
+        ? `Your selected file has been delivered. Enjoy responsibly.${cleanupNote}`
+        : `Delivered ${delivered} of ${files.length} item${files.length === 1 ? '' : 's'}. Enjoy responsibly.${cleanupNote}`
     );
   } else {
     await ctx.reply('I could not retrieve these files from the storage channel. Please let the catalog administrator know.');
