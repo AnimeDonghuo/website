@@ -209,7 +209,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
   { command: 'stats', description: 'View publisher analytics' },
-  { command: 'cmd', description: 'Import manual Watch player links (JSON/CSV)' },
+  { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
   { command: 'backup', description: 'Send a signed private data backup' },
   { command: 'recover', description: 'Restore a signed backup file' },
   { command: 'addchannel', description: 'Add an announcement channel' },
@@ -2190,24 +2190,64 @@ function streamingDownloadOptionsFromConfig(config) {
   };
 }
 
-function watchPageUrl(config, content) {
+function episodePathRange(episode) {
+  const start = Number(episode?.start);
+  const end = Number(episode?.end ?? episode?.start);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) return null;
+  return start === end ? String(start) : `${start}-${end}`;
+}
+
+function directEpisodeLabel(start, end) {
+  return start === end
+    ? `Episode ${String(start).padStart(2, '0')}`
+    : `Episodes ${String(start).padStart(2, '0')}–${String(end).padStart(2, '0')}`;
+}
+
+/**
+ * Accept one clearly scoped player link without making publishers build a
+ * manifest. Bare URLs remain intentional release-level players; adding
+ * `ep`/`episode` (or a leading number) ties the link to that delivery episode.
+ */
+export function parseDirectStreamingInput(value) {
+  const supplied = cleanText(value, 2_200);
+  const match = supplied.match(/^(?:(?:episode|ep)\.?\s*)?(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?\s+([\s\S]+)$/i);
+  if (!match) return { playerValue: supplied, episode: null, error: null };
+  const start = Number(match[1]);
+  const end = Number(match[2] || match[1]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+    return { playerValue: '', episode: null, error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+  }
+  return {
+    playerValue: cleanText(match[3], 2_000),
+    episode: { start, end, label: directEpisodeLabel(start, end) },
+    error: null
+  };
+}
+
+function watchPageUrl(config, content, episode = null) {
   const detailUrl = getContentPageUrl(config, content);
-  return detailUrl ? `${detailUrl}/watch` : null;
+  if (!detailUrl) return null;
+  const range = episodePathRange(episode);
+  return `${detailUrl}/watch${range ? `/episode/${range}` : ''}`;
 }
 
 function streamImportInstructions(targetAdminId = null) {
   const target = targetAdminId
     ? `Every valid row in the next manifest will be attached to ${targetAdminId}.`
     : 'Each row needs a Post ID, or a Title that exactly matches one existing SoraBox release.';
+  const armedEpisodeExample = targetAdminId
+    ? `In this armed chat, you can also send: ep 1 https://soraboxs.embedseek.com/#your-video`
+    : 'For one episode now: /cmd SB-0123ABCDEF ep 1 https://soraboxs.embedseek.com/#your-video';
   return [
     'Manual Watch-link import is armed for 15 minutes.',
     target,
     '',
-    'Send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
+    'For many episodes at once, send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
     'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL.',
     '',
     'Recommended CSV columns: postId, episode, label, embedUrl, watchUrl',
-    'or use /cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#your-video for one direct player link.',
+    armedEpisodeExample,
+    'For a release-wide player, omit ep: /cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#your-video',
     'Use /cmd cancel to stop this import.'
   ].join('\n');
 }
@@ -2284,7 +2324,7 @@ export async function applyStreamingManifest({ repository, manifest, targetAdmin
       rejected.push({ row: '?', error: `could not update ${group.content.adminId}; it may have been removed` });
       continue;
     }
-    updated.push({ content: saved, rows: group.rows, stream });
+    updated.push({ content: saved, rows: group.rows, stream, entries: group.entries });
   }
   return {
     updated,
@@ -2293,7 +2333,7 @@ export async function applyStreamingManifest({ repository, manifest, targetAdmin
   };
 }
 
-function directStreamingManifest(targetAdminId, playerUrl) {
+function directStreamingManifest(targetAdminId, playerUrl, episode = null) {
   const provider = new URL(playerUrl).hostname.replace(/^www\./i, '');
   return {
     entries: [{
@@ -2301,23 +2341,33 @@ function directStreamingManifest(targetAdminId, playerUrl) {
       postId: targetAdminId,
       sourceTitle: null,
       category: null,
-      entry: { label: 'Main player', episode: null, provider, embedUrl: playerUrl, watchUrl: playerUrl }
+      entry: {
+        label: episode?.label || 'Main player',
+        episode: episode || null,
+        provider,
+        embedUrl: playerUrl,
+        watchUrl: playerUrl
+      }
     }],
     rejected: []
   };
 }
 
 function streamImportResultText(result, config) {
-  const pages = result.updated
-    .map(({ content }) => watchPageUrl(config, content))
-    .filter(Boolean)
+  const pages = [...new Set(result.updated
+    .flatMap(({ content, entries }) => (entries || []).map((entry) => watchPageUrl(config, content, entry?.episode)))
+    .filter(Boolean))]
     .slice(0, 4);
+  const hasEpisodePlayers = result.updated.some(({ entries }) => (entries || []).some((entry) => episodePathRange(entry?.episode)));
   const success = result.updated.length
     ? `✅ Saved ${result.attachedRows} manual player link${result.attachedRows === 1 ? '' : 's'} on ${result.updated.length} existing catalog post${result.updated.length === 1 ? '' : 's'}. No Telegram announcement was sent.`
     : 'No Watch links were saved.';
+  const availability = hasEpisodePlayers
+    ? 'Matching episode delivery pages now show Watch beside their Telegram file action. Set PUBLIC_SITE_URL on Koyeb if you also want direct episode Watch URLs here.'
+    : 'The Watch button is now available on the existing release page. Set PUBLIC_SITE_URL on Koyeb if you also want the bot to return its direct Watch URL.';
   return [
     success,
-    pages.length ? `Watch page${pages.length === 1 ? '' : 's'}:\n${pages.join('\n')}` : result.updated.length ? 'The Watch button is now available on the existing release page. Set PUBLIC_SITE_URL on Koyeb if you also want the bot to return its direct Watch URL.' : null,
+    pages.length ? `Watch page${pages.length === 1 ? '' : 's'}:\n${pages.join('\n')}` : result.updated.length ? availability : null,
     result.rejected.length ? streamImportIssueText(result.rejected).trimStart() : null
   ].filter(Boolean).join('\n\n');
 }
@@ -2328,23 +2378,30 @@ async function handleStreamImportUpload(ctx, repository, config) {
   if (!pending) return false;
   const document = ctx.message?.document;
   if (!document) {
-    const playerUrl = pending.targetAdminId && ctx.message?.text
-      ? safeStreamingUrl(ctx.message.text, streamingOptionsFromConfig(config))
+    const directInput = pending.targetAdminId && ctx.message?.text
+      ? parseDirectStreamingInput(ctx.message.text)
+      : null;
+    if (directInput?.error) {
+      await ctx.reply(directInput.error);
+      return true;
+    }
+    const playerUrl = directInput
+      ? safeStreamingUrl(directInput.playerValue, streamingOptionsFromConfig(config))
       : null;
     if (playerUrl) {
       const result = await applyStreamingManifest({
         repository,
         targetAdminId: pending.targetAdminId,
         config,
-        manifest: directStreamingManifest(pending.targetAdminId, playerUrl)
+        manifest: directStreamingManifest(pending.targetAdminId, playerUrl, directInput.episode)
       });
       if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
       await ctx.reply(streamImportResultText(result, config));
       return true;
     }
     await ctx.reply(pending.targetAdminId
-      ? 'Watch-link import is waiting for a .json/.csv document or one approved player URL/iframe. Send it now, or use /cmd cancel.'
-      : 'Watch-link import is waiting for one .json or .csv document. To paste one player URL directly, start with /cmd SB-0123ABCDEF <player URL>.');
+      ? 'Watch-link import is waiting for a .json/.csv document or one approved player URL/iframe. For one episode, send “ep 1 <player URL or iframe>”. Send it now, or use /cmd cancel.'
+      : 'Watch-link import is waiting for one .json or .csv document. To paste one episode player directly, start with /cmd SB-0123ABCDEF ep 1 <player URL>.');
     return true;
   }
   const format = inferStreamManifestFormat(document);
@@ -2966,7 +3023,7 @@ export async function launchTelegramBot({ config, repository }) {
 
     const target = argument.match(/^(SB-[A-F0-9]{10})(?:\s+([\s\S]+))?$/i);
     if (argument && !target) {
-      await ctx.reply('Usage: /cmd SB-0123ABCDEF <player URL or iframe>, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields.');
+      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields.');
       return;
     }
     const targetAdminId = target?.[1]?.toUpperCase() || null;
@@ -2978,16 +3035,21 @@ export async function launchTelegramBot({ config, repository }) {
         return;
       }
       if (directValue) {
-        const playerUrl = safeStreamingUrl(directValue, streamingOptionsFromConfig(config));
+        const directInput = parseDirectStreamingInput(directValue);
+        if (directInput.error) {
+          await ctx.reply(directInput.error);
+          return;
+        }
+        const playerUrl = safeStreamingUrl(directInput.playerValue, streamingOptionsFromConfig(config));
         if (!playerUrl) {
-          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; add another trusted domain through STREAMING_ALLOWED_HOSTS.');
+          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; add another trusted domain through STREAMING_ALLOWED_HOSTS. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
           return;
         }
         const result = await applyStreamingManifest({
           repository,
           targetAdminId,
           config,
-          manifest: directStreamingManifest(targetAdminId, playerUrl)
+          manifest: directStreamingManifest(targetAdminId, playerUrl, directInput.episode)
         });
         await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
         await ctx.reply(streamImportResultText(result, config));

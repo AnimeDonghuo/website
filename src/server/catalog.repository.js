@@ -1948,7 +1948,10 @@ export class MongoCatalogRepository {
           languageCode: cleanText(user?.language_code || '', 20),
           lastSeenAt: now
         },
-        $setOnInsert: { id, firstSeenAt: now, interactionCount: 0 },
+        // `$inc` creates a missing counter at 1 during an upsert. Do not also
+        // initialize interactionCount in $setOnInsert: MongoDB rejects two
+        // update operators targeting the same path in one update document.
+        $setOnInsert: { id, firstSeenAt: now },
         $inc: { interactionCount: 1 }
       },
       { upsert: true, returnDocument: 'after', includeResultMetadata: false }
@@ -1964,7 +1967,9 @@ export class MongoCatalogRepository {
       { visitorId: id },
       {
         $set: { lastSeenAt: now },
-        $setOnInsert: { visitorId: id, firstSeenAt: now, visitCount: 0 },
+        // `$inc` creates a missing counter at 1 during an upsert. Keeping it
+        // out of $setOnInsert avoids MongoDB's conflicting update-path error.
+        $setOnInsert: { visitorId: id, firstSeenAt: now },
         $inc: { visitCount: 1 }
       },
       { upsert: true, returnDocument: 'after', includeResultMetadata: false }

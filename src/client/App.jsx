@@ -8,6 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
+import { episodePagePath, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, releaseLevelStreamEntries, streamEntriesForEpisode, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 const categoryCopy = {
@@ -259,33 +260,7 @@ function SearchPage() {
   );
 }
 
-function formatEpisodeNumber(value) {
-  return String(value).padStart(2, '0');
-}
-
-function episodePagePath(item, group) {
-  const range = group.start === group.end ? String(group.start) : `${group.start}-${group.end}`;
-  return `/${item.category}/${item.slug}/episode/${range}`;
-}
-
-function watchPagePath(item) {
-  return `/${item.category}/${item.slug}/watch`;
-}
-
-function parseEpisodeRoute(value) {
-  const match = String(value || '').match(/^(\d{1,3})(?:-(\d{1,3}))?$/);
-  if (!match) return null;
-  const start = Number(match[1]);
-  const end = Number(match[2] || match[1]);
-  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) return null;
-  return {
-    start,
-    end,
-    label: start === end ? `Episode ${formatEpisodeNumber(start)}` : `Episodes ${formatEpisodeNumber(start)}–${formatEpisodeNumber(end)}`
-  };
-}
-
-function FileChoiceList({ item, choices, onGetFiles }) {
+function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
   return <div className="file-choice-list">
     {choices.map((file) => {
       const heading = file.episode?.label || file.label || `Delivery file ${file.position}`;
@@ -296,6 +271,9 @@ function FileChoiceList({ item, choices, onGetFiles }) {
           : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
         : `FILE ${String(file.position).padStart(2, '0')}`;
       const deliveryHref = file.deliveryUrl || file.telegramUrl;
+      // An episode row deliberately ignores release-level players. Only an
+      // explicitly matching episode stream earns a Watch action beside it.
+      const hasEpisodeWatch = Boolean(file.episode && streamEntriesForEpisode(item?.stream?.entries, file.episode).length);
       return <article className="file-choice" key={file.id}>
         <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
         <div className="file-choice__details">
@@ -308,7 +286,10 @@ function FileChoiceList({ item, choices, onGetFiles }) {
             {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
           </div>
         </div>
-        {file.deliveryReady && deliveryHref ? <a className="file-choice__action" href={deliveryHref} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+        <div className="file-choice__actions">
+          {showWatch && hasEpisodeWatch ? <Link className="file-choice__action file-choice__action--watch" to={watchPagePath(item, file.episode)} aria-label={`Watch ${heading}`}><Icon name="play" size={15} /> Watch</Link> : null}
+          {file.deliveryReady && deliveryHref ? <a className="file-choice__action" href={deliveryHref} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+        </div>
       </article>;
     })}
   </div>;
@@ -363,7 +344,7 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
               {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
               <div className="tag-list">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div>
               <div className="detail-actions">
-                {item.stream?.available ? <Link className="button button--watch" to={watchPagePath(item)}><Icon name="play" size={19} /> Watch</Link> : null}
+                {hasReleaseLevelWatch(item.stream) ? <Link className="button button--watch" to={watchPagePath(item)}><Icon name="play" size={19} /> Watch</Link> : null}
                 {item.episodeGroups?.length
                   ? <a className="button button--telegram" href="#episode-guide-title"><Icon name="layers" size={20} /> Browse episode guide</a>
                   : <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>}
@@ -435,7 +416,7 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
   const matchingGroup = item?.episodeGroups?.find((group) => group.start === requestedEpisode?.start && group.end === requestedEpisode?.end);
   const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
   const choices = item && requestedEpisode
-    ? (item.fileChoices || []).filter((file) => file.episode && file.episode.start <= requestedEpisode.end && file.episode.end >= requestedEpisode.start)
+    ? fileChoicesForEpisode(item.fileChoices, requestedEpisode)
     : [];
 
   if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
@@ -477,7 +458,7 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
 }
 
 function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
-  const { category, slug } = useParams();
+  const { category, slug, episodeRange } = useParams();
   const requestedAdultCategory = category === 'adult';
   const release = useRemote(
     () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
@@ -489,7 +470,17 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   );
   const item = release.data?.item;
   const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
-  const entries = item?.stream?.entries || [];
+  const requestedEpisode = parseEpisodeRoute(episodeRange);
+  const allEntries = item?.stream?.entries || [];
+  // A generic /watch page is reserved for intentional release-level players.
+  // An episode route sees only players that explicitly overlap that episode.
+  const entries = requestedEpisode
+    ? streamEntriesForEpisode(allEntries, requestedEpisode)
+    : releaseLevelStreamEntries(allEntries);
+  const matchingFiles = requestedEpisode
+    ? fileChoicesForEpisode(item?.fileChoices, requestedEpisode)
+      .filter((file) => streamEntriesForEpisode(allEntries, file.episode).length)
+    : [];
   const [selectedId, setSelectedId] = useState(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
   const relatedItems = useMemo(() => {
@@ -499,7 +490,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
 
   useEffect(() => {
     setSelectedId(entries[0]?.id || null);
-  }, [slug, item?.stream?.updatedAt]);
+  }, [slug, episodeRange, item?.stream?.updatedAt]);
 
   if (adultLocked) {
     return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
@@ -507,14 +498,28 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
     return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
   }
-  if (release.error || !item || item.category !== category) {
+  if (release.error || !item || item.category !== category || (episodeRange && !requestedEpisode)) {
     return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>WATCH NOT FOUND</Eyebrow><h1>This player page is off the map.</h1><p>{release.error?.message || 'Return to the release and choose an available Watch option.'}</p><Link className="button button--primary" to={item ? `/${item.category}/${item.slug}` : '/browse'}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
   }
-  if (!item.stream?.available || !selected) {
-    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized provider player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  if (!item.stream?.available) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+  if (requestedEpisode && !matchingFiles.length) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>This player needs a matching delivery file.</h1><p>{requestedEpisode.label} is not an indexed delivery context for this release, so SoraBox will not play an arbitrary episode here.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></section></PageShell>;
+  }
+  if (!selected) {
+    if (!requestedEpisode && allEntries.some((entry) => entry?.episode?.start)) {
+      return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>Select an episode to watch.</h1><p>Players are attached to individual episodes, not the whole release. Open the matching episode delivery page to find its Watch button.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></section></PageShell>;
+    }
+    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>This Watch option is unavailable.</h1><p>The selected player is no longer available. Return to the release to choose another option.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
   }
 
-  const selectedTitle = selected.episode?.label || selected.label || 'Main player';
+  const selectedTitle = selected.label || selected.episode?.label || 'Main player';
+  const selectedFileTitle = matchingFiles[0]?.label || (selectedTitle === 'Main player' ? item.title : selectedTitle);
+  const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
+  const hasEpisodeDelivery = matchingFiles.length > 0;
+  const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
+
   return (
     <PageShell>
       <section className={`watch-hero detail-hero--${item.tone}`}>
@@ -523,13 +528,9 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
           <div className="watch-hero__heading">
             <div>
-              <Eyebrow><Icon name="play" size={13} /> WATCH {item.categoryLabel.toUpperCase()}</Eyebrow>
-              <h1>{item.title}</h1>
-              <p>{selectedTitle} · hosted by {selected.provider || item.stream.provider || 'an approved provider'}.</p>
-            </div>
-            <div className="watch-hero__actions">
-              {selected.watchUrl ? <a className="button button--ghost" href={selected.watchUrl} target="_blank" rel="noreferrer"><Icon name="external" size={17} /> Open source</a> : null}
-              {item.deliveryReady ? <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get files</button> : null}
+              <Eyebrow><Icon name="play" size={13} /> WATCH</Eyebrow>
+              <h1>{selectedFileTitle}</h1>
+              <p className="watch-hero__meta">{episodeContext ? <span className="watch-hero__episode">{episodeContext}</span> : null}<span>Hosted by SoraBox</span></p>
             </div>
           </div>
           <div className="watch-player-shell">
@@ -537,27 +538,32 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               key={selected.id}
               className="watch-player-shell__frame"
               src={selected.embedUrl}
-              title={`${item.title} — ${selectedTitle}`}
+              title={`${item.title} — ${selectedFileTitle}`}
               allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
               referrerPolicy="strict-origin-when-cross-origin"
               allowFullScreen
-            /> : <div className="watch-player-shell__fallback"><Icon name="external" size={24} /><strong>This provider supplied an external Watch link.</strong><p>Open the approved source to play this option.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Open player <Icon name="external" size={16} /></a> : null}</div>}
+            /> : <div className="watch-player-shell__fallback"><Icon name="play" size={24} /><strong>This video opens in its approved player.</strong><p>Use the play button to continue.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Play video <Icon name="arrow" size={16} /></a> : null}</div>}
           </div>
+          {(hasEpisodeDelivery || item.deliveryReady) ? <div className="watch-delivery">
+            <div>
+              <span>{episodeContext || 'TELEGRAM DELIVERY'}</span>
+              <strong>{hasEpisodeDelivery ? 'Get these matching files on Telegram' : 'Get files on Telegram'}</strong>
+            </div>
+            <button className="button button--telegram" type="button" onClick={() => onGetFiles(item, hasEpisodeDelivery ? { files: matchingFiles, title: deliveryTitle, episodeLabel: episodeContext } : undefined)}><Icon name="telegram" size={18} /> Get files</button>
+          </div> : null}
+          {entries.length > 1 ? <div className="watch-player-options" aria-label="Player options">
+            <span>Choose a player</span>
+            <div>{entries.map((entry, index) => <button className={entry.id === selected.id ? 'is-active' : ''} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}><Icon name="play" size={13} /> Player {index + 1}</button>)}</div>
+          </div> : null}
         </div>
       </section>
 
-      {entries.length > 1 ? <section className="watch-choices page-width" aria-labelledby="watch-choices-title">
-        <div className="watch-choices__heading"><div><Eyebrow>PLAYER & EPISODE OPTIONS</Eyebrow><h2 id="watch-choices-title">Choose your <em>Watch option.</em></h2></div><span>{entries.length} approved source{entries.length === 1 ? '' : 's'}</span></div>
-        <div className="watch-choices__grid">
-          {entries.map((entry) => {
-            const label = entry.episode?.label || entry.label || 'Main player';
-            return <button className={`watch-choice ${entry.id === selected.id ? 'watch-choice--active' : ''}`} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}>
-              <span className="watch-choice__play"><Icon name="play" size={15} /></span>
-              <span><strong>{label}</strong><small>{entry.provider || 'Approved provider'}{entry.embedUrl ? ' · embedded player' : ' · external player'}</small></span>
-              <Icon name="arrow" size={16} />
-            </button>;
-          })}
+      {hasEpisodeDelivery ? <section className="file-choice-section file-choice-section--watch page-width" aria-labelledby="watch-file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>{episodeContext || 'EPISODE'} · TELEGRAM DELIVERY</Eyebrow><h2 id="watch-file-choice-title">Choose your <em>file.</em></h2><p>These are the files matched to this Watch page. Each Telegram action delivers only the selected file.</p></div>
+          <Link className="button button--secondary" to={episodePagePath(item, requestedEpisode)}><Icon name="layers" size={18} /> Episode delivery</Link>
         </div>
+        <FileChoiceList item={item} choices={matchingFiles} onGetFiles={onGetFiles} showWatch={false} />
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="watch-related-title">
@@ -584,6 +590,11 @@ export default function App() {
   const [confirmingAdult, setConfirmingAdult] = useState(false);
   const [adultAccessError, setAdultAccessError] = useState(null);
   const [adultAccessVersion, setAdultAccessVersion] = useState(0);
+
+  function openDelivery(item, options = {}) {
+    if (!item) return;
+    setDeliveryItem({ item, ...options });
+  }
 
   async function handleAdultConfirmation() {
     if (confirmingAdult) return;
@@ -619,16 +630,17 @@ export default function App() {
   return (
     <>
       <Routes>
-        <Route path="/" element={<HomePage onGetFiles={setDeliveryItem} />} />
+        <Route path="/" element={<HomePage onGetFiles={openDelivery} />} />
         <Route path="/browse" element={<BrowsePage {...adultGateProps} />} />
         <Route path="/browse/:category" element={<BrowsePage {...adultGateProps} />} />
         <Route path="/search" element={<SearchPage />} />
-        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
-        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
-        <Route path="/:category/:slug" element={<DetailPage onGetFiles={setDeliveryItem} {...adultGateProps} />} />
+        <Route path="/:category/:slug/watch/episode/:episodeRange" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug" element={<DetailPage onGetFiles={openDelivery} {...adultGateProps} />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
-      {deliveryItem ? <DeliveryDialog item={deliveryItem} onClose={() => setDeliveryItem(null)} /> : null}
+      {deliveryItem ? <DeliveryDialog item={deliveryItem.item} files={deliveryItem.files} title={deliveryItem.title} episodeLabel={deliveryItem.episodeLabel} onClose={() => setDeliveryItem(null)} /> : null}
     </>
   );
 }

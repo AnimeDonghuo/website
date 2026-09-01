@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
@@ -104,6 +104,24 @@ test('publisher menu exposes post management, backup, and compatible metadata co
   assert.equal(parsePublishedPostEdit('Hindi, English'), null);
 });
 
+
+test('direct /cmd input can attach one explicit episode player while preserving intentional main players', () => {
+  assert.deepEqual(parseDirectStreamingInput('ep 01 https://soraboxs.embedseek.com/#episode-one'), {
+    playerValue: 'https://soraboxs.embedseek.com/#episode-one',
+    episode: { start: 1, end: 1, label: 'Episode 01' },
+    error: null
+  });
+  assert.deepEqual(parseDirectStreamingInput('episode 2-4 <iframe src="https://soraboxs.embedseek.com/#episodes-two-four"></iframe>'), {
+    playerValue: '<iframe src="https://soraboxs.embedseek.com/#episodes-two-four"></iframe>',
+    episode: { start: 2, end: 4, label: 'Episodes 02–04' },
+    error: null
+  });
+  assert.deepEqual(parseDirectStreamingInput('https://soraboxs.embedseek.com/#release-main'), {
+    playerValue: 'https://soraboxs.embedseek.com/#release-main',
+    episode: null,
+    error: null
+  });
+});
 
 test('18+ posts never dispatch a Telegram announcement', async () => {
   let listed = 0;

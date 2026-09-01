@@ -295,7 +295,7 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .watch-hero__heading p { margin: 0; color: #aab5c0; font-size: 12px; font-weight: 700; }
 .watch-hero__actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 8px; }
 .watch-player-shell { position: relative; overflow: hidden; width: 100%; min-height: 320px; border: 1px solid rgba(255,255,255,.16); border-radius: 14px; background: #06090e; box-shadow: 0 30px 75px rgba(0,0,0,.38), inset 0 0 0 1px rgba(197,248,106,.04); aspect-ratio: 16 / 9; }
-.watch-player-shell::before { content: 'AUTHORIZED PROVIDER PLAYER'; position: absolute; z-index: 0; left: 17px; top: 13px; color: rgba(197,248,106,.36); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 600; letter-spacing: .12em; }
+.watch-player-shell::before { content: 'HOSTED BY SORABOX'; position: absolute; z-index: 0; left: 17px; top: 13px; color: rgba(197,248,106,.36); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 600; letter-spacing: .12em; }
 .watch-player-shell__frame { position: relative; z-index: 1; display: block; width: 100%; height: 100%; border: 0; background: #070a0f; }
 .watch-player-shell__fallback { position: relative; z-index: 1; display: grid; place-items: center; align-content: center; gap: 9px; min-height: 320px; padding: 35px; text-align: center; }
 .watch-player-shell__fallback > svg { color: var(--lime); }.watch-player-shell__fallback strong { color: #eaf0f3; font-size: 14px; }.watch-player-shell__fallback p { margin: 0 0 5px; color: #93a0ae; font-size: 11px; }
@@ -305,4 +305,45 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 @media (max-width: 760px) {
   .detail-actions .button--watch { width: 100%; }
   .watch-hero { padding-bottom: 48px; }.watch-hero__inner { padding-top: 19px; }.watch-hero__heading { align-items: flex-start; flex-direction: column; gap: 17px; margin-bottom: 19px; }.watch-hero__heading h1 { font-size: clamp(30px,8.2vw,47px); }.watch-hero__heading p { font-size: 10px; line-height: 1.55; }.watch-hero__actions { width: 100%; }.watch-hero__actions .button { flex: 1; }.watch-player-shell { min-height: 190px; border-radius: 10px; }.watch-player-shell__fallback { min-height: 190px; }.watch-choices { padding-top: 52px; }.watch-choices__heading { align-items: flex-start; flex-direction: column; gap: 8px; }.watch-choices__heading h2 { font-size: 29px; }.watch-choices__grid { grid-template-columns: 1fr; }.watch-choice { min-height: 70px; }
+}
+
+/* Episode-scoped Watch controls and the simplified SoraBox player page. */
+.file-choice__actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: 6px; }
+.file-choice__action--watch { color: #1a250c; border-color: rgba(197,248,106,.72); background: var(--lime); }
+.file-choice__action--watch:hover { color: #14200a; background: #d7ff8c; }
+
+.watch-hero__heading { display: block; margin-bottom: 22px; }
+.watch-hero__heading h1 { max-width: 900px; overflow-wrap: anywhere; font-size: clamp(31px,4.2vw,55px); }
+.watch-hero__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.watch-hero__meta > span:last-child { color: #d5dee3; }
+.watch-hero__episode { display: inline-flex; align-items: center; min-height: 21px; padding: 3px 7px; color: #dce9ee; border: 1px solid rgba(137,223,252,.32); border-radius: 999px; background: rgba(42,172,235,.1); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; letter-spacing: .035em; }
+.watch-player-shell::before { content: 'HOSTED BY SORABOX'; }
+.watch-delivery { display: flex; align-items: center; justify-content: space-between; gap: 17px; margin-top: 14px; padding: 13px 14px 13px 17px; border: 1px solid rgba(42,172,235,.24); border-radius: 11px; background: linear-gradient(100deg, rgba(42,172,235,.1), rgba(42,172,235,.035)); }
+.watch-delivery > div { display: grid; gap: 3px; min-width: 0; }
+.watch-delivery > div > span { color: #8fcfe8; font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; letter-spacing: .07em; text-transform: uppercase; }
+.watch-delivery strong { color: #edf4f7; font-size: 11px; font-weight: 800; }
+.watch-delivery .button { flex: 0 0 auto; min-height: 39px; padding-inline: 15px; font-size: 10px; }
+.watch-player-options { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; padding: 0 2px; }
+.watch-player-options > span { color: #a8b3bf; font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
+.watch-player-options > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.watch-player-options button { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 9px; color: #c1cbd2; border: 1px solid rgba(255,255,255,.13); border-radius: 999px; background: rgba(255,255,255,.035); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
+.watch-player-options button:hover, .watch-player-options button.is-active { color: #17210a; border-color: var(--lime); background: var(--lime); }
+.file-choice-section--watch { padding-top: 54px; padding-bottom: 83px; }
+
+.delivery-file-list { display: grid; gap: 8px; max-height: 255px; overflow-y: auto; padding-right: 3px; }
+.delivery-file-link { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 57px; padding: 10px 11px; color: #eaf2f5; border: 1px solid rgba(42,172,235,.27); border-radius: 9px; background: rgba(42,172,235,.065); transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+.delivery-file-link:hover { border-color: rgba(137,223,252,.72); background: rgba(42,172,235,.13); transform: translateY(-1px); }
+.delivery-file-link > span { min-width: 0; }.delivery-file-link strong, .delivery-file-link small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.delivery-file-link strong { font-size: 10px; font-weight: 800; }.delivery-file-link small { margin-top: 3px; color: #99adba; font-family: 'DM Mono', monospace; font-size: 8px; }.delivery-file-link b { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; color: #9fe5ff; font-size: 9px; font-weight: 800; white-space: nowrap; }.delivery-file-link--unavailable { color: #97a4ae; border-color: rgba(255,255,255,.1); background: rgba(255,255,255,.025); }.delivery-file-link--unavailable:hover { border-color: rgba(255,255,255,.1); background: rgba(255,255,255,.025); transform: none; }.delivery-file-link--unavailable b { color: #c4a772; }
+
+@media (max-width: 760px) {
+  .file-choice { grid-template-columns: 49px minmax(0, 1fr) auto; gap: 8px; padding: 10px; }
+  .file-choice__index { width: 47px; min-height: 39px; font-size: 7px; }
+  .file-choice__actions { gap: 4px; }
+  .file-choice__actions .file-choice__action { min-height: 30px; padding-inline: 7px; font-size: 8px; }
+  .file-choice__actions .file-choice__action svg { width: 14px; }
+  .watch-hero__heading { margin-bottom: 18px; }.watch-hero__heading h1 { font-size: clamp(28px,8vw,43px); }.watch-hero__meta { gap: 6px; }.watch-hero__episode { font-size: 7px; }
+  .watch-delivery { align-items: flex-start; flex-direction: column; gap: 10px; padding: 13px; }.watch-delivery .button { width: 100%; }
+  .watch-player-options { align-items: flex-start; flex-direction: column; gap: 8px; }.watch-player-options > div { justify-content: flex-start; }
+  .file-choice-section--watch { padding-top: 43px; padding-bottom: 64px; }
+  .delivery-file-list { max-height: 225px; }.delivery-file-link { min-height: 53px; gap: 8px; }.delivery-file-link b { font-size: 8px; }
 }
