@@ -5,7 +5,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - **No media files live on Koyeb.** The bot copies uploads into a private Telegram database channel.
 - **Every published poster is mirrored once to ImgBB** and the permanent hosted URL is saved to MongoDB. The catalog never fetches a poster on every page view.
 - **Visitors get a Telegram deep link** (`https://t.me/<bot>?start=get-<code>`). After they tap **Start**, the bot copies that release's saved channel messages into their own chat.
-- **MongoDB stores catalog metadata, file message references, delivery codes, in-progress publisher/request-selection drafts, and private aggregate analytics.** Sensitive channel and file references never leave the public API.
+- **MongoDB stores catalog metadata, file message references, delivery codes, in-progress publisher/request-selection drafts, and private aggregate analytics.** Sensitive channel and file references never leave the public API. Signed, compressed application backups can be sent to the private storage channel and restored into a replacement MongoDB database.
 - A single Node service serves the React site, API, and Telegram long-polling bot — deliberately small enough for a Koyeb free instance.
 
 > **Rights reminder:** only upload and deliver files you own or have explicit permission to distribute. Telegram and ImgBB each have their own content policies.
@@ -34,12 +34,12 @@ A production-minded, responsive catalog for **media you are authorized to distri
   - `/movie Title`
   - `/series Title`
 - Start a draft, send the title, upload files in the same private bot chat, then use `/done`
-- Optional metadata commands: `/lang`, `/year`, `/genres`, `/description`, and `/poster`
+- Optional draft metadata commands: `/lang`, `/subtitles`, `/year`, `/genres`, `/description`, and `/poster`; the same metadata can be corrected on an existing private `SB-…` post ID
 - Category-aware metadata fallback chain: AniList for Anime/Donghua, TMDB, then OMDb when configured
 - Server-side poster download validation, then permanent ImgBB upload during publishing
 - A generated category-colored PNG fallback poster **renders the release title** and is uploaded to ImgBB if no provider has suitable artwork
 - Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
-- Upload captions/file names also resolve explicit language labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label
+- Upload captions/file names resolve explicit audio and subtitle labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label. Dual/Multi or unlabeled media is inspected with MediaInfo only after the entire manual, batch, or auto release has collected; candidates are downloaded and parsed one at a time with byte, timeout, and file-count caps, so a failed/unavailable scan safely retains caption/filename fallback labels
 - Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot
 - `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel as **one release**, including long runs such as 448 episode messages. It preserves original storage message IDs, retries Telegram rate limits, reports progress, infers title/category when no name is supplied, and enumerates every already-published, active-draft, non-media, inaccessible, or protected message ID instead of reporting a vague skip count
@@ -48,7 +48,9 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel; `/requests` opens a multi-select publisher workflow that marks selected requests **Completed** or **Rejected** and immediately notifies each requester
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
-- Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards
+- Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards. Authorized publisher command scopes are registered on startup and when an allowed owner opens/logs into the bot, so `/posts`, `/postid`, and other publisher commands remain visible through Telegram menu caching
+- `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…`, `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
+- `/backup` creates a signed gzip application snapshot and sends it only to the configured private storage channel; `/recover` accepts one signed backup document in an authorized private publisher chat and restores it into the current database, including a new/empty MongoDB URI. A durable India-calendar-month scheduler sends one automatic backup each month
 - `/stats` reports private aggregate bot activity, anonymous site visitors/visits, catalog totals, and request status totals. Site tracking uses only a random first-party visitor cookie—never raw IPs or public Telegram data
 - Draft/login/request-selection sessions survive restarts when MongoDB is configured and expire automatically
 
@@ -146,6 +148,8 @@ TELEGRAM_ADMIN_IDS=123456789,987654321
 # Required publisher passcode; set your desired value as a Koyeb secret (for example, AYU).
 ADMIN_LOGIN_CODE=your_private_publisher_passcode
 ADMIN_SESSION_HOURS=24
+# Set this separately and keep it stable across admin-passcode rotations.
+BACKUP_SIGNING_SECRET=a_long_random_backup_signing_secret
 TELEGRAM_MODE=polling
 ```
 
@@ -160,6 +164,41 @@ Check `/api/health` after deployment: `deliveryBotUsername` must be the replacem
 #### Storage-channel troubleshooting
 
 Use the channel's **numeric** ID (normally `-100…`), not its invite link. The bot must be an administrator with **Post Messages** enabled. SoraBox first uses Telegram `copyMessage`; if Telegram refuses a copied/forwarded file, it automatically retries by sending the file ID in its original type. If Telegram says the source is protected, send the original file directly to your bot instead of forwarding it from a protected channel. `/batch` only accepts a private `t.me/c/...` link whose internal ID maps exactly to `TELEGRAM_STORAGE_CHANNEL_ID`; it temporarily forwards each requested message into the logged-in publisher’s private chat to inspect it, then deletes that preview. Its final report names every inaccessible/protected, non-media, already-published, and active-draft message ID and reason. If a previous broken auto run already created one-file cards, those IDs are deliberately reported as already linked; use `/posts 50`, remove the unwanted cards with `/delete`, then rerun `/batch` to build one clean post.
+
+### MediaInfo audio/subtitle inspection
+
+The production Docker image installs `mediainfo`. SoraBox does **not** download or inspect every upload while a publisher is still uploading. Instead, at the final `/done` stage (including after `/batch` and an auto-publish group finishes collecting), it queues only files whose labels say **Dual**, **Multi**, or do not contain a concrete audio language.
+
+Each eligible candidate is handled **sequentially**: the stored Telegram file size is checked first, it is downloaded to a temporary file only when it is within the configured cap, MediaInfo reads Audio/Text tracks, then the temporary file is removed before the next file. The detected ISO tags are normalized to public labels such as Hindi, English, Japanese, and Chinese; audio and subtitle labels are stored separately and displayed separately on a release page. A source with no tagged tracks, a file above the cap, Telegram's cloud download limits, a timeout, or an unavailable binary never blocks publishing—the caption/filename result remains the safe fallback and the scan state is recorded privately on the file.
+
+```dotenv
+MEDIAINFO_ENABLED=true
+MEDIAINFO_COMMAND=mediainfo
+# Telegram's cloud Bot API normally downloads up to 20 MB. Raise only when your
+# Bot API deployment supports it and your Koyeb memory/network budget permits it.
+MEDIAINFO_MAX_DOWNLOAD_BYTES=20971520
+MEDIAINFO_TIMEOUT_MS=45000
+# A hard sequential bound that still accommodates long inclusive ranges.
+MEDIAINFO_MAX_FILES=500
+```
+
+### Signed backup and recovery
+
+Set a stable server-only backup signing secret before relying on recovery:
+
+```dotenv
+BACKUP_SIGNING_SECRET=a_long_random_secret_at_least_12_characters
+BACKUP_MAX_BYTES=19922944
+BACKUP_MAX_UNCOMPRESSED_BYTES=83886080
+BACKUP_DOWNLOAD_TIMEOUT_MS=60000
+BACKUP_MONTHLY_ENABLED=true
+```
+
+Run `/backup` from an unlocked publisher chat to export catalog records, upload sessions, requests, private bot/site analytics, announcement destinations, and automation/backup settings as one signed, gzip-compressed document in `TELEGRAM_STORAGE_CHANNEL_ID`. The archive contains **application data only**—not a MongoDB URI, Telegram token, ImgBB/TMDB key, passcode, or other environment secret. It does contain private catalog file references and analytics, so keep the storage channel and downloaded archive private.
+
+SoraBox verifies the HMAC signature before it writes anything on `/recover`. In an unlocked **private** publisher chat, run `/recover`, then send the unmodified `.json.gz` document within 15 minutes. This replaces the backed-up application collections in the currently configured MongoDB database, so it works after pointing `MONGODB_URI`/`MONGODB_DB` at a new empty deployment. Keep `BACKUP_SIGNING_SECRET` unchanged across that migration; if it changes, old archives intentionally fail verification. Active login/request-selection/recovery prompts are intentionally not imported because they are short-lived authorization state; log in again if a process has been restarted.
+
+The bot checks on startup and every six hours for a completed backup in the current **India calendar month**. A durable MongoDB claim permits one automatic archive per month even across restarts. A successful manual `/backup` also satisfies that month. Set `BACKUP_MONTHLY_ENABLED=false` only if an external backup policy replaces it.
 
 ### 4. Configure permanent ImgBB posters
 
@@ -236,19 +275,22 @@ Useful commands:
 | `/anime`, `/cartoon`, `/donghua`, `/kdrama`, `/movie`, `/series` | Start a category draft; title may follow the command |
 | `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category |
 | `/auto` | Show persistent ON/OFF controls for direct database-channel auto-publishing |
-| `/title Title` | Replace a draft title and re-run provider lookup |
-| `/lang Hindi, English` | Set public language labels |
-| `/year 2026` | Set the release year |
-| `/genres Action, Fantasy` | Set public genre labels |
-| `/description …` | Set a public synopsis |
-| `/poster https://…` | Override automatic artwork with a public HTTPS image |
-| `/status` | See the active draft state and detected episode index |
+| `/title Title` | Replace a draft title and re-run provider lookup; `/title SB-… Corrected title` edits an existing card without changing its delivery identity |
+| `/lang Hindi, English` | Set draft audio labels; `/lang SB-… Hindi, English` edits an existing card (`/lan` and `/lam` are compatible aliases) |
+| `/subtitles English` | Set draft subtitle labels; `/subtitles SB-… English, Hindi` edits an existing card (`/subs` is an alias) |
+| `/year 2026` | Set draft year; `/year SB-… 2026` corrects an existing card |
+| `/genres Action, Fantasy` | Set draft genres; prefix with `SB-…` to edit a published card |
+| `/description …` | Set a draft synopsis; prefix with `SB-…` to edit a published card |
+| `/poster https://…` | Override draft artwork; `/poster SB-… https://…` validates and mirrors a replacement poster to ImgBB before changing a published card |
+| `/category SB-… anime`, `/release SB-… Label`, `/status SB-… Updated` | Edit a published card's category, release label, or status; bare `/status` still shows the active draft |
 | `/teststorage` | Send a harmless test message to verify the configured database channel |
-| `/cancel` | Discard the active draft |
+| `/cancel` | Discard the active draft or a pending `/recover` prompt |
 | `/done` | Mirror poster, create MongoDB record, announce to every configured channel, and return share + Post ID |
 | `/posts 50` | List recent private `SB-…` post IDs for cleanup or management |
 | `/postid` | Open Today, Yesterday, Week, and Month buttons to return uploaded post IDs with names for that period (IST) |
 | `/stats` | Show anonymous site-visitor/visit activity, private bot-user activity, catalog totals, and request status totals |
+| `/backup` | Create a signed compressed application-data snapshot and send it only to the private storage channel |
+| `/recover` | Arm a 15-minute private-chat prompt for one signed backup document; after signature verification it restores backed-up application data into the configured database |
 | `/delete SB-0123ABCDEF[, SB-FEDCBA3210]` | Remove one or several published catalog records and disable their deep links |
 | `/addchannel -1001234567890` | Add a channel for automatic professional new-post announcements |
 | `/channels` / `/removechannel ID` | View or remove announcement destinations |
@@ -260,7 +302,7 @@ When `PUBLIC_SITE_URL` is configured, publishing returns the stable catalog deta
 https://t.me/YourBotUsername?start=get-7kWJdR7oTg
 ```
 
-The public site creates a stable all-files `/deliver/<code>` action and a separate `/deliver/<code>/file/<position>` action for every uploaded file. Each routes to the current bot's Telegram deep link only when clicked, so a bot replacement does not require a catalog migration. The detail page displays cleaned file labels, detected quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete`. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
+The public site creates a stable all-files `/deliver/<code>` action and a separate `/deliver/<code>/file/<position>` action for every uploaded file. Each routes to the current bot's Telegram deep link only when clicked, so a bot replacement does not require a catalog migration. The detail page displays cleaned file labels, detected audio and subtitle languages, quality, size, and episode/range information so visitors can choose exactly one delivery option or request all files. A successful publish also returns a private `SB-…` Post ID for `/delete` or later metadata corrections. The user never sees the storage channel, raw Telegram file IDs, or that deletion ID.
 
 ### Import an existing private storage range
 
@@ -341,16 +383,22 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `ADMIN_LOGIN_CODE` | Secret | Yes | Publisher passcode; use your chosen value, not a client variable |
 | `ADMIN_SESSION_HOURS` | Plaintext | No | Defaults to `24` |
 | `TELEGRAM_ADMIN_IDS` | Secret or plaintext | No | Optional CSV numeric login allowlist |
+| `BACKUP_SIGNING_SECRET` | Secret | Strongly recommended | Stable 12+ character HMAC secret for `/backup` and `/recover`; set separately from the login code |
+| `BACKUP_MONTHLY_ENABLED` | Plaintext | No | Defaults to `true`; sends one signed private backup per India calendar month |
+| `BACKUP_MAX_BYTES` | Plaintext | No | Default `19922944` (19 MiB); safe Telegram archive/recovery size cap |
+| `MEDIAINFO_ENABLED` | Plaintext | No | Defaults to `true`; Docker installs the `mediainfo` runtime binary |
+| `MEDIAINFO_MAX_DOWNLOAD_BYTES` | Plaintext | No | Default `20971520` (20 MiB) per ambiguous file, handled sequentially |
+| `MEDIAINFO_TIMEOUT_MS` / `MEDIAINFO_MAX_FILES` | Plaintext | No | Defaults to `45000` ms / `500`; bounded final-stage MediaInfo scan |
 | `TELEGRAM_MODE` | Plaintext | Yes | `polling` |
 | `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN` | Secret | Recommended | Enables broader automatic metadata/posters |
 | `OMDB_API_KEY` | Secret | Optional | Movie/series metadata fallback |
 
-Koyeb's default route/port conventions also recognize port 8000, but setting it explicitly makes the service configuration clear. Keep the bot token, publisher passcode, ImgBB key, TMDB/OMDb credentials, and MongoDB URI in Koyeb's secret store rather than in Git.
+Koyeb's default route/port conventions also recognize port 8000, but setting it explicitly makes the service configuration clear. Keep the bot token, publisher passcode, **backup signing secret**, ImgBB key, TMDB/OMDb credentials, and MongoDB URI in Koyeb's secret store rather than in Git.
 
 ### Why it fits a small Koyeb instance
 
 - React assets are built during the Docker build, then served as static files with compression.
-- The server does not store poster files or media files on its disk.
+- The server does not store poster files or media files on its disk; an eligible MediaInfo input exists only as one bounded temporary file during final publishing and is removed before the next file.
 - ImgBB work happens once per publishing event rather than on every catalog request.
 - Media delivery is Telegram-to-Telegram; Koyeb only handles small metadata/API requests.
 - MongoDB Atlas free tier can hold the catalog records and bot draft state.

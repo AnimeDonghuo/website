@@ -12,6 +12,16 @@ function asHours(value, fallback = 24) {
   return Number.isInteger(hours) && hours >= 1 && hours <= 168 ? hours : fallback;
 }
 
+function asBoundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function asBoolean(value, fallback = true) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  return !/^(?:0|false|no|off)$/i.test(String(value).trim());
+}
+
 function csvNumbers(value) {
   return new Set(
     (value || '')
@@ -81,6 +91,27 @@ export function loadConfig(env = process.env) {
     omdbApiKey: (env.OMDB_API_KEY || '').trim(),
     adminLoginCode: (env.ADMIN_LOGIN_CODE || '').trim(),
     adminSessionHours: asHours(env.ADMIN_SESSION_HOURS),
+    // Deferred track inspection only downloads one ambiguous media file at a
+    // time, after a release has finished collecting. Cloud Bot API downloads
+    // are normally capped at 20 MB, so keep this conservative unless using a
+    // compatible local Bot API deployment.
+    mediaInfo: {
+      enabled: asBoolean(env.MEDIAINFO_ENABLED, true),
+      executable: (env.MEDIAINFO_COMMAND || 'mediainfo').trim() || 'mediainfo',
+      maxDownloadBytes: asBoundedInteger(env.MEDIAINFO_MAX_DOWNLOAD_BYTES, 20 * 1024 * 1024, 1_024, 2_000 * 1024 * 1024),
+      timeoutMs: asBoundedInteger(env.MEDIAINFO_TIMEOUT_MS, 45_000, 1_000, 10 * 60_000),
+      maxFiles: asBoundedInteger(env.MEDIAINFO_MAX_FILES, 500, 1, 2_000)
+    },
+    // A separate stable signing secret keeps backups recoverable even when the
+    // publisher login code changes. The login code is a compatibility fallback
+    // for existing deployments, but production should set BACKUP_SIGNING_SECRET.
+    backup: {
+      signingSecret: (env.BACKUP_SIGNING_SECRET || env.ADMIN_LOGIN_CODE || '').trim(),
+      maxBytes: asBoundedInteger(env.BACKUP_MAX_BYTES, 19 * 1024 * 1024, 1_024, 50 * 1024 * 1024),
+      maxUncompressedBytes: asBoundedInteger(env.BACKUP_MAX_UNCOMPRESSED_BYTES, 80 * 1024 * 1024, 16 * 1024, 500 * 1024 * 1024),
+      timeoutMs: asBoundedInteger(env.BACKUP_DOWNLOAD_TIMEOUT_MS, 60_000, 1_000, 10 * 60_000),
+      monthlyEnabled: asBoolean(env.BACKUP_MONTHLY_ENABLED, true)
+    },
     telegram: {
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),
       botUsername: normalizeBotUsername(env.TELEGRAM_BOT_USERNAME),

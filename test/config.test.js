@@ -2,6 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getContentPageUrl, getDeliveryRedirectPath, getTelegramFileDeliveryUrl, loadConfig } from '../src/server/config.js';
 
+test('MediaInfo and signed backup safety settings have bounded production defaults', () => {
+  const config = loadConfig({
+    ADMIN_LOGIN_CODE: 'long-enough-admin-code',
+    MEDIAINFO_MAX_DOWNLOAD_BYTES: '12345',
+    MEDIAINFO_TIMEOUT_MS: '5000',
+    MEDIAINFO_MAX_FILES: '44',
+    BACKUP_MAX_BYTES: '23456',
+    BACKUP_MONTHLY_ENABLED: 'false'
+  });
+  assert.equal(config.mediaInfo.maxDownloadBytes, 12345);
+  assert.equal(config.mediaInfo.timeoutMs, 5000);
+  assert.equal(config.mediaInfo.maxFiles, 44);
+  assert.equal(config.backup.signingSecret, 'long-enough-admin-code');
+  assert.equal(config.backup.maxBytes, 23456);
+  assert.equal(config.backup.monthlyEnabled, false);
+});
+
 test('announcement URLs resolve to a public content detail page', () => {
   const config = loadConfig({
     PUBLIC_SITE_URL: 'https://sorabox-demo.koyeb.app/',

@@ -91,6 +91,40 @@ test('memory repository persists and atomically claims due automation groups', a
   assert.equal((await repository.findSession('-100123', 'auto-storage-group-raakh')).auto.lastError, 'ImgBB unavailable');
 });
 
+test('memory repository updates published metadata by private post ID without changing its stable delivery identity', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Original title',
+    category: 'movie',
+    languages: ['English'],
+    files: [{ storageMessageId: 20, name: 'original.mkv' }]
+  });
+  const updated = await repository.updateContentByAdminId(created.adminId, {
+    title: 'Corrected title',
+    year: 2026,
+    languages: ['Hindi', 'English', 'hindi'],
+    subtitleLanguages: ['English'],
+    genres: ['Action', 'action'],
+    description: 'Corrected synopsis',
+    status: 'Updated',
+    releaseLabel: 'Season 2',
+    category: 'web-series'
+  });
+  assert.equal(updated.adminId, created.adminId);
+  assert.equal(updated.slug, created.slug);
+  assert.equal(updated.shareCode, created.shareCode);
+  assert.equal(updated.title, 'Corrected title');
+  assert.equal(updated.year, 2026);
+  assert.deepEqual(updated.languages, ['Hindi', 'English']);
+  assert.deepEqual(updated.subtitleLanguages, ['English']);
+  assert.equal(updated.subtitleLanguageSource, 'manual');
+  assert.deepEqual(updated.genres, ['Action']);
+  assert.equal(updated.category, 'web-series');
+  assert.equal(updated.art.tone, 'blue');
+  assert.equal(updated.titleKey, 'corrected-title');
+  assert.ok(updated.automationKeys.includes('original-title'));
+});
+
 test('memory repository merges later files into a same-title content record without duplicates', async () => {
   const repository = new MemoryCatalogRepository([]);
   const created = await repository.createContent({
@@ -114,6 +148,7 @@ test('memory repository persists login sessions, requests, announcement destinat
   const expiresAt = new Date(Date.now() + 60_000);
   await repository.createAdminSession({ chatId: 100, ownerId: 200, expiresAt });
   assert.ok(await repository.findAdminSession(100, 200));
+  assert.deepEqual((await repository.listActiveAdminSessions()).map((session) => session.chatId), ['100']);
 
   const request = await repository.createRequest({
     requestText: 'A requested series',

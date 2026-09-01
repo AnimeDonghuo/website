@@ -49,8 +49,8 @@ export function cleanText(value, maxLength = 280) {
     .slice(0, maxLength);
 }
 
-export function parseCommandArgument(text) {
-  return cleanText(String(text || '').replace(/^\/\S+\s*/, ''), 180);
+export function parseCommandArgument(text, maxLength = 180) {
+  return cleanText(String(text || '').replace(/^\/\S+\s*/, ''), maxLength);
 }
 
 export function titleInitials(title) {

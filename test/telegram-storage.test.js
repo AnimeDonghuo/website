@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { PUBLISHER_COMMANDS, automationGroupKey, automationMergeKeys, autoPublishStoragePost, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, requestManagerKeyboard, requestResolutionNotificationText, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
@@ -53,6 +53,23 @@ test('request management starts with Select requests and Back buttons, while pos
   assert.deepEqual(requestButtons.map((button) => button.text), ['Select requests', 'Back']);
   const postIdButtons = postIdKeyboard().reply_markup.inline_keyboard.flat();
   assert.deepEqual(postIdButtons.map((button) => button.text), ['Today', 'Yesterday', 'Week', 'Month', 'Back']);
+});
+
+test('publisher menu exposes post management, backup, and compatible metadata commands', () => {
+  const commands = PUBLISHER_COMMANDS.map((entry) => entry.command);
+  for (const command of ['posts', 'postid', 'lang', 'lan', 'lam', 'year', 'backup', 'recover']) {
+    assert.ok(commands.includes(command), `${command} should be available to publisher command scopes`);
+  }
+  assert.deepEqual(parsePublishedPostEdit('SB-a1b2c3d4e5 Hindi, English'), {
+    adminId: 'SB-A1B2C3D4E5', value: 'Hindi, English'
+  });
+  assert.deepEqual(parsePublishedPostEdit('SB-A1B2C3D4E5: 2026'), {
+    adminId: 'SB-A1B2C3D4E5', value: '2026'
+  });
+  assert.deepEqual(parsePublishedPostEdit('SB-A1B2C3D4E5'), {
+    adminId: 'SB-A1B2C3D4E5', value: ''
+  });
+  assert.equal(parsePublishedPostEdit('Hindi, English'), null);
 });
 
 test('post ID time windows use India calendar boundaries for publisher filters', () => {
@@ -548,7 +565,18 @@ test('stored file record keeps the returned storage message ID', () => {
   assert.equal(file.episode.start, 204);
   assert.equal(file.episode.source, 'caption');
   assert.deepEqual(file.languages, ['Hindi', 'Malayalam']);
+  assert.deepEqual(file.audioLanguages, ['Hindi', 'Malayalam']);
+  assert.deepEqual(file.subtitleLanguages, ['English']);
+  assert.equal(file.mediaInfo.status, 'filename');
   assert.equal(file.quality, '1080P');
+
+  const dualCaptionFile = fileFromMessage({
+    message_id: 13,
+    caption: 'Release Dual Audio Hindi + English 1080p',
+    document: { file_id: 'dual-file', file_name: 'release.1080p.mkv' }
+  }, 988);
+  assert.equal(dualCaptionFile.mediaInfo.status, 'pending');
+  assert.equal(dualCaptionFile.mediaInfo.needsInspection, true);
 });
 
 test('storage troubleshooting distinguishes protected content and wrong channel IDs', () => {

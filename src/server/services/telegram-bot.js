@@ -2,9 +2,11 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
-import { cleanMediaName, summarizeEpisodes, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages } from './episode-service.js';
+import { cleanMediaName, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
+import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
+import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'];
 const BATCH_PROGRESS_INTERVAL = 25;
@@ -114,7 +116,7 @@ const VISITOR_COMMANDS = [
   { command: 'help', description: 'Get bot help' }
 ];
 
-const PUBLISHER_COMMANDS = [
+export const PUBLISHER_COMMANDS = [
   ...VISITOR_COMMANDS,
   { command: 'panel', description: 'Open the publisher panel' },
   { command: 'movie', description: 'New movie draft' },
@@ -125,13 +127,28 @@ const PUBLISHER_COMMANDS = [
   { command: 'series', description: 'New web series draft' },
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'auto', description: 'Control storage auto-publish' },
+  { command: 'title', description: 'Set draft or post title' },
+  { command: 'lang', description: 'Set draft or post audio languages' },
+  { command: 'lan', description: 'Alias for /lang' },
+  { command: 'lam', description: 'Alias for /lang' },
+  { command: 'subtitles', description: 'Set draft or post subtitle languages' },
+  { command: 'subs', description: 'Alias for /subtitles' },
+  { command: 'year', description: 'Set draft or post year' },
+  { command: 'genres', description: 'Set draft or post genres' },
+  { command: 'description', description: 'Set draft or post synopsis' },
+  { command: 'poster', description: 'Set draft or post poster' },
+  { command: 'category', description: 'Set a published post category' },
+  { command: 'release', description: 'Set a published post release label' },
   { command: 'done', description: 'Publish current draft' },
   { command: 'status', description: 'Show current draft' },
   { command: 'teststorage', description: 'Check the storage channel connection' },
+  { command: 'cancel', description: 'Discard current upload draft' },
   { command: 'delete', description: 'Delete one or more post IDs' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
   { command: 'stats', description: 'View publisher analytics' },
+  { command: 'backup', description: 'Send a signed private data backup' },
+  { command: 'recover', description: 'Restore a signed backup file' },
   { command: 'addchannel', description: 'Add an announcement channel' },
   { command: 'channels', description: 'List announcement channels' },
   { command: 'removechannel', description: 'Remove an announcement channel' },
@@ -149,12 +166,30 @@ async function setPublisherCommands(bot, ctx) {
   }
 }
 
-async function clearPublisherCommands(bot, ctx) {
-  try {
-    await bot.telegram.deleteMyCommands({ scope: { type: 'chat', chat_id: chatId(ctx) } });
-  } catch (error) {
-    console.warn('[telegram] Could not clear publisher command scope:', error?.message || 'Unknown error');
+async function setConfiguredPublisherCommandScopes(bot, config, repository) {
+  const chatIds = new Set([...(config?.telegram?.adminIds || [])].map(String));
+  if (typeof repository?.listActiveAdminSessions === 'function') {
+    try {
+      const sessions = await repository.listActiveAdminSessions();
+      for (const session of sessions) {
+        if (session?.chatId) chatIds.add(String(session.chatId));
+      }
+    } catch (error) {
+      console.warn('[telegram] Could not read active publisher command scopes:', error?.message || 'Unknown error');
+    }
   }
+  await Promise.all([...chatIds].map(async (id) => {
+    try {
+      // In a private Telegram chat the chat ID is the owner user ID. Restoring
+      // this per-chat scope at startup avoids Telegram menu-cache gaps after a
+      // Koyeb/bot restart for publishers who still have an active login.
+      await bot.telegram.setMyCommands(PUBLISHER_COMMANDS, {
+        scope: { type: 'chat', chat_id: id }
+      });
+    } catch (error) {
+      console.warn('[telegram] Could not set configured publisher command scope:', error?.message || 'Unknown error');
+    }
+  }));
 }
 
 function publisherWelcomeText() {
@@ -183,6 +218,7 @@ function displayDraft(session) {
   const files = session.files?.length || 0;
   const matched = session.metadata?.matched ? `${String(session.metadata.provider || 'metadata').toUpperCase()} match ready` : 'Fallback artwork ready';
   const detectedLanguages = summarizeUploadLanguages(session.files || []);
+  const detectedSubtitles = summarizeSubtitleLanguages(session.files || []);
   const language = session.overrides?.languages?.length
     ? `${session.overrides.languages.join(', ')} (manual)`
     : detectedLanguages.length
@@ -197,7 +233,8 @@ function displayDraft(session) {
     `Files: ${files}`,
     `Episodes: ${episodeSummary.releaseLabel || 'No episode labels detected yet'}`,
     `Poster: ${session.posterOriginalUrl ? 'Manual poster selected' : matched}`,
-    `Languages: ${language}`,
+    `Audio: ${language}`,
+    `Subtitles: ${session.overrides?.subtitleLanguages?.length ? `${session.overrides.subtitleLanguages.join(', ')} (manual)` : detectedSubtitles.length ? `${detectedSubtitles.join(', ')} (from uploaded file details)` : 'Not set'}`,
     '',
     'Caption episode labels are checked before filenames. Telegram @channel names are removed automatically.',
     session.workflow === 'batch'
@@ -227,16 +264,19 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const episode = detectUploadEpisode({ caption: message.caption, filename });
   const quality = detectMediaQuality({ caption: message.caption, filename });
-  const languages = detectUploadLanguages({ caption: message.caption, filename });
-
-  return {
+  const audioLanguages = detectUploadLanguages({ caption: message.caption, filename });
+  const subtitleLanguages = detectUploadSubtitleLanguages({ caption: message.caption, filename });
+  const file = {
     storageMessageId: storedMessageId,
     storageMethod,
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),
     displayName: episode.displayName,
     quality,
-    languages,
+    // `languages` stays as a compatibility alias for existing catalog records.
+    languages: audioLanguages,
+    audioLanguages,
+    subtitleLanguages,
     mimeType: cleanText(source?.mime_type || '', 80),
     size: Number(source?.file_size) || 0,
     kind,
@@ -248,9 +288,34 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
     } : null,
     addedAt: new Date().toISOString()
   };
+  const trackCapable = isInspectableMediaFile(file);
+  const needsInspection = trackCapable && needsMediaTrackInspection({
+    ...file,
+    // Keep the raw caption for the trigger check; displayName deliberately
+    // strips release tags such as "Dual Audio" from public file labels.
+    displayName: message.caption || filename
+  });
+  return {
+    ...file,
+    mediaInfo: {
+      status: trackCapable ? (needsInspection ? 'pending' : 'filename') : 'not-media',
+      needsInspection
+    }
+  };
+}
+
+function isBackupArchiveMessage(message) {
+  const document = message?.document;
+  if (!document) return false;
+  const filename = String(document.file_name || '').toLowerCase();
+  const mimeType = String(document.mime_type || '').toLowerCase();
+  return /\.json(?:\.gz)?$/.test(filename) || /(?:application\/json|application\/(?:x-)?gzip)/.test(mimeType);
 }
 
 function isMediaMessage(message) {
+  // A signed backup is sent into the same private storage channel as media.
+  // Never let its document update turn into an accidental auto-publish card.
+  if (isBackupArchiveMessage(message)) return false;
   return Boolean(message?.document || message?.video || message?.audio || message?.animation || message?.photo?.length);
 }
 
@@ -322,6 +387,37 @@ function parseDelimitedList(value) {
     .map((entry) => cleanText(entry, 40))
     .filter(Boolean)
     .slice(0, 8);
+}
+
+/** Parse `/field SB-ABC… value` without confusing an active-draft value. */
+export function parsePublishedPostEdit(value) {
+  const match = String(value || '').trim().match(/^(SB-[A-F0-9]{10})(?=$|\s|[,;:])(?:\s+|\s*[,;:]\s*)?([\s\S]*)$/i);
+  if (!match) return null;
+  return {
+    adminId: match[1].toUpperCase(),
+    value: cleanText(match[2], 1_600)
+  };
+}
+
+async function updatePublishedPost({ ctx, repository, argument, field, value, fieldLabel }) {
+  const target = parsePublishedPostEdit(argument);
+  if (!target) return null;
+  if (!target.value && value === undefined) {
+    await ctx.reply(`Add a ${fieldLabel} after the post ID. Example: /${field} ${target.adminId} value`);
+    return { handled: true, content: null };
+  }
+  if (typeof repository.updateContentByAdminId !== 'function') {
+    await ctx.reply('Published-post editing is not available in this catalog store.');
+    return { handled: true, content: null };
+  }
+  const patchValue = value === undefined ? target.value : value;
+  const updated = await repository.updateContentByAdminId(target.adminId, { [field]: patchValue });
+  if (!updated) {
+    await ctx.reply(`No published catalog post was found for ${target.adminId}. Use /posts or /postid to find an ID.`);
+    return { handled: true, content: null };
+  }
+  await ctx.reply(`${fieldLabel} updated for ${updated.adminId} · ${updated.title}.`);
+  return { handled: true, content: updated };
 }
 
 // A t.me/c link contains Telegram's private-channel internal ID, rather than
@@ -884,6 +980,7 @@ function announcementCaption(content) {
   const facts = [
     content.year ? `📅 <b>Year:</b> ${content.year}` : null,
     content.languages?.length ? `🗣 <b>Audio:</b> ${escapeHtml(content.languages.join(' · '))}` : null,
+    content.subtitleLanguages?.length ? `💬 <b>Subtitles:</b> ${escapeHtml(content.subtitleLanguages.join(' · '))}` : null,
     content.genres?.length ? `✦ <b>Genres:</b> ${escapeHtml(content.genres.join(' · '))}` : null,
     episodeSummary ? `▣ <b>Included:</b> ${episodeSummary}` : `▣ <b>Delivery files:</b> ${content.filesCount}`
   ].filter(Boolean);
@@ -949,8 +1046,31 @@ async function announcePublishedContent({ bot, repository, content, websiteUrl, 
   return { sent, failed, skipped };
 }
 
+export async function inspectSessionMediaTracks({ session, bot, repository, config } = {}) {
+  if (!session?.files?.length) return { session, inspection: { scanned: 0, skipped: 0, unavailable: 0, failed: 0 } };
+  try {
+    const inspection = await inspectDeferredMediaTracks({
+      files: session.files,
+      telegram: bot?.telegram,
+      mediaInfo: config?.mediaInfo || {}
+    });
+    const changed = inspection.files.some((file, index) => file !== session.files[index]);
+    if (!changed) return { session, inspection };
+    let saved = null;
+    if (typeof repository?.replaceSessionFiles === 'function') {
+      saved = await repository.replaceSessionFiles(session.chatId, session.ownerId, inspection.files);
+    }
+    return { session: saved || { ...session, files: inspection.files }, inspection };
+  } catch (error) {
+    // Track labels are an enhancement. A failed download, timeout, or missing
+    // MediaInfo binary must never prevent a publisher from releasing files.
+    console.warn('[telegram] deferred media-track inspection failed:', automationDiagnostic(error));
+    return { session, inspection: { scanned: 0, skipped: 0, unavailable: 0, failed: 1 } };
+  }
+}
+
 export async function publishDraft(ctx, bot, repository, config) {
-  const session = await repository.findSession(chatId(ctx), userId(ctx));
+  let session = await repository.findSession(chatId(ctx), userId(ctx));
   if (!session) {
     const error = 'There is no active draft. Start one from /panel first.';
     await ctx.reply(error);
@@ -972,7 +1092,15 @@ export async function publishDraft(ctx, bot, repository, config) {
     return { content: null, error };
   }
 
-  await ctx.reply('Publishing your draft. I am mirroring the poster to ImgBB now…');
+  // MediaInfo is deliberately deferred until all manual or batch files have
+  // arrived. It processes only ambiguous candidates sequentially, rather than
+  // opening a download/process for every incoming Telegram upload.
+  const mediaTrackWork = await inspectSessionMediaTracks({ session, bot, repository, config });
+  session = mediaTrackWork.session || session;
+  const inspectionNote = mediaTrackWork.inspection?.scanned
+    ? ` I verified tracks for ${mediaTrackWork.inspection.scanned} eligible file${mediaTrackWork.inspection.scanned === 1 ? '' : 's'} before publication.`
+    : '';
+  await ctx.reply(`Publishing your draft. I am mirroring the poster to ImgBB now…${inspectionNote}`);
 
   try {
     const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
@@ -998,8 +1126,10 @@ export async function publishDraft(ctx, bot, repository, config) {
     const overrides = session.overrides || {};
     const episodeSummary = summarizeEpisodes(session.files);
     const uploadedLanguages = summarizeUploadLanguages(session.files);
+    const uploadedSubtitleLanguages = summarizeSubtitleLanguages(session.files);
     const metadataLanguages = (metadata.languages || []).filter((language) => !/^multi(?:\s+language)?$/i.test(String(language || '')));
     const releaseLanguages = overrides.languages?.length ? overrides.languages : uploadedLanguages.length ? uploadedLanguages : metadataLanguages;
+    const releaseSubtitleLanguages = overrides.subtitleLanguages?.length ? overrides.subtitleLanguages : uploadedSubtitleLanguages;
     const posterResult = await mirrorPosterToImgBB({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
@@ -1017,6 +1147,8 @@ export async function publishDraft(ctx, bot, repository, config) {
       // Explicit /lang settings win. Otherwise the file caption/filename is
       // the source of truth for release audio labels (e.g. Multi Hindi + Malayalam).
       languages: releaseLanguages,
+      subtitleLanguages: releaseSubtitleLanguages,
+      subtitleLanguageSource: overrides.subtitleLanguages?.length ? 'manual' : uploadedSubtitleLanguages.length ? 'upload' : null,
       languageSource: overrides.languages?.length ? 'manual' : uploadedLanguages.length ? 'upload' : 'metadata',
       genres: overrides.genres || metadata.genres || [],
       description: overrides.description || metadata.description || '',
@@ -1349,6 +1481,10 @@ export async function processQueuedAutomationSessions({ bot, repository, config,
 
     const groupKey = session.auto?.groupKey || automationGroupKey(session.title, session.files[0]?.storageMessageId || session.ownerId);
     try {
+      // Just like manual and /batch publishing, do this after the group has
+      // fully collected and before any merge/create decision is persisted.
+      const mediaTrackWork = await inspectSessionMediaTracks({ session, bot, repository, config });
+      session = mediaTrackWork.session || session;
       // Resolve a canonical provider identity before looking for an existing
       // release. This makes aliases/noisy filenames converge instead of
       // producing a fresh post just because their raw group keys differ.
@@ -1697,6 +1833,103 @@ function formatPublisherStats(stats) {
   ].join('\n');
 }
 
+function backupOptionsFromConfig(config) {
+  return config?.backup || {};
+}
+
+function backupCreatedAt(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function formatBackupCounts(counts = {}) {
+  const content = Number(counts.content || 0);
+  const sessions = Number(counts.upload_sessions || 0);
+  const requests = Number(counts.requests || 0);
+  const visitors = Number(counts.site_visitors || 0);
+  return `${content} post${content === 1 ? '' : 's'} · ${sessions} upload session${sessions === 1 ? '' : 's'} · ${requests} request${requests === 1 ? '' : 's'} · ${visitors} anonymous visitor record${visitors === 1 ? '' : 's'}`;
+}
+
+export async function sendStorageBackup({ repository, telegram, config, createdAt = new Date().toISOString() } = {}) {
+  return createAndSendBackup({
+    repository,
+    telegram,
+    storageChannelId: config?.telegram?.storageChannelId,
+    signingSecret: config?.backup?.signingSecret,
+    options: backupOptionsFromConfig(config),
+    createdAt
+  });
+}
+
+/** Run once per India calendar month, with a durable repository claim. */
+export async function runMonthlyBackup({ bot, repository, config, now = new Date() } = {}) {
+  if (!config?.backup?.monthlyEnabled || !config?.telegram?.storageChannelId) {
+    return { sent: false, reason: 'disabled-or-no-storage-channel' };
+  }
+  if (!config?.backup?.signingSecret) return { sent: false, reason: 'no-signing-secret' };
+  if (typeof repository?.claimMonthlyBackup !== 'function') {
+    return { sent: false, reason: 'repository-does-not-support-monthly-backups' };
+  }
+  const createdAt = backupCreatedAt(now);
+  const month = indiaMonthKey(createdAt);
+  if (!month) return { sent: false, reason: 'invalid-date' };
+  const claimed = await repository.claimMonthlyBackup({ month, now: createdAt });
+  if (!claimed) return { sent: false, reason: 'already-sent-or-claimed', month };
+  try {
+    const backup = await sendStorageBackup({ repository, telegram: bot?.telegram, config, createdAt });
+    if (typeof repository.markMonthlyBackupCreated === 'function') {
+      await repository.markMonthlyBackupCreated({ month, createdAt });
+    }
+    return { sent: true, month, backup };
+  } catch (error) {
+    if (typeof repository.releaseMonthlyBackupClaim === 'function') {
+      await repository.releaseMonthlyBackupClaim({ month }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function handleBackupRecoveryUpload(ctx, repository, config) {
+  if (typeof repository?.findBackupRecovery !== 'function') return false;
+  const recovery = await repository.findBackupRecovery(chatId(ctx), userId(ctx));
+  if (!recovery) return false;
+  const document = ctx.message?.document;
+  if (!document) {
+    await ctx.reply('Recovery is waiting for a signed SoraBox backup document. Send the .json.gz backup file as a document, not as a photo/video.');
+    return true;
+  }
+  if (typeof repository.restoreBackupData !== 'function') {
+    await ctx.reply('This catalog store cannot restore backup data.');
+    return true;
+  }
+  try {
+    await ctx.reply('Verifying the signed backup before replacing application data…');
+    const archive = await downloadTelegramDocument({
+      document,
+      telegram: ctx.telegram,
+      options: backupOptionsFromConfig(config)
+    });
+    const backup = readSignedBackupArchive({
+      archive,
+      signingSecret: config?.backup?.signingSecret,
+      options: backupOptionsFromConfig(config)
+    });
+    const counts = await repository.restoreBackupData(backup.data);
+    await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
+    await ctx.reply([
+      '✅ Backup recovery completed.',
+      `Restored signed snapshot: ${backup.createdAt || 'unknown timestamp'}.`,
+      `Application data restored: ${formatBackupCounts(counts)}.`,
+      'Your current Telegram publisher login remains active; open /posts or /stats to verify the restored catalog.'
+    ].join('\n'));
+  } catch (error) {
+    const message = cleanText(error?.message || 'The backup could not be restored.', 500);
+    console.error('[telegram] backup recovery failed:', message);
+    await ctx.reply(`Recovery was not applied. ${message}\nThe existing application data was left unchanged.`);
+  }
+  return true;
+}
+
 export async function launchTelegramBot({ config, repository }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
@@ -1757,8 +1990,11 @@ export async function launchTelegramBot({ config, repository }) {
       await deliverContent(ctx, delivery, repository, config);
       return;
     }
+    // Install the owner/admin scope as soon as an authorized person opens the
+    // bot, not only after a later successful /login. This avoids Telegram's
+    // command-menu cache leaving /posts or /postid absent for the owner.
+    if (hasAllowedPublisherId(ctx, config) && config.adminLoginCode) await setPublisherCommands(bot, ctx);
     const publisher = await isPublisher(ctx, repository, config);
-    if (publisher) await setPublisherCommands(bot, ctx);
     await ctx.reply(publisher ? publisherWelcomeText() : visitorWelcomeText(hasAllowedPublisherId(ctx, config)), publisher ? panelKeyboard() : undefined);
   });
 
@@ -1780,8 +2016,10 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('logout', async (ctx) => {
     await repository.deleteAdminSession(chatId(ctx), userId(ctx));
-    await clearPublisherCommands(bot, ctx);
-    await ctx.reply('Publisher session locked. You can still open delivery links or use /request.');
+    // Keep the owner scope registered: visible command names never grant
+    // access, while deleting the scope made Telegram intermittently hide
+    // /posts and /postid until its command-menu cache refreshed.
+    await ctx.reply('Publisher session locked. Publisher commands remain visible but are locked until /login; you can still open delivery links or use /request.');
   });
 
   bot.command('request', async (ctx) => {
@@ -1811,8 +2049,9 @@ export async function launchTelegramBot({ config, repository }) {
           'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
           'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
-          'Optional metadata: /lang Hindi, English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL',
-          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
+          'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
+          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -1847,9 +2086,18 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('title', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const title = parseCommandArgument(ctx.message.text);
-    if (!title) {
-      await ctx.reply('Usage: /title Your release title');
+    const argument = parseCommandArgument(ctx.message.text);
+    const postTarget = parsePublishedPostEdit(argument);
+    if (postTarget) {
+      if (!postTarget.value) {
+        await ctx.reply(`Usage: /title ${postTarget.adminId} Your corrected title`);
+        return;
+      }
+      await updatePublishedPost({ ctx, repository, argument, field: 'title', fieldLabel: 'Title' });
+      return;
+    }
+    if (!argument) {
+      await ctx.reply('Usage: /title Your release title\nEdit an existing post: /title SB-0123ABCDEF Corrected title');
       return;
     }
     const session = await repository.findSession(chatId(ctx), userId(ctx));
@@ -1857,41 +2105,111 @@ export async function launchTelegramBot({ config, repository }) {
       await ctx.reply('Start a draft first using /panel.');
       return;
     }
-    await updateTitleAndMetadata({ ctx, repository, config, title });
+    await updateTitleAndMetadata({ ctx, repository, config, title: argument });
   });
 
-  bot.command('lang', async (ctx) => {
+  const handleLanguageCommand = async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const languages = parseDelimitedList(parseCommandArgument(ctx.message.text));
+    const argument = parseCommandArgument(ctx.message.text);
+    const postTarget = parsePublishedPostEdit(argument);
+    if (postTarget) {
+      const languages = parseDelimitedList(postTarget.value);
+      if (!languages.length) {
+        await ctx.reply(`Usage: /lang ${postTarget.adminId} Hindi, English`);
+        return;
+      }
+      await updatePublishedPost({
+        ctx,
+        repository,
+        argument,
+        field: 'languages',
+        value: languages,
+        fieldLabel: 'Audio languages'
+      });
+      return;
+    }
+    const languages = parseDelimitedList(argument);
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !languages.length) {
-      await ctx.reply('Usage: /lang Hindi, English');
+      await ctx.reply('Usage: /lang Hindi, English\nEdit an existing post: /lang SB-0123ABCDEF Hindi, English');
       return;
     }
     const overrides = { ...(session.overrides || {}), languages };
     await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
     await ctx.reply(`Languages saved: ${languages.join(', ')}`);
-  });
+  };
+  for (const command of ['lang', 'lan', 'lam']) bot.command(command, handleLanguageCommand);
+
+  const handleSubtitleCommand = async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text);
+    const postTarget = parsePublishedPostEdit(argument);
+    const languages = parseDelimitedList(postTarget ? postTarget.value : argument);
+    if (!languages.length) {
+      await ctx.reply(postTarget ? `Usage: /subtitles ${postTarget.adminId} English, Hindi` : 'Usage: /subtitles English, Hindi\nEdit an existing post: /subtitles SB-0123ABCDEF English, Hindi');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'subtitleLanguages', value: languages, fieldLabel: 'Subtitle languages' });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), subtitleLanguages: languages };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply(`Subtitle languages saved: ${languages.join(', ')}`);
+  };
+  for (const command of ['subtitles', 'subs']) bot.command(command, handleSubtitleCommand);
 
   bot.command('year', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const year = Number.parseInt(parseCommandArgument(ctx.message.text), 10);
-    const session = await repository.findSession(chatId(ctx), userId(ctx));
-    if (!session || !Number.isInteger(year) || year < 1888 || year > new Date().getFullYear() + 5) {
-      await ctx.reply('Usage: /year 2026');
+    const argument = parseCommandArgument(ctx.message.text);
+    const postTarget = parsePublishedPostEdit(argument);
+    const suppliedYear = Number.parseInt(postTarget ? postTarget.value : argument, 10);
+    if (!Number.isInteger(suppliedYear) || suppliedYear < 1888 || suppliedYear > new Date().getFullYear() + 5) {
+      await ctx.reply(postTarget ? `Usage: /year ${postTarget.adminId} 2026` : 'Usage: /year 2026\nEdit an existing post: /year SB-0123ABCDEF 2026');
       return;
     }
-    const overrides = { ...(session.overrides || {}), year };
+    if (postTarget) {
+      await updatePublishedPost({
+        ctx,
+        repository,
+        argument,
+        field: 'year',
+        value: suppliedYear,
+        fieldLabel: 'Year'
+      });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), year: suppliedYear };
     await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
-    await ctx.reply(`Year saved: ${year}`);
+    await ctx.reply(`Year saved: ${suppliedYear}`);
   });
 
   bot.command('genres', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const genres = parseDelimitedList(parseCommandArgument(ctx.message.text));
+    const argument = parseCommandArgument(ctx.message.text);
+    const postTarget = parsePublishedPostEdit(argument);
+    const genres = parseDelimitedList(postTarget ? postTarget.value : argument);
+    if (!genres.length) {
+      await ctx.reply(postTarget ? `Usage: /genres ${postTarget.adminId} Action, Fantasy` : 'Usage: /genres Action, Fantasy\nEdit an existing post: /genres SB-0123ABCDEF Action, Fantasy');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'genres', value: genres, fieldLabel: 'Genres' });
+      return;
+    }
     const session = await repository.findSession(chatId(ctx), userId(ctx));
-    if (!session || !genres.length) {
-      await ctx.reply('Usage: /genres Action, Fantasy');
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
       return;
     }
     const overrides = { ...(session.overrides || {}), genres };
@@ -1901,10 +2219,20 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('description', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const description = cleanText(parseCommandArgument(ctx.message.text), 1400);
+    const argument = parseCommandArgument(ctx.message.text, 1_500);
+    const postTarget = parsePublishedPostEdit(argument);
+    const description = cleanText(postTarget ? postTarget.value : argument, 1400);
+    if (!description) {
+      await ctx.reply(postTarget ? `Usage: /description ${postTarget.adminId} A short, readable synopsis` : 'Usage: /description A short, readable synopsis\nEdit an existing post: /description SB-0123ABCDEF New synopsis');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'description', value: description, fieldLabel: 'Description' });
+      return;
+    }
     const session = await repository.findSession(chatId(ctx), userId(ctx));
-    if (!session || !description) {
-      await ctx.reply('Usage: /description A short, readable synopsis');
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
       return;
     }
     const overrides = { ...(session.overrides || {}), description };
@@ -1914,18 +2242,96 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('poster', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const posterOriginalUrl = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, 2_000);
+    const postTarget = parsePublishedPostEdit(argument);
+    const posterOriginalUrl = postTarget ? postTarget.value : argument;
+    if (!posterOriginalUrl.startsWith('https://')) {
+      await ctx.reply(postTarget ? `Usage: /poster ${postTarget.adminId} https://public-image-host.example/poster.jpg` : 'Usage: /poster https://public-image-host.example/poster.jpg\nEdit an existing post: /poster SB-0123ABCDEF https://public-image-host.example/poster.jpg');
+      return;
+    }
+    if (postTarget) {
+      const existing = await repository.findContentByAdminId(postTarget.adminId);
+      if (!existing) {
+        await ctx.reply(`No published catalog post was found for ${postTarget.adminId}. Use /posts or /postid to find an ID.`);
+        return;
+      }
+      try {
+        await ctx.reply(`Mirroring the new poster for ${existing.adminId} to ImgBB…`);
+        const posterResult = await mirrorPosterToImgBB({
+          sourceUrl: posterOriginalUrl,
+          sourceIsManual: true,
+          title: existing.title,
+          category: existing.category,
+          config
+        });
+        const updated = await repository.updateContentByAdminId(postTarget.adminId, {
+          posterUrl: posterResult.url,
+          backdropUrl: posterResult.url,
+          poster: {
+            provider: 'imgbb',
+            providerId: posterResult.providerId,
+            originalUrl: posterResult.originalUrl,
+            source: posterResult.source,
+            mirroredAt: new Date().toISOString()
+          }
+        });
+        await ctx.reply(updated ? `Poster updated for ${updated.adminId} · ${updated.title}.` : `The poster was mirrored, but ${postTarget.adminId} is no longer available.`);
+      } catch (error) {
+        const message = error instanceof PosterHostingError ? error.message : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+        console.error('[telegram] published-poster edit failed:', error?.message || 'Unknown error');
+        await ctx.reply(`Poster was not changed. ${message}`);
+      }
+      return;
+    }
     const session = await repository.findSession(chatId(ctx), userId(ctx));
-    if (!session || !posterOriginalUrl.startsWith('https://')) {
-      await ctx.reply('Usage: /poster https://public-image-host.example/poster.jpg');
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
       return;
     }
     await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl });
     await ctx.reply('Manual poster saved. It will be validated, downloaded once, and mirrored to ImgBB during publishing.');
   });
 
+  bot.command('category', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text);
+    const target = parsePublishedPostEdit(argument);
+    const rawCategory = String(target?.value || '').trim().toLowerCase().replace(/[\s_-]+/g, '-');
+    const category = rawCategory === 'webseries'
+      ? 'web-series'
+      : rawCategory === 'k-drama' || rawCategory === 'kdrama'
+        ? 'kdrama'
+        : rawCategory;
+    if (!target || !PUBLISH_CATEGORIES.includes(category)) {
+      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series');
+      return;
+    }
+    await updatePublishedPost({ ctx, repository, argument, field: 'category', value: category, fieldLabel: 'Category' });
+  });
+
+  bot.command('release', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text);
+    const target = parsePublishedPostEdit(argument);
+    if (!target?.value) {
+      await ctx.reply('Usage: /release SB-0123ABCDEF Season 2 · 12 episodes');
+      return;
+    }
+    await updatePublishedPost({ ctx, repository, argument, field: 'releaseLabel', fieldLabel: 'Release label' });
+  });
+
   bot.command('status', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text);
+    const target = parsePublishedPostEdit(argument);
+    if (target) {
+      if (!target.value) {
+        await ctx.reply(`Usage: /status ${target.adminId} New release`);
+        return;
+      }
+      await updatePublishedPost({ ctx, repository, argument, field: 'status', fieldLabel: 'Status' });
+      return;
+    }
     await showDraftStatus(ctx, repository);
   });
 
@@ -1951,7 +2357,8 @@ export async function launchTelegramBot({ config, repository }) {
   bot.command('cancel', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     await repository.deleteSession(chatId(ctx), userId(ctx));
-    await ctx.reply('Draft discarded. No catalog record was created.', panelKeyboard());
+    await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Draft or pending backup recovery discarded. No catalog record was created.', panelKeyboard());
   });
 
   bot.command('done', async (ctx) => {
@@ -2018,6 +2425,53 @@ export async function launchTelegramBot({ config, repository }) {
     }
     const stats = await repository.getPublisherStats();
     await ctx.reply(formatPublisherStats(stats));
+  });
+
+  bot.command('backup', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (!config.telegram.storageChannelId) {
+      await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is required before I can send a private backup file.');
+      return;
+    }
+    try {
+      await ctx.reply('Creating a signed, compressed application backup and sending it only to the private storage channel…');
+      const createdAt = new Date().toISOString();
+      const backup = await sendStorageBackup({ repository, telegram: bot.telegram, config, createdAt });
+      const month = indiaMonthKey(createdAt);
+      if (month && typeof repository.markMonthlyBackupCreated === 'function') {
+        await repository.markMonthlyBackupCreated({ month, createdAt });
+      }
+      await ctx.reply(`✅ Backup sent privately as ${backup.filename}. Snapshot: ${formatBackupCounts(backup.counts)}. Keep the file private; it is signed and can be restored with /recover.`);
+    } catch (error) {
+      const message = cleanText(error?.message || 'The backup could not be created.', 500);
+      console.error('[telegram] backup failed:', message);
+      await ctx.reply(`Backup was not sent. ${message}`);
+    }
+  });
+
+  bot.command('recover', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /recover in your private chat with this bot, then send the signed backup document there.');
+      return;
+    }
+    if (typeof repository.startBackupRecovery !== 'function') {
+      await ctx.reply('Backup recovery is not available in this catalog store.');
+      return;
+    }
+    try {
+      await repository.startBackupRecovery({ chatId: chatId(ctx), ownerId: userId(ctx) });
+      await ctx.reply([
+        'Recovery mode is armed for 15 minutes.',
+        'Send one unmodified SoraBox .json.gz backup document in this private chat.',
+        'I will verify its signature before replacing catalog/application data. This works after switching to a new or empty MongoDB URI, provided BACKUP_SIGNING_SECRET is unchanged.',
+        'Do not send backups in a public group.'
+      ].join('\n'));
+    } catch (error) {
+      const message = cleanText(error?.message || 'Could not arm backup recovery.', 300);
+      console.error('[telegram] could not arm backup recovery:', message);
+      await ctx.reply(`Recovery was not armed. ${message}`);
+    }
   });
 
   bot.command('addchannel', async (ctx) => {
@@ -2197,6 +2651,7 @@ export async function launchTelegramBot({ config, repository }) {
   bot.on('message', async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
     const message = ctx.message;
+    if (await handleBackupRecoveryUpload(ctx, repository, config)) return;
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
     if (isMediaMessage(message)) {
@@ -2320,9 +2775,11 @@ export async function launchTelegramBot({ config, repository }) {
   });
 
   try {
-    // Public command menu stays intentionally small. A successful /login installs
-    // the full publisher menu only in that administrator's private bot chat.
+    // Public command menu stays intentionally small. Publisher scopes are
+    // installed both for configured owners at startup and for a permitted user
+    // on /start or /login, so Telegram reliably exposes /posts and /postid.
     await bot.telegram.setMyCommands(VISITOR_COMMANDS);
+    await setConfiguredPublisherCommandScopes(bot, config, repository);
   } catch (error) {
     console.warn('[telegram] Could not register bot commands:', error?.message || 'Unknown error');
   }
@@ -2356,9 +2813,32 @@ export async function launchTelegramBot({ config, repository }) {
   await runAutomationQueue();
   const automationTimer = setInterval(() => { void runAutomationQueue(); }, AUTO_QUEUE_INTERVAL_MS);
   automationTimer.unref?.();
+
+  let monthlyBackupPromise = null;
+  const runMonthlyBackupSafely = () => {
+    if (monthlyBackupPromise) return monthlyBackupPromise;
+    monthlyBackupPromise = runMonthlyBackup({ bot, repository, config })
+      .then((result) => {
+        if (result.sent) console.info(`[telegram] monthly signed backup sent for ${result.month}.`);
+        return result;
+      })
+      .catch((error) => {
+        console.error('[telegram] monthly backup failed:', automationDiagnostic(error));
+        return { sent: false, reason: 'error' };
+      })
+      .finally(() => { monthlyBackupPromise = null; });
+    return monthlyBackupPromise;
+  };
+  // Check at startup and periodically. The durable monthly claim prevents a
+  // restart or multiple worker wakeups from generating duplicate archive files.
+  await runMonthlyBackupSafely();
+  const monthlyBackupTimer = setInterval(() => { void runMonthlyBackupSafely(); }, 6 * 60 * 60 * 1000);
+  monthlyBackupTimer.unref?.();
+
   const originalStop = bot.stop.bind(bot);
   bot.stop = (reason) => {
     clearInterval(automationTimer);
+    clearInterval(monthlyBackupTimer);
     return originalStop(reason);
   };
 

@@ -348,7 +348,9 @@ function DetailPage({ onGetFiles }) {
         <div className="detail-info__languages">
           <Eyebrow>AVAILABLE LABELS</Eyebrow>
           <h2>Language & <em>release details.</em></h2>
+          <p className="detail-info__track-label">Audio</p>
           <div className="language-tags">{item.languages.length ? item.languages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>) : <span><Icon name="check" size={14} /> Check Telegram delivery</span>}</div>
+          {(item.subtitleLanguages || []).length ? <><p className="detail-info__track-label">Subtitles</p><div className="language-tags language-tags--subtitles">{item.subtitleLanguages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>)}</div></> : null}
           {item.episodeGroups?.length ? <p className="detail-info__episode-hint"><Icon name="arrow" size={15} /> Select an episode below to see its available files and qualities.</p> : null}
         </div>
       </section>
@@ -417,6 +419,7 @@ function EpisodePage({ onGetFiles }) {
             <div className="episode-page-hero__facts">
               <span><Icon name="layers" size={15} /> {choices.length} file option{choices.length === 1 ? '' : 's'}</span>
               {item.languages.length ? <span><Icon name="check" size={15} /> {item.languages.join(' · ')}</span> : null}
+              {(item.subtitleLanguages || []).length ? <span><Icon name="check" size={15} /> Subs: {item.subtitleLanguages.join(' · ')}</span> : null}
             </div>
           </div>
         </div>

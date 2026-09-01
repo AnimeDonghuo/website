@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { cleanMediaName, detectMediaQuality, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, detectMediaQuality, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,7 +76,7 @@ function publicLanguages(content) {
   const savedLanguages = Array.isArray(content?.languages)
     ? content.languages
       .map((language) => cleanText(language, 40))
-      .filter((language) => language && !/^multi(?:\s+language)?$/i.test(language))
+      .filter((language) => language && !/^multi(?:\s+language)?$/i.test(language) && !/\b(?:sub|subs|subtitle|subtitles|cc)$/i.test(language))
     : [];
   const uploadLanguages = content?.languageSource === 'manual' ? [] : summarizeUploadLanguages(content?.files || []);
   const languages = uploadLanguages.length ? uploadLanguages : savedLanguages;
@@ -90,6 +90,24 @@ function publicLanguages(content) {
     if (uniqueLanguages.length === 8) break;
   }
   return uniqueLanguages;
+}
+
+function publicSubtitleLanguages(content) {
+  const savedLanguages = Array.isArray(content?.subtitleLanguages)
+    ? content.subtitleLanguages.map((language) => cleanText(language, 40)).filter(Boolean)
+    : [];
+  // Older cards put labels such as "English Sub" in the one shared language
+  // array. Present those accurately without requiring a risky data migration.
+  const legacySubtitleLanguages = Array.isArray(content?.languages)
+    ? content.languages
+      .map((language) => cleanText(language, 40).replace(/\s*(?:sub|subs|subtitle|subtitles|cc)$/i, ''))
+      .filter((language, index) => /\b(?:sub|subs|subtitle|subtitles|cc)$/i.test(String(content.languages[index] || '')) && language)
+    : [];
+  const uploadLanguages = content?.subtitleLanguageSource === 'manual'
+    ? []
+    : summarizeSubtitleLanguages(content?.files || []);
+  const languages = uploadLanguages.length ? uploadLanguages : savedLanguages.length ? savedLanguages : legacySubtitleLanguages;
+  return [...new Map(languages.map((language) => [language.toLowerCase(), language])).values()].slice(0, 8);
 }
 
 function publicFileChoices(files, config, shareCode) {
@@ -136,6 +154,7 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
     art: content.art || { tone: category.tone },
     year: content.year || null,
     languages: publicLanguages(content),
+    subtitleLanguages: publicSubtitleLanguages(content),
     genres: Array.isArray(content.genres) ? content.genres : [],
     description: content.description || '',
     status: content.status || 'New release',

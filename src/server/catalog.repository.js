@@ -1,12 +1,25 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
-import { CATEGORY_IDS, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { summarizeEpisodes, summarizeUploadLanguages } from './services/episode-service.js';
+import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
+import { summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
+const BACKUP_RECOVERY_TTL_MS = 1000 * 60 * 15;
 const MAX_ADMIN_CONTENT_RESULTS = 100;
 const MAX_REQUEST_RESULTS = 200;
+const BACKUP_COLLECTION_NAMES = [
+  'content',
+  'upload_sessions',
+  'requests',
+  'bot_users',
+  'site_visitors',
+  'site_visits',
+  'announcement_channels',
+  'automation_settings',
+  'backup_settings'
+];
+const MAX_BACKUP_DOCUMENTS_PER_COLLECTION = 500_000;
 
 // List cards only need safe display fields plus enough file-label information
 // to derive languages from older uploads. Storage message IDs and Telegram file
@@ -18,6 +31,8 @@ const LIST_CONTENT_PROJECTION = {
   art: 1,
   year: 1,
   languages: 1,
+  subtitleLanguages: 1,
+  subtitleLanguageSource: 1,
   languageSource: 1,
   genres: 1,
   description: 1,
@@ -34,11 +49,43 @@ const LIST_CONTENT_PROJECTION = {
   hasDelivery: 1,
   'files.name': 1,
   'files.displayName': 1,
-  'files.languages': 1
+  'files.languages': 1,
+  'files.audioLanguages': 1,
+  'files.subtitleLanguages': 1
 };
 
 function clone(value) {
   return structuredClone(value);
+}
+
+function safeBackupCollections(data) {
+  if (Number(data?.schemaVersion) !== 1) {
+    throw new Error('The signed backup uses an unsupported application-data schema.');
+  }
+  const supplied = data?.collections;
+  if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied)) {
+    throw new Error('The backup does not contain an application collections payload.');
+  }
+  const collections = {};
+  for (const name of BACKUP_COLLECTION_NAMES) {
+    const rows = supplied[name] === undefined ? [] : supplied[name];
+    if (!Array.isArray(rows)) throw new Error(`Backup collection ${name} is not an array.`);
+    if (rows.length > MAX_BACKUP_DOCUMENTS_PER_COLLECTION) {
+      throw new Error(`Backup collection ${name} exceeds the safe document limit.`);
+    }
+    if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+      throw new Error(`Backup collection ${name} contains an invalid document.`);
+    }
+    collections[name] = rows;
+  }
+  return collections;
+}
+
+function backupSnapshot(collections) {
+  return {
+    schemaVersion: 1,
+    collections: Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name] || []]))
+  };
 }
 
 function sessionKey(chatId, ownerId) {
@@ -158,12 +205,18 @@ function contentFileAppendPatch(content, additionalFiles) {
   const files = uniqueFiles(content?.files || [], additionalFiles);
   const episodeSummary = summarizeEpisodes(files);
   const uploadLanguages = summarizeUploadLanguages(files);
+  const uploadSubtitleLanguages = summarizeSubtitleLanguages(files);
   const now = new Date().toISOString();
   const languages = content?.languageSource === 'manual' && Array.isArray(content?.languages) && content.languages.length
     ? content.languages
     : uploadLanguages.length
       ? uploadLanguages
       : content?.languages || [];
+  const subtitleLanguages = content?.subtitleLanguageSource === 'manual' && Array.isArray(content?.subtitleLanguages) && content.subtitleLanguages.length
+    ? content.subtitleLanguages
+    : uploadSubtitleLanguages.length
+      ? uploadSubtitleLanguages
+      : content?.subtitleLanguages || [];
   const releaseLabel = episodeSummary.releaseLabel
     || content?.releaseLabel
     || (files.length === 1 ? 'Feature' : `${files.length} files`);
@@ -176,16 +229,83 @@ function contentFileAppendPatch(content, additionalFiles) {
     episodeCount: episodeSummary.count,
     releaseLabel,
     languages,
+    subtitleLanguages,
+    subtitleLanguageSource: content?.subtitleLanguageSource === 'manual'
+      ? 'manual'
+      : uploadSubtitleLanguages.length
+        ? 'upload'
+        : content?.subtitleLanguageSource || null,
     languageSource: content?.languageSource === 'manual'
       ? 'manual'
       : uploadLanguages.length
         ? 'upload'
         : content?.languageSource || null,
-    searchText: [content?.title, content?.description, content?.category, ...languages, ...(content?.genres || [])]
+    searchText: [content?.title, content?.description, content?.category, ...languages, ...subtitleLanguages, ...(content?.genres || [])]
       .filter(Boolean)
       .join(' ')
       .toLowerCase(),
     updatedAt: now
+  };
+}
+
+function cleanUniqueMetadataList(value, fallback = []) {
+  const source = Array.isArray(value) ? value : fallback;
+  const result = [];
+  const seen = new Set();
+  for (const raw of source) {
+    const item = cleanText(raw, 40);
+    const key = item.toLowerCase();
+    if (!item || seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+    if (result.length === 8) break;
+  }
+  return result;
+}
+
+function contentMetadataPatch(content, requested = {}) {
+  const title = requested.title === undefined ? content.title : cleanText(requested.title, 180) || content.title;
+  const category = requested.category === undefined
+    ? content.category
+    : CATEGORY_IDS.has(requested.category) ? requested.category : content.category;
+  const visibleLanguages = cleanUniqueMetadataList(requested.languages, content.languages || []);
+  const subtitleLanguages = cleanUniqueMetadataList(requested.subtitleLanguages, content.subtitleLanguages || []);
+  const genres = cleanUniqueMetadataList(requested.genres, content.genres || []);
+  const parsedYear = requested.year === undefined ? content.year : Number.parseInt(requested.year, 10);
+  const year = Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5
+    ? parsedYear
+    : content.year || null;
+  const description = requested.description === undefined ? content.description : cleanText(requested.description, 1400);
+  const status = requested.status === undefined ? content.status : cleanText(requested.status, 60) || content.status || 'New release';
+  const releaseLabel = requested.releaseLabel === undefined ? content.releaseLabel : cleanText(requested.releaseLabel, 80) || content.releaseLabel;
+  const posterUrl = requested.posterUrl === undefined ? content.posterUrl : cleanText(requested.posterUrl, 2_000) || null;
+  const backdropUrl = requested.backdropUrl === undefined
+    ? (requested.posterUrl === undefined ? content.backdropUrl : posterUrl)
+    : cleanText(requested.backdropUrl, 2_000) || posterUrl || null;
+  const titleKey = normalizedMergeKey(title);
+  return {
+    title,
+    category,
+    year,
+    languages: visibleLanguages,
+    subtitleLanguages,
+    subtitleLanguageSource: requested.subtitleLanguages === undefined ? content.subtitleLanguageSource || null : 'manual',
+    languageSource: requested.languages === undefined ? content.languageSource || null : 'manual',
+    genres,
+    description,
+    status,
+    releaseLabel,
+    posterUrl,
+    backdropUrl,
+    ...(requested.category === undefined ? {} : { art: { ...(content.art || {}), tone: categoryDetails(category).tone } }),
+    ...(requested.poster === undefined ? {} : { poster: requested.poster || null }),
+    titleKey,
+    automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey]),
+    searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase(),
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -198,6 +318,9 @@ function normalizeContent(input) {
   const languages = Array.isArray(input.languages)
     ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
     : [];
+  const subtitleLanguages = Array.isArray(input.subtitleLanguages)
+    ? input.subtitleLanguages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : summarizeSubtitleLanguages(files);
   const genres = Array.isArray(input.genres)
     ? input.genres.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
     : [];
@@ -225,6 +348,8 @@ function normalizeContent(input) {
     category,
     year: Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5 ? parsedYear : null,
     languages,
+    subtitleLanguages,
+    subtitleLanguageSource: ['manual', 'upload'].includes(input.subtitleLanguageSource) ? input.subtitleLanguageSource : null,
     languageSource: ['manual', 'upload', 'metadata'].includes(input.languageSource) ? input.languageSource : null,
     genres,
     description,
@@ -252,7 +377,7 @@ function normalizeContent(input) {
     hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
     episodeGroups,
     episodeCount,
-    searchText: [title, description, category, ...languages, ...genres].join(' ').toLowerCase(),
+    searchText: [title, description, category, ...languages, ...subtitleLanguages, ...genres].join(' ').toLowerCase(),
     featured: Boolean(input.featured),
     published: true,
     publishedAt: input.publishedAt || now,
@@ -282,11 +407,13 @@ export class MemoryCatalogRepository {
     this.adminSessions = new Map();
     this.requests = new Map();
     this.requestSelections = new Map();
+    this.backupRecoveries = new Map();
     this.botUsers = new Map();
     this.siteVisitors = new Map();
     this.siteVisits = [];
     this.announcementChannels = new Map();
     this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
+    this.backupSettings = { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
   }
 
   async init() {}
@@ -373,6 +500,15 @@ export class MemoryCatalogRepository {
     return item;
   }
 
+  async updateContentByAdminId(adminId, patch) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    Object.assign(saved, contentMetadataPatch(saved, patch));
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
   async createContent(input) {
     const baseSlug = slugify(input.title);
     let suffix = 0;
@@ -452,6 +588,17 @@ export class MemoryCatalogRepository {
     item.files.push(clone(file));
     item.updatedAt = new Date().toISOString();
     item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    return clone(item);
+  }
+
+  async replaceSessionFiles(chatId, ownerId, files) {
+    const key = sessionKey(chatId, ownerId);
+    const item = this.sessions.get(key);
+    if (!item) return null;
+    item.files = Array.isArray(files) ? clone(files) : item.files;
+    item.updatedAt = new Date().toISOString();
+    item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    this.sessions.set(key, item);
     return clone(item);
   }
 
@@ -602,6 +749,18 @@ export class MemoryCatalogRepository {
     this.adminSessions.delete(sessionKey(chatId, ownerId));
   }
 
+  async listActiveAdminSessions() {
+    const active = [];
+    for (const [key, session] of this.adminSessions.entries()) {
+      if (new Date(session.expiresAt).getTime() <= Date.now()) {
+        this.adminSessions.delete(key);
+        continue;
+      }
+      active.push(clone(session));
+    }
+    return active;
+  }
+
   async createRequest({ requestText, requester }) {
     const now = new Date().toISOString();
     const request = {
@@ -678,6 +837,33 @@ export class MemoryCatalogRepository {
 
   async deleteRequestSelection(chatId, ownerId) {
     this.requestSelections.delete(sessionKey(chatId, ownerId));
+  }
+
+  async startBackupRecovery({ chatId, ownerId, expiresAt = new Date(Date.now() + BACKUP_RECOVERY_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const recovery = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      createdAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + BACKUP_RECOVERY_TTL_MS).toISOString()
+    };
+    this.backupRecoveries.set(sessionKey(chatId, ownerId), recovery);
+    return clone(recovery);
+  }
+
+  async findBackupRecovery(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const recovery = this.backupRecoveries.get(key);
+    if (!recovery) return null;
+    if (!safeDateTime(recovery.expiresAt) || safeDateTime(recovery.expiresAt).getTime() <= Date.now()) {
+      this.backupRecoveries.delete(key);
+      return null;
+    }
+    return clone(recovery);
+  }
+
+  async deleteBackupRecovery(chatId, ownerId) {
+    this.backupRecoveries.delete(sessionKey(chatId, ownerId));
   }
 
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
@@ -824,6 +1010,88 @@ export class MemoryCatalogRepository {
     return clone(this.autoPublishSettings);
   }
 
+  async exportBackupData() {
+    return backupSnapshot({
+      content: [...this.contents.values()].map(clone),
+      upload_sessions: [...this.sessions.values()].map(clone),
+      requests: [...this.requests.values()].map(clone),
+      bot_users: [...this.botUsers.values()].map(clone),
+      site_visitors: [...this.siteVisitors.values()].map(clone),
+      site_visits: this.siteVisits.map(clone),
+      announcement_channels: [...this.announcementChannels.values()].map(clone),
+      automation_settings: [{ _id: 'auto-publish', ...clone(this.autoPublishSettings) }],
+      backup_settings: [{ _id: 'monthly-backup', ...clone(this.backupSettings) }]
+    });
+  }
+
+  async restoreBackupData(data) {
+    const collections = safeBackupCollections(data);
+    this.contents = new Map(collections.content.map((item) => [String(item.slug), clone(item)]));
+    this.sessions = new Map(collections.upload_sessions.map((item) => [sessionKey(item.chatId, item.ownerId), clone(item)]));
+    this.requests = new Map(collections.requests.map((item) => [String(item.id), clone(item)]));
+    this.botUsers = new Map(collections.bot_users.map((item) => [String(item.id), clone(item)]));
+    this.siteVisitors = new Map(collections.site_visitors.map((item) => [String(item.visitorId), clone(item)]));
+    this.siteVisits = collections.site_visits.map(clone);
+    this.announcementChannels = new Map(collections.announcement_channels.map((item) => [String(item.channelId), clone(item)]));
+    const autoSettings = collections.automation_settings.find((item) => String(item._id) === 'auto-publish');
+    const { _id: ignoredAutoSettingsId, ...savedAutoSettings } = autoSettings || {};
+    this.autoPublishSettings = autoSettings
+      ? clone(savedAutoSettings)
+      : { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
+    const backupSettings = collections.backup_settings.find((item) => String(item._id) === 'monthly-backup');
+    const { _id: ignoredBackupSettingsId, ...savedBackupSettings } = backupSettings || {};
+    this.backupSettings = backupSettings
+      ? clone(savedBackupSettings)
+      : { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
+    return Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name].length]));
+  }
+
+  async getBackupSettings() {
+    return clone(this.backupSettings);
+  }
+
+  async claimMonthlyBackup({ month, now = new Date().toISOString(), claimTtlMs = 30 * 60_000 } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return false;
+    const current = safeDateTime(now) || new Date();
+    const claimExpiresAt = safeDateTime(this.backupSettings.claimExpiresAt);
+    if (this.backupSettings.lastBackupMonth === safeMonth) return false;
+    if (this.backupSettings.inProgressMonth === safeMonth && claimExpiresAt && claimExpiresAt > current) return false;
+    this.backupSettings = {
+      ...this.backupSettings,
+      inProgressMonth: safeMonth,
+      claimExpiresAt: new Date(current.getTime() + Math.max(60_000, Number(claimTtlMs) || 30 * 60_000)).toISOString(),
+      updatedAt: current.toISOString()
+    };
+    return true;
+  }
+
+  async markMonthlyBackupCreated({ month, createdAt = new Date().toISOString() } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return null;
+    this.backupSettings = {
+      ...this.backupSettings,
+      lastBackupMonth: safeMonth,
+      lastBackupAt: safeDateTime(createdAt)?.toISOString() || new Date().toISOString(),
+      inProgressMonth: null,
+      claimExpiresAt: null,
+      updatedAt: new Date().toISOString()
+    };
+    return clone(this.backupSettings);
+  }
+
+  async releaseMonthlyBackupClaim({ month } = {}) {
+    if (this.backupSettings.inProgressMonth === String(month || '')) {
+      this.backupSettings = {
+        ...this.backupSettings,
+        inProgressMonth: null,
+        claimExpiresAt: null,
+        updatedAt: new Date().toISOString()
+      };
+    }
+    return clone(this.backupSettings);
+  }
+
   async close() {}
 }
 
@@ -838,11 +1106,13 @@ export class MongoCatalogRepository {
     this.adminSessions = db.collection('admin_sessions');
     this.requests = db.collection('requests');
     this.requestSelections = db.collection('request_selections');
+    this.backupRecoveries = db.collection('backup_recoveries');
     this.botUsers = db.collection('bot_users');
     this.siteVisitors = db.collection('site_visitors');
     this.siteVisits = db.collection('site_visits');
     this.announcementChannels = db.collection('announcement_channels');
     this.automationSettings = db.collection('automation_settings');
+    this.backupSettings = db.collection('backup_settings');
   }
 
   async init() {
@@ -867,6 +1137,8 @@ export class MongoCatalogRepository {
       this.requests.createIndex({ status: 1, createdAt: -1 }),
       this.requestSelections.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.requestSelections.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.backupRecoveries.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.backupRecoveries.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.botUsers.createIndex({ id: 1 }, { unique: true }),
       this.botUsers.createIndex({ lastSeenAt: -1 }),
       this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
@@ -1001,6 +1273,16 @@ export class MongoCatalogRepository {
     );
   }
 
+  async updateContentByAdminId(adminId, patch) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: contentMetadataPatch(content, patch) },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
   async createContent(input) {
     const baseSlug = slugify(input.title);
     for (let attempt = 0; attempt < 16; attempt += 1) {
@@ -1100,6 +1382,20 @@ export class MongoCatalogRepository {
     // rather than a findOneAndUpdate metadata wrapper.
     if (update.matchedCount !== 1) return null;
     return this.sessions.findOne(filter);
+  }
+
+  async replaceSessionFiles(chatId, ownerId, files) {
+    return this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          files: Array.isArray(files) ? files : [],
+          updatedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
   }
 
   async queueAutomationSession({ chatId, ownerId, category, title, file, groupKey, scheduledAt, maxWaitAt, firstReceivedAt, receivedAt = new Date().toISOString() }) {
@@ -1263,6 +1559,13 @@ export class MongoCatalogRepository {
     await this.adminSessions.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
   }
 
+  async listActiveAdminSessions() {
+    return this.adminSessions.find(
+      { expiresAt: { $gt: new Date() } },
+      { projection: { chatId: 1, ownerId: 1 } }
+    ).toArray();
+  }
+
   async createRequest({ requestText, requester }) {
     const now = new Date().toISOString();
     const document = {
@@ -1355,6 +1658,33 @@ export class MongoCatalogRepository {
 
   async deleteRequestSelection(chatId, ownerId) {
     await this.requestSelections.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startBackupRecovery({ chatId, ownerId, expiresAt = new Date(Date.now() + BACKUP_RECOVERY_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.backupRecoveries.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          createdAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + BACKUP_RECOVERY_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId) }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findBackupRecovery(chatId, ownerId) {
+    return this.backupRecoveries.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteBackupRecovery(chatId, ownerId) {
+    await this.backupRecoveries.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
   }
 
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
@@ -1528,6 +1858,141 @@ export class MongoCatalogRepository {
       { upsert: true }
     );
     return settings;
+  }
+
+  async exportBackupData() {
+    const entries = await Promise.all([
+      this.contents.find({}).toArray(),
+      this.sessions.find({}).toArray(),
+      this.requests.find({}).toArray(),
+      this.botUsers.find({}).toArray(),
+      this.siteVisitors.find({}).toArray(),
+      this.siteVisits.find({}).toArray(),
+      this.announcementChannels.find({}).toArray(),
+      this.automationSettings.find({}).toArray(),
+      this.backupSettings.find({}).toArray()
+    ]);
+    return backupSnapshot(Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name, index) => [name, entries[index]])));
+  }
+
+  async restoreBackupData(data) {
+    const collections = safeBackupCollections(data);
+    const targets = {
+      content: this.contents,
+      upload_sessions: this.sessions,
+      requests: this.requests,
+      bot_users: this.botUsers,
+      site_visitors: this.siteVisitors,
+      site_visits: this.siteVisits,
+      announcement_channels: this.announcementChannels,
+      automation_settings: this.automationSettings,
+      backup_settings: this.backupSettings
+    };
+    const replaceAll = async (session = undefined) => {
+      for (const name of BACKUP_COLLECTION_NAMES) {
+        const collection = targets[name];
+        const options = session ? { session } : undefined;
+        await collection.deleteMany({}, options);
+        if (collections[name].length) await collection.insertMany(collections[name], options);
+      }
+    };
+
+    // Atlas supports transactions and keeps a bad/partial upload from
+    // replacing only half the application. A standalone development MongoDB
+    // has no transaction support, so it falls back to a validated sequential
+    // replacement rather than making recovery unavailable.
+    let completed = false;
+    const session = this.client.startSession();
+    try {
+      await session.withTransaction(async () => replaceAll(session));
+      completed = true;
+    } catch (error) {
+      if (!/transaction numbers are only allowed|replica set|mongos|transactions are not supported/i.test(String(error?.message || ''))) throw error;
+    } finally {
+      await session.endSession();
+    }
+    if (!completed) await replaceAll();
+    await this.init();
+    return Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name].length]));
+  }
+
+  async getBackupSettings() {
+    return (await this.backupSettings.findOne({ _id: 'monthly-backup' })) || {
+      lastBackupMonth: null,
+      lastBackupAt: null,
+      inProgressMonth: null,
+      claimExpiresAt: null,
+      updatedAt: null
+    };
+  }
+
+  async claimMonthlyBackup({ month, now = new Date(), claimTtlMs = 30 * 60_000 } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return false;
+    const current = safeDateTime(now) || new Date();
+    const claimExpiresAt = new Date(current.getTime() + Math.max(60_000, Number(claimTtlMs) || 30 * 60_000));
+    try {
+      const claimed = await this.backupSettings.findOneAndUpdate(
+        {
+          _id: 'monthly-backup',
+          lastBackupMonth: { $ne: safeMonth },
+          $or: [
+            { inProgressMonth: { $ne: safeMonth } },
+            { claimExpiresAt: { $lte: current } }
+          ]
+        },
+        {
+          $set: {
+            inProgressMonth: safeMonth,
+            claimExpiresAt,
+            updatedAt: current
+          },
+          $setOnInsert: { lastBackupMonth: null, lastBackupAt: null }
+        },
+        { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+      );
+      return Boolean(claimed);
+    } catch (error) {
+      // If another replica created the singleton settings document between our
+      // non-match and upsert, it owns the claim; do not send a duplicate file.
+      if (error?.code === 11000) return false;
+      throw error;
+    }
+  }
+
+  async markMonthlyBackupCreated({ month, createdAt = new Date() } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return null;
+    const current = safeDateTime(createdAt) || new Date();
+    const result = await this.backupSettings.findOneAndUpdate(
+      { _id: 'monthly-backup' },
+      {
+        $set: {
+          lastBackupMonth: safeMonth,
+          lastBackupAt: current,
+          inProgressMonth: null,
+          claimExpiresAt: null,
+          updatedAt: current
+        }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async releaseMonthlyBackupClaim({ month } = {}) {
+    const result = await this.backupSettings.findOneAndUpdate(
+      { _id: 'monthly-backup', inProgressMonth: String(month || '') },
+      {
+        $set: {
+          inProgressMonth: null,
+          claimExpiresAt: null,
+          updatedAt: new Date()
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
   }
 
   async close() {
