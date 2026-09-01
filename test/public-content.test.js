@@ -55,3 +55,25 @@ test('manual subtitle metadata remains public when later files carry other capti
   }, config);
   assert.deepEqual(record.subtitleLanguages, ['Hindi']);
 });
+
+test('delivery choices retain a meaningful season title and remove ESubs release noise', () => {
+  const record = toPublicContent({
+    id: 'gentlemen', slug: 'the-gentlemen', title: 'The Gentlemen Season 1', category: 'web-series',
+    releaseLabel: 'Season 1', shareCode: 'gentlemenCode', hasDelivery: true,
+    files: [
+      {
+        name: 'video-77',
+        // This is what historical native-video records retained after the old
+        // cleaner had stripped the season and left only an ESubs suffix.
+        displayName: 'The Gentlemen ESubs', quality: '720P', kind: 'video'
+      },
+      {
+        name: 'The Gentlemen Season 1 (2024) [Hindi-English] 720p HEVC Netflix WEB-DL ESubs.mkv',
+        displayName: 'The Gentlemen ESubs',
+        sourceLabel: 'The Gentlemen Season 1 (2024) [Hindi-English] 720p HEVC Netflix WEB-DL ESubs.mkv',
+        quality: '720P', kind: 'video'
+      }
+    ]
+  }, config);
+  assert.deepEqual(record.fileChoices.map((file) => file.label), ['The Gentlemen Season 1', 'The Gentlemen Season 1']);
+});

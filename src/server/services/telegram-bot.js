@@ -271,6 +271,10 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
     storageMethod,
     telegramFileId: source?.file_id || null,
     name: cleanText(filename, 180),
+    // Keep a private source label so native Telegram video uploads (which do
+    // not provide file_name) can still render their meaningful caption later.
+    // The public API only exposes a cleaned label derived from this value.
+    sourceLabel: cleanText(message.caption || filename, 500),
     displayName: episode.displayName,
     quality,
     // `languages` stays as a compatibility alias for existing catalog records.

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { cleanMediaName, detectMediaQuality, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanDeliveryFileName, cleanMediaName, detectMediaQuality, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -110,14 +110,50 @@ function publicSubtitleLanguages(content) {
   return [...new Map(languages.map((language) => [language.toLowerCase(), language])).values()].slice(0, 8);
 }
 
-function publicFileChoices(files, config, shareCode) {
+function isUsableTelegramFileName(value) {
+  const filename = cleanText(value, 180);
+  return Boolean(filename) && !/^(?:document|video|audio|animation|photo|file)-\d+$/i.test(filename);
+}
+
+function catalogFileTitle(content) {
+  let title = cleanDeliveryFileName(content?.title);
+  const releaseLabel = cleanText(content?.releaseLabel, 80);
+  // Older native-video uploads only retained a shortened display name. If the
+  // catalog metadata knows this is a season, use it to restore the meaningful
+  // file title rather than exposing a leftover tag such as "ESubs".
+  if (title && /^season\s*\d+\b/i.test(releaseLabel) && !/\bseason\s*\d+\b/i.test(title)) {
+    title = `${title} ${releaseLabel}`;
+  }
+  return title;
+}
+
+function publicFileChoiceLabel(file, content, index) {
+  const rawLabel = isUsableTelegramFileName(file?.sourceLabel)
+    ? file.sourceLabel
+    : isUsableTelegramFileName(file?.name)
+      ? file.name
+      : file?.displayName;
+  const sourceTitle = cleanDeliveryFileName(rawLabel);
+  const catalogTitle = catalogFileTitle(content);
+  if (!sourceTitle) return catalogTitle || `Delivery file ${index + 1}`;
+
+  // Prefer a richer canonical title when a legacy file record only retained a
+  // shortened prefix. For example, `The Gentlemen ESubs` becomes
+  // `The Gentlemen Season 1` when the catalog title contains the season.
+  const sourceKey = sourceTitle.toLowerCase();
+  const catalogKey = catalogTitle?.toLowerCase() || '';
+  if (catalogTitle && (sourceKey === catalogKey || catalogKey.startsWith(`${sourceKey} `))) return catalogTitle;
+  return sourceTitle;
+}
+
+function publicFileChoices(files, config, shareCode, content) {
   if (!Array.isArray(files)) return [];
   // A published detail page intentionally lists every uploaded file: selecting
   // one must never force a visitor to receive a different quality or episode.
   return files.map((file, index) => {
     const episode = publicEpisodeGroups([file?.episode])[0] || null;
-    const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.displayName });
-    const label = cleanMediaName(file?.displayName || file?.name) || `Delivery file ${index + 1}`;
+    const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.sourceLabel || file?.displayName });
+    const label = publicFileChoiceLabel(file, content, index);
     const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
     const deliveryUrl = getDeliveryRedirectPath(shareCode, index + 1);
 
@@ -142,7 +178,7 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
   const shareCode = content.shareCode || null;
   const telegramUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
   const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
-  const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode) : [];
+  const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode, content) : [];
 
   return {
     id: String(content._id || content.id || content.slug),

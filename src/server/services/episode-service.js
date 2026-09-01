@@ -82,7 +82,14 @@ const LANGUAGE_CODES = new Map([
   ['lt', 'Lithuanian'], ['lit', 'Lithuanian']
 ]);
 
-const SUBTITLE_MARKER = /\b(?:sub(?:title)?s?|cc|closed\s*captions?|engsub|softsub|hardsub)\b/i;
+// Accept compact release labels such as `ESubs` as well as normal `English
+// Subtitles` wording. Keep `English Subtitles` split into its language and
+// marker so the nearby-language parser can identify English rather than an
+// unrelated earlier audio language.
+const SUBTITLE_MARKER = /\b(?:sub(?:title)?s?|(?:e|eng)[- ]?sub(?:title)?s?|cc|closed\s*captions?|softsub|hardsub)\b/i;
+const ENGLISH_SUBTITLE_TAG = /^(?:(?:e|eng)[- ]?sub(?:title)?s?|english\s+sub(?:title)?s?)$/i;
+const RELEASE_SUBTITLE_TAG = /\b(?:e(?:ng(?:lish)?)?[- ]?sub(?:title)?s?|softsub|hardsub|closed\s*captions?)\b/gi;
+const NEARBY_SUBTITLE_TAGS = ['sub', 'subs', 'subtitle', 'subtitles', 'e-sub', 'e-subs', 'esub', 'esubs', 'eng-sub', 'eng-subs', 'engsub', 'engsubs', 'cc', 'closed captions', 'softsub', 'hardsub'];
 
 function validEpisode(value) {
   return Number.isInteger(value) && value >= 1 && value <= MAX_EPISODE;
@@ -169,9 +176,36 @@ export function cleanMediaName(value) {
     // Common providers/release labels found in direct Telegram uploads.
     .replace(/\b(?:nf|netflix|amzn|amazon|prime(?:video)?|zee\s*5?|jiocinema|jiohotstar|hotstar|sonyliv|sony\s*liv|mx(?:player)?|altbalaji|aha|hoichoi|voot|hulu|hbo(?:max)?|max|atvp|apple\s*tv\+?|disney\+?|youtube|tubi|crunchyroll|bilibili|wetv|iqiyi)\b/gi, ' ')
     .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio)\b/gi, ' ')
+    .replace(RELEASE_SUBTITLE_TAG, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return cleanText(withoutAttribution, 180);
+}
+
+/**
+ * A delivery option needs a readable file label, not the catalog-title merge
+ * key. Unlike `cleanMediaName`, keep a useful standalone season marker (for
+ * example `The Gentlemen Season 1`) while removing codecs, providers, quality,
+ * language brackets, and subtitle release tags such as `ESubs`.
+ */
+export function cleanDeliveryFileName(value) {
+  const label = stripTelegramAttribution(value)
+    .replace(/\.(mkv|mp4|avi|webm|mov|m4v|ts|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
+    .replace(/[\[\(][^\]\)]{0,160}[\]\)]/g, ' ')
+    .replace(/[._~|]+/g, ' ')
+    .replace(/\b(?:19\d{2}|20\d{2})\b/g, ' ')
+    .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
+    .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
+    .replace(/\b(?:web[- ]?(?:dl|rip)?|blu[- ]?ray|brrip|hdrip|dvdrip|remux|cam|hdcam|predvd|proper|repack|uncut|extended|unrated)\b/gi, ' ')
+    .replace(/\b(?:x\s*26[45]|h\s*26[45]|hevc|av1|avc|vp9|10bit|8bit)\b/gi, ' ')
+    .replace(/\b(?:ddp?|eac3|ac3|truehd|dts(?:[- ]?hd)?|aac|opus|flac|mp3)\s*\d+(?:\s+\d+)?\b/gi, ' ')
+    .replace(/\b(?:atmos|dolby[- ]?vision|hdr10(?:\+)?|sdr)\b/gi, ' ')
+    .replace(/\b(?:nf|netflix|amzn|amazon|prime(?:video)?|zee\s*5?|jiocinema|jiohotstar|hotstar|sonyliv|sony\s*liv|mx(?:player)?|altbalaji|aha|hoichoi|voot|hulu|hbo(?:max)?|max|atvp|apple\s*tv\+?|disney\+?|youtube|tubi|crunchyroll|bilibili|wetv|iqiyi)\b/gi, ' ')
+    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio)\b/gi, ' ')
+    .replace(RELEASE_SUBTITLE_TAG, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleanText(label, 180);
 }
 
 export function detectMediaQuality({ caption, filename }) {
@@ -226,21 +260,59 @@ function detectedLanguagesIn(value) {
     .map(([label]) => label);
 }
 
+function startsNearbySubtitleTag(value) {
+  const text = String(value || '').toLowerCase().trimStart().replace(/^[-:+|]+\s*/, '');
+  return NEARBY_SUBTITLE_TAGS.some((tag) => text.startsWith(tag) && !/[a-z]/.test(text[tag.length] || ''));
+}
+
+function endsNearbySubtitleTag(value) {
+  const text = String(value || '').toLowerCase().replace(/[-:+|\s]+$/, '');
+  return NEARBY_SUBTITLE_TAGS.some((tag) => {
+    const start = text.length - tag.length;
+    return start >= 0 && text.endsWith(tag) && !/[a-z]/.test(text[start - 1] || '');
+  });
+}
+
+function languageIsAttachedToSubtitleTag(text, language) {
+  const source = String(text || '');
+  const canonical = String(language || '').toLowerCase();
+  // `Eng-Subs` is another common compact English-only subtitle label.
+  const needles = canonical === 'english' ? ['english', 'eng'] : [canonical];
+  for (const needle of needles) {
+    if (!needle) continue;
+    let position = source.toLowerCase().indexOf(needle);
+    while (position >= 0) {
+      const beforeCharacter = source[position - 1] || '';
+      const afterCharacter = source[position + needle.length] || '';
+      // Match whole words only: `Englishman` is not an English track label.
+      if (!/[A-Za-z]/.test(beforeCharacter) && !/[A-Za-z]/.test(afterCharacter)) {
+        const after = source.slice(position + needle.length, position + needle.length + 18);
+        const before = source.slice(Math.max(0, position - 18), position);
+        // The subtitle marker must be immediately next to the language. A later
+        // `ESubs` tag should not erase English from `[Hindi-English]` audio.
+        if (startsNearbySubtitleTag(after) || endsNearbySubtitleTag(before)) return true;
+      }
+      position = source.toLowerCase().indexOf(needle, position + needle.length);
+    }
+  }
+  return false;
+}
+
 function audioLanguagesIn(value) {
   const labels = detectedLanguagesIn(value);
   const subtitleLabels = subtitleLanguagesIn(value);
   if (!subtitleLabels.length) return labels;
-  // Captions frequently say "Hindi Audio + English Subtitles". Do not promote
-  // the subtitle language to an audio track just because it appears in the
-  // same uploader caption; MediaInfo may later verify/expand ambiguous cases.
-  return labels.filter((label) => !subtitleLabels.some((subtitle) => subtitle.toLowerCase() === label.toLowerCase()));
+  const text = stripTelegramAttribution(value).replace(/[_.+/]+/g, ' ');
+  return labels.filter((label) => !subtitleLabels.some((subtitle) => (
+    subtitle.toLowerCase() === label.toLowerCase() && languageIsAttachedToSubtitleTag(text, label)
+  )));
 }
 
 function subtitleLanguagesIn(value) {
   const text = stripTelegramAttribution(value).replace(/[_.+/]+/g, ' ');
   if (!text || !SUBTITLE_MARKER.test(text)) return [];
   const labels = [];
-  for (const marker of text.matchAll(/\b(?:sub(?:title)?s?|cc|closed\s*captions?|engsub|softsub|hardsub)\b/gi)) {
+  for (const marker of text.matchAll(new RegExp(SUBTITLE_MARKER.source, 'gi'))) {
     const index = marker.index || 0;
     const keyword = marker[0].toLowerCase();
     // Take the directly adjacent word(s), rather than every language elsewhere
@@ -255,7 +327,7 @@ function subtitleLanguagesIn(value) {
     // after-marker form only when there is no explicit language immediately
     // before it, as in "Subtitles: English".
     else if (afterLabel) labels.push(afterLabel);
-    if (keyword === 'engsub') labels.push('English');
+    if (ENGLISH_SUBTITLE_TAG.test(keyword)) labels.push('English');
   }
   return uniqueLanguageLabels(labels);
 }
