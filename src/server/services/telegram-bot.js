@@ -543,6 +543,28 @@ async function updatePublishedPost({ ctx, repository, argument, field, value, fi
  * Publisher artwork commands (/poster, /p, /imgdd)
  * ------------------------------------------------------------------------- */
 
+/**
+ * Acknowledge an inline-keyboard tap. Telegraf exposes `answerCbQuery(text,
+ * extra)`; other Bot API wrappers expose `answerCallbackQuery({ text })`. The
+ * acknowledgement is only cosmetic, so a missing method, an already-answered
+ * callback, or a 400 from Telegram must never abort the action behind the tap.
+ */
+async function acknowledgeTap(ctx, text, { alert = false } = {}) {
+  const note = cleanText(text, 190);
+  try {
+    if (typeof ctx.answerCbQuery === 'function') {
+      await ctx.answerCbQuery(note || undefined, { show_alert: alert });
+      return;
+    }
+    if (typeof ctx.answerCallbackQuery === 'function') {
+      await ctx.answerCallbackQuery({ text: note, show_alert: alert });
+    }
+  } catch {
+    // The chat reply is what the publisher actually needs; tap feedback is not
+    // worth losing it over, and Telegram rejects an expired callback anyway.
+  }
+}
+
 const POSTER_COMMAND_USAGE = [
   'Poster commands accept both styles:',
   '',
@@ -565,6 +587,14 @@ export function posterCancelKeyboard() {
   return Markup.inlineKeyboard([[Markup.button.callback('Cancel', 'poster:cancel')]]);
 }
 
+// Publishers recognise the service people actually quote, not the raw API id.
+const POSTER_PROVIDER_LABELS = { anilist: 'AniList', tmdb: 'TMDB', omdb: 'IMDb', imdb: 'IMDb' };
+
+export function posterProviderLabel(provider) {
+  const key = cleanText(provider, 20).toLowerCase();
+  return POSTER_PROVIDER_LABELS[key] || (key ? key.toUpperCase() : '');
+}
+
 /** Telegram measures a button label in UTF-8 bytes, not JavaScript characters. */
 function telegramButtonText(value, maxBytes = 62) {
   const text = cleanText(value, 160);
@@ -582,9 +612,11 @@ export function posterCandidateKeyboard(candidates = []) {
     rows.push(candidates.slice(index, index + 2).map((candidate, offset) => {
       const title = cleanText(candidate.title, 60) || 'Untitled';
       const year = Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : '';
-      const provider = cleanText(candidate.provider, 10).toUpperCase();
+      const provider = posterProviderLabel(candidate.provider);
+      // The provider tag leads the label because a truncated "· TM" explains
+      // nothing, while a shortened title is still recognisable at a glance.
       return Markup.button.callback(
-        telegramButtonText(`${index + offset + 1}. ${title}${year}${provider ? ` · ${provider}` : ''}`),
+        telegramButtonText(`${index + offset + 1}.${provider ? ` ${provider} \u00b7` : ''} ${title}${year}`),
         `poster:pick:${index + offset}`
       );
     }));
@@ -676,19 +708,19 @@ export async function handlePosterAction(ctx, repository, config, action) {
   const key = cleanText(action, 40);
   if (key === 'poster:cancel') {
     await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
-    await ctx.answerCallbackQuery({ text: 'Cancelled' }).catch(() => {});
+    await acknowledgeTap(ctx, 'Cancelled');
     await ctx.reply('Poster selection cancelled.');
     return true;
   }
   const flow = await repository.findPosterFlow(chatId(ctx), userId(ctx));
   if (!flow) {
-    await ctx.answerCallbackQuery({ text: 'This poster menu expired. Send /poster again.' }).catch(() => {});
+    await acknowledgeTap(ctx, 'This poster menu expired. Send /poster again.', { alert: true });
     return true;
   }
   if (key === 'poster:style:old' || key === 'poster:style:new') {
     const style = key.endsWith(':old') ? 'old' : 'new';
     await repository.updatePosterFlow?.(chatId(ctx), userId(ctx), { style, stage: 'post-id', candidates: [], query: '' });
-    await ctx.answerCallbackQuery().catch(() => {});
+    await acknowledgeTap(ctx);
     await ctx.reply(
       style === 'old'
         ? 'Old style: send the Post ID, for example SB-0123ABCDEF. Find it with /posts or /postid.'
@@ -698,18 +730,20 @@ export async function handlePosterAction(ctx, repository, config, action) {
     return true;
   }
   if (key === 'poster:retry') {
+    // Answer the tap first: a provider search can outlive Telegram's short
+    // callback window, and an unacknowledged tap makes the button look broken.
+    await acknowledgeTap(ctx, 'Searching artwork again\u2026');
     await presentPosterCandidates({ ctx, repository, config, adminId: flow.targetAdminId, query: flow.query });
-    await ctx.answerCallbackQuery().catch(() => {});
     return true;
   }
   const pick = key.match(/^poster:pick:(\d{1,2})$/);
   if (pick) {
     const candidate = (flow.candidates || [])[Number.parseInt(pick[1], 10)];
     if (!candidate?.posterUrl) {
-      await ctx.answerCallbackQuery({ text: 'That artwork is no longer available. Search again.' }).catch(() => {});
+      await acknowledgeTap(ctx, 'That artwork is no longer available. Search again.', { alert: true });
       return true;
     }
-    await ctx.answerCallbackQuery({ text: `Mirroring ${candidate.title || 'poster'}…` }).catch(() => {});
+    await acknowledgeTap(ctx, `Mirroring ${cleanText(candidate.title, 60) || 'poster'}…`);
     if (!flow.targetAdminId) {
       const session = await repository.findSession(chatId(ctx), userId(ctx));
       if (!session) {
@@ -726,7 +760,7 @@ export async function handlePosterAction(ctx, repository, config, action) {
       if (!result) return true;
       await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
       await ctx.reply(result.updated
-        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title} using the ${cleanText(candidate.provider, 20).toUpperCase() || 'chosen'} artwork.`
+        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title} using the ${posterProviderLabel(candidate.provider) || 'chosen'} artwork.`
         : `The poster was mirrored, but ${flow.targetAdminId} is no longer available.`);
       try {
         await ctx.replyWithPhoto(result.posterResult.url, { caption: 'New catalog artwork preview' });
@@ -3313,7 +3347,7 @@ export async function launchTelegramBot({ config, repository }) {
   bot.action(/^poster:(?:style:(?:old|new)|cancel|retry|pick:\d{1,2})$/, async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
     const handled = await handlePosterAction(ctx, repository, config, ctx.match?.[0] || '');
-    if (!handled) await ctx.answerCallbackQuery().catch(() => {});
+    if (!handled) await acknowledgeTap(ctx, 'That poster button is no longer active.');
   });
 
   bot.command('category', async (ctx) => {

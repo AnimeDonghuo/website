@@ -986,12 +986,14 @@ test('the old poster style still works: post ID then an HTTPS image link', async
     return new Response(Buffer.from('poster-bytes'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
   };
   const replies = [];
+  const taps = [];
+  // Telegraf, not grammY: the real context answers a tap through `answerCbQuery`.
   const ctx = {
     chat: { id: 641 },
     from: { id: 641 },
     message: { text: '' },
     reply: async (text) => { replies.push(text); },
-    answerCallbackQuery: async () => {},
+    answerCbQuery: async (text, extra) => { taps.push({ text, showAlert: Boolean(extra?.show_alert) }); },
     replyWithPhoto: async () => {}
   };
   try {
@@ -999,6 +1001,7 @@ test('the old poster style still works: post ID then an HTTPS image link', async
 
     await handlePosterAction(ctx, repository, posterConfig, 'poster:style:old');
     assert.equal((await repository.findPosterFlow(641, 641)).stage, 'post-id');
+    assert.deepEqual(taps, [{ text: undefined, showAlert: false }], 'the tap is answered exactly once');
 
     ctx.message = { text: 'not-a-post-id' };
     assert.equal(await handlePosterFlowMessage(ctx, repository, posterConfig), true);
@@ -1043,48 +1046,68 @@ test('the new poster style mirrors a tapped artwork button and a failed search s
     ? new Response(JSON.stringify({ success: true, data: { id: 'imgbb-2', url: 'https://i.ibb.co/mirror/pick.png', display_url: 'https://i.ibb.co/mirror/pick.png' } }), { status: 200, headers: { 'content-type': 'application/json' } })
     : new Response(Buffer.from('picked-bytes'), { status: 200, headers: { 'content-type': 'image/png' } }));
   const replies = [];
+  const taps = [];
   const ctx = {
     chat: { id: 642 },
     from: { id: 642 },
     reply: async (text) => { replies.push(text); },
-    answerCallbackQuery: async () => {},
+    answerCbQuery: async (text, extra) => { taps.push({ text, showAlert: Boolean(extra?.show_alert) }); },
     replyWithPhoto: async () => {}
   };
-  try {
-    await repository.startPosterFlow({
-      chatId: 642,
-      ownerId: 642,
-      style: 'new',
-      targetAdminId: created.adminId,
-      stage: 'pick',
-      query: 'Picked release',
-      candidates: [
-        { title: 'Picked Release', year: 2026, provider: 'tmdb', posterUrl: 'https://8.8.8.8/a.jpg' },
-        { title: 'Picked Release 2', year: null, provider: 'anilist', posterUrl: 'https://8.8.8.8/b.jpg' }
-      ]
-    });
+  const candidates = [
+    { title: 'Picked Release', year: 2026, provider: 'tmdb', posterUrl: 'https://8.8.8.8/a.jpg' },
+    { title: 'Kaizen रेलीज डेका के से बहुत लम्बा पहला बुत लम्बा है', year: null, provider: 'omdb', posterUrl: 'https://8.8.8.8/b.jpg' }
+  ];
+  const arm = (list) => repository.startPosterFlow({
+    chatId: 642,
+    ownerId: 642,
+    style: 'new',
+    targetAdminId: created.adminId,
+    stage: 'pick',
+    query: 'Picked release',
+    candidates: list
+  });
 
-    const keyboard = posterCandidateKeyboard([
-      { title: 'Picked Release', year: 2026, provider: 'tmdb' },
-      { title: `Kaizen \u0930\u0947\u0932\u0940\u091c \u0921\u0947\u0915\u093e \u0915\u0947 \u0938\u0947 \u092c\u0939\u0941\u0924 \u0932\u092e\u094d\u092c\u093e \u092a\u0939\u0932\u093e \u092c\u0941\u0924 \u0932\u092e\u094d\u092c\u093e`, year: 2026, provider: 'omdb' }
-    ]);
+  try {
+    const keyboard = posterCandidateKeyboard(candidates);
     const labels = keyboard.reply_markup.inline_keyboard.flat().map((button) => button.text);
-    assert.ok(labels.length >= 3);
+    assert.equal(labels[0], '1. TMDB · Picked Release (2026)', 'the provider tag leads so a cut label stays readable');
+    assert.ok(labels[1].startsWith('2. IMDb · '), labels[1]);
+    assert.ok(labels[1].endsWith('…') && !labels[1].includes('IMDb…'), `a long non-Latin title is shortened, not the provider: ${labels[1]}`);
+    assert.deepEqual(labels.at(-1), 'Cancel');
     for (const label of labels) {
       assert.ok(Buffer.byteLength(label, 'utf8') <= 64, `button label must fit Telegram: ${label}`);
     }
 
+    await arm(candidates);
+    await arm(candidates);
     assert.equal(await handlePosterAction(ctx, repository, posterConfig, 'poster:pick:1'), true);
+    assert.equal(taps.length, 1, 'the tap is answered exactly once');
+    assert.ok(taps[0].text.startsWith('Mirroring '), taps[0].text);
+    assert.ok(taps[0].text.length <= 200, 'a tap note must stay inside the Bot API text limit');
+    assert.equal(taps[0].showAlert, false, 'progress belongs in the chat, not in an alert popup');
     const updated = await repository.findContentByAdminId(created.adminId);
     assert.equal(updated.posterUrl, 'https://i.ibb.co/mirror/pick.png');
     assert.equal(updated.poster.originalUrl, 'https://8.8.8.8/b.jpg');
+    assert.equal(updated.poster.source, 'remote-mirror');
+    assert.match(replies.at(-1), /Poster updated for SB-.* using the IMDb artwork\./);
     assert.equal(updated.files.length, 1, 'choosing artwork never touches the files');
-    assert.equal(await repository.findPosterFlow(642, 642), null);
+    assert.equal(await repository.findPosterFlow(642, 642), null, 'a finished flow is removed');
 
-    // An expired menu must not publish anything, throw, or spam the chat.
-    const repliesBeforeExpiry = replies.length;
-    assert.equal(await handlePosterAction(ctx, repository, posterConfig, 'poster:pick:0'), true);
-    assert.equal(replies.length, repliesBeforeExpiry, 'no reply is sent when the flow is gone');
+    // A context that cannot answer a tap at all must still complete the update:
+    // tap feedback is cosmetic, the publisher's artwork choice is not.
+    const blind = { chat: { id: 642 }, from: { id: 642 }, reply: async (text) => { replies.push(text); } };
+    await repository.updateContentByAdminId(created.adminId, { posterUrl: 'https://old.example/poster.jpg' });
+    await arm(candidates);
+    assert.equal(await handlePosterAction(blind, repository, posterConfig, 'poster:pick:0'), true);
+    assert.equal((await repository.findContentByAdminId(created.adminId)).posterUrl, 'https://i.ibb.co/mirror/pick.png');
+    assert.match(replies.at(-1), /using the TMDB artwork\./);
+
+    // An expired menu says so instead of throwing or changing anything.
+    replies.length = 0;
+    assert.equal(await handlePosterAction(ctx, repository, posterConfig, 'poster:pick:1'), true);
+    assert.deepEqual(taps.at(-1), { text: 'This poster menu expired. Send /poster again.', showAlert: true });
+    assert.deepEqual(replies, [], 'no chat spam for an expired button');
     assert.equal((await repository.findContentByAdminId(created.adminId)).posterUrl, 'https://i.ibb.co/mirror/pick.png');
 
     // No provider keys configured: the search reports it instead of guessing.
