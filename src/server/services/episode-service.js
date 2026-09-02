@@ -106,6 +106,109 @@ export function formatEpisodeLabel(start, end = start) {
     : `Episodes ${paddedEpisode(start)}–${paddedEpisode(end)}`;
 }
 
+export function formatRangeLabel(start, end = start) {
+  return `EP ${paddedEpisode(start)}${start === end ? '' : `–${paddedEpisode(end)}`}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Quality ordering
+ * ------------------------------------------------------------------------- */
+
+// Names are far more useful to a visitor when every quality of one release is
+// listed from the smallest file to the largest, instead of upload order.
+const QUALITY_HEIGHTS = new Map([
+  ['hd', 720],
+  ['fhd', 1080],
+  ['qhd', 1440],
+  ['uhd', 2160],
+  ['sd', 480]
+]);
+const K_RESOLUTION_HEIGHTS = new Map([[2, 1440], [4, 2160], [5, 2880], [6, 3840], [8, 4320]]);
+
+/** `1080p`, `1080`, `FHD` and `4K` all collapse into one comparable label. */
+export function normalizeQualityLabel(value) {
+  const raw = cleanText(value, 24).toUpperCase().replace(/\s+/g, '');
+  if (!raw) return null;
+  const pixels = raw.match(/^(\d{3,4})P?$/);
+  if (pixels) return `${pixels[1]}P`;
+  const k = raw.match(/^(\d{1,2})K$/);
+  if (k) return `${k[1]}K`;
+  return raw;
+}
+
+/** Vertical resolution estimate used only for ordering; null when unknown. */
+export function qualityHeight(value) {
+  const label = normalizeQualityLabel(value);
+  if (!label) return null;
+  const pixels = label.match(/^(\d{3,4})P$/);
+  if (pixels) return Number(pixels[1]);
+  const k = label.match(/^(\d{1,2})K$/);
+  if (k) {
+    const known = K_RESOLUTION_HEIGHTS.get(Number(k[1]));
+    return Number.isInteger(known) ? known : Number(k[1]) * 540;
+  }
+  return QUALITY_HEIGHTS.get(label.toLowerCase()) || null;
+}
+
+export function compareQualityAscending(first, second) {
+  const firstHeight = qualityHeight(first);
+  const secondHeight = qualityHeight(second);
+  // An unknown quality is not "small"; it belongs after every known one so a
+  // reader still sees the real 480p → 720p → 1080p ladder in sequence.
+  if (firstHeight === null && secondHeight === null) return 0;
+  if (firstHeight === null) return 1;
+  if (secondHeight === null) return -1;
+  return firstHeight - secondHeight;
+}
+
+/* ---------------------------------------------------------------------------
+ * Season detection
+ * ------------------------------------------------------------------------- */
+
+export const MAX_SEASON = 99;
+
+function validSeason(value) {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_SEASON;
+}
+
+export function formatSeasonLabel(season) {
+  return validSeason(season) ? `Season ${season}` : null;
+}
+
+/**
+ * Recognise `S01E05`, `Season 1`, `S2`, `1x05`, and a season word inside a
+ * caption. Years and quality labels are explicitly excluded, so `2024` or
+ * `1080p` can never be read as a season number.
+ */
+export function extractSeasonNumber(value) {
+  const text = stripTelegramAttribution(value)
+    .replace(/[_.]/g, ' ')
+    .replace(/\s+/g, ' ');
+  if (!text) return null;
+
+  const explicit = text.match(/\b(?:SEASON|S)[\s-]*0*(\d{1,2})\b/i);
+  if (explicit && validSeason(Number.parseInt(explicit[1], 10))) return Number.parseInt(explicit[1], 10);
+
+  // A compact package marker such as `S01E05`, `S01 1080p`, or `S2`. The token
+  // must not continue into another word, so `Soul`, `1080p`, and `8bit` can
+  // never be mistaken for a season.
+  const compact = text.match(/\bS[\s-]*0*(\d{1,2})(?!\d)(?![a-df-z])/i);
+  if (compact && validSeason(Number.parseInt(compact[1], 10))) return Number.parseInt(compact[1], 10);
+
+  const classic = text.match(/\b(\d{1,2})\s*x\s*\d{1,3}\b/);
+  if (classic && validSeason(Number.parseInt(classic[1], 10))) return Number.parseInt(classic[1], 10);
+
+  return null;
+}
+
+export function detectUploadSeason({ caption, filename } = {}) {
+  const captionSeason = extractSeasonNumber(caption);
+  if (captionSeason) return { season: captionSeason, source: 'caption' };
+  const filenameSeason = extractSeasonNumber(filename);
+  if (filenameSeason) return { season: filenameSeason, source: 'filename' };
+  return { season: null, source: null };
+}
+
 // Captions are checked first because uploaders often put the clean title and
 // episode range there. Telegram handles and t.me links are removed before any
 // parsing, so @channel names never become part of a release/episode label.
@@ -216,6 +319,94 @@ export function detectMediaQuality({ caption, filename }) {
   }
   return null;
 }
+
+/**
+ * A delivery row must tell the visitor what they are actually receiving, so
+ * this keeps every useful word of the uploader's own caption/filename and only
+ * removes Telegram promotion, the container extension, and separator noise.
+ * Unlike `cleanMediaName` it never strips quality, episode, season, language,
+ * or source labels — those are exactly what distinguishes one file from the
+ * next when a release has several uploads to choose from.
+ */
+export function publicFileDisplayName(value) {
+  const name = stripTelegramAttribution(value, 320)
+    .replace(/\.(mkv|mp4|avi|webm|mov|m4v|ts|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
+    .replace(/[{}]/g, ' ')
+    .replace(/[_~|]+/g, ' ')
+    .replace(/\.(?=\S)/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleanText(name, 260);
+}
+
+/**
+ * Two files describe the same delivery slot when a later upload should replace
+ * the earlier one. Episode ranges ignore quality on purpose: re-uploading a
+ * corrected Episode 1 should refresh every older Episode 1 variant instead of
+ * leaving the release half old and half new. Files without an episode (typically
+ * a feature film) only collide when the cleaned title, audio languages, and
+ * quality all match, so adding a new quality of the same movie is preserved.
+ */
+export function fileReplacementKey(file) {
+  if (!file || typeof file !== 'object') return null;
+  const start = Number(file?.episode?.start);
+  const end = Number(file?.episode?.end ?? file?.episode?.start);
+  const languages = uniqueLanguageLabels(
+    Array.isArray(file?.audioLanguages) && file.audioLanguages.length
+      ? file.audioLanguages
+      : Array.isArray(file?.languages) ? file.languages : []
+  ).map((language) => language.toLowerCase()).sort().join('+');
+
+  if (validEpisode(start) && validEpisode(end) && end >= start) {
+    return { key: `ep:${start}-${end}`, languages };
+  }
+
+  const quality = normalizeQualityLabel(file?.quality);
+  if (!quality) return null;
+  const titleKey = cleanMediaName(file?.displayName || file?.sourceLabel || file?.name || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!titleKey) return null;
+  return { key: `name:${titleKey}|${quality.toLowerCase()}`, languages };
+}
+
+/**
+ * Split one upload batch into per-season file groups so different seasons can
+ * never share a catalog post. Episodes restart at 1 in every season, so an
+ * unmarked file is attributed by upload position — it joins the season block it
+ * was sent inside, or the first season when nothing precedes it.
+ */
+export function groupFilesBySeason(files = []) {
+  const entries = (Array.isArray(files) ? files : []).map((file) => {
+    const stored = Number(file?.season);
+    return {
+      file,
+      season: validSeason(stored)
+        ? stored
+        : (detectUploadSeason({ caption: file?.displayName || file?.sourceLabel, filename: file?.name }).season ?? null)
+    };
+  });
+  const seasons = [...new Set(entries.map((entry) => entry.season).filter(Boolean))].sort((first, second) => first - second);
+  if (seasons.length <= 1) return [];
+
+  const groups = new Map(seasons.map((season) => [season, []]));
+  let currentSeason = null;
+  for (const entry of entries) {
+    const season = entry.season || currentSeason || seasons[0];
+    groups.get(season).push(entry.file);
+    currentSeason = season;
+  }
+
+  return seasons
+    .filter((season) => groups.get(season).length)
+    .map((season) => ({
+      season,
+      label: formatSeasonLabel(season),
+      files: groups.get(season)
+    }));
+}
+
 
 function uniqueLanguageLabels(values = [], maximum = 8) {
   const labels = [];
@@ -404,14 +595,27 @@ export function summarizeSubtitleLanguages(files = []) {
 export function detectUploadEpisode({ caption, filename }) {
   const captionText = stripTelegramAttribution(caption);
   const captionEpisode = extractEpisodeRange(captionText);
+  const season = detectUploadSeason({ caption, filename });
   if (captionEpisode) {
-    return { ...captionEpisode, source: 'caption', displayName: cleanMediaName(captionText) || captionEpisode.label };
+    return {
+      ...captionEpisode,
+      source: 'caption',
+      season: season.season,
+      seasonSource: season.source,
+      displayName: cleanMediaName(captionText) || captionEpisode.label
+    };
   }
 
   const filenameText = cleanMediaName(filename);
   const filenameEpisode = extractEpisodeRange(filenameText);
   if (filenameEpisode) {
-    return { ...filenameEpisode, source: 'filename', displayName: filenameText || filenameEpisode.label };
+    return {
+      ...filenameEpisode,
+      source: 'filename',
+      season: season.season,
+      seasonSource: season.source,
+      displayName: filenameText || filenameEpisode.label
+    };
   }
 
   return {
@@ -419,6 +623,8 @@ export function detectUploadEpisode({ caption, filename }) {
     end: null,
     label: null,
     source: null,
+    season: season.season,
+    seasonSource: season.source,
     displayName: cleanMediaName(captionText || filenameText) || 'Delivery file'
   };
 }
@@ -438,6 +644,10 @@ export function summarizeEpisodes(files = []) {
       start,
       end,
       label: formatEpisodeLabel(start, end),
+      // A range covering more than one episode is a combined pack. The website
+      // lists those in their own block instead of mixing them into the single
+      // episode rows they overlap.
+      combined: end !== start,
       fileCount: 0
     };
     current.fileCount += 1;

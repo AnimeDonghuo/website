@@ -17,10 +17,10 @@ A production-minded, responsive catalog for **media you are authorized to distri
 ### Public catalog
 
 - Editorial dark-mode homepage, feature card, latest releases, category rail, and responsive mobile layout
-- Categories for Anime, Cartoons, Donghua, K-Drama, Movies, Web Series, and a visible **18+** area
+- Categories for Anime, Cartoons, Donghua, K-Drama, Movies, Web Series, and **18+**. The homepage “Choose a universe” rail deliberately lists only the six general categories; **18+** stays reachable through the menu (mobile drawer) and the browse/category navigation, so restricted material is never presented on the front page by default
 - The 18+ area displays an explicit age-confirmation prompt before the browser requests any restricted cards, details, Watch pages, episode pages, or Telegram delivery redirect; ordinary home, search, featured, and all-catalog APIs never include restricted records
 - Search by title, genre, and language labels
-- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. When a publisher manually attaches an approved provider player, the existing card also gains a **Watch** button leading to an in-site embedded Watch page with episode/source choices and related titles from the same category. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker.
+- Dedicated details pages with metadata, tags, availability labels, a smart episode index whose cards open episode-specific delivery pages, related releases, individual file/quality delivery choices, and a polished all-files Telegram delivery dialog. When a publisher manually attaches an approved provider player, the existing card also gains a **Watch** button leading to an in-site embedded Watch page with episode/source choices and related titles from the same category. Episode-based releases intentionally keep quality/file choices inside the selected-episode page instead of showing a confusing all-release picker. On every file list, qualities are ordered as an ascending ladder (**280p → 480p → 720p → 1080p → 1440p → 4K**, unknown quality last) rather than in upload order, and each row shows the complete uploader wording under a shortened label instead of a cut-off name. An episode page also carries a compact **Watch** panel that lists every player the publisher attached to that episode (via `/cmd`), so an episode never looks unwatchable just because a player exists. Combined multi-episode uploads are listed in their own **Batch packs** block and never appear inside a single episode's file list.
 - Search that supports multi-word title, genre, and language matching
 - Safe public API responses: no Telegram file IDs, database-channel IDs, storage-message IDs, or delete-only post IDs are exposed
 - A visual demo catalog appears automatically before MongoDB is configured, so the UI is immediately previewable
@@ -36,13 +36,14 @@ A production-minded, responsive catalog for **media you are authorized to distri
   - `/series Title`
   - `/adultdb Title` (or the requested `/18db Title` alias) for a private 18+ draft
 - Start a draft, send the title, upload files in the same private bot chat, then use `/done`. The adult command requires its own private storage channel, skips metadata-provider lookup, and never creates a public Telegram announcement
-- Optional draft metadata commands: `/lang`, `/subtitles`, `/year`, `/genres`, `/description`, and `/poster`; the same metadata can be corrected on an existing private `SB-…` post ID
+- Optional draft metadata commands: `/lang`, `/subtitles`, `/year`, `/genres`, `/description`, and `/poster` (also `/p` and `/imgdd`); the same metadata can be corrected on an existing private `SB-…` post ID
 - Category-aware metadata fallback chain: AniList for Anime/Donghua, TMDB, then OMDb when configured
 - Server-side poster download validation, then permanent ImgBB upload during publishing
 - A generated category-colored PNG fallback poster **renders the release title** and is uploaded to ImgBB if no provider has suitable artwork
 - Smart episode parser: cleans captions first, removes `@channel` / `t.me` attribution, recognizes `EP 01`, `Episode 1 To 5`, and `S01E01-E05`, then falls back to the filename
+- Season markers (`S02`, `Season 2`, `2x05`) are read per file. When one upload batch contains more than one season, `/done` publishes **one catalog post per season** (`Title Season 1`, `Title Season 2`, …) and each season's merge keys are season-scoped, so a later Episode-of-Season-2 upload appends to the Season 2 post instead of colliding with Season 1. Files without a season marker join the season block they were sent inside
 - Upload captions/file names resolve explicit audio and subtitle labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label. Dual/Multi or unlabeled media is inspected with MediaInfo only after the entire manual, batch, or auto release has collected; candidates are downloaded and parsed one at a time with byte, timeout, and file-count caps, so a failed/unavailable scan safely retains caption/filename fallback labels
-- Post pages show a safe, public episode index; each episode/range card opens a dedicated page containing every matching file-quality delivery link, while storage message IDs remain private
+- Post pages show a safe, public episode index; each episode card opens a dedicated page containing exactly the delivery files for that episode (all qualities, ordered low to high) plus the players attached to it, while combined episode ranges open their own pack page. Storage message IDs remain private
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot. Fresh copied/resend captions and saved file labels automatically remove Telegram `@channel`, `t.me`, and promotional attribution while preserving title, quality, language, season, and episode information
 - `/batch Optional title` imports an inclusive existing `t.me/c/<internal-channel-id>/<message-id>` range from that private database channel as **one release**, including long runs such as 448 episode messages. It preserves original storage message IDs, retries Telegram rate limits, reports progress, infers title/category when no name is supplied, and enumerates every already-published, active-draft, non-media, inaccessible, or protected message ID instead of reporting a vague skip count
 - `/auto` presents persistent ON/OFF controls; when ON, direct database-channel media is collected by normalized release title for 90 seconds of quiet (15-minute maximum), then classified, provider-verified, poster-mirrored, and published as one combined post. Provider identity and cleaned aliases are retained so later noisy title variants append to the same post without a duplicate announcement
@@ -52,7 +53,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel; `/requests` opens a multi-select publisher workflow that marks selected requests **Completed** or **Rejected** and immediately notifies each requester
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
 - Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards. Authorized publisher command scopes are registered on startup and when an allowed owner opens/logs into the bot, so `/posts`, `/postid`, and other publisher commands remain visible through Telegram menu caching
-- `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…`, `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
+- `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…` (or `/p`, `/imgdd`), `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
 - `/backup` creates a signed gzip application snapshot and sends it only to the configured private storage channel; `/recover` accepts one signed backup document in an authorized private publisher chat and restores it into the current database, including a new/empty MongoDB URI. A durable India-calendar-month scheduler sends one automatic backup each month
 - `/stats` reports private aggregate bot activity, anonymous site visitors/visits, catalog totals, and request status totals. Site tracking uses only a random first-party visitor cookie—never raw IPs or public Telegram data
 - Draft/login/request-selection sessions survive restarts when MongoDB is configured and expire automatically
@@ -220,7 +221,7 @@ Set your ImgBB server API key as **`IMGBB_API_KEY`**. It is used only by server-
 IMGBB_API_KEY=your_imgbb_server_key
 ```
 
-At `/done`, the server does this once:
+At `/done`, the server does this for every card it publishes (one card per detected season):
 
 1. Uses the selected/manual/AniList/TMDB/OMDb poster if available.
 2. Validates the source is a public HTTPS image and limits it to 8 MB.
@@ -228,6 +229,13 @@ At `/done`, the server does this once:
 4. Saves only the hosted ImgBB URL and non-sensitive provider metadata in MongoDB.
 
 If automatic matching finds no poster, SoraBox generates a branded category-colored fallback PNG **with the release title rendered on it** and uploads that to ImgBB instead. This keeps the poster path hosted externally, recognizable in the catalog, and avoids loading Koyeb storage.
+
+**Replacing artwork later — `/poster` (also `/p` and `/imgdd`).** Both styles are supported at the same time:
+
+- **Old style (direct link):** `/poster SB-0123ABCDEF https://host/poster.jpg`. The URL must be a public HTTPS image of at most 8 MB; it is downloaded, mirrored to ImgBB, and only then written to the card. A private host, a non-image response, or an ImgBB rejection leaves the existing poster untouched.
+- **New style (search and pick):** `/poster SB-0123ABCDEF Perfect World` (a year is optional). SoraBox searches AniList, TMDB, and OMDb artwork, scores the results against the requested title, and answers with up to 10 inline **Poster** buttons. Tapping a button mirrors exactly that image and updates the card's poster/backdrop, then previews it back in the chat. An ambiguous or unmatched title is reported instead of guessing.
+- **Draft artwork:** send `/poster https://…` or `/poster Title` before `/done`; the choice is stored on the draft and mirrored during publishing.
+- A bare `/poster` (or `/poster help`) asks which style you want and keeps a small pending conversation (`poster_flows`, 15-minute TTL) so you can reply with only the Post ID, then only the link or title. **Cancel** and **Search again** are always offered, and an expired menu says so instead of changing anything.
 
 ### 5. Optional: enable automatic metadata and artwork matching
 
@@ -294,7 +302,7 @@ Useful commands:
 | `/year 2026` | Set draft year; `/year SB-… 2026` corrects an existing card |
 | `/genres Action, Fantasy` | Set draft genres; prefix with `SB-…` to edit a published card |
 | `/description …` | Set a draft synopsis; prefix with `SB-…` to edit a published card |
-| `/poster https://…` | Override draft artwork; `/poster SB-… https://…` validates and mirrors a replacement poster to ImgBB before changing a published card |
+| `/poster`, `/p`, `/imgdd` | Set artwork. `/poster https://…` overrides draft artwork and `/poster SB-… https://…` mirrors a replacement poster to ImgBB before changing a published card (the original style). `/poster SB-… Exact Title` searches AniList/TMDB/OMDb artwork and returns up to 10 **Poster** buttons — tapping one mirrors that exact image and updates the card. A bare `/poster` asks which style you want and the conversation stays open for 15 minutes |
 | `/category SB-… anime`, `/release SB-… Label`, `/status SB-… Updated` | Edit a published card's category, release label, or status; bare `/status` still shows the active draft |
 | `/teststorage` | Send a harmless test message to verify the configured database channel |
 | `/cancel` | Discard the active draft or a pending `/recover` prompt |

@@ -341,6 +341,142 @@ async function findAniListMetadata(title, category = 'anime') {
   };
 }
 
+/* ---------------------------------------------------------------------------
+ * Publisher artwork picker
+ * ------------------------------------------------------------------------- */
+
+const PICKER_MIN_MATCH_SCORE = 0.34;
+
+function candidateKey(provider, id, type = '') {
+  return [provider, type, id].filter(Boolean).join(':').toLowerCase();
+}
+
+async function searchTmdbCandidates(title, type, config) {
+  if (!config.tmdbApiKey && !config.tmdbReadAccessToken) return [];
+  let response;
+  try {
+    response = await fetch(
+      tmdbUrl(`/search/${type}`, config, { query: title, include_adult: 'false', language: 'en-US' }),
+      { headers: tmdbHeaders(config), signal: AbortSignal.timeout(10_000) }
+    );
+  } catch {
+    return [];
+  }
+  if (!response.ok) return [];
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return [];
+  }
+  return (Array.isArray(payload?.results) ? payload.results : [])
+    .map((entry) => {
+      const candidateTitle = cleanText(entry?.title || entry?.name || entry?.original_title || entry?.original_name, 180);
+      return {
+        provider: 'tmdb',
+        externalId: entry?.id ? String(entry.id) : null,
+        type,
+        title: candidateTitle,
+        year: yearFromDate(entry?.release_date || entry?.first_air_date),
+        posterUrl: entry?.poster_path ? `${TMDB_IMAGE_BASE}${entry.poster_path}` : null,
+        backdropUrl: entry?.backdrop_path ? `${TMDB_IMAGE_BASE}${entry.backdrop_path}` : null,
+        popularity: Number(entry?.popularity) || 0,
+        score: metadataTitleMatchScore(title, candidateTitle)
+      };
+    })
+    .filter((entry) => entry.title && entry.posterUrl);
+}
+
+const ANILIST_PICKER_QUERY = `
+  query ($search: String) {
+    Page(page: 1, perPage: 10) {
+      media(search: $search, sort: POPULARITY_DESC) {
+        id
+        type
+        title { romaji english native }
+        startDate { year }
+        popularity
+        coverImage { extraLarge large medium }
+        bannerImage
+      }
+    }
+  }
+`;
+
+async function searchAniListCandidates(title) {
+  let response;
+  try {
+    response = await fetch(ANILIST_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ query: ANILIST_PICKER_QUERY, variables: { search: title } }),
+      signal: AbortSignal.timeout(10_000)
+    });
+  } catch {
+    return [];
+  }
+  if (!response.ok) return [];
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return [];
+  }
+  return (Array.isArray(payload?.data?.Page?.media) ? payload.data.Page.media : [])
+    .map((entry) => {
+      const titles = [entry?.title?.romaji, entry?.title?.english, entry?.title?.native].filter(Boolean);
+      const best = bestTitleMatch(title, titles);
+      return {
+        provider: 'anilist',
+        externalId: entry?.id ? String(entry.id) : null,
+        type: cleanText(entry?.type, 12).toLowerCase() || 'anime',
+        title: best?.candidate || cleanText(titles[0], 180),
+        year: Number.isInteger(entry?.startDate?.year) ? entry.startDate.year : null,
+        posterUrl: entry?.coverImage?.extraLarge || entry?.coverImage?.large || entry?.coverImage?.medium || null,
+        backdropUrl: entry?.bannerImage || null,
+        popularity: Number(entry?.popularity) || 0,
+        score: best?.score || 0
+      };
+    })
+    .filter((entry) => entry.title && entry.posterUrl);
+}
+
+/**
+ * Give the publisher every plausible artwork match instead of silently keeping
+ * the single highest-scoring one. Titles are ranked by the same similarity score
+ * used during automatic matching, so an unrelated popular show cannot crowd
+ * out the actual release, and TMDB/AniList identity is retained so the chosen
+ * poster can later be re-resolved without a second search.
+ */
+export async function searchPosterCandidates(title, category = 'movie', config = {}, { limit = 8 } = {}) {
+  const lookupTitle = canonicalMetadataTitle(title) || cleanText(title, 180);
+  if (!lookupTitle) return [];
+
+  const providers = ['anime', 'donghua'].includes(category)
+    ? [() => searchAniListCandidates(lookupTitle), () => searchTmdbCandidates(lookupTitle, 'tv', config), () => searchTmdbCandidates(lookupTitle, 'movie', config)]
+    : category === 'movie'
+      ? [() => searchTmdbCandidates(lookupTitle, 'movie', config), () => searchTmdbCandidates(lookupTitle, 'tv', config)]
+      : [() => searchTmdbCandidates(lookupTitle, 'tv', config), () => searchTmdbCandidates(lookupTitle, 'movie', config), () => searchAniListCandidates(lookupTitle)];
+
+  const settled = await Promise.allSettled(providers.map((provider) => provider()));
+  const seen = new Set();
+  const candidates = [];
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') continue;
+    for (const entry of result.value || []) {
+      const key = candidateKey(entry.provider, entry.externalId, entry.type);
+      if (!key || seen.has(key)) continue;
+      if (entry.score < PICKER_MIN_MATCH_SCORE) continue;
+      seen.add(key);
+      candidates.push(entry);
+    }
+  }
+
+  return candidates
+    .sort((first, second) => second.score - first.score || second.popularity - first.popularity)
+    .slice(0, Math.max(1, Math.min(Number(limit) || 8, 10)));
+}
+
 // Provider order is category-aware. This lets anime/donghua benefit from AniList
 // while movies and TV categories prefer TMDB/OMDb metadata. Each provider is a
 // fallback, so one outage or incomplete catalogue does not block publication.

@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
-import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, needsMediaTrackInspection } from './episode-service.js';
-import { findMetadata } from './metadata-service.js';
+import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
@@ -198,7 +198,9 @@ export const PUBLISHER_COMMANDS = [
   { command: 'year', description: 'Set draft or post year' },
   { command: 'genres', description: 'Set draft or post genres' },
   { command: 'description', description: 'Set draft or post synopsis' },
-  { command: 'poster', description: 'Set draft or post poster' },
+  { command: 'poster', description: 'Set artwork: old link style or search & pick' },
+  { command: 'p', description: 'Short alias for /poster' },
+  { command: 'imgdd', description: 'Add artwork with the same old/new poster flow' },
   { command: 'category', description: 'Set a published post category' },
   { command: 'release', description: 'Set a published post release label' },
   { command: 'done', description: 'Publish current draft' },
@@ -275,6 +277,18 @@ function visitorWelcomeText(canLogIn) {
   return lines.join('\n');
 }
 
+function draftSeasonSummary(files = []) {
+  const seasons = new Set();
+  for (const file of files) {
+    const season = detectUploadSeasonForFile(file);
+    if (season) seasons.add(season);
+  }
+  if (!seasons.size) return 'No season marker detected';
+  const labels = [...seasons].sort((first, second) => first - second).map((season) => formatSeasonLabel(season));
+  if (labels.length === 1) return `${labels[0]} · every file matches this season`;
+  return `${labels.length} seasons detected (${labels.join(', ')}) — /done publishes one post per season`;
+}
+
 function displayDraft(session) {
   const category = categoryDetails(session.category).label;
   const title = session.title || 'Waiting for title';
@@ -295,6 +309,7 @@ function displayDraft(session) {
     `Title: ${title}`,
     `Files: ${files}`,
     `Episodes: ${episodeSummary.releaseLabel || 'No episode labels detected yet'}`,
+    `Seasons: ${draftSeasonSummary(session.files || [])}`,
     `Poster: ${session.posterOriginalUrl ? 'Manual poster selected' : matched}`,
     `Audio: ${language}`,
     `Subtitles: ${session.overrides?.subtitleLanguages?.length ? `${session.overrides.subtitleLanguages.join(', ')} (manual)` : detectedSubtitles.length ? `${detectedSubtitles.join(', ')} (from uploaded file details)` : 'Not set'}`,
@@ -365,6 +380,10 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
       label: episode.label,
       source: episode.source
     } : null,
+    // A season number is stored separately from the episode so a multi-season
+    // upload can be split into one catalog post per season later.
+    season: Number.isInteger(episode.season) && episode.season >= 1 ? episode.season : null,
+    seasonSource: episode.seasonSource || null,
     addedAt: new Date().toISOString()
   };
   const trackCapable = isInspectableMediaFile(file);
@@ -518,6 +537,270 @@ async function updatePublishedPost({ ctx, repository, argument, field, value, fi
   }
   await ctx.reply(`${fieldLabel} updated for ${updated.adminId} · ${updated.title}.`);
   return { handled: true, content: updated };
+}
+
+/* ---------------------------------------------------------------------------
+ * Publisher artwork commands (/poster, /p, /imgdd)
+ * ------------------------------------------------------------------------- */
+
+const POSTER_COMMAND_USAGE = [
+  'Poster commands accept both styles:',
+  '',
+  '• Old style — /poster SB-0123ABCDEF https://public-image-host.example/poster.jpg',
+  '• New style — /poster SB-0123ABCDEF Exact Title, then tap the artwork you want',
+  '• Draft — /poster https://public-image-host.example/poster.jpg',
+  '',
+  'Send /poster on its own and I will ask which style you want. /p and /imgdd do exactly the same thing.'
+].join('\n');
+
+export function posterStyleKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔗 Old style · ID + image link', 'poster:style:old')],
+    [Markup.button.callback('✨ New style · search & pick artwork', 'poster:style:new')],
+    [Markup.button.callback('Cancel', 'poster:cancel')]
+  ]);
+}
+
+export function posterCancelKeyboard() {
+  return Markup.inlineKeyboard([[Markup.button.callback('Cancel', 'poster:cancel')]]);
+}
+
+/** Telegram measures a button label in UTF-8 bytes, not JavaScript characters. */
+function telegramButtonText(value, maxBytes = 62) {
+  const text = cleanText(value, 160);
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let truncated = text;
+  while (truncated.length && Buffer.byteLength(`${truncated}…`, 'utf8') > maxBytes) {
+    truncated = truncated.slice(0, -1);
+  }
+  return `${truncated.replace(/[\s.,:-]+$/, '')}…`;
+}
+
+export function posterCandidateKeyboard(candidates = []) {
+  const rows = [];
+  for (let index = 0; index < Math.min(candidates.length, 10); index += 2) {
+    rows.push(candidates.slice(index, index + 2).map((candidate, offset) => {
+      const title = cleanText(candidate.title, 60) || 'Untitled';
+      const year = Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : '';
+      const provider = cleanText(candidate.provider, 10).toUpperCase();
+      return Markup.button.callback(
+        telegramButtonText(`${index + offset + 1}. ${title}${year}${provider ? ` · ${provider}` : ''}`),
+        `poster:pick:${index + offset}`
+      );
+    }));
+  }
+  rows.push([Markup.button.callback('Search again', 'poster:retry'), Markup.button.callback('Cancel', 'poster:cancel')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+/** Validate, mirror, and store one replacement poster for a published card. */
+export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config }) {
+  const existing = await repository.findContentByAdminId(adminId);
+  if (!existing) {
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /postid to find an ID.`);
+    return null;
+  }
+  const posterResult = await mirrorPosterToImgBB({
+    sourceUrl,
+    // A manual pick must fail loudly rather than quietly falling back to a
+    // generated poster the publisher never chose.
+    sourceIsManual: true,
+    title: existing.title,
+    category: existing.category,
+    config
+  });
+  const updated = await repository.updateContentByAdminId(adminId, {
+    posterUrl: posterResult.url,
+    backdropUrl: posterResult.url,
+    poster: {
+      provider: 'imgbb',
+      providerId: posterResult.providerId,
+      originalUrl: posterResult.originalUrl,
+      source: posterResult.source,
+      mirroredAt: new Date().toISOString()
+    }
+  });
+  return { existing, posterResult, updated };
+}
+
+export async function presentPosterCandidates({ ctx, repository, config, adminId, query }) {
+  const target = adminId ? await repository.findContentByAdminId(adminId) : null;
+  if (adminId && !target) {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /postid to find an ID.`);
+    return false;
+  }
+  const searchTitle = cleanText(query, 180) || target?.title || '';
+  if (!searchTitle) {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Send the release name to search artwork for. Example: /poster SB-0123ABCDEF Cocktail 2');
+    return false;
+  }
+  const category = target?.category || 'movie';
+  await ctx.reply(`Searching AniList, TMDB, and OMDb artwork for “${searchTitle}”…`);
+  let candidates = [];
+  try {
+    candidates = await searchPosterCandidates(searchTitle, category, config, { limit: 10 });
+  } catch (error) {
+    console.error('[telegram] poster candidate search failed:', error?.message || 'Unknown error');
+  }
+  if (!candidates.length) {
+    // Nothing was chosen, so the conversation is closed instead of being left
+    // waiting for another title the publisher may never send.
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply(
+      `No provider artwork matched “${searchTitle}”. ${adminId ? `Send a direct link instead: /poster ${adminId} https://…` : 'Send a direct link instead: /poster https://…'}`,
+      adminId ? posterCancelKeyboard() : undefined
+    );
+    return false;
+  }
+  await repository.startPosterFlow?.({
+    chatId: chatId(ctx),
+    ownerId: userId(ctx),
+    style: 'new',
+    targetAdminId: adminId || null,
+    stage: 'pick',
+    query: searchTitle,
+    candidates
+  });
+  await ctx.reply(
+    `Found ${candidates.length} match${candidates.length === 1 ? '' : 'es'} for ${adminId || 'this draft'}. Tap the artwork to mirror it to ImgBB and use it on the card.`,
+    posterCandidateKeyboard(candidates)
+  );
+  return true;
+}
+
+/** Answers a `poster:*` button. Returns false when the payload is unknown. */
+export async function handlePosterAction(ctx, repository, config, action) {
+  if (typeof repository.findPosterFlow !== 'function') return false;
+  const key = cleanText(action, 40);
+  if (key === 'poster:cancel') {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.answerCallbackQuery({ text: 'Cancelled' }).catch(() => {});
+    await ctx.reply('Poster selection cancelled.');
+    return true;
+  }
+  const flow = await repository.findPosterFlow(chatId(ctx), userId(ctx));
+  if (!flow) {
+    await ctx.answerCallbackQuery({ text: 'This poster menu expired. Send /poster again.' }).catch(() => {});
+    return true;
+  }
+  if (key === 'poster:style:old' || key === 'poster:style:new') {
+    const style = key.endsWith(':old') ? 'old' : 'new';
+    await repository.updatePosterFlow?.(chatId(ctx), userId(ctx), { style, stage: 'post-id', candidates: [], query: '' });
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply(
+      style === 'old'
+        ? 'Old style: send the Post ID, for example SB-0123ABCDEF. Find it with /posts or /postid.'
+        : 'New style: send the Post ID first, for example SB-0123ABCDEF. I will then ask for the title and show you the artwork I can find.',
+      posterCancelKeyboard()
+    );
+    return true;
+  }
+  if (key === 'poster:retry') {
+    await presentPosterCandidates({ ctx, repository, config, adminId: flow.targetAdminId, query: flow.query });
+    await ctx.answerCallbackQuery().catch(() => {});
+    return true;
+  }
+  const pick = key.match(/^poster:pick:(\d{1,2})$/);
+  if (pick) {
+    const candidate = (flow.candidates || [])[Number.parseInt(pick[1], 10)];
+    if (!candidate?.posterUrl) {
+      await ctx.answerCallbackQuery({ text: 'That artwork is no longer available. Search again.' }).catch(() => {});
+      return true;
+    }
+    await ctx.answerCallbackQuery({ text: `Mirroring ${candidate.title || 'poster'}…` }).catch(() => {});
+    if (!flow.targetAdminId) {
+      const session = await repository.findSession(chatId(ctx), userId(ctx));
+      if (!session) {
+        await ctx.reply('That draft is no longer active, so the artwork has nowhere to go. Start one with /panel, or edit a published post with /poster SB-… <name>.');
+        return true;
+      }
+      await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl: candidate.posterUrl });
+      await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+      await ctx.reply(`Draft artwork selected: ${cleanText(candidate.title, 80)}${Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : ''}. Publish with /done to mirror it to ImgBB.`);
+      return true;
+    }
+    try {
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config });
+      if (!result) return true;
+      await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+      await ctx.reply(result.updated
+        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title} using the ${cleanText(candidate.provider, 20).toUpperCase() || 'chosen'} artwork.`
+        : `The poster was mirrored, but ${flow.targetAdminId} is no longer available.`);
+      try {
+        await ctx.replyWithPhoto(result.posterResult.url, { caption: 'New catalog artwork preview' });
+      } catch {
+        // A preview is a convenience; the catalog card is already updated.
+      }
+    } catch (error) {
+      const message = error instanceof PosterHostingError ? error.message : 'The chosen poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+      console.error('[telegram] poster selection failed:', error?.message || 'Unknown error');
+      await ctx.reply(`Poster was not changed. ${message}`);
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Continues an armed /poster conversation: Post ID → image link (old style) or
+ * Post ID → title → artwork buttons (new style).
+ */
+export async function handlePosterFlowMessage(ctx, repository, config) {
+  if (typeof repository.findPosterFlow !== 'function') return false;
+  const flow = await repository.findPosterFlow(chatId(ctx), userId(ctx));
+  if (!flow) return false;
+  const text = cleanText(ctx.message?.text, 2_000);
+  if (!text) return false;
+
+  if (flow.stage === 'post-id') {
+    const trimmed = text.trim();
+    const target = /^SB-[A-F0-9]{10}$/i.test(trimmed)
+      ? trimmed.toUpperCase()
+      : parsePublishedPostEdit(trimmed)?.adminId || null;
+    if (!target) {
+      await ctx.reply('Send the post ID only, for example SB-0123ABCDEF. Use /posts or /postid to find it, or /poster cancel to stop.');
+      return true;
+    }
+    await repository.updatePosterFlow(chatId(ctx), userId(ctx), { targetAdminId: target, stage: flow.style === 'old' ? 'image-url' : 'search-title' });
+    await ctx.reply(
+      flow.style === 'old'
+        ? `Editing ${target}. Now send the HTTPS image link for the new poster.`
+        : `Editing ${target}. Now send the exact movie/series name (add a year if it helps) and I will show the artwork I can find.`,
+      posterCancelKeyboard()
+    );
+    return true;
+  }
+
+  if (flow.stage === 'image-url') {
+    const match = text.match(/https:\/\/\S+/i);
+    if (!match) {
+      await ctx.reply('That is not an HTTPS image link. Send a URL such as https://example.com/poster.jpg, or use /poster cancel.');
+      return true;
+    }
+    try {
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: match[0], config });
+      if (!result) return true;
+      await repository.deletePosterFlow(chatId(ctx), userId(ctx));
+      await ctx.reply(result.updated
+        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title}.`
+        : `The poster was mirrored, but ${flow.targetAdminId} is no longer available.`);
+    } catch (error) {
+      const message = error instanceof PosterHostingError ? error.message : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+      console.error('[telegram] poster flow mirror failed:', error?.message || 'Unknown error');
+      await ctx.reply(`Poster was not changed. ${message}\nThe prompt is still open — send another link or use /poster cancel.`);
+    }
+    return true;
+  }
+
+  if (flow.stage === 'search-title') {
+    // A failed search closes the flow itself, so nothing has to be cleaned up here.
+    await presentPosterCandidates({ ctx, repository, config, adminId: flow.targetAdminId, query: text });
+    return true;
+  }
+
+  return false;
 }
 
 // A t.me/c link contains Telegram's private-channel internal ID, rather than
@@ -1264,6 +1547,63 @@ export async function inspectSessionMediaTracks({ session, bot, repository, conf
   }
 }
 
+/** A usable season number only: `null`, `0`, and text never count as Season 0. */
+export function readSeason(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 && number <= 99 ? number : null;
+}
+
+export function detectUploadSeasonForFile(file) {
+  const stored = Number(file?.season);
+  if (Number.isInteger(stored) && stored >= 1) return stored;
+  return detectUploadSeason({
+    caption: file?.displayName || file?.sourceLabel,
+    filename: file?.name
+  }).season;
+}
+
+/**
+ * The season a whole release belongs to, or null when the batch is ambiguous.
+ * A mixed batch deliberately returns null: existing posts stay addressable by
+ * their title key, while a freshly split upload always knows its own season.
+ */
+export function dominantReleaseSeason(files = []) {
+  const seasons = new Set();
+  for (const file of Array.isArray(files) ? files : []) {
+    const season = detectUploadSeasonForFile(file);
+    if (season) seasons.add(season);
+  }
+  // One agreement is a season. A mixed or unreadable batch deliberately stays
+  // null so an older catalog card can never be reinterpreted by accident.
+  return seasons.size === 1 ? [...seasons][0] : null;
+}
+
+/**
+ * A catalog card must be readable at a glance, so a season release gets its
+ * season in the title. An explicit publisher title that already names a season
+ * is never rewritten unless `replace` is requested by the multi-season split.
+ */
+export function withSeasonLabel(value, season, { replace = false } = {}) {
+  const title = cleanText(value, 180);
+  const number = readSeason(season);
+  if (!title || !number) return title;
+  const label = formatSeasonLabel(number);
+  if (!label) return title;
+  if (!replace && /\b(?:season|s)\s*0*\d{1,2}\b/i.test(title)) return title;
+  const cleaned = replace
+    ? cleanText(
+      title
+        // Keep an attached episode marker such as S01E03 intact while removing
+        // the standalone season package label.
+        .replace(/\b(?:SEASON|S)\s*0*\d{1,2}\b(?!\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3})/gi, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim(),
+      180
+    )
+    : title;
+  return cleanText(`${cleaned || title} ${label}`, 180);
+}
+
 export async function publishDraft(ctx, bot, repository, config) {
   let session = await repository.findSession(chatId(ctx), userId(ctx));
   if (!session) {
@@ -1302,21 +1642,94 @@ export async function publishDraft(ctx, bot, repository, config) {
     : '';
   await ctx.reply(`Preparing your draft for publication…${inspectionNote}`);
 
+  // A batch that mixes seasons is split before anything is written. One card
+  // holding Season 1, 4, and 6 together makes every episode list and delivery
+  // page look inconsistent, and a later Season 2 upload could otherwise be
+  // appended into the wrong season.
+  const seasonGroups = groupFilesBySeason(session.files || []);
+  if (seasonGroups.length > 1) {
+    const summary = seasonGroups
+      .map((group) => `${formatSeasonLabel(group.season)} (${group.files.length} file${group.files.length === 1 ? '' : 's'})`)
+      .join(', ');
+    await ctx.reply(`${seasonGroups.length} seasons were detected in this upload: ${summary}. Each season is published as its own catalog post so their episode lists never collide.`);
+
+    const seasons = [];
+    for (const group of seasonGroups) {
+      // Each season is a separate publishing event with its own announcement,
+      // so sequential work is intentional even though one draft produced it.
+      // eslint-disable-next-line no-await-in-loop
+      const result = await publishDraftSession({
+        ctx,
+        bot,
+        repository,
+        config,
+        session: { ...session, title: withSeasonLabel(session.title, group.season, { replace: true }), files: group.files },
+        season: group.season,
+        deleteSessionOnSuccess: false
+      });
+      seasons.push({ ...result, season: group.season });
+    }
+    await repository.deleteSession(chatId(ctx), userId(ctx));
+
+    const succeeded = seasons.filter((entry) => entry.content);
+    if (!succeeded.length) {
+      const error = seasons.find((entry) => entry.error)?.error || 'No season post could be published.';
+      await ctx.reply(`Nothing was published. ${error}`);
+      return { content: null, error, seasons };
+    }
+    const last = succeeded.at(-1).content;
+    await ctx.reply([
+      `Published ${succeeded.length} season post${succeeded.length === 1 ? '' : 's'} for “${session.title}”.`,
+      '',
+      ...seasons.map((entry) => (entry.content
+        ? `✓ ${entry.content.title} · ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} · Post ID ${entry.content.adminId}`
+        : `✗ ${withSeasonLabel(session.title, entry.season, { replace: true })} — ${entry.error || 'not published'}`)),
+      '',
+      'Use /done again only if a season still needs its own files.'
+    ].join('\n'), publicationKeyboard(getContentPageUrl(config, last), getTelegramDeliveryUrl(config, last.shareCode)));
+    return { content: last, seasons, multiSeason: true, websiteUrl: getContentPageUrl(config, last), deliveryUrl: getTelegramDeliveryUrl(config, last.shareCode) };
+  }
+
+  return publishDraftSession({ ctx, bot, repository, config, session });
+}
+
+/**
+ * Publish exactly one prepared draft. Manual uploads, /batch imports, storage
+ * automation, and each split season group all share this path so identity,
+ * poster mirroring, announcements, and replies stay identical everywhere.
+ */
+async function publishDraftSession({
+  ctx,
+  bot,
+  repository,
+  config,
+  session,
+  season = null,
+  deleteSessionOnSuccess = true
+}) {
+  // A season release is keyed and titled by season. The split orchestrator hands
+  // each group its own season; a plain upload is settled by
+  // `dominantReleaseSeason`, which deliberately returns null for a movie or an
+  // ambiguous batch so those keep their established merge behaviour.
+  const releaseSeason = readSeason(season) ?? dominantReleaseSeason(session?.files || []);
+
+  const draftTitle = withSeasonLabel(session.title, releaseSeason);
+
   try {
     const metadata = session.metadata || (isAdultCategory(session.category)
-      ? emptyPrivateCategoryMetadata(session.title)
-      : await findMetadata(session.title, session.category, config));
-    const mergeKeys = releaseMergeKeys(session, metadata);
+      ? emptyPrivateCategoryMetadata(draftTitle)
+      : await findMetadata(draftTitle, session.category, config));
+    const mergeKeys = releaseMergeKeys(session, metadata, { season: releaseSeason });
     // This final guard applies to manual uploads, /batch imports, and storage
     // automation. A later upload for the same category/title or verified
     // provider identity extends the existing post instead of making a second
     // catalog card and second delivery link.
     if (mergeKeys.length && typeof repository.appendFilesToContentByMergeKey === 'function') {
-      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, session.category);
+      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, session.category, { season: releaseSeason });
       if (existingMatch) {
         const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys, session.category);
         if (!content) throw new Error('The existing same-title post could not be updated.');
-        await repository.deleteSession(chatId(ctx), userId(ctx));
+        if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
         const websiteUrl = getContentPageUrl(config, content);
         const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
         await ctx.reply(
@@ -1337,12 +1750,14 @@ export async function publishDraft(ctx, bot, repository, config) {
     const posterResult = await mirrorPosterToImgBB({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
-      title: session.title,
+      title: withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason),
       category: session.category,
       config
     });
 
-    const title = metadata.matched ? metadata.title : session.title;
+    // The provider's canonical name wins, but a season boundary is never lost:
+    // AniList and TMDB return the same series title for every season.
+    const title = withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason);
     const releaseLabel = overrides.releaseLabel || episodeSummary.releaseLabel || metadata.releaseLabel || `${session.files.length} files`;
     const content = await repository.createContent({
       title,
@@ -1381,7 +1796,7 @@ export async function publishDraft(ctx, bot, repository, config) {
       automationKeys: mergeKeys,
       files: session.files
     });
-    await repository.deleteSession(chatId(ctx), userId(ctx));
+    if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
     const websiteUrl = getContentPageUrl(config, content);
@@ -1488,7 +1903,7 @@ function standaloneReleaseMergeAlias(value) {
  * publisher has created a post, sending more files for that same release
  * should extend its existing delivery page—not create a duplicate card.
  */
-export function releaseMergeKeys(session, metadata = {}) {
+export function releaseMergeKeys(session, metadata = {}, { season = null } = {}) {
   const rawValues = [
     // Prefer the verified provider identity over a collision-prone upload name.
     metadata?.metadataKey,
@@ -1496,7 +1911,7 @@ export function releaseMergeKeys(session, metadata = {}) {
     session?.auto?.groupKey,
     session?.title
   ];
-  return [...new Set([
+  const baseKeys = [...new Set([
     ...rawValues.map((value) => slugify(cleanText(value, 180))),
     // Preserve a title-only alias for noisy standalone movie/release labels
     // such as "RRR (2022) Hindi 1080p". This is deliberately not generated
@@ -1504,21 +1919,38 @@ export function releaseMergeKeys(session, metadata = {}) {
     standaloneReleaseMergeAlias(metadata?.title),
     standaloneReleaseMergeAlias(session?.title)
   ].filter((key) => key && key !== 'untitled-release'))];
+
+  // A season upload is looked up by its own season-scoped identity first, so
+  // Season 2 of a show cannot be appended onto the Season 1 card merely
+  // because both share one provider ID. The plain keys stay behind it so an
+  // older single-card release still merges rather than duplicating.
+  const number = Number(season);
+  if (!Number.isInteger(number) || number < 1) return baseKeys;
+  return [...new Set([...baseKeys.map((key) => `${key}-season-${number}`), ...baseKeys])];
 }
 
 // Kept as the public name used by existing automation tests/integrations.
-export function automationMergeKeys(session, metadata = {}) {
-  return releaseMergeKeys(session, metadata);
+export function automationMergeKeys(session, metadata = {}, options = {}) {
+  return releaseMergeKeys(session, metadata, options);
 }
 
-async function findContentByMergeKeys(repository, keys, category = null) {
+async function findContentByMergeKeys(repository, keys, category = null, { season = null } = {}) {
   if (typeof repository?.findContentByMergeKey !== 'function') return null;
+  const wantedSeason = readSeason(season);
   for (const key of keys) {
     const content = await repository.findContentByMergeKey(key, category);
     // A title such as "Avatar" can legitimately exist in multiple categories.
     // Do not append a movie upload to an anime or series card merely because a
     // loose title happened to match.
-    if (content && (!category || content.category === category)) return { content, key };
+    if (!content || (category && content.category !== category)) continue;
+    // A season-specific upload must not land on a card whose own files clearly
+    // belong to another season. An older card with no readable season stays
+    // mergeable, so an established catalog keeps receiving its next episodes.
+    if (wantedSeason) {
+      const contentSeason = dominantReleaseSeason(content.files || []);
+      if (contentSeason && contentSeason !== wantedSeason) continue;
+    }
+    return { content, key };
   }
   return null;
 }
@@ -2603,6 +3035,7 @@ export async function launchTelegramBot({ config, repository }) {
           '18+ publishing: /18db Title (or /adultdb Title) stores files only in TELEGRAM_ADULT_STORAGE_CHANNEL_ID. Use /batch adult | Your title for an existing adult-storage range. These releases are never sent to announcement channels and use the website age gate.',
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
+          'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
           'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
           'Manual Watch pages: /cmd SB-0123ABCDEF <SeekStreaming Embed Link or iframe> saves one player immediately. Or use /cmd SB-0123ABCDEF then send the provider’s small JSON/CSV export. It updates only the existing post, never uploads media through Koyeb and never sends an announcement. /cmd without an ID can match an exact exported Title.',
           'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
@@ -2801,56 +3234,86 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply('Description saved.');
   });
 
-  bot.command('poster', async (ctx) => {
+  const handlePosterCommand = async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     const argument = parseCommandArgument(ctx.message.text, 2_000);
-    const postTarget = parsePublishedPostEdit(argument);
-    const posterOriginalUrl = postTarget ? postTarget.value : argument;
-    if (!posterOriginalUrl.startsWith('https://')) {
-      await ctx.reply(postTarget ? `Usage: /poster ${postTarget.adminId} https://public-image-host.example/poster.jpg` : 'Usage: /poster https://public-image-host.example/poster.jpg\nEdit an existing post: /poster SB-0123ABCDEF https://public-image-host.example/poster.jpg');
-      return;
-    }
-    if (postTarget) {
-      const existing = await repository.findContentByAdminId(postTarget.adminId);
-      if (!existing) {
-        await ctx.reply(`No published catalog post was found for ${postTarget.adminId}. Use /posts or /postid to find an ID.`);
+    if (!argument || /^(help|style|menu|\?)$/i.test(argument)) {
+      if (typeof repository.startPosterFlow === 'function') {
+        await repository.startPosterFlow({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          stage: 'style',
+          targetAdminId: null,
+          query: '',
+          candidates: []
+        });
+        await ctx.reply('How should I set this poster?', posterStyleKeyboard());
         return;
       }
-      try {
-        await ctx.reply(`Mirroring the new poster for ${existing.adminId} to ImgBB…`);
-        const posterResult = await mirrorPosterToImgBB({
-          sourceUrl: posterOriginalUrl,
-          sourceIsManual: true,
-          title: existing.title,
-          category: existing.category,
-          config
-        });
-        const updated = await repository.updateContentByAdminId(postTarget.adminId, {
-          posterUrl: posterResult.url,
-          backdropUrl: posterResult.url,
-          poster: {
-            provider: 'imgbb',
-            providerId: posterResult.providerId,
-            originalUrl: posterResult.originalUrl,
-            source: posterResult.source,
-            mirroredAt: new Date().toISOString()
-          }
-        });
-        await ctx.reply(updated ? `Poster updated for ${updated.adminId} · ${updated.title}.` : `The poster was mirrored, but ${postTarget.adminId} is no longer available.`);
-      } catch (error) {
-        const message = error instanceof PosterHostingError ? error.message : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
-        console.error('[telegram] published-poster edit failed:', error?.message || 'Unknown error');
-        await ctx.reply(`Poster was not changed. ${message}`);
+      await ctx.reply(POSTER_COMMAND_USAGE);
+      return;
+    }
+
+    const postTarget = parsePublishedPostEdit(argument);
+    const posterValue = postTarget ? postTarget.value : argument;
+
+    // Old style: an explicit image link is validated, mirrored, and saved.
+    if (posterValue.startsWith('https://')) {
+      if (postTarget) {
+        try {
+          await ctx.reply(`Mirroring the new poster for ${postTarget.adminId} to ImgBB…`);
+          const result = await mirrorPosterForPublishedPost({
+            ctx,
+            repository,
+            adminId: postTarget.adminId,
+            sourceUrl: posterValue,
+            config
+          });
+          if (!result) return;
+          await ctx.reply(result.updated
+            ? `Poster updated for ${result.updated.adminId} · ${result.updated.title}.`
+            : `The poster was mirrored, but ${postTarget.adminId} is no longer available.`);
+        } catch (error) {
+          const message = error instanceof PosterHostingError
+            ? error.message
+            : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+          console.error('[telegram] published-poster edit failed:', error?.message || 'Unknown error');
+          await ctx.reply(`Poster was not changed. ${message}`);
+        }
+        return;
       }
+      const session = await repository.findSession(chatId(ctx), userId(ctx));
+      if (!session) {
+        await ctx.reply('Start a draft first using /panel.');
+        return;
+      }
+      await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl: posterValue });
+      await ctx.reply('Manual poster saved. It will be validated, downloaded once, and mirrored to ImgBB during publishing.');
       return;
     }
-    const session = await repository.findSession(chatId(ctx), userId(ctx));
-    if (!session) {
-      await ctx.reply('Start a draft first using /panel.');
+
+    // New style: search provider artwork for the supplied title and let the
+    // publisher tap the exact poster they want.
+    if (postTarget && !posterValue) {
+      await ctx.reply(`Usage: /poster ${postTarget.adminId} Exact Title — I will show the artwork I can find, or send a direct HTTPS image link instead.`);
       return;
     }
-    await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl });
-    await ctx.reply('Manual poster saved. It will be validated, downloaded once, and mirrored to ImgBB during publishing.');
+    await presentPosterCandidates({
+      ctx,
+      repository,
+      config,
+      adminId: postTarget?.adminId || null,
+      query: posterValue
+    });
+  };
+  // /p is the short form publishers asked for, and /imgdd follows the identical
+  // old/new flow so artwork handling has exactly one behaviour to learn.
+  for (const command of ['poster', 'p', 'imgdd']) bot.command(command, handlePosterCommand);
+
+  bot.action(/^poster:(?:style:(?:old|new)|cancel|retry|pick:\d{1,2})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const handled = await handlePosterAction(ctx, repository, config, ctx.match?.[0] || '');
+    if (!handled) await ctx.answerCallbackQuery().catch(() => {});
   });
 
   bot.command('category', async (ctx) => {
@@ -3291,6 +3754,9 @@ export async function launchTelegramBot({ config, repository }) {
     const message = ctx.message;
     if (await handleBackupRecoveryUpload(ctx, repository, config)) return;
     if (await handleStreamImportUpload(ctx, repository, config)) return;
+    // An armed /poster conversation takes the next message (post ID, image
+    // link, or title) before it can be mistaken for a draft title.
+    if (await handlePosterFlowMessage(ctx, repository, config)) return;
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
     if (isMediaMessage(message)) {

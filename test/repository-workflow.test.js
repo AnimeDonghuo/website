@@ -297,3 +297,71 @@ test('admin date windows and private analytics aggregate catalog, requests, bot 
   assert.equal(stats.bot.users, 2);
   assert.equal(stats.bot.activeUsers24h, 1);
 });
+
+test('an updated episode replaces older files for the same delivery slot', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.createContent({
+    title: 'Demon Slayer',
+    category: 'anime',
+    files: [
+      { storageMessageId: 1, name: 'Demon.Slayer.S01E01.480p.mkv', quality: '480P', episode: { start: 1, end: 1, label: 'Episode 01' } },
+      { storageMessageId: 2, name: 'Demon.Slayer.S01E02.480p.mkv', quality: '480P', episode: { start: 2, end: 2, label: 'Episode 02' } },
+      { storageMessageId: 3, name: 'Demon.Slayer.S01E01.1080p.mkv', quality: '1080P', episode: { start: 1, end: 1, label: 'Episode 01' } }
+    ]
+  });
+
+  // The publisher re-uploads Episode 2 as a fix and, by accident, the storage
+  // message that is already attached. The duplicate is not stored twice, the
+  // Episode 2 slot keeps exactly one current file, and the untouched Episode 1
+  // qualities stay available.
+  const merged = await repository.appendFilesToContentByMergeKey('demon-slayer', [
+    { storageMessageId: 4, name: 'Demon.Slayer.S01E02.1080p.mkv', quality: '1080P', episode: { start: 2, end: 2, label: 'Episode 02' } },
+    { storageMessageId: 3, name: 'Demon.Slayer.S01E01.1080p.mkv', quality: '1080P', episode: { start: 1, end: 1, label: 'Episode 01' } },
+    { storageMessageId: 5, name: 'Demon.Slayer.S01E03.1080p.mkv', quality: '1080P', episode: { start: 3, end: 3, label: 'Episode 03' } }
+  ]);
+
+  assert.deepEqual(merged.files.map((file) => file.storageMessageId), [1, 3, 4, 5]);
+  assert.equal(merged.filesCount, 4);
+  assert.equal(merged.episodeCount, 3);
+});
+
+test('a second quality of the same movie is kept while an identical quality is refreshed', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.createContent({
+    title: 'Cocktail 2',
+    category: 'movie',
+    files: [
+      { storageMessageId: 1, name: 'Cocktail.2.1080p.mkv', quality: '1080P' },
+      { storageMessageId: 2, name: 'Cocktail.2.480p.mkv', quality: '480P' }
+    ]
+  });
+
+  const refreshed = await repository.appendFilesToContentByMergeKey('cocktail-2', [
+    { storageMessageId: 9, name: 'Cocktail.2.1080p.mkv', quality: '1080P' },
+    { storageMessageId: 10, name: 'Cocktail.2.720p.mkv', quality: '720P' }
+  ]);
+
+  assert.deepEqual(refreshed.files.map((file) => file.storageMessageId), [2, 9, 10]);
+  assert.equal(refreshed.filesCount, 3);
+});
+
+test('a different audio language of one episode is a separate delivery slot', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.createContent({
+    title: 'Dual Audio Show',
+    category: 'donghua',
+    files: [{
+      storageMessageId: 1,
+      name: 'Show.E01.Hindi.mkv',
+      audioLanguages: ['Hindi'],
+      episode: { start: 1, end: 1, label: 'Episode 01' }
+    }]
+  });
+  const merged = await repository.appendFilesToContentByMergeKey('dual-audio-show', [{
+    storageMessageId: 2,
+    name: 'Show.E01.Tamil.mkv',
+    audioLanguages: ['Tamil'],
+    episode: { start: 1, end: 1, label: 'Episode 01' }
+  }]);
+  assert.deepEqual(merged.files.map((file) => file.storageMessageId), [1, 2]);
+});

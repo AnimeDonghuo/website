@@ -4,6 +4,9 @@ import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
 import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
+import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
+
+const posterConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
 
 test('storage uses a reusable Telegram file ID when copyMessage is refused', async () => {
   const calls = [];
@@ -882,4 +885,214 @@ test('stored file record keeps the returned storage message ID', () => {
 test('storage troubleshooting distinguishes protected content and wrong channel IDs', () => {
   assert.match(storageErrorHint({ description: "Bad Request: message can't be copied" }), /protected/i);
   assert.match(storageErrorHint({ description: 'Bad Request: chat not found' }), /numeric -100/i);
+});
+
+test('a mixed-season batch publishes one catalog post per season and keeps later uploads apart', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  await repository.startSession({ chatId: 640, ownerId: 640, category: 'anime', title: 'Demon Slayer' });
+  await repository.updateSession(640, 640, {
+    workflow: 'batch',
+    metadata: { matched: false, title: 'Demon Slayer', languages: ['Hindi'], genres: [], description: '', status: 'New release', releaseLabel: null }
+  });
+  const names = ['Demon.Slayer.S01E01.1080p.mkv', 'Demon.Slayer.S01E02.1080p.mkv', 'Demon.Slayer.S02E01.1080p.mkv', 'Demon.Slayer.S02E02.1080p.mkv'];
+  for (const [index, name] of names.entries()) {
+    await repository.appendSessionFile(640, 640, { storageMessageId: 900 + index, storageChannelId: '-100normal', name, kind: 'video' });
+  }
+
+  const replies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ success: true, data: { id: 'imgbb-seasons', url: 'https://i.ibb.co/mirror/seasons.png', display_url: 'https://i.ibb.co/mirror/seasons.png' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const publishConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
+  try {
+    const result = await publishDraft(
+      { chat: { id: 640 }, from: { id: 640 }, reply: async (text) => { replies.push(text); } },
+      { telegram: {} },
+      repository,
+      publishConfig
+    );
+
+    assert.equal(result.multiSeason, true);
+    assert.equal(result.seasons.length, 2);
+    const posts = (await repository.listContent({ category: 'anime', limit: 10 }))
+      .sort((first, second) => first.title.localeCompare(second.title));
+    assert.deepEqual(posts.map((post) => post.title), ['Demon Slayer Season 1', 'Demon Slayer Season 2']);
+    assert.deepEqual(posts.map((post) => post.files.length), [2, 2], 'each season holds exactly its own files');
+    assert.deepEqual(posts.map((post) => post.files.map((file) => file.name)), [
+      ['Demon.Slayer.S01E01.1080p.mkv', 'Demon.Slayer.S01E02.1080p.mkv'],
+      ['Demon.Slayer.S02E01.1080p.mkv', 'Demon.Slayer.S02E02.1080p.mkv']
+    ]);
+    assert.ok(replies.some((text) => /2 seasons were detected/.test(text)));
+    assert.equal(await repository.findSession(640, 640), null, 'the draft is cleared once every season is published');
+
+    // A lone Season 2 file sent later must land on the Season 2 card, not the
+    // first post that happens to share the base title.
+    await repository.startSession({ chatId: 640, ownerId: 640, category: 'anime', title: 'Demon Slayer' });
+    await repository.updateSession(640, 640, {
+      workflow: 'batch',
+      metadata: { matched: false, title: 'Demon Slayer', languages: ['Hindi'], genres: [], description: '', status: 'New release', releaseLabel: null }
+    });
+    await repository.appendSessionFile(640, 640, { storageMessageId: 970, storageChannelId: '-100normal', name: 'Demon.Slayer.S02E03.1080p.mkv', kind: 'video' });
+    const followUp = await publishDraft(
+      { chat: { id: 640 }, from: { id: 640 }, reply: async (text) => { replies.push(text); } },
+      { telegram: {} },
+      repository,
+      publishConfig
+    );
+
+    assert.equal(followUp.merged, true);
+    assert.equal(followUp.content.adminId, posts[1].adminId);
+    assert.equal(followUp.content.files.length, 3);
+    assert.ok(replies.some((text) => /Added 1 new file to the existing catalog post/.test(text)));
+    assert.equal((await repository.listContent({ category: 'anime', limit: 10 })).length, 2, 'no third post was created');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('season identity is part of the release merge key, while legacy posts still merge', () => {
+  assert.deepEqual(
+    releaseMergeKeys({ title: 'Show' }, { metadataKey: 'tmdb-tv-9' }, { season: 2 }),
+    ['tmdb-tv-9-season-2', 'show-season-2', 'tmdb-tv-9', 'show']
+  );
+  assert.deepEqual(releaseMergeKeys({ title: 'Show' }, { title: 'Show' }), ['show'], 'a season-less release keeps its old key');
+  assert.deepEqual(automationMergeKeys({ title: 'Show' }, { metadataKey: 'tmdb-tv-9' }, { season: 4 })[0], 'tmdb-tv-9-season-4');
+  assert.equal(withSeasonLabel('Show', 2), 'Show Season 2');
+  assert.equal(withSeasonLabel('Show', null), 'Show');
+  assert.equal(withSeasonLabel('Show Season 1', 1), 'Show Season 1', 'a season already named in the title is not repeated');
+  assert.equal(withSeasonLabel('Demon Slayer', 3, { replace: true }), 'Demon Slayer Season 3');
+
+  // `Number(null)` is 0, which used to be accepted as a season and silently
+  // produced "Season 0" keys that matched nothing.
+  for (const value of [null, undefined, '', 0, '3', 2.5, 100]) {
+    assert.equal(readSeason(value), Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 99 ? Number(value) : null, `readSeason(${String(value)})`);
+  }
+});
+
+test('the old poster style still works: post ID then an HTTPS image link', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Poster release',
+    category: 'movie',
+    posterUrl: 'https://old.example/poster.jpg',
+    files: [{ storageMessageId: 60, name: 'Poster.release.1080p.mkv', quality: '1080P' }]
+  });
+  const originalFetch = globalThis.fetch;
+  const posted = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('api.imgbb.com')) {
+      posted.push(options?.method || 'GET');
+      return new Response(JSON.stringify({ success: true, data: { id: 'imgbb-1', url: 'https://i.ibb.co/mirror/poster.png', display_url: 'https://i.ibb.co/mirror/poster.png' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(Buffer.from('poster-bytes'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
+  };
+  const replies = [];
+  const ctx = {
+    chat: { id: 641 },
+    from: { id: 641 },
+    message: { text: '' },
+    reply: async (text) => { replies.push(text); },
+    answerCallbackQuery: async () => {},
+    replyWithPhoto: async () => {}
+  };
+  try {
+    await repository.startPosterFlow({ chatId: 641, ownerId: 641, style: 'old', stage: 'post-id' });
+
+    await handlePosterAction(ctx, repository, posterConfig, 'poster:style:old');
+    assert.equal((await repository.findPosterFlow(641, 641)).stage, 'post-id');
+
+    ctx.message = { text: 'not-a-post-id' };
+    assert.equal(await handlePosterFlowMessage(ctx, repository, posterConfig), true);
+    assert.match(replies.at(-1), /Send the post ID only/);
+
+    ctx.message = { text: created.adminId };
+    assert.equal(await handlePosterFlowMessage(ctx, repository, posterConfig), true);
+    assert.equal((await repository.findPosterFlow(641, 641)).stage, 'image-url');
+    assert.match(replies.at(-1), new RegExp(`Editing ${created.adminId}`));
+
+    ctx.message = { text: 'please mirror this one' };
+    assert.equal(await handlePosterFlowMessage(ctx, repository, posterConfig), true);
+    assert.match(replies.at(-1), /not an HTTPS image link/);
+    assert.equal((await repository.findContentByAdminId(created.adminId)).posterUrl, 'https://old.example/poster.jpg', 'an invalid link never touches the card');
+
+    ctx.message = { text: 'mirror https://8.8.8.8/new-poster.jpg thanks' };
+    assert.equal(await handlePosterFlowMessage(ctx, repository, posterConfig), true);
+    assert.match(replies.at(-1), /Poster updated for SB-/);
+    const updated = await repository.findContentByAdminId(created.adminId);
+    assert.equal(updated.posterUrl, 'https://i.ibb.co/mirror/poster.png');
+    assert.equal(updated.poster.source, 'remote-mirror');
+    assert.equal(updated.poster.provider, 'imgbb');
+    assert.equal(updated.poster.providerId, 'imgbb-1');
+    assert.equal(updated.poster.originalUrl, 'https://8.8.8.8/new-poster.jpg');
+    assert.equal(await repository.findPosterFlow(641, 641), null, 'a finished flow is removed');
+    assert.deepEqual(posted, ['POST']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('the new poster style mirrors a tapped artwork button and a failed search stays harmless', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Picked release',
+    category: 'anime',
+    posterUrl: 'https://old.example/poster.jpg',
+    files: [{ storageMessageId: 61, name: 'Picked.release.S01E01.mkv' }]
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => (String(url).includes('api.imgbb.com')
+    ? new Response(JSON.stringify({ success: true, data: { id: 'imgbb-2', url: 'https://i.ibb.co/mirror/pick.png', display_url: 'https://i.ibb.co/mirror/pick.png' } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    : new Response(Buffer.from('picked-bytes'), { status: 200, headers: { 'content-type': 'image/png' } }));
+  const replies = [];
+  const ctx = {
+    chat: { id: 642 },
+    from: { id: 642 },
+    reply: async (text) => { replies.push(text); },
+    answerCallbackQuery: async () => {},
+    replyWithPhoto: async () => {}
+  };
+  try {
+    await repository.startPosterFlow({
+      chatId: 642,
+      ownerId: 642,
+      style: 'new',
+      targetAdminId: created.adminId,
+      stage: 'pick',
+      query: 'Picked release',
+      candidates: [
+        { title: 'Picked Release', year: 2026, provider: 'tmdb', posterUrl: 'https://8.8.8.8/a.jpg' },
+        { title: 'Picked Release 2', year: null, provider: 'anilist', posterUrl: 'https://8.8.8.8/b.jpg' }
+      ]
+    });
+
+    const keyboard = posterCandidateKeyboard([
+      { title: 'Picked Release', year: 2026, provider: 'tmdb' },
+      { title: `Kaizen \u0930\u0947\u0932\u0940\u091c \u0921\u0947\u0915\u093e \u0915\u0947 \u0938\u0947 \u092c\u0939\u0941\u0924 \u0932\u092e\u094d\u092c\u093e \u092a\u0939\u0932\u093e \u092c\u0941\u0924 \u0932\u092e\u094d\u092c\u093e`, year: 2026, provider: 'omdb' }
+    ]);
+    const labels = keyboard.reply_markup.inline_keyboard.flat().map((button) => button.text);
+    assert.ok(labels.length >= 3);
+    for (const label of labels) {
+      assert.ok(Buffer.byteLength(label, 'utf8') <= 64, `button label must fit Telegram: ${label}`);
+    }
+
+    assert.equal(await handlePosterAction(ctx, repository, posterConfig, 'poster:pick:1'), true);
+    const updated = await repository.findContentByAdminId(created.adminId);
+    assert.equal(updated.posterUrl, 'https://i.ibb.co/mirror/pick.png');
+    assert.equal(updated.poster.originalUrl, 'https://8.8.8.8/b.jpg');
+    assert.equal(updated.files.length, 1, 'choosing artwork never touches the files');
+    assert.equal(await repository.findPosterFlow(642, 642), null);
+
+    // An expired menu must not publish anything, throw, or spam the chat.
+    const repliesBeforeExpiry = replies.length;
+    assert.equal(await handlePosterAction(ctx, repository, posterConfig, 'poster:pick:0'), true);
+    assert.equal(replies.length, repliesBeforeExpiry, 'no reply is sent when the flow is gone');
+    assert.equal((await repository.findContentByAdminId(created.adminId)).posterUrl, 'https://i.ibb.co/mirror/pick.png');
+
+    // No provider keys configured: the search reports it instead of guessing.
+    await repository.startPosterFlow({ chatId: 642, ownerId: 642, style: 'new', targetAdminId: created.adminId, stage: 'search-title' });
+    const found = await presentPosterCandidates({ ctx, repository, config: posterConfig, adminId: created.adminId, query: 'Nothing matches this title' });
+    assert.equal(found, false);
+    assert.equal(await repository.findPosterFlow(642, 642), null, 'a failed search leaves no half-open flow');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

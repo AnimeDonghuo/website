@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { cleanDeliveryFileName, cleanMediaName, detectMediaQuality, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
@@ -86,13 +86,19 @@ function serializeDate(value) {
 function publicEpisodeGroups(value) {
   if (!Array.isArray(value)) return [];
   return value
-    .map((group) => ({
-      start: Number(group?.start),
-      end: Number(group?.end),
-      label: cleanText(group?.label, 50),
-      fileCount: Math.max(1, Number(group?.fileCount) || 1)
-    }))
-    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label);
+    .map((group) => {
+      const start = Number(group?.start);
+      const end = Number(group?.end);
+      return {
+        start,
+        end,
+        label: cleanText(group?.label, 50),
+        combined: Number.isInteger(start) && Number.isInteger(end) && end > start,
+        fileCount: Math.max(1, Number(group?.fileCount) || 1)
+      };
+    })
+    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
+    .sort((first, second) => first.start - second.start || first.end - second.end);
 }
 
 function publicLanguages(content) {
@@ -173,7 +179,7 @@ function publicFileChoices(files, config, shareCode, content) {
   if (!Array.isArray(files)) return [];
   // A published detail page intentionally lists every uploaded file: selecting
   // one must never force a visitor to receive a different quality or episode.
-  return files.map((file, index) => {
+  const choices = files.map((file, index) => {
     const episode = publicEpisodeGroups([file?.episode])[0] || null;
     const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.sourceLabel || file?.displayName });
     const label = publicFileChoiceLabel(file, content, index);
@@ -184,7 +190,10 @@ function publicFileChoices(files, config, shareCode, content) {
       id: `file-${index + 1}`,
       position: index + 1,
       label,
-      quality: quality || null,
+      // The uploader's own full wording, kept intact so a visitor can tell two
+      // similarly titled files apart instead of reading a shortened label.
+      fileName: publicFileDisplayName(file?.sourceLabel || file?.name || file?.displayName) || null,
+      quality: quality ? normalizeQualityLabel(quality) : null,
       size: formatBytes(Number(file?.size) || 0),
       kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
       episode,
@@ -192,6 +201,26 @@ function publicFileChoices(files, config, shareCode, content) {
       deliveryUrl,
       deliveryReady: Boolean(telegramUrl && deliveryUrl)
     };
+  });
+
+  // Known qualities then read as a ladder (small file → 4K) rather than in
+  // random upload order, grouped per episode so a series list still walks
+  // through its episodes in sequence.
+  return choices.sort((first, second) => {
+    const firstEpisode = Number(first?.episode?.start);
+    const secondEpisode = Number(second?.episode?.start);
+    const firstKnown = Number.isInteger(firstEpisode) && firstEpisode >= 1;
+    const secondKnown = Number.isInteger(secondEpisode) && secondEpisode >= 1;
+    if (firstKnown && secondKnown && firstEpisode !== secondEpisode) return firstEpisode - secondEpisode;
+    if (firstKnown !== secondKnown) return firstKnown ? -1 : 1;
+    const qualityOrder = compareQualityAscending(first?.quality, second?.quality);
+    if (qualityOrder !== 0) return qualityOrder;
+    if (firstKnown && secondKnown) {
+      const firstEnd = Number(first?.episode?.end) || firstEpisode;
+      const secondEnd = Number(second?.episode?.end) || secondEpisode;
+      if (firstEnd !== secondEnd) return firstEnd - secondEnd;
+    }
+    return first.position - second.position;
   });
 }
 

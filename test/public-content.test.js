@@ -121,3 +121,58 @@ test('delivery choices retain a meaningful season title and remove ESubs release
   }, config);
   assert.deepEqual(record.fileChoices.map((file) => file.label), ['The Gentlemen Season 1', 'The Gentlemen Season 1']);
 });
+
+test('quality choices are ordered small file to 4K without disturbing their delivery index', () => {
+  const record = toPublicContent({
+    id: 'ordering', slug: 'ordering', title: 'Perfect World', category: 'donghua',
+    shareCode: 'orderCode', hasDelivery: true,
+    files: [
+      { storageMessageId: 1, name: 'Perfect.World.S01E05.1080p.mkv', sourceLabel: 'Perfect World S01E05 1080p', quality: '1080P', episode: { start: 5, end: 5 } },
+      { storageMessageId: 2, name: 'Perfect.World.S01E05.480p.mkv', sourceLabel: 'Perfect World S01E05 480p', quality: '480P', episode: { start: 5, end: 5 } },
+      { storageMessageId: 3, name: 'Perfect.World.S01E05.720p.mkv', sourceLabel: 'Perfect World S01E05 720p', quality: '720P', episode: { start: 5, end: 5 } },
+      { storageMessageId: 4, name: 'Perfect.World.S01E06.no-quality.mkv', sourceLabel: 'Perfect World S01E06', episode: { start: 6, end: 6 } }
+    ]
+  }, config);
+
+  assert.deepEqual(record.fileChoices.map((file) => file.quality), ['480P', '720P', '1080P', null]);
+  // Every row still points at its own Telegram file position after reordering.
+  assert.deepEqual(record.fileChoices.map((file) => file.position), [2, 3, 1, 4]);
+  assert.deepEqual(record.fileChoices.map((file) => file.deliveryUrl), [
+    '/deliver/orderCode/file/2',
+    '/deliver/orderCode/file/3',
+    '/deliver/orderCode/file/1',
+    '/deliver/orderCode/file/4'
+  ]);
+});
+
+test('public file rows keep the complete upload wording so a name is never half-shown', () => {
+  const record = toPublicContent({
+    id: 'names', slug: 'names', title: 'Perfect World', category: 'anime',
+    shareCode: 'nameCode', hasDelivery: true,
+    files: [{
+      storageMessageId: 7,
+      name: `Perfect.World.S01E05.1080p.${'WEB-DL.Hindi.Dual.Audio.'.repeat(6)}mkv`,
+      sourceLabel: 'Perfect World S01E05 1080p WEB-DL Hindi @promo_channel',
+      kind: 'video'
+    }]
+  }, config);
+
+  assert.equal(record.fileChoices[0].fileName, 'Perfect World S01E05 1080p WEB-DL Hindi');
+  assert.equal(record.fileChoices[0].fileName.includes('@promo_channel'), false);
+  assert.match(record.fileChoices[0].label, /Perfect World/);
+});
+
+test('episode groups mark combined uploads so packs can be listed apart', () => {
+  const record = toPublicContent({
+    id: 'packs', slug: 'packs', title: 'Solo Leveling', category: 'anime',
+    shareCode: 'packCode', hasDelivery: true,
+    episodeGroups: [
+      { start: 1, end: 5, label: 'Episodes 01–05', fileCount: 2 },
+      { start: 6, end: 6, label: 'Episode 06', fileCount: 1 }
+    ],
+    files: [{ storageMessageId: 8, name: 'Solo.Leveling.EP.1-5.1080p.mkv', episode: { start: 1, end: 5, label: 'Episodes 01\u201305' } }]
+  }, config);
+
+  assert.deepEqual(record.episodeGroups.map((group) => group.combined), [true, false]);
+  assert.equal(record.fileChoices[0].episode.combined, true);
+});

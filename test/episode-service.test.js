@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanDeliveryFileName, cleanMediaName, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
+import { cleanDeliveryFileName, cleanMediaName, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -83,4 +83,76 @@ test('episode summary creates an ordered public-friendly index', () => {
   assert.equal(summary.groups.length, 2);
   assert.equal(summary.groups[0].fileCount, 2);
   assert.equal(summary.releaseLabel, '10 episodes');
+});
+
+test('known qualities read as an ascending ladder instead of upload order', () => {
+  assert.equal(normalizeQualityLabel('1080p'), '1080P');
+  assert.equal(normalizeQualityLabel('4K'), '4K');
+  assert.equal(qualityHeight('4K'), 2160);
+  assert.equal(qualityHeight('720P'), 720);
+  const shuffled = ['1080P', null, '480p', '4K', '280P', '720P'];
+  assert.deepEqual(
+    [...shuffled].sort((first, second) => compareQualityAscending(first, second)),
+    ['280P', '480p', '720P', '1080P', '4K', null]
+  );
+});
+
+test('season markers are recognised without confusing years or quality labels', () => {
+  assert.equal(extractSeasonNumber('Demon Slayer S01E05 1080p'), 1);
+  assert.equal(extractSeasonNumber('Show.Season.4.720p.mkv'), 4);
+  assert.equal(extractSeasonNumber('Solo Leveling S2 EP 3'), 2);
+  assert.equal(extractSeasonNumber('Breaking Bad 3x07'), 3);
+  assert.equal(extractSeasonNumber('Cocktail 2 (2026) 1080p NF WEB-DL'), null);
+  assert.equal(extractSeasonNumber('Naruto.Shippuden.1920x1080.mp4'), null);
+});
+
+test('a mixed-season batch becomes one file group per season', () => {
+  const files = [
+    { name: 'Show.S01E01.mkv', episode: { start: 1, end: 1 }, season: 1 },
+    { name: 'Show.S01E02.mkv', episode: { start: 2, end: 2 }, season: 1 },
+    { name: 'Show.S06E01.mkv', episode: { start: 1, end: 1 }, season: 6 },
+    // A caption that only says "EP 40" still belongs to the season that holds it.
+    { name: 'Show EP 40.mkv', episode: { start: 40, end: 40 } }
+  ];
+  const groups = groupFilesBySeason(files);
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups.map((group) => group.season), [1, 6]);
+  assert.deepEqual(groups[1].files.map((file) => file.name), ['Show.S06E01.mkv', 'Show EP 40.mkv']);
+
+  // A single-season batch is deliberately not split.
+  assert.deepEqual(groupFilesBySeason(files.slice(0, 2)), []);
+});
+
+test('a re-upload replaces its own slot, and only its own slot', () => {
+  const episodeFile = (messageId, quality, languages = []) => ({
+    storageMessageId: messageId,
+    quality,
+    audioLanguages: languages,
+    languages: languages,
+    episode: { start: 1, end: 5, label: 'Episodes 01–05' }
+  });
+  assert.deepEqual(
+    fileReplacementKey(episodeFile(1, '480P')),
+    fileReplacementKey(episodeFile(2, '1080P', [])),
+    'the same episode range replaces an older quality'
+  );
+  assert.notDeepEqual(
+    fileReplacementKey(episodeFile(1, '480P', ['Hindi'])),
+    fileReplacementKey(episodeFile(2, '480P', ['Tamil'])),
+    'a different audio language is a different delivery slot'
+  );
+
+  const movie1080 = { name: 'Cocktail.2.1080p.mkv', quality: '1080P' };
+  const movie480 = { name: 'Cocktail.2.480p.mkv', quality: '480P' };
+  assert.notEqual(fileReplacementKey(movie1080).key, fileReplacementKey(movie480).key, 'adding a quality must not delete another');
+  assert.equal(fileReplacementKey({ name: 'Cocktail.2.1080p.mkv', quality: '1080P' }).key, fileReplacementKey(movie1080).key);
+  assert.equal(fileReplacementKey({ name: 'Cocktail.2.1080p.mkv' }), null, 'an unknown quality never replaces anything');
+});
+
+test('public file labels keep the uploader wording that identifies the file', () => {
+  assert.equal(
+    publicFileDisplayName('Demon.Slayer.S01E05.1080p.WEB-DL.Hindi.mkv @promo_channel'),
+    'Demon Slayer S01E05 1080p WEB-DL Hindi'
+  );
+  assert.equal(publicFileDisplayName('https://t.me/promo Perfect World EP 01 4K'), 'Perfect World EP 01 4K');
 });

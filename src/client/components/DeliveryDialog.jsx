@@ -6,7 +6,11 @@ function fileHeading(file) {
 }
 
 function fileMeta(file) {
-  return [file?.quality, file?.size, file?.kind].filter(Boolean).join(' · ');
+  // The uploader's full wording is repeated here on purpose: two files can
+  // share a title while being different uploads, and nobody should have to
+  // guess which one they are about to receive.
+  const distinctName = file?.fileName && file.fileName.toLowerCase() !== String(file?.label || '').toLowerCase() ? file.fileName : '';
+  return [file?.quality, file?.size, file?.kind, distinctName].filter(Boolean).join(' · ');
 }
 
 export default function DeliveryDialog({ item, files = [], title, episodeLabel, onClose }) {

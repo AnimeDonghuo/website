@@ -52,8 +52,49 @@ export function streamEntriesForEpisode(entries = [], episode) {
   });
 }
 
-export function fileChoicesForEpisode(choices = [], episode) {
-  return (Array.isArray(choices) ? choices : []).filter((choice) => rangesOverlap(choice?.episode, episode));
+/** Players that touch this episode at all, including a partial batch link. */
+export function overlappingStreamEntries(entries = [], episode) {
+  const requested = episodeRange(episode);
+  if (!requested) return [];
+  return (Array.isArray(entries) ? entries : []).filter((entry) => rangesOverlap(entry?.episode, requested));
+}
+
+/**
+ * An episode page offers every player the publisher attached to that episode.
+ * A covering link is preferred; an overlapping one is still surfaced so a Watch
+ * button never silently disappears from an episode a publisher linked.
+ */
+export function episodeStreamEntries(entries = [], episode) {
+  const covering = streamEntriesForEpisode(entries, episode);
+  if (covering.length) return covering;
+  return overlappingStreamEntries(entries, episode);
+}
+
+/**
+ * Files listed on an episode page. A combined upload (Episodes 1–5) is shown
+ * only on its own pack page, so a single episode never appears to contain the
+ * whole batch. When nothing matches exactly — an older card, or a shared link
+ * opened directly — overlapping files are still offered instead of a dead page.
+ */
+export function fileChoicesForEpisode(choices = [], episode, { includeOverlapping = true } = {}) {
+  const requested = episodeRange(episode);
+  if (!requested) return [];
+  const list = Array.isArray(choices) ? choices : [];
+  const exact = list.filter((choice) => {
+    const range = episodeRange(choice?.episode);
+    return Boolean(range && range.start === requested.start && range.end === requested.end);
+  });
+  if (exact.length || !includeOverlapping) return exact;
+  return list.filter((choice) => rangesOverlap(choice?.episode, requested));
+}
+
+/** Split one episode index into single episodes and combined pack uploads. */
+export function splitEpisodeGroups(groups = []) {
+  const list = Array.isArray(groups) ? groups : [];
+  return {
+    episodes: list.filter((group) => Number.isInteger(group?.start) && group.start === Number(group?.end)),
+    packs: list.filter((group) => Number.isInteger(group?.start) && Number(group?.end) > group.start)
+  };
 }
 
 export function isReleaseLevelStream(entry) {

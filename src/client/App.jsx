@@ -8,9 +8,12 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { episodePagePath, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, releaseLevelStreamEntries, streamEntriesForEpisode, watchPagePath } from './watch-utils.js';
+import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, releaseLevelStreamEntries, splitEpisodeGroups, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
+// 18+ stays out of the public homepage rail; it is reachable from the menu and
+// the age-confirmed browse collection.
+const homeCategoryOrder = categoryOrder.filter((category) => category !== 'adult');
 const categoryCopy = {
   anime: { eyebrow: 'ANIMATED WORLDS', title: 'Anime worth crossing worlds for.', description: 'Fresh series, feature films and hand-picked adventures gathered in one focused collection.' },
   cartoon: { eyebrow: 'ALL-AGES ADVENTURES', title: 'Bright worlds. Big imagination.', description: 'A playful corner of the catalog for family animation, classic characters and original adventures.' },
@@ -136,10 +139,13 @@ function HomePage({ onGetFiles }) {
           <div><Eyebrow>EXPLORE BY MOOD</Eyebrow><h2 id="explore-categories">Choose a universe.</h2></div>
           <Link className="text-link" to="/browse">See everything <Icon name="arrow" size={16} /></Link>
         </div>
+        {/* The age-restricted collection is deliberately absent from the public
+            home rail. It remains reachable from the menu and from the
+            age-confirmed browse pages, where its consent prompt is shown. */}
         <div className="category-rail__items">
-          {categoryOrder.map((category, index) => {
-            const label = category === 'adult' ? '18+' : category === 'web-series' ? 'Web Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
-            const icons = ['✦', '☺', '◇', '♡', '▶', '▣', '18+'];
+          {homeCategoryOrder.map((category, index) => {
+            const label = category === 'web-series' ? 'Web Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+            const icons = ['✦', '☺', '◇', '♡', '▶', '▣'];
             return <Link className={`category-tile category-tile--${category}`} key={category} to={`/browse/${category}`}>
               <span className="category-tile__number">0{index + 1}</span>
               <span className="category-tile__icon" aria-hidden="true">{icons[index]}</span>
@@ -260,29 +266,35 @@ function SearchPage() {
   );
 }
 
+/**
+ * One delivery row. The uploader's own wording stays visible in full — a
+ * shortened "half name" tells a visitor nothing about which file they receive,
+ * so the complete label is the heading and the raw upload name is its own line.
+ */
 function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
   return <div className="file-choice-list">
     {choices.map((file) => {
-      const heading = file.episode?.label || file.label || `Delivery file ${file.position}`;
-      const hasDistinctLabel = file.episode?.label && file.label && file.label.toLowerCase() !== file.episode.label.toLowerCase();
+      const heading = file.label || file.episode?.label || `Delivery file ${file.position}`;
+      const rawName = file.fileName && file.fileName.toLowerCase() !== String(file.label || '').toLowerCase() ? file.fileName : '';
       const episodeIndex = file.episode
         ? file.episode.start === file.episode.end
           ? `EP ${formatEpisodeNumber(file.episode.start)}`
           : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
         : `FILE ${String(file.position).padStart(2, '0')}`;
       const deliveryHref = file.deliveryUrl || file.telegramUrl;
-      // An episode row deliberately ignores release-level players. Only an
-      // explicitly matching episode stream earns a Watch action beside it.
-      const hasEpisodeWatch = Boolean(file.episode && streamEntriesForEpisode(item?.stream?.entries, file.episode).length);
+      // An episode row deliberately ignores release-level players. Only a
+      // player attached to this episode earns a Watch action beside it.
+      const hasEpisodeWatch = Boolean(file.episode && episodeStreamEntries(item?.stream?.entries, file.episode).length);
       return <article className="file-choice" key={file.id}>
-        <span className={`file-choice__index ${file.episode ? 'file-choice__index--episode' : ''}`}>{episodeIndex}</span>
+        <span className={`file-choice__index ${file.episode ? (file.episode.combined ? 'file-choice__index--pack' : 'file-choice__index--episode') : ''}`}>{episodeIndex}</span>
         <div className="file-choice__details">
-          <strong>{heading}</strong>
-          {hasDistinctLabel ? <span className="file-choice__label">{file.label}</span> : null}
+          <strong title={heading}>{heading}</strong>
+          {rawName ? <span className="file-choice__label" title={rawName}>{rawName}</span> : null}
           <div className="file-choice__meta">
             {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
             {file.size ? <span>{file.size}</span> : null}
             <span>{file.kind}</span>
+            {file.episode?.combined ? <span className="file-choice__pack">Combined upload</span> : null}
             {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
           </div>
         </div>
@@ -292,6 +304,27 @@ function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
         </div>
       </article>;
     })}
+  </div>;
+}
+
+/**
+ * The publisher attached players per episode with /cmd. Those links belong on
+ * the episode's own page, where the quality is chosen, so a visitor never has
+ * to find a Watch button hidden beside one particular file.
+ */
+function EpisodeWatchPanel({ item, episode, entries }) {
+  if (!entries?.length) return null;
+  return <div className="episode-watch-panel">
+    <div className="episode-watch-panel__copy">
+      <Eyebrow><Icon name="play" size={13} /> AVAILABLE NOW</Eyebrow>
+      <strong>{entries.length === 1 ? 'A player is ready for this episode' : `${entries.length} players are ready for this episode`}</strong>
+      <p>{entries[0]?.label ? <span>Source: {entries[0].label}</span> : null}<span>Streaming opens in the site player. Telegram delivery below stays a separate choice.</span></p>
+    </div>
+    <div className="episode-watch-panel__actions">
+      {entries.map((entry, index) => <Link className={`button ${index === 0 ? 'button--watch' : 'button--secondary'}`} key={entry.id} to={watchPagePath(item, episode)}>
+        <Icon name="play" size={18} /> {entries.length > 1 ? `Watch · Player ${index + 1}` : 'Watch now'}
+      </Link>)}
+    </div>
   </div>;
 }
 
@@ -307,6 +340,7 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
     [requestedAdultCategory, adultAccess, adultAccessVersion]
   );
   const item = release.data?.item;
+  const groups = useMemo(() => splitEpisodeGroups(item?.episodeGroups), [item?.episodeGroups]);
   const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
   const relatedItems = useMemo(() => {
     if (!item) return [];
@@ -346,7 +380,7 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
               <div className="detail-actions">
                 {hasReleaseLevelWatch(item.stream) ? <Link className="button button--watch" to={watchPagePath(item)}><Icon name="play" size={19} /> Watch</Link> : null}
                 {item.episodeGroups?.length
-                  ? <a className="button button--telegram" href="#episode-guide-title"><Icon name="layers" size={20} /> Browse episode guide</a>
+                  ? <a className="button button--telegram" href={groups.episodes.length ? '#episode-guide-title' : '#episode-packs-title'}><Icon name="layers" size={20} /> Browse episode guide</a>
                   : <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>}
                 <Link className="button button--ghost" to={`/browse/${item.category}`}>More {item.categoryLabel}</Link>
               </div>
@@ -363,7 +397,7 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
           <p className="detail-info__track-label">Audio</p>
           <div className="language-tags">{item.languages.length ? item.languages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>) : <span><Icon name="check" size={14} /> Check Telegram delivery</span>}</div>
           {(item.subtitleLanguages || []).length ? <><p className="detail-info__track-label">Subtitles</p><div className="language-tags language-tags--subtitles">{item.subtitleLanguages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>)}</div></> : null}
-          {item.episodeGroups?.length ? <p className="detail-info__episode-hint"><Icon name="arrow" size={15} /> Select an episode below to see its available files and qualities.</p> : null}
+          {item.episodeGroups?.length ? <p className="detail-info__episode-hint"><Icon name="arrow" size={15} /> {groups.episodes.length ? 'Select an episode below to see its available files and qualities.' : 'Select a combined pack below to see its available files and qualities.'}</p> : null}
         </div>
       </section>
 
@@ -375,20 +409,35 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
         <FileChoiceList item={item} choices={item.fileChoices} onGetFiles={onGetFiles} />
       </section> : null}
 
-      {item.episodeGroups?.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
+      {groups.episodes.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
         <div className="episode-section__heading">
           <div><Eyebrow>SMART EPISODE INDEX</Eyebrow><h2 id="episode-guide-title">Episode <em>guide.</em></h2></div>
           <span>{item.episodeCount || item.episodeGroups.length} indexed episode{(item.episodeCount || item.episodeGroups.length) === 1 ? '' : 's'}</span>
         </div>
         <div className="episode-grid">
-          {item.episodeGroups.map((group) => <Link className="episode-card" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
-            <span className={`episode-card__number ${group.start === group.end ? '' : 'episode-card__number--range'}`}>{group.start === group.end ? `EP ${formatEpisodeNumber(group.start)}` : `${formatEpisodeNumber(group.start)}–${formatEpisodeNumber(group.end)}`}</span>
+          {groups.episodes.map((group) => <Link className="episode-card" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
+            <span className="episode-card__number">EP {formatEpisodeNumber(group.start)}</span>
             <strong>{group.label}</strong>
             <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
             <Icon name="arrow" size={15} />
           </Link>)}
         </div>
         <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Select an episode to open its own delivery page and compare every available file option.</p>
+      </section> : null}
+
+      {groups.packs.length ? <section className="episode-packs page-width" aria-labelledby="episode-packs-title">
+        <div className="episode-section__heading">
+          <div><Eyebrow>COMBINED UPLOADS</Eyebrow><h2 id="episode-packs-title">Batch <em>packs.</em></h2><p>Multi-episode files live here instead of inside the single-episode list, so each pack keeps its own quality choices.</p></div>
+          <span>{groups.packs.length} combined upload{groups.packs.length === 1 ? '' : 's'}</span>
+        </div>
+        <div className="episode-grid episode-grid--packs">
+          {groups.packs.map((group) => <Link className="episode-card episode-card--pack" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
+            <span className="episode-card__number episode-card__number--range">{formatEpisodeNumber(group.start)}–{formatEpisodeNumber(group.end)}</span>
+            <strong>{group.label}</strong>
+            <small>{group.fileCount} combined file{group.fileCount === 1 ? '' : 's'} · episodes {group.start} to {group.end} in one upload</small>
+            <Icon name="arrow" size={15} />
+          </Link>)}
+        </div>
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">
@@ -415,9 +464,17 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
   const requestedEpisode = parseEpisodeRoute(episodeRange);
   const matchingGroup = item?.episodeGroups?.find((group) => group.start === requestedEpisode?.start && group.end === requestedEpisode?.end);
   const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
+  const isPack = Boolean(matchingGroup && matchingGroup.start !== matchingGroup.end);
+  // Only this episode's own uploads are listed. A combined file that spans this
+  // episode belongs to its pack page, not to every episode it touches.
   const choices = item && requestedEpisode
     ? fileChoicesForEpisode(item.fileChoices, requestedEpisode)
     : [];
+  const watchEntries = item && requestedEpisode
+    ? episodeStreamEntries(item.stream?.entries, requestedEpisode)
+    : [];
+  const groupFileCount = matchingGroup?.fileCount || 0;
+  const hiddenPackCount = groupFileCount > choices.length ? groupFileCount - choices.length : 0;
 
   if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
     return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
@@ -439,6 +496,7 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
             <p>Choose one version below. Each Telegram link delivers only that selected file, so you can pick the quality or upload that suits you.</p>
             <div className="episode-page-hero__facts">
               <span><Icon name="layers" size={15} /> {choices.length} file option{choices.length === 1 ? '' : 's'}</span>
+              {isPack ? <span><Icon name="layers" size={15} /> Combined upload</span> : null}
               {item.languages.length ? <span><Icon name="check" size={15} /> {item.languages.join(' · ')}</span> : null}
               {(item.subtitleLanguages || []).length ? <span><Icon name="check" size={15} /> Subs: {item.subtitleLanguages.join(' · ')}</span> : null}
             </div>
@@ -451,7 +509,11 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
           <div><Eyebrow>FILES FOR {episodeLabel.toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
           <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> Episode guide</Link>
         </div>
-        {choices.length ? <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} /> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
+        <EpisodeWatchPanel item={item} episode={requestedEpisode} entries={watchEntries} />
+        {choices.length ? <>
+          <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} />
+          {hiddenPackCount ? <p className="episode-section__note"><Icon name="info" size={14} /> {hiddenPackCount} combined upload{hiddenPackCount === 1 ? ' is' : 's are'} also available for this release in the pack list on the release page — they are kept out of this episode on purpose so every option here covers exactly {episodeLabel.toLowerCase()}.</p> : null}
+        </> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
       </section>
     </PageShell>
   );
@@ -473,13 +535,15 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   const requestedEpisode = parseEpisodeRoute(episodeRange);
   const allEntries = item?.stream?.entries || [];
   // A generic /watch page is reserved for intentional release-level players.
-  // An episode route sees only players that explicitly overlap that episode.
+  // An episode route sees only players attached to that episode.
   const entries = requestedEpisode
-    ? streamEntriesForEpisode(allEntries, requestedEpisode)
+    ? episodeStreamEntries(allEntries, requestedEpisode)
     : releaseLevelStreamEntries(allEntries);
-  const matchingFiles = requestedEpisode
+  // The delivery files shown under a player are this episode's own files. A
+  // combined pack is offered here only when nothing matches the episode
+  // exactly, so a single-episode Watch page is never filled with a batch file.
+  const matchingFiles = requestedEpisode && entries.length
     ? fileChoicesForEpisode(item?.fileChoices, requestedEpisode)
-      .filter((file) => streamEntriesForEpisode(allEntries, file.episode).length)
     : [];
   const [selectedId, setSelectedId] = useState(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
@@ -504,8 +568,8 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   if (!item.stream?.available) {
     return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
   }
-  if (requestedEpisode && !matchingFiles.length) {
-    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>This player needs a matching delivery file.</h1><p>{requestedEpisode.label} is not an indexed delivery context for this release, so SoraBox will not play an arbitrary episode here.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></section></PageShell>;
+  if (requestedEpisode && !entries.length) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>No player is attached to {requestedEpisode.label.toLowerCase()} yet.</h1><p>{item.title} has a Watch link for other episodes, and SoraBox will not play an unrelated one here. Open this episode page to see its delivery files, or pick another episode from the guide.</p><div className="not-found__actions"><Link className="button button--primary" to={episodePagePath(item, requestedEpisode)}><Icon name="telegram" size={18} /> Episode files</Link><Link className="button button--secondary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></div></section></PageShell>;
   }
   if (!selected) {
     if (!requestedEpisode && allEntries.some((entry) => entry?.episode?.start)) {

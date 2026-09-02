@@ -1,12 +1,13 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, fileReplacementKey, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
 const BACKUP_RECOVERY_TTL_MS = 1000 * 60 * 15;
 const STREAM_IMPORT_TTL_MS = 1000 * 60 * 15;
+const POSTER_FLOW_TTL_MS = 1000 * 60 * 15;
 const MAX_ADMIN_CONTENT_RESULTS = 100;
 const MAX_REQUEST_RESULTS = 200;
 const BACKUP_COLLECTION_NAMES = [
@@ -237,29 +238,83 @@ function storageReferenceMatches(file, storageMessageId, storageChannelId = null
   return fileChannel ? fileChannel === requestedChannel : includeLegacy;
 }
 
-function uniqueFiles(existingFiles = [], additionalFiles = []) {
-  const files = [];
-  const storageReferences = new Set();
-  for (const rawFile of [...existingFiles, ...additionalFiles]) {
-    if (!rawFile || typeof rawFile !== 'object') continue;
-    const file = sanitizeStoredFileRecord(rawFile);
+function uniqueFiles(existingFiles = [], additionalFiles = [], { supersedeExisting = false } = {}) {
+  const seenReferences = new Set();
+  const referenceOf = (file) => {
     const storageId = file.storageMessageId === null || file.storageMessageId === undefined
       ? ''
       : String(file.storageMessageId);
+    if (!storageId) return '';
     const storageChannelId = storageReferenceChannel(file.storageChannelId);
     // Telegram message IDs are scoped to their channel. Include the source
     // channel in the dedupe key so normal and 18+ private stores may both have
     // message 42 without losing a legitimate file during a merge.
-    const reference = storageId ? `${storageChannelId || 'legacy'}:${storageId}` : '';
-    if (reference && storageReferences.has(reference)) continue;
-    if (reference) storageReferences.add(reference);
-    files.push(file);
+    return `${storageChannelId || 'legacy'}:${storageId}`;
+  };
+
+  const keptExisting = [];
+  for (const rawFile of existingFiles) {
+    if (!rawFile || typeof rawFile !== 'object') continue;
+    const file = sanitizeStoredFileRecord(rawFile);
+    const reference = referenceOf(file);
+    if (reference) seenReferences.add(reference);
+    keptExisting.push(file);
   }
-  return files;
+
+  const incoming = [];
+  for (const rawFile of additionalFiles) {
+    if (!rawFile || typeof rawFile !== 'object') continue;
+    const file = sanitizeStoredFileRecord(rawFile);
+    const reference = referenceOf(file);
+    if (reference && seenReferences.has(reference)) continue;
+    if (reference) seenReferences.add(reference);
+    incoming.push(file);
+  }
+
+  // A new upload for the same delivery slot replaces the older one, so an
+  // update never leaves a release looking half old and half new. Only a file
+  // that will actually be kept can supersede another: dropping both sides of a
+  // re-published storage message would lose the media entirely.
+  const replacements = supersedeExisting ? replacementIndex(incoming) : null;
+  const survivors = replacements?.size
+    ? keptExisting.filter((file) => !isSupersededBy(replacements, file))
+    : keptExisting;
+
+  return [...survivors, ...incoming];
+}
+
+/**
+ * Index the incoming files by their replacement identity. An episode range
+ * matches regardless of quality, while a non-episodic file also has to share
+ * the same quality and audio-language labels, so adding a second quality of a
+ * movie can never delete the first one.
+ */
+function replacementIndex(incomingFiles = []) {
+  const index = new Map();
+  for (const file of incomingFiles) {
+    const replacement = fileReplacementKey(file);
+    if (!replacement) continue;
+    const current = index.get(replacement.key) || { anyLanguage: false, languages: new Set() };
+    if (!replacement.languages) current.anyLanguage = true;
+    else current.languages.add(replacement.languages);
+    index.set(replacement.key, current);
+  }
+  return index;
+}
+
+function isSupersededBy(replacements, file) {
+  if (!replacements?.size) return false;
+  const replacement = fileReplacementKey(file);
+  if (!replacement) return false;
+  const incoming = replacements.get(replacement.key);
+  if (!incoming) return false;
+  // Either side naming no language is treated as the same default track list.
+  if (incoming.anyLanguage || !replacement.languages) return true;
+  return incoming.languages.has(replacement.languages);
 }
 
 function contentFileAppendPatch(content, additionalFiles) {
-  const files = uniqueFiles(content?.files || [], additionalFiles);
+  const files = uniqueFiles(content?.files || [], additionalFiles, { supersedeExisting: true });
   const episodeSummary = summarizeEpisodes(files);
   const uploadLanguages = summarizeUploadLanguages(files);
   const uploadSubtitleLanguages = summarizeSubtitleLanguages(files);
@@ -477,6 +532,7 @@ export class MemoryCatalogRepository {
     this.requestSelections = new Map();
     this.backupRecoveries = new Map();
     this.streamImports = new Map();
+    this.posterFlows = new Map();
     this.botUsers = new Map();
     this.siteVisitors = new Map();
     this.siteVisits = [];
@@ -964,6 +1020,61 @@ export class MemoryCatalogRepository {
     this.backupRecoveries.delete(sessionKey(chatId, ownerId));
   }
 
+  /**
+   * Short-lived publisher artwork flow: it remembers whether the old style
+   * (post ID + image link) or the new style (post ID + title + artwork
+   * buttons) was chosen, so the publisher can answer in separate messages.
+   */
+  async startPosterFlow({
+    chatId,
+    ownerId,
+    style = null,
+    targetAdminId = null,
+    stage = 'style',
+    query = '',
+    candidates = [],
+    expiresAt = new Date(Date.now() + POSTER_FLOW_TTL_MS)
+  } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      style: cleanText(style, 20) || null,
+      targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+      stage,
+      query: cleanText(query, 180),
+      candidates: Array.isArray(candidates) ? candidates.slice(0, 12) : [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + POSTER_FLOW_TTL_MS).toISOString()
+    };
+    this.posterFlows.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findPosterFlow(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.posterFlows.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.posterFlows.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async updatePosterFlow(chatId, ownerId, patch = {}) {
+    const current = await this.findPosterFlow(chatId, ownerId);
+    if (!current) return null;
+    const saved = this.posterFlows.get(sessionKey(chatId, ownerId));
+    Object.assign(saved, patch, { updatedAt: new Date().toISOString() });
+    return clone(saved);
+  }
+
+  async deletePosterFlow(chatId, ownerId) {
+    this.posterFlows.delete(sessionKey(chatId, ownerId));
+  }
+
   async startStreamImport({ chatId, ownerId, targetAdminId = null, expiresAt = new Date(Date.now() + STREAM_IMPORT_TTL_MS) } = {}) {
     const now = new Date().toISOString();
     const session = {
@@ -1239,6 +1350,7 @@ export class MongoCatalogRepository {
     this.requestSelections = db.collection('request_selections');
     this.backupRecoveries = db.collection('backup_recoveries');
     this.streamImports = db.collection('stream_imports');
+    this.posterFlows = db.collection('poster_flows');
     this.botUsers = db.collection('bot_users');
     this.siteVisitors = db.collection('site_visitors');
     this.siteVisits = db.collection('site_visits');
@@ -1273,6 +1385,8 @@ export class MongoCatalogRepository {
       this.backupRecoveries.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.streamImports.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.streamImports.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.posterFlows.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.posterFlows.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.botUsers.createIndex({ id: 1 }, { unique: true }),
       this.botUsers.createIndex({ lastSeenAt: -1 }),
       this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
@@ -1913,6 +2027,60 @@ export class MongoCatalogRepository {
 
   async deleteStreamImport(chatId, ownerId) {
     await this.streamImports.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startPosterFlow({
+    chatId,
+    ownerId,
+    style = null,
+    targetAdminId = null,
+    stage = 'style',
+    query = '',
+    candidates = [],
+    expiresAt = new Date(Date.now() + POSTER_FLOW_TTL_MS)
+  } = {}) {
+    const now = new Date();
+    return this.posterFlows.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          style: cleanText(style, 20) || null,
+          targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+          stage,
+          query: cleanText(query, 180),
+          candidates: Array.isArray(candidates) ? candidates.slice(0, 12) : [],
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + POSTER_FLOW_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findPosterFlow(chatId, ownerId) {
+    return this.posterFlows.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async updatePosterFlow(chatId, ownerId, patch = {}) {
+    const safePatch = { ...patch };
+    delete safePatch.chatId;
+    delete safePatch.ownerId;
+    delete safePatch.createdAt;
+    safePatch.updatedAt = new Date();
+    return this.posterFlows.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId), expiresAt: { $gt: new Date() } },
+      { $set: safePatch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async deletePosterFlow(chatId, ownerId) {
+    await this.posterFlows.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
   }
 
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
