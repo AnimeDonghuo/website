@@ -54,6 +54,8 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - `/category`, `/lang`, `/subtitles`, `/genres`, `/year`, `/release`, and `/status` accept a **list of Post IDs** before the value (`/category SB-0123ABCDEF, SB-1122334455 anime`), so one mislabelled batch is corrected in a single line; every named post is updated, each post’s existing Telegram announcement is edited in place, unknown IDs are reported and skipped, and a restricted 18+ post in the list is left alone instead of failing the whole command. Titles, synopses, and artwork stay one-post-at-a-time because they are per-release identity
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
 - Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards. Authorized publisher command scopes are registered on startup and when an allowed owner opens/logs into the bot, so `/posts`, `/postid`, and other publisher commands remain visible through Telegram menu caching
+- `/merge <exact title> <target Post ID> <Post ID to absorb> [more IDs]` collapses cards that a provider split apart: the target keeps its ID, slug, poster, and delivery links, every file and player of the other cards moves onto it, its season blocks are rebuilt (Season 1 with its episodes, then Season 2 with its own Episode 01 — same-numbered episodes of different seasons never overwrite each other), and the absorbed cards plus **their announcement-channel messages** are deleted while the private storage messages stay untouched. A title in front is a safety check that stops the merge when that Post ID carries another name, mistyped IDs are reported instead of read as titles, 18+ cards are never mixed with normal ones, and the plan is applied only after **Confirm merge** or `/merge confirm`. `/merge drop SB-… season 2`, `ep 5`, or `season 2 ep 5-7` trims files back off one card and reports the players left behind
+
 - `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…` (or `/p`, `/imgdd`), `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
 - `/backup` creates a signed gzip application snapshot and sends it only to the configured private storage channel; `/recover` accepts one signed backup document in an authorized private publisher chat and restores it into the current database, including a new/empty MongoDB URI. A durable India-calendar-month scheduler sends one automatic backup each month
 - `/stats` reports private aggregate bot activity, anonymous site visitors/visits, catalog totals, and request status totals. Site tracking uses only a random first-party visitor cookie—never raw IPs or public Telegram data
@@ -426,6 +428,33 @@ Metadata edits take one Post ID or as many as needed, separated by commas, space
 Only the Post IDs at the very front of the message are read as targets, so a value that contains commas (`Hindi, English`) or a file name that merely starts with `SB-` is never mistaken for another ID. The reply names each post it changed, lists any ID it could not find, and reports how many announcement messages were edited. A category change into or out of 18+ is refused for that one post (its storage channel and age gate must stay separate) while the rest of the list is still corrected.
 
 `/title`, `/description`, and `/poster` intentionally do **not** accept a list: a title, synopsis, and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
+
+### Merge split cards into one post
+
+Providers sometimes export one show as several cards — a card per season, or a season and its movie. `/merge` puts them back together. The **first** Post ID is the card that survives; every ID after it is absorbed into it:
+
+```text
+/merge Bleach SB-0123ABCDEF SB-1111222233 SB-4444555566
+/merge SB-0123ABCDEF SB-1111222233
+```
+
+The target keeps its own Post ID, slug, poster, and delivery links. Every file and player of the absorbed cards moves onto it, its episode index is rebuilt into season blocks (Season 1 with its episodes, then Season 2 with its own Episode 01 — two seasons never overwrite each other's numbers), and the absorbed cards are deleted from the website **and** from the announcement channels. The private storage messages are never touched, so nothing has to be re-uploaded.
+
+A title in front of the target ID is a safety check, not a search: if that Post ID carries a different name, the merge stops instead of moving files onto the wrong card. A mistyped ID (`Sb -29292`, `SB-112233445`) is reported as not being a Post ID rather than silently ignored.
+
+Nothing changes until the plan is confirmed — the preview names each card, its file and episode counts, how many announcement messages will be deleted, and any card that was skipped. Confirm with the **Confirm merge** button or `/merge confirm`, and drop it with `/merge cancel` or `/cancel`. A card on the other side of the 18+ boundary is always refused, because storage channel and age gate follow the target.
+
+To take files back off one card — a whole season, or an episode that landed in the wrong block — a trim is applied immediately and only touches that card:
+
+```text
+/merge drop SB-0123ABCDEF season 2
+/merge drop SB-0123ABCDEF ep 5
+/merge drop SB-0123ABCDEF season 2 ep 5-7
+```
+
+The reply reports how many files and episodes are left, warns when the card became empty, and names the players still attached to the removed episodes (`/cmd SB-0123ABCDEF del ep 5`). Because a drop can make a plan stale, it clears any pending merge. `/merge help` lists every form.
+
+On the website, a card that spans seasons gets one heading per block, and an episode page keeps its season in the link (`/donghua/bleach/episode/1?s=2`) so Season 2's Episode 01 opens its own files rather than Season 1's. Cards with a single season are untouched, and the episode card design never changed: only the block heading and the season name inside the label were added.
 
 ### Manage requests, post IDs, and publisher analytics
 

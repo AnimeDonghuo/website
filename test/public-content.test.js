@@ -176,3 +176,41 @@ test('episode groups mark combined uploads so packs can be listed apart', () => 
   assert.deepEqual(record.episodeGroups.map((group) => group.combined), [true, false]);
   assert.equal(record.fileChoices[0].episode.combined, true);
 });
+
+test('a card that spans seasons publishes its season blocks, and a single season stays plain', () => {
+  const record = toPublicContent({
+    id: 'merged', slug: 'bleach', title: 'Bleach', category: 'donghua',
+    shareCode: 'mergedCode', hasDelivery: true,
+    episodeGroups: [
+      { start: 1, end: 1, label: 'Episode 01', fileCount: 1, season: 2, seasonLabel: 'Season 2' },
+      { start: 1, end: 1, label: 'Episode 01', fileCount: 1, season: 1, seasonLabel: 'Season 1' },
+      { start: 2, end: 2, label: 'Episode 02', fileCount: 1, season: 1, seasonLabel: 'Season 1' }
+    ],
+    files: [
+      { storageMessageId: 1, name: 'Bleach.S01E01.mkv', season: 1, episode: { start: 1, end: 1, label: 'Episode 01' } },
+      { storageMessageId: 2, name: 'Bleach.S02E01.mkv', season: 2, episode: { start: 1, end: 1, label: 'Episode 01' } }
+    ]
+  }, config);
+
+  // The merge appended Season 2 first in storage order; the page still walks
+  // Season 1 before Season 2 so a viewer never jumps between blocks.
+  assert.deepEqual(
+    record.episodeGroups.map((group) => [group.season, group.label]),
+    [[1, 'Episode 01'], [1, 'Episode 02'], [2, 'Episode 01']]
+  );
+  assert.deepEqual([...new Set(record.episodeGroups.map((group) => group.seasonLabel))], ['Season 1', 'Season 2']);
+  assert.deepEqual(record.fileChoices.map((file) => file.season), [1, 2], 'each file knows which block it belongs to');
+  assert.deepEqual(record.fileChoices.map((file) => file.position), [1, 2], 'the delivery links still follow the stored file order');
+
+  // A card that only ever had one season carries no season data at all, which is
+  // what keeps its guide exactly as it looked before merging existed.
+  const single = toPublicContent({
+    id: 'solo', slug: 'solo', title: 'Solo Leveling', category: 'anime',
+    shareCode: 'soloCode', hasDelivery: true,
+    files: [{ storageMessageId: 1, name: 'Solo.Leveling.S01E01.mkv', season: 1, episode: { start: 1, end: 1, label: 'Episode 01' } }],
+    episodeGroups: [{ start: 1, end: 1, label: 'Episode 01', fileCount: 1 }]
+  }, config);
+  assert.deepEqual(single.episodeGroups.map((group) => [group.season, group.seasonLabel]), [[null, null]]);
+  assert.equal(single.fileChoices[0].season, null);
+});
+

@@ -4,6 +4,7 @@ import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
 import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, announcementSyncNote, planDraftPublicationGroups, syncPublishedAnnouncements, updatePublishedPost, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parseStreamRemoval, playersList, playersListText, removeAttachedPlayers, splitPlayerLinks, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest, publicStreamingData, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
+import { applyMergeDrop, applyMergePlan, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan } from '../src/server/services/telegram-bot.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
 const posterConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
@@ -1466,3 +1467,241 @@ test('the new poster style mirrors a tapped artwork button and a failed search s
     globalThis.fetch = originalFetch;
   }
 });
+
+// ── /merge: one card absorbs the others, and can be trimmed again ──────────
+function mergeFile(messageId, name, season, episode) {
+  return {
+    storageMessageId: messageId,
+    name,
+    sourceLabel: name,
+    displayName: name,
+    season,
+    episode: episode ? { start: episode, end: episode, label: `Episode ${String(episode).padStart(2, '0')}` } : null
+  };
+}
+
+async function mergeFixture() {
+  const repository = new MemoryCatalogRepository([]);
+  const seasonOne = await repository.createContent({
+    title: 'Bleach',
+    category: 'donghua',
+    files: [mergeFile(1, 'Bleach.S01E01.mkv', 1, 1), mergeFile(2, 'Bleach.S01E02.mkv', 1, 2)],
+    announcementRefs: [{ channelId: '-100anime', messageId: 100, kind: 'photo', websiteUrl: 'https://site.test/donghua/bleach' }]
+  });
+  const seasonTwo = await repository.createContent({
+    title: 'Bleach Season 2',
+    category: 'donghua',
+    files: [mergeFile(3, 'Bleach.S02E01.mkv', 2, 1), mergeFile(4, 'Bleach.S02E02.mkv', 2, 2), mergeFile(5, 'Bleach.S02E03.mkv', 2, 3)],
+    stream: { entries: [{ label: 'S02E01', episode: { start: 1, end: 1, label: 'Episode 01' }, embedUrl: 'https://www.dailymotion.com/embed/video/xS2E1' }] },
+    announcementRefs: [{ channelId: '-100anime', messageId: 101, kind: 'photo' }]
+  });
+  const movie = await repository.createContent({
+    title: 'Bleach Movie',
+    category: 'movie',
+    files: [mergeFile(6, 'Bleach.Movie.1080p.mkv', null, null)]
+  });
+  const edits = [];
+  const deletes = [];
+  const bot = {
+    telegram: {
+      async editMessageText(...args) { edits.push(args); return true; },
+      async deleteMessage(chatId, messageId) { deletes.push(`${chatId}:${messageId}`); return true; }
+    }
+  };
+  return { repository, seasonOne, seasonTwo, movie, bot, edits, deletes };
+}
+
+test('the first Post ID is always the card that survives a merge', () => {
+  const target = 'SB-0123ABCDEF';
+  const first = 'SB-1111222233';
+  const second = 'SB-4444555566';
+  assert.deepEqual(parseMergeCommand(`${target} ${first}`), { action: 'plan', label: '', targetAdminId: target, sourceAdminIds: [first] });
+  assert.deepEqual(parseMergeCommand(`bleach ${target} ${first} ${second}`), { action: 'plan', label: 'bleach', targetAdminId: target, sourceAdminIds: [first, second] });
+  assert.deepEqual(parseMergeCommand('confirm'), { action: 'confirm' });
+  assert.deepEqual(parseMergeCommand('cancel'), { action: 'cancel' });
+  assert.deepEqual(parseMergeCommand('help'), { action: 'help' });
+  assert.deepEqual(parseMergeCommand(''), { action: 'help' });
+  assert.deepEqual(parseMergeCommand(`drop ${target} season 2`), { action: 'drop', targetAdminId: target, drop: { mode: 'season', season: 2 } });
+
+  // A name alone, or a name and no source, is never enough to act on.
+  assert.match(parseMergeCommand('Bleach').error, /Usage: \/merge Bleach SB-/);
+  assert.match(parseMergeCommand(target).error, /Add at least one Post ID to absorb/);
+  // "Sb -29292" looks like an ID and must be reported, not read as a title.
+  assert.match(parseMergeCommand('bleach Sb -29292 SB-1111222233').error, /is not a SoraBox Post ID/);
+  // A valid ID is never reported as a near-miss, however the rest reads.
+  assert.equal(parseMergeCommand('SB-0123ABCDEF SB-1111222233').error, undefined);
+});
+
+test('a merge trim is described by season, episode, or both', () => {
+  assert.deepEqual(parseMergeDropInstruction('season 2'), { mode: 'season', season: 2 });
+  assert.deepEqual(parseMergeDropInstruction('s2'), { mode: 'season', season: 2 });
+  assert.deepEqual(parseMergeDropInstruction('all of season 12'), { mode: 'season', season: 12 });
+  assert.deepEqual(parseMergeDropInstruction('ep 5'), { mode: 'episodes', season: null, start: 5, end: 5 });
+  assert.deepEqual(parseMergeDropInstruction('episode 2 to 7'), { mode: 'episodes', season: null, start: 2, end: 7 });
+  assert.deepEqual(parseMergeDropInstruction('season 2 ep 5-7'), { mode: 'episodes', season: 2, start: 5, end: 7 });
+  assert.match(parseMergeDropInstruction('').error, /Say what to remove/);
+  assert.match(parseMergeDropInstruction('season 0').error, /Season numbers must be digits from 1 to 99/);
+  assert.match(parseMergeDropInstruction('season two').error, /Season numbers must be digits from 1 to 99/);
+  assert.match(parseMergeDropInstruction('ep 9-2').error, /no earlier than the start/);
+  assert.match(parseMergeDropInstruction('everything').error, /Use a form such as season 2/);
+});
+
+test('a merge plan names the cards, the season blocks, and the announcements it will delete', async () => {
+  const { repository } = await mergeFixture();
+  const mistyped = parseMergeCommand('bleach SB-NOPE SB-112233445');
+  assert.match(mistyped.error, /is not a SoraBox Post ID/);
+  assert.match(mistyped.error, /copy the exact IDs from \/posts 50/);
+
+  const missing = await resolveMergePlan({ repository, parsed: { action: 'plan', targetAdminId: 'SB-0000000000', sourceAdminIds: ['SB-1111111111'], label: '' } });
+  assert.match(missing.error, /No published catalog post was found for SB-0000000000/);
+
+  const cards = await repository.listAdminContent({ limit: 50 });
+  const byTitle = new Map((Array.isArray(cards) ? cards : cards.items).map((item) => [item.title, item.adminId]));
+  const preview = await resolveMergePlan({
+    repository,
+    parsed: { action: 'plan', label: 'Bleach', targetAdminId: byTitle.get('Bleach'), sourceAdminIds: [byTitle.get('Bleach Season 2'), byTitle.get('Bleach Movie'), 'SB-9999999999'] }
+  });
+  assert.equal(preview.error, undefined);
+  assert.deepEqual(preview.plan.sources.map((source) => source.title), ['Bleach Season 2', 'Bleach Movie']);
+  assert.deepEqual(preview.plan.seasons, [1, 2], 'the merged card spans both seasons');
+  assert.equal(preview.plan.movedFiles, 4);
+  assert.equal(preview.plan.movedAnnouncements, 1);
+  assert.deepEqual(preview.plan.missing, ['SB-9999999999']);
+
+  const text = mergePlanText(preview.plan, {});
+  assert.match(text, new RegExp(`Merge into ${byTitle.get('Bleach')} \u00b7 Bleach`));
+  assert.match(text, /6 files and 5 episodes across 2 season blocks \(S1, S2\)/);
+  assert.match(text, /1 announcement message for the absorbed posts will be deleted/);
+  assert.match(text, /Not found and skipped: SB-9999999999/);
+  assert.match(text, /Nothing changes until then/);
+
+  // The title in front is a safety check, and a mismatch stops the merge.
+  const refused = await resolveMergePlan({
+    repository,
+    parsed: { action: 'plan', label: 'Naruto', targetAdminId: byTitle.get('Bleach'), sourceAdminIds: [byTitle.get('Bleach Season 2')] }
+  });
+  assert.match(refused.error, /is not the name of/);
+  assert.match(refused.error, /I stopped so the files cannot land on the wrong card/);
+
+  // 18+ never shares a card with a normal release, because the age gate and the
+  // private storage channel both follow the target.
+  const adult = await repository.createContent({ title: 'Bleach 18+', category: 'adult', files: [mergeFile(7, 'Bleach.X.mp4', null, null)] });
+  const boundary = await resolveMergePlan({
+    repository,
+    parsed: { action: 'plan', targetAdminId: byTitle.get('Bleach'), sourceAdminIds: [adult.adminId], label: '' }
+  });
+  assert.deepEqual(boundary.error.match(/18\+ storage and age gate stay separate/), boundary.error.match(/18\+ storage and age gate stay separate/));
+  assert.match(boundary.error, /18\+ storage and age gate stay separate/);
+  assert.match(mergeInstructions(), /\/merge drop SB-0123ABCDEF season 2/);
+});
+
+test('applying a merge moves every file and player, deletes the absorbed cards, and keeps the storage', async () => {
+  const { repository, seasonOne, seasonTwo, movie, bot, deletes } = await mergeFixture();
+  const { plan } = await resolveMergePlan({
+    repository,
+    parsed: parseMergeCommand(`bleach ${seasonOne.adminId} ${seasonTwo.adminId} ${movie.adminId} SB-9999999999`)
+  });
+  const outcome = await applyMergePlan({ bot, repository, config: { publicSiteUrl: 'https://site.test' }, plan });
+
+  assert.equal(outcome.error, undefined);
+  assert.deepEqual(outcome.moved.map((entry) => entry.title), ['Bleach Season 2', 'Bleach Movie']);
+  assert.deepEqual(deletes, ['-100anime:101'], 'only the absorbed announcement message is deleted');
+  assert.equal(await repository.findContentByAdminId(seasonTwo.adminId), null);
+  assert.equal(await repository.findContentByAdminId(movie.adminId), null);
+  assert.notEqual(await repository.findContentByAdminId(seasonOne.adminId), null, 'the target keeps its own card');
+
+  const merged = await repository.findContentByAdminId(seasonOne.adminId);
+  assert.equal(merged.files.length, 6, 'Season 2 Episode 01 must never replace Season 1 Episode 01');
+  assert.equal(merged.episodeCount, 5);
+  assert.deepEqual(merged.files.map((file) => file.storageMessageId).sort(), [1, 2, 3, 4, 5, 6], 'the same Telegram messages are still what gets delivered');
+  assert.deepEqual(
+    merged.episodeGroups.map((group) => [group.season, group.seasonLabel, group.label]),
+    [[1, 'Season 1', 'Episode 01'], [1, 'Season 1', 'Episode 02'], [2, 'Season 2', 'Episode 01'], [2, 'Season 2', 'Episode 02'], [2, 'Season 2', 'Episode 03']]
+  );
+  assert.equal(merged.stream.entries.some((entry) => entry.embedUrl === 'https://www.dailymotion.com/embed/video/xS2E1'), true, 'the moved player travels with the files');
+  assert.deepEqual(
+    [merged.automationKey, ...(merged.automationKeys || [])].filter(Boolean).sort(),
+    [...new Set(['bleach', 'bleach', 'bleach-movie', 'bleach-season-2'])].sort(),
+    'an upload using an absorbed title lands on this card instead of a new one'
+  );
+
+  const result = mergeResultText(outcome, { publicSiteUrl: 'https://site.test' });
+  assert.match(result, /6 files on this card \u00b7 5 episodes/);
+  assert.match(result, /Season 1: 2 episodes/);
+  assert.match(result, /Season 2: 3 episodes/);
+  assert.match(result, /Deleted from the website: SB-/);
+  assert.match(result, /Announcement messages: 1 deleted/);
+  assert.match(result, /private storage files were not touched/);
+
+  // The card is still announced from its own post, so its own announcement has
+  // to be rewritten with the new episode summary.
+  assert.equal(deletes.length, 1);
+  assert.equal(outcome.announcementSync.updated >= 0, true);
+
+  // Merging the same card again is refused instead of half-applied.
+  const replay = await applyMergePlan({ bot, repository, config: {}, plan });
+  assert.match(replay.error, /None of the listed posts still exist/);
+});
+
+test('a merge that cannot delete an announcement still reports it', async () => {
+  const { repository, seasonOne, seasonTwo } = await mergeFixture();
+  const refused = {
+    telegram: {
+      async editMessageText() { return true; },
+      async deleteMessage() { throw new Error('Forbidden: bot is not a channel admin'); }
+    }
+  };
+  const { plan } = await resolveMergePlan({ repository, parsed: parseMergeCommand(`bleach ${seasonOne.adminId} ${seasonTwo.adminId}`) });
+  const outcome = await applyMergePlan({ bot: refused, repository, config: {}, plan });
+  assert.equal(outcome.announcementMessages.deleted, 0);
+  assert.equal(outcome.announcementMessages.failed, 1, 'the card is merged even when Telegram refuses the delete');
+  assert.match(mergeResultText(outcome, {}), /1 could not be deleted \(is the bot an admin in that channel\?\)/);
+});
+
+test('dropping a season or an episode trims one card without touching storage', async () => {
+  const { repository, seasonOne, seasonTwo, bot } = await mergeFixture();
+  const { plan } = await resolveMergePlan({ repository, parsed: parseMergeCommand(`bleach ${seasonOne.adminId} ${seasonTwo.adminId}`) });
+  await applyMergePlan({ bot, repository, config: {}, plan });
+  const card = await repository.findContentByAdminId(seasonOne.adminId);
+
+  const dropped = await applyMergeDrop({ repository, bot, config: {}, adminId: card.adminId, drop: { mode: 'season', season: 1 } });
+  assert.equal(dropped.error, undefined);
+  assert.equal(dropped.removed.length, 2, 'both Season 1 files came off the card');
+  assert.equal(dropped.remaining, 3);
+  const afterSeason = await repository.findContentByAdminId(card.adminId);
+  assert.deepEqual(afterSeason.files.map((file) => file.name), ['Bleach.S02E01.mkv', 'Bleach.S02E02.mkv', 'Bleach.S02E03.mkv']);
+  // One season left is not a season block any more, so the labels collapse back.
+  assert.deepEqual(afterSeason.episodeGroups.map((group) => group.seasonLabel ?? null), [null, null, null]);
+
+  const episodes = await applyMergeDrop({ repository, bot, config: {}, adminId: card.adminId, drop: { mode: 'episodes', season: null, start: 2, end: 3 } });
+  assert.deepEqual(episodes.removed.map((file) => file.name), ['Bleach.S02E02.mkv', 'Bleach.S02E03.mkv']);
+  const emptied = await repository.findContentByAdminId(card.adminId);
+  assert.equal(emptied.files.length, 1);
+  assert.equal(emptied.episodeCount, 1);
+
+  const nothing = await applyMergeDrop({ repository, bot, config: {}, adminId: card.adminId, drop: { mode: 'season', season: 5 } });
+  assert.match(nothing.error, /has no Season 5 block \(S2\)/);
+
+  // The last file on the card is refused so no empty card is left behind silently.
+  const last = await applyMergeDrop({ repository, bot, config: {}, adminId: card.adminId, drop: { mode: 'episodes', season: null, start: 1, end: 1 } });
+  assert.deepEqual(last.removed.map((file) => file.name), ['Bleach.S02E01.mkv']);
+  assert.equal((await repository.findContentByAdminId(card.adminId)).files.length, 0);
+});
+
+test('a pending merge is remembered for one publisher chat and forgotten on cancel', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  assert.equal(await repository.findMergePlan(642, 642), null, 'no plan before the publisher asks for one');
+  await repository.startMergePlan({ chatId: 642, ownerId: 642, plan: { targetAdminId: 'SB-0123ABCDEF', sources: [{ adminId: 'SB-1111222233' }] } });
+  const pending = await repository.findMergePlan(642, 642);
+  assert.equal(pending.plan.targetAdminId, 'SB-0123ABCDEF');
+  await repository.startMergePlan({ chatId: 642, ownerId: 642, plan: { targetAdminId: 'SB-0000000000', sources: [] } });
+  assert.equal((await repository.findMergePlan(642, 642)).plan.targetAdminId, 'SB-0000000000', 'the newest plan replaces the old one');
+  assert.equal(await repository.findMergePlan(643, 643), null, 'another publisher never inherits this plan');
+  await repository.deleteMergePlan(642, 642);
+  assert.equal(await repository.findMergePlan(642, 642), null);
+
+  const expired = await repository.startMergePlan({ chatId: 642, ownerId: 642, plan: { targetAdminId: 'SB-0123ABCDEF' }, expiresAt: new Date(Date.now() - 1000) });
+  assert.equal(expired.plan.targetAdminId, 'SB-0123ABCDEF');
+  assert.equal(await repository.findMergePlan(642, 642), null, 'an unread merge plan lapses instead of waiting to be confirmed by accident');
+});
+

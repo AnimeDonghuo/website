@@ -372,12 +372,15 @@ export function fileReplacementKey(file) {
 }
 
 /**
- * Split one upload batch into per-season file groups so different seasons can
- * never share a catalog post. Episodes restart at 1 in every season, so an
- * unmarked file is attributed by upload position — it joins the season block it
- * was sent inside, or the first season when nothing precedes it.
+ * Resolve the season of every file in one list. A stored season wins, then a
+ * caption/filename marker; an unmarked file is attributed by upload position —
+ * it joins the season block it was sent inside, or the first season when
+ * nothing precedes it. Returns null seasons when the list is not seasonal, so a
+ * single-season card never gains a season label and a movie never invents one.
+ * Both the upload split and a merged card use this one attribution, so the
+ * blocks a publisher reads are the blocks the website shows.
  */
-export function groupFilesBySeason(files = []) {
+export function attributeUploadSeasons(files = []) {
   const entries = (Array.isArray(files) ? files : []).map((file) => {
     const stored = Number(file?.season);
     return {
@@ -388,16 +391,24 @@ export function groupFilesBySeason(files = []) {
     };
   });
   const seasons = [...new Set(entries.map((entry) => entry.season).filter(Boolean))].sort((first, second) => first - second);
-  if (seasons.length <= 1) return [];
+  if (seasons.length <= 1) return { entries: entries.map((entry) => ({ ...entry, season: null })), seasons: [] };
 
-  const groups = new Map(seasons.map((season) => [season, []]));
   let currentSeason = null;
-  for (const entry of entries) {
+  const attributed = entries.map((entry) => {
     const season = entry.season || currentSeason || seasons[0];
-    groups.get(season).push(entry.file);
     currentSeason = season;
-  }
+    return { ...entry, season };
+  });
+  return { entries: attributed, seasons };
+}
 
+/** Split one upload batch into per-season file groups so different seasons can
+ * never share a catalog post. */
+export function groupFilesBySeason(files = []) {
+  const { entries, seasons } = attributeUploadSeasons(files);
+  if (seasons.length <= 1) return [];
+  const groups = new Map(seasons.map((season) => [season, []]));
+  for (const entry of entries) groups.get(entry.season).push(entry.file);
   return seasons
     .filter((season) => groups.get(season).length)
     .map((season) => ({
@@ -406,7 +417,6 @@ export function groupFilesBySeason(files = []) {
       files: groups.get(season)
     }));
 }
-
 
 function uniqueLanguageLabels(values = [], maximum = 8) {
   const labels = [];
@@ -633,13 +643,18 @@ export function summarizeEpisodes(files = []) {
   const groups = new Map();
   const episodeNumbers = new Set();
   let detectedFiles = 0;
+  // A merged or multi-season post keeps its blocks apart by season: episodes
+  // restart at 1 in every season, so Season 1 Episode 5 and Season 2 Episode 5
+  // are two different rows instead of one crowded pair of qualities.
+  const { entries, seasons } = attributeUploadSeasons(files);
+  const seasonal = seasons.length > 1;
 
-  for (const file of files) {
+  for (const { file, season } of entries) {
     const start = Number(file?.episode?.start);
     const end = Number(file?.episode?.end ?? file?.episode?.start);
     if (!validEpisode(start) || !validEpisode(end) || end < start || end - start > MAX_RANGE_WIDTH) continue;
     detectedFiles += 1;
-    const key = `${start}-${end}`;
+    const key = seasonal ? `${season ?? 0}:${start}-${end}` : `${start}-${end}`;
     const current = groups.get(key) || {
       start,
       end,
@@ -648,14 +663,18 @@ export function summarizeEpisodes(files = []) {
       // lists those in their own block instead of mixing them into the single
       // episode rows they overlap.
       combined: end !== start,
-      fileCount: 0
+      fileCount: 0,
+      ...(seasonal ? { season, seasonLabel: formatSeasonLabel(season) } : {})
     };
     current.fileCount += 1;
     groups.set(key, current);
-    for (let episode = start; episode <= end; episode += 1) episodeNumbers.add(episode);
+    for (let episode = start; episode <= end; episode += 1) {
+      episodeNumbers.add(seasonal ? `${season ?? 0}:${episode}` : episode);
+    }
   }
 
-  const publicGroups = [...groups.values()].sort((first, second) => first.start - second.start || first.end - second.end);
+  const publicGroups = [...groups.values()].sort((first, second) =>
+    (first.season || 0) - (second.season || 0) || first.start - second.start || first.end - second.end);
   const count = episodeNumbers.size;
   const releaseLabel = count
     ? publicGroups.length === 1 && publicGroups[0].start !== publicGroups[0].end

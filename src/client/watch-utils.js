@@ -5,17 +5,29 @@ function episodeRange(value) {
   return { start, end };
 }
 
+/** A usable season number only: nothing, `0`, and text never become Season 0. */
+function episodeSeason(value) {
+  const season = Number(value?.season);
+  return Number.isInteger(season) && season >= 1 && season <= 99 ? season : null;
+}
+
 export function formatEpisodeNumber(value) {
   return String(value).padStart(2, '0');
 }
 
-export function parseEpisodeRoute(value) {
+/**
+ * An episode route plus the season it belongs to. A card that spans seasons has
+ * more than one Episode 01, so `?s=2` travels beside the number and keeps the
+ * page on the right block.
+ */
+export function parseEpisodeRoute(value, season = null) {
   const match = String(value || '').match(/^(\d{1,3})(?:-(\d{1,3}))?$/);
   if (!match) return null;
   const range = episodeRange({ start: match[1], end: match[2] || match[1] });
   if (!range) return null;
   return {
     ...range,
+    season: episodeSeason({ season }),
     label: range.start === range.end
       ? `Episode ${formatEpisodeNumber(range.start)}`
       : `Episodes ${formatEpisodeNumber(range.start)}–${formatEpisodeNumber(range.end)}`
@@ -26,7 +38,27 @@ export function episodePagePath(item, group) {
   const range = episodeRange(group);
   if (!range) return `/${item.category}/${item.slug}`;
   const pathRange = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
-  return `/${item.category}/${item.slug}/episode/${pathRange}`;
+  const season = episodeSeason(group);
+  return `/${item.category}/${item.slug}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
+}
+
+/**
+ * The episode-index block a route belongs to. When the route names a season the
+ * same-numbered block of another season is never an acceptable match; an older
+ * card without season data still falls back to the number alone.
+ */
+export function findEpisodeGroup(groups = [], episode = null) {
+  const range = episodeRange(episode);
+  if (!range) return null;
+  const list = Array.isArray(groups) ? groups : [];
+  const season = episodeSeason(episode);
+  const matches = list.filter((group) => Number(group?.start) === range.start && Number(group?.end ?? group?.start) === range.end);
+  if (!season) return matches[0] || null;
+  const seasonMatches = matches.filter((group) => episodeSeason(group) === season);
+  if (seasonMatches.length) return seasonMatches[0];
+  // A card whose blocks carry no season at all (published before merging existed)
+  // is still readable by number alone, so an old link never turns into a 404.
+  return matches.find((group) => !episodeSeason(group)) || null;
 }
 
 /**
@@ -79,7 +111,14 @@ export function episodeStreamEntries(entries = [], episode) {
 export function fileChoicesForEpisode(choices = [], episode, { includeOverlapping = true } = {}) {
   const requested = episodeRange(episode);
   if (!requested) return [];
-  const list = Array.isArray(choices) ? choices : [];
+  let list = Array.isArray(choices) ? choices : [];
+  // A merged card holds the same episode number in two seasons. When the route
+  // names a season and the files really are season-tagged, only that block is
+  // offered; otherwise the list is left alone so older releases keep every file.
+  const season = episodeSeason(episode);
+  if (season && list.some((choice) => episodeSeason(choice))) {
+    list = list.filter((choice) => episodeSeason(choice) === season);
+  }
   const exact = list.filter((choice) => {
     const range = episodeRange(choice?.episode);
     return Boolean(range && range.start === requested.start && range.end === requested.end);
@@ -91,10 +130,23 @@ export function fileChoicesForEpisode(choices = [], episode, { includeOverlappin
 /** Split one episode index into single episodes and combined pack uploads. */
 export function splitEpisodeGroups(groups = []) {
   const list = Array.isArray(groups) ? groups : [];
-  return {
-    episodes: list.filter((group) => Number.isInteger(group?.start) && group.start === Number(group?.end)),
-    packs: list.filter((group) => Number.isInteger(group?.start) && Number(group?.end) > group.start)
-  };
+  const isSingle = (group) => Number.isInteger(group?.start) && group.start === Number(group?.end);
+  const episodes = list.filter(isSingle);
+  const packs = list.filter((group) => Number.isInteger(group?.start) && Number(group?.end) > group.start);
+  // Season blocks are only handed to the page when a card spans more than one
+  // season, so every other release renders its guide exactly as it did before.
+  const seasons = [];
+  for (const group of list) {
+    const season = episodeSeason(group);
+    if (!season) continue;
+    let block = seasons.find((entry) => entry.season === season);
+    if (!block) {
+      block = { season, seasonLabel: group.seasonLabel || `Season ${season}`, episodes: [], packs: [] };
+      seasons.push(block);
+    }
+    (isSingle(group) ? block.episodes : block.packs).push(group);
+  }
+  return { episodes, packs, seasons: seasons.length > 1 ? seasons : [] };
 }
 
 export function isReleaseLevelStream(entry) {
@@ -143,11 +195,15 @@ function seasonFromLabel(label) {
 export function episodeSeasonNumber(item, episode) {
   const range = episodeRange(episode);
   if (!range) return null;
+  // The route itself knows its season after /merge, which is the only answer
+  // that cannot be confused with the same number in another block.
+  const requestedSeason = episodeSeason(episode);
+  if (requestedSeason) return requestedSeason;
   for (const group of Array.isArray(item?.episodeGroups) ? item.episodeGroups : []) {
     const start = Number(group?.start);
     const end = Number(group?.end) || start;
     if (!Number.isInteger(start) || range.start < start || range.start > end) continue;
-    const season = seasonFromLabel(group?.label);
+    const season = episodeSeason(group) || seasonFromLabel(group?.label);
     if (season) return season;
   }
   return seasonFromLabel(item?.title);
@@ -197,5 +253,6 @@ export function watchPagePath(item, episode = null) {
   const range = episodeRange(episode);
   if (!range) return base;
   const pathRange = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
-  return `${base}/episode/${pathRange}`;
+  const season = episodeSeason(episode);
+  return `${base}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
 }

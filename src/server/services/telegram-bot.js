@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
-import { cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { attributeUploadSeasons, cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
@@ -208,6 +208,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'teststorage', description: 'Check the storage channel connection' },
   { command: 'cancel', description: 'Discard current upload draft' },
   { command: 'delete', description: 'Delete one or more post IDs' },
+  { command: 'merge', description: 'Absorb cards into one post, or drop a season/episodes' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
   { command: 'stats', description: 'View publisher analytics' },
@@ -3292,6 +3293,442 @@ export function playersKeyboard(entries) {
   return Markup.inlineKeyboard(rows);
 }
 
+/* ---------------------------------------------------------------------------
+ * Post merging (/merge)
+ *
+ * A multi-season upload is intentionally published as one card per season, and
+ * providers sometimes export the same show as several cards. /merge puts those
+ * cards back together: the target keeps its own ID, slug, poster, and delivery
+ * identity, absorbs every file and player of the listed cards, rebuilds its
+ * season blocks, and the cards it absorbed are removed from the website and from
+ * the announcement channels. Private storage messages are never touched, so a
+ * merge can be undone by re-adding files with /batch.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Parse a /merge line. The first Post ID is always the card that receives the
+ * files; a title in front of it is a safety check, not a search. `drop` trims
+ * files back off one card, by season or by episode range.
+ */
+export function parseMergeCommand(value) {
+  const text = cleanText(value, 1_200);
+  const lowered = text.trim().toLowerCase();
+  if (!text || /^(?:help|example|\?)$/.test(lowered)) return { action: 'help' };
+  if (/^(?:confirm|yes|do it|go ahead|merge it)$/.test(lowered)) return { action: 'confirm' };
+  if (/^(?:cancel|never mind|stop|no)$/.test(lowered)) return { action: 'cancel' };
+
+  const adminIds = postIdsFromCommand(text);
+  // Everything that is not a Post ID, so a mistyped ID can never be read as a
+  // title: "Sb -29292" is reported instead of silently ignored.
+  const words = cleanText(text.replace(/SB-[A-F0-9]{10}/gi, ' ').replace(/\s+/g, ' ').trim(), 140);
+  // Anything shaped like a Post ID that is not one: a wrong length or stray
+  // letters is reported instead of being read as a title or dropped silently.
+  const malformed = [...text.matchAll(/\bs\s*b\s*[-]?\s*[a-f0-9]{1,14}\b/gi)]
+    .filter((match) => !adminIds.includes(cleanText(match[0], 40).toUpperCase().replace(/\s+/g, '').replace(/^(SB)[^A-F0-9]/, 'SB-')));
+  if (adminIds.length < 2 && malformed.length) {
+    return { error: `“${malformed.map((match) => cleanText(match[0], 24)).join('”, “')}” ${malformed.length === 1 ? 'is' : 'are'} not a SoraBox Post ID. A Post ID is SB- plus ten hexadecimal characters — copy the exact IDs from /posts 50.` };
+  }
+
+  if (/^drop\b/i.test(words)) {
+    const instruction = cleanText(words.replace(/^drop\b/i, '').trim(), 120);
+    const drop = parseMergeDropInstruction(instruction);
+    if (drop.error) return { error: drop.error };
+    if (!adminIds.length) return { error: 'Say which card to trim: /merge drop SB-0123ABCDEF season 2' };
+    return { action: 'drop', targetAdminId: adminIds[0], drop };
+  }
+
+  if (adminIds.length === 0) {
+    return { error: 'Usage: /merge Bleach SB-0123ABCDEF SB-1111222233 SB-4444555566 — the first Post ID keeps its card and receives every file of the others. Use /merge help for removing a season or episodes.' };
+  }
+  if (adminIds.length < 2) {
+    return { error: `Add at least one Post ID to absorb after the target: /merge ${adminIds[0]} SB-SECONDID${words ? ` (or /merge ${words.split(' ')[0]} ${adminIds[0]} SB-SECONDID)` : ''}` };
+  }
+  return {
+    action: 'plan',
+    label: adminIds.length > 1 ? cleanText(words, 140) : '',
+    targetAdminId: adminIds[0],
+    sourceAdminIds: adminIds.slice(1)
+  };
+}
+
+/**
+ * `season 2`, `s2`, `ep 5`, `episodes 5-7`, or `season 2 ep 5-7`. Episode
+ * numbers restart in every season, so a bare `ep 5` on a merged card removes
+ * Episode 5 of every season and a season-qualified one removes only that block.
+ */
+export function parseMergeDropInstruction(value) {
+  const text = cleanText(value, 120);
+  if (!text) return { error: 'Say what to remove: /merge drop SB-0123ABCDEF season 2, ep 5, ep 2-7, or season 2 ep 5.' };
+  const season = text.match(/^(?:all\s+of\s+)?s(?:eason)?\.?\s*0*(\d{1,2})\b(.*)$/i);
+  const seasonNumber = season ? Number(season[1]) : null;
+  // `Season 0` is not a block anyone can read back off a card, and a bare word
+  // like `season two` must be reported rather than dropped.
+  if (season && !(Number.isInteger(seasonNumber) && seasonNumber >= 1)) {
+    return { error: 'Season numbers must be digits from 1 to 99, for example season 2.' };
+  }
+  const remainder = cleanText(season ? season[2] : text, 60);
+  const episodes = remainder.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?$/i);
+  if (episodes) {
+    const start = Number(episodes[1]);
+    const end = Number(episodes[2] || episodes[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+      return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+    }
+    return { mode: 'episodes', season: seasonNumber, start, end };
+  }
+  if (remainder) {
+    // "season two" names a season but not in digits, which is the mistake worth
+    // calling out rather than a generic format complaint.
+    const words = /^(?:all\s+of\s+)?s(?:eason)?\.?\b/i.test(remainder);
+    return { error: words
+      ? 'Season numbers must be digits from 1 to 99, for example season 2.'
+      : 'Use a form such as season 2, ep 5, ep 2-7, or season 2 ep 5-7.' };
+  }
+  if (!season) {
+    const bareSeason = text.match(/^s(?:eason)?\.?\s*0*(\d{1,2})$/i);
+    if (bareSeason) return { mode: 'season', season: Number(bareSeason[1]) };
+    return { error: 'Use a form such as season 2, ep 5, ep 2-7, or season 2 ep 5-7.' };
+  }
+  return { mode: 'season', season: seasonNumber };
+}
+
+function titleIdentityKey(value) {
+  return cleanText(value, 180).toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Read every card the publisher named and turn it into an explicit plan. Nothing
+ * is changed here: a merge deletes catalog posts, so the plan is shown first and
+ * applied by the confirmation button.
+ */
+export async function resolveMergePlan({ repository, parsed = {} }) {
+  if (typeof repository.findContentByAdminId !== 'function' || typeof repository.deleteContentByAdminId !== 'function') {
+    return { error: 'Post merging is not available in this catalog store.' };
+  }
+  const target = await repository.findContentByAdminId(parsed.targetAdminId);
+  if (!target) return { error: `No published catalog post was found for ${parsed.targetAdminId}. Use /posts 50 to copy the exact target ID.` };
+  if (parsed.label && titleIdentityKey(parsed.label) !== titleIdentityKey(target.title)) {
+    return { error: `“${parsed.label}” is not the name of ${target.adminId} (“${target.title}”). I stopped so the files cannot land on the wrong card — check the target ID with /posts 50.` };
+  }
+
+  const sources = [];
+  const missing = [];
+  const blocked = [];
+  const sourceFiles = [];
+  const seasons = new Set();
+  let movedFiles = 0;
+  let movedPlayers = 0;
+  let movedAnnouncements = 0;
+  for (const adminId of parsed.sourceAdminIds) {
+    if (adminId === target.adminId) continue;
+    const source = await repository.findContentByAdminId(adminId);
+    if (!source) {
+      missing.push(adminId);
+      continue;
+    }
+    if (isAdultCategory(source.category) !== isAdultCategory(target.category)) {
+      blocked.push({ adminId, title: cleanText(source.title, 70), reason: '18+ storage and age gate stay separate' });
+      continue;
+    }
+    const files = Array.isArray(source.files) ? source.files : [];
+    const summary = summarizeEpisodes(files);
+    // Per-file detection, not the split planner: a source carrying one marked
+    // season is still worth naming in the preview even though it needs no split.
+    const sourceSeasons = [...new Set(files.map((file) => detectUploadSeasonForFile(file)).filter(Boolean))].sort((first, second) => first - second);
+    for (const season of sourceSeasons) seasons.add(season);
+    sourceFiles.push(...files);
+    movedFiles += files.length;
+    movedPlayers += (Array.isArray(source.stream?.entries) ? source.stream.entries : []).length;
+    movedAnnouncements += (Array.isArray(source.announcementRefs) ? source.announcementRefs : []).length;
+    sources.push({
+      adminId: source.adminId,
+      title: cleanText(source.title, 70),
+      category: source.category,
+      files: files.length,
+      episodes: summary.count,
+      seasons: sourceSeasons,
+      players: (Array.isArray(source.stream?.entries) ? source.stream.entries : []).length,
+      announcements: (Array.isArray(source.announcementRefs) ? source.announcementRefs : []).length
+    });
+  }
+  if (!sources.length) {
+    if (blocked.length) return { error: `None of the listed posts can be merged into ${target.adminId}: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}.` };
+    return { error: `There is no other post to absorb${missing.length ? ` (${missing.join(', ')} was not found)` : ''}.` };
+  }
+
+  const targetFiles = Array.isArray(target.files) ? target.files : [];
+  const targetSummary = summarizeEpisodes(targetFiles);
+  for (const season of targetFiles.map((file) => detectUploadSeasonForFile(file)).filter(Boolean)) seasons.add(season);
+
+  return {
+    plan: {
+      targetAdminId: target.adminId,
+      targetTitle: cleanText(target.title, 90),
+      targetCategory: target.category,
+      label: cleanText(parsed.label, 140) || null,
+      targetFiles: targetFiles.length,
+      targetPlayers: (Array.isArray(target.stream?.entries) ? target.stream.entries : []).length,
+      sources,
+      missing,
+      blocked,
+      movedFiles,
+      movedPlayers,
+      movedAnnouncements,
+      // The blocks the card will actually show: season attribution runs over the
+      // combined list the same way the merged card itself computes it.
+      seasons: attributeUploadSeasons([...targetFiles, ...sourceFiles]).seasons,
+      targetSeasons: [...seasons].sort((first, second) => first - second),
+      resultingFiles: targetFiles.length + movedFiles,
+      resultingEpisodes: targetSummary.count + sources.reduce((total, source) => total + (source.episodes || 0), 0)
+    }
+  };
+}
+
+export function mergePlanText(plan, config = {}) {
+  const lines = [
+    `Merge into ${plan.targetAdminId} · ${plan.targetTitle}`,
+    '',
+    `▪ Absorbing ${plan.sources.length} post${plan.sources.length === 1 ? '' : 's'} — ${plan.movedFiles} file${plan.movedFiles === 1 ? '' : 's'} move to ${plan.targetAdminId}:`,
+    ...plan.sources.map((source) => `   • ${source.adminId} · ${source.title} — ${source.files} file${source.files === 1 ? '' : 's'}${source.episodes ? `, ${source.episodes} episode${source.episodes === 1 ? '' : 's'}` : ''}${source.seasons.length ? `, S${source.seasons.join('/S')}` : ''}${source.players ? `, ${source.players} player${source.players === 1 ? '' : 's'}` : ''}`),
+    '',
+    `▪ The target keeps its own ID, slug, poster, and delivery links, then shows ${plan.resultingFiles} file${plan.resultingFiles === 1 ? '' : 's'} and ${plan.resultingEpisodes} episode${plan.resultingEpisodes === 1 ? '' : 's'}${plan.seasons.length > 1 ? ` across ${plan.seasons.length} season blocks (${plan.seasons.map((season) => `S${season}`).join(', ')})` : ''}.`,
+    plan.movedAnnouncements ? `▪ ${plan.movedAnnouncements} announcement message${plan.movedAnnouncements === 1 ? '' : 's'} for the absorbed posts will be deleted from the announcement channel${plan.movedAnnouncements === 1 ? '' : 's'}.` : '▪ None of the absorbed posts has a recorded announcement message.',
+    '▪ The files themselves stay in the private storage channel, so this can be undone with /batch and /merge drop.',
+    plan.missing.length ? `▪ Not found and skipped: ${plan.missing.join(', ')}.` : null,
+    plan.blocked.length ? `▪ Left alone: ${plan.blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}.` : null,
+    '',
+    'Confirm to apply. Nothing changes until then.'
+  ].filter((line) => line !== null);
+  return lines.join('\n').slice(0, 3_700);
+}
+
+export function mergeConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Confirm merge', 'mrg:go'), Markup.button.callback('Cancel', 'mrg:no')],
+    [Markup.button.callback('Show the cards again', 'mrg:peek')]
+  ]);
+}
+
+export function mergeInstructions() {
+  return [
+    'Merge cards so one show lives in one post.',
+    '',
+    'Put the target first, then every card to absorb:',
+    '/merge Bleach SB-0123ABCDEF SB-1111222233 SB-4444555566',
+    '/merge SB-0123ABCDEF SB-1111222233',
+    '',
+    'The title in front is only a check: I stop if that Post ID carries a different name. The target keeps its ID, slug, poster, and delivery links; every file and player of the other cards moves into it; season blocks are rebuilt (S1 with its episodes, then S2 …); and the absorbed cards are deleted from the website and their announcement messages deleted from the announcement channels.',
+    '',
+    'I show the plan first and change nothing until you tap Confirm merge (or /merge confirm). /merge cancel drops the plan.',
+    '',
+    'To trim a card instead — a whole season, or an episode added to it by mistake:',
+    '/merge drop SB-0123ABCDEF season 2',
+    '/merge drop SB-0123ABCDEF ep 5',
+    '/merge drop SB-0123ABCDEF season 2 ep 5-7',
+    'A drop only removes files from that card; the storage messages stay, so you can re-add them with /batch. Players attached to removed episodes stay until you remove them: /players SB-0123ABCDEF, then /cmd SB-0123ABCDEF del ep 5.'
+  ].join('\n');
+}
+
+export function mergeResultText(outcome, config = {}) {
+  if (outcome.error) return outcome.error;
+  const content = outcome.content || {};
+  const moved = Array.isArray(outcome.moved) ? outcome.moved : [];
+  const totalFiles = (Array.isArray(content?.files) ? content.files : []).length;
+  // One line per season block the website now shows, so the publisher can read
+  // the same structure a visitor sees without opening the page.
+  const perSeason = new Map();
+  for (const group of Array.isArray(content?.episodeGroups) ? content.episodeGroups : []) {
+    if (!group.seasonLabel) continue;
+    const current = perSeason.get(group.seasonLabel) || 0;
+    perSeason.set(group.seasonLabel, current + (group.count || 1));
+  }
+  const seasonLines = [...perSeason.entries()].map(([label, count]) => `   • ${label}: ${count} episode${count === 1 ? '' : 's'}`);
+  const multiSeason = perSeason.size > 1;
+  return [
+    `Merged ${moved.length || outcome.plan?.sources?.length || 0} post${(moved.length || 0) === 1 ? '' : 's'} into ${content.adminId || outcome.plan?.targetAdminId} · ${content.title || outcome.plan?.targetTitle}.`,
+    `▪ ${totalFiles} file${totalFiles === 1 ? '' : 's'} on this card · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'}.`,
+    seasonLines.length ? `▪ Season blocks on the website:\n${seasonLines.join('\n')}` : null,
+    outcome.playersMerged ? `▪ ${outcome.playersMerged} player${outcome.playersMerged === 1 ? '' : 's'} moved to /players ${content.adminId}.${multiSeason ? ' Players are matched by episode number only, so check each season keeps its own link.' : ''}` : null,
+    moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
+    outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
+      ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
+      : null,
+    outcome.plan.missing?.length ? `▪ Already gone: ${outcome.plan.missing.join(', ')}.` : null,
+    '▪ The private storage files were not touched, so nothing was uploaded again.',
+    getContentPageUrl(config, content) ? `Card: ${getContentPageUrl(config, content)}` : null
+  ].filter((line) => line !== null).join('\n').slice(0, 3_700);
+}
+
+export function mergeDropResultText(outcome, config = {}) {
+  if (outcome.error) return outcome.error;
+  const { content, removed, remaining } = outcome;
+  return [
+    `Removed ${removed.length} file${removed.length === 1 ? '' : 's'} (${outcome.description}) from ${content.adminId} · ${content.title}.`,
+    `▪ ${remaining} file${remaining === 1 ? '' : 's'} · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'} left on the card${content.episodeCount === 0 ? ' — it is empty now, so use /delete ' + content.adminId + ' to drop the card or /batch to re-add the files' : ''}.`,
+    outcome.playersLeft ? `▪ ${outcome.playersLeft} player${outcome.playersLeft === 1 ? '' : 's'} for the removed ${outcome.playersLeft === 1 ? 'episode is' : 'episodes are'} still attached: /cmd ${content.adminId} del ep ${outcome.playerRange || 'all'}.` : null,
+    '▪ The storage messages were not deleted, so these files can be added back with /batch later.'
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Move every absorbed card's files and players onto the target, then delete the
+ * absorbed cards and their announcement messages. The plan is re-read here, so a
+ * catalog change between preview and confirmation is applied as it stands rather
+ * than from a stale snapshot.
+ */
+export async function applyMergePlan({ bot, repository, config = {}, plan = {} }) {
+  const target = await repository.findContentByAdminId(plan.targetAdminId);
+  if (!target) return { error: `${plan.targetAdminId} no longer exists, so nothing was merged.` };
+  const movedFiles = [];
+  const movedPlayers = [];
+  const aliases = [];
+  const moved = [];
+  const missing = [];
+  const blocked = [];
+  const announcementMessages = { deleted: 0, failed: 0 };
+  const telegram = bot?.telegram;
+
+  for (const entry of plan.sources || []) {
+    const source = await repository.findContentByAdminId(entry.adminId);
+    if (!source) {
+      missing.push(entry.adminId);
+      continue;
+    }
+    if (isAdultCategory(source.category) !== isAdultCategory(target.category)) {
+      blocked.push({ adminId: source.adminId, reason: '18+ storage and age gate stay separate' });
+      continue;
+    }
+    movedFiles.push(...(Array.isArray(source.files) ? source.files : []));
+    movedPlayers.push(...(Array.isArray(source.stream?.entries) ? source.stream.entries : []));
+    aliases.push(...[source.titleKey, source.automationKey, ...(Array.isArray(source.automationKeys) ? source.automationKeys : [])].filter(Boolean));
+    for (const reference of Array.isArray(source.announcementRefs) ? source.announcementRefs : []) {
+      try {
+        await telegram.deleteMessage(reference.channelId, reference.messageId);
+        announcementMessages.deleted += 1;
+      } catch (error) {
+        announcementMessages.failed += 1;
+        console.warn('[telegram] merged-post announcement delete failed:', reference.channelId, error?.description || error?.message || 'Unknown error');
+      }
+    }
+    moved.push({
+      adminId: source.adminId,
+      title: cleanText(source.title, 70),
+      files: (Array.isArray(source.files) ? source.files : []).length
+    });
+    await repository.deleteContentByAdminId(source.adminId);
+  }
+
+  if (!moved.length) {
+    return {
+      error: missing.length
+        ? `None of the listed posts still exist (${missing.join(', ')}), so nothing was merged.`
+        : 'Every listed post was refused, so nothing was merged.'
+    };
+  }
+
+  // supersede: false — a Season 2 Episode 1 must land beside the Season 1
+  // Episode 1, unlike a re-upload of the same delivery slot, which replaces it.
+  const appended = await repository.appendFilesToContentByAdminId(target.adminId, movedFiles, aliases, { supersede: false });
+  if (!appended) return { error: `The absorbed files could not be saved on ${target.adminId}. No card was deleted.` };
+
+  let playersMerged = 0;
+  if (movedPlayers.length && typeof repository.updateContentStreamByAdminId === 'function') {
+    const stream = mergeStreamingEntries(appended.stream, movedPlayers.map((entry) => ({ entry })), { ...streamingOptionsFromConfig(config), granularity: 'exact' });
+    if (stream) {
+      await repository.updateContentStreamByAdminId(target.adminId, stream);
+      playersMerged = movedPlayers.length;
+    }
+  }
+
+  const content = await repository.findContentByAdminId(target.adminId);
+  // The merged card shows a new episode summary, so its own announcement must
+  // say the same thing.
+  const sync = await syncPublishedAnnouncements({ telegram, repository, content, config });
+  return {
+    plan,
+    content,
+    moved,
+    missing,
+    blocked,
+    filesMoved: movedFiles.length,
+    playersMerged,
+    announcementMessages,
+    announcementSync: sync
+  };
+}
+
+/**
+ * Trim files off one card: a whole season block, or specific episodes. Season
+ * attribution matches how the card was grouped, so "season 2" removes exactly
+ * what the card shows under Season 2.
+ */
+export async function applyMergeDrop({ repository, bot, config = {}, adminId, drop = {} }) {
+  const existing = await repository.findContentByAdminId(adminId);
+  if (!existing) return { error: `No published catalog post was found for ${adminId}.` };
+  const files = Array.isArray(existing.files) ? existing.files : [];
+  if (!files.length) return { error: `${existing.title} has no files attached, so there is nothing to remove.` };
+  const { entries, seasons } = attributeUploadSeasons(files);
+  if (drop.mode === 'season' && !seasons.includes(drop.season)) {
+    // A single-season card reports no blocks at all, so the season numbers that
+    // are really present are read file by file to make the refusal useful.
+    const present = [...new Set(files.map((file) => detectUploadSeasonForFile(file)).filter(Boolean))].sort((first, second) => first - second);
+    const listing = present.length ? ` (${present.map((season) => `S${season}`).join(', ')})` : '';
+    return { error: `${existing.adminId} has no Season ${drop.season} block${listing}. Nothing was removed.` };
+  }
+
+  const kept = [];
+  const removed = [];
+  for (const entry of entries) {
+    if (drop.mode === 'season') {
+      (entry.season === drop.season ? removed : kept).push(entry.file);
+      continue;
+    }
+    const start = Number(entry.file?.episode?.start);
+    const end = Number(entry.file?.episode?.end ?? entry.file?.episode?.start);
+    const overlaps = Number.isInteger(start) && Number.isInteger(end) && start <= drop.end && end >= drop.start;
+    const seasonOk = !drop.season || entry.season === drop.season;
+    (overlaps && seasonOk ? removed : kept).push(entry.file);
+  }
+  if (!removed.length) {
+    return { error: `Nothing on ${existing.adminId} matches ${describeMergeDrop(drop)}, so nothing was removed.` };
+  }
+  const content = await repository.replaceContentFilesByAdminId(existing.adminId, kept);
+  if (!content) return { error: 'The card could not be saved. Nothing was removed.' };
+
+  const players = publicStreamingData(content.stream, streamingOptionsFromConfig(config)).entries;
+  const droppedEpisodes = removed.map((file) => Number(file?.episode?.start)).filter(Number.isInteger);
+  const playersLeft = players.filter((entry) => {
+    const entryStart = Number(entry.episode?.start);
+    return Number.isInteger(entryStart) && droppedEpisodes.includes(entryStart);
+  }).length;
+  const sync = await syncPublishedAnnouncements({ telegram: bot?.telegram, repository, content, config });
+  return {
+    content,
+    removed,
+    remaining: kept.length,
+    description: describeMergeDrop(drop),
+    playersLeft,
+    // The advice has to name the episodes that actually lost their files, not
+    // the season number, because players are matched by episode number only.
+    playerRange: droppedEpisodes.length
+      ? (() => {
+        const lowest = Math.min(...droppedEpisodes);
+        const highest = Math.max(...droppedEpisodes);
+        return lowest === highest ? `${lowest}` : `${lowest}-${highest}`;
+      })()
+      : null,
+    announcementSync: sync
+  };
+}
+
+function describeMergeDrop(drop = {}) {
+  const seasonPart = drop.season ? `Season ${drop.season} ` : '';
+  if (drop.mode === 'season') return `${seasonPart.trim()}`;
+  return drop.end && drop.end !== drop.start
+    ? `${seasonPart}Episodes ${String(drop.start).padStart(2, '0')}\u2013${String(drop.end).padStart(2, '0')}`
+    : `${seasonPart}Episode ${String(drop.start).padStart(2, '0')}`;
+}
+
 function streamImportResultText(result, config) {
   const pages = [...new Set(result.updated
     .flatMap(({ content, entries }) => (entries || []).map((entry) => watchPageUrl(config, content, entry?.episode)))
@@ -3562,6 +3999,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
+          'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
           'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
@@ -3934,7 +4372,8 @@ export async function launchTelegramBot({ config, repository }) {
     await repository.deleteSession(chatId(ctx), userId(ctx));
     await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
     await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
-    await ctx.reply('Draft, pending backup recovery, or manual Watch-link import discarded. No catalog record was created.', panelKeyboard());
+    await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Draft, pending backup recovery, manual Watch-link import, or merge plan discarded. No catalog record was created or deleted.', panelKeyboard());
   });
 
   bot.command('done', async (ctx) => {
@@ -3966,6 +4405,95 @@ export async function launchTelegramBot({ config, repository }) {
       'Their delivery links no longer resolve. The original files remain in the private storage channel so you can manage them separately.',
       missing.length ? `Not found: ${missing.join(', ')}.` : null
     ].filter(Boolean).join('\n'));
+  });
+
+  // ── /merge: absorb other cards into one, then delete them and their
+  //    announcements. Destructive, so the plan is always shown first.
+  bot.command('merge', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /merge in your private publisher chat — it deletes catalog posts.');
+      return;
+    }
+    if (typeof repository.startMergePlan !== 'function' || typeof repository.findMergePlan !== 'function') {
+      await ctx.reply('This catalog store cannot hold a pending merge plan, so /merge is unavailable here.');
+      return;
+    }
+    const parsed = parseMergeCommand(parseCommandArgument(ctx.message.text, 1_200));
+    if (parsed.action === 'help') {
+      await ctx.reply(mergeInstructions());
+      return;
+    }
+    if (parsed.error) {
+      await ctx.reply(`${parsed.error}\nSend /merge help for the full form, including how to drop one season or a few episodes.`);
+      return;
+    }
+    if (parsed.action === 'cancel') {
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await ctx.reply('Merge cancelled. No post was merged or deleted.', panelKeyboard());
+      return;
+    }
+    if (parsed.action === 'confirm') {
+      const pending = await repository.findMergePlan?.(chatId(ctx), userId(ctx));
+      if (!pending?.plan) {
+        await ctx.reply('There is no merge waiting for confirmation. Start one with /merge Title SB-TARGET SB-SOURCE.');
+        return;
+      }
+      const outcome = await applyMergePlan({ bot, repository, config, plan: pending.plan });
+      if (outcome.error) {
+        await ctx.reply(outcome.error);
+        return;
+      }
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await replyBatchDiagnostics(ctx, [mergeResultText(outcome, config)]);
+      return;
+    }
+    if (parsed.action === 'drop') {
+      const outcome = await applyMergeDrop({ repository, bot, config, adminId: parsed.targetAdminId, drop: parsed.drop });
+      if (outcome.error) {
+        await ctx.reply(outcome.error);
+        return;
+      }
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await ctx.reply(mergeDropResultText(outcome, config));
+      return;
+    }
+
+    const resolved = await resolveMergePlan({ repository, parsed });
+    if (resolved.error) {
+      await ctx.reply(resolved.error);
+      return;
+    }
+    await repository.startMergePlan({ chatId: chatId(ctx), ownerId: userId(ctx), plan: resolved.plan });
+    await ctx.reply(mergePlanText(resolved.plan, config), mergeConfirmKeyboard());
+  });
+
+  bot.action(/^mrg:(go|no|peek)$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const pending = await repository.findMergePlan?.(chatId(ctx), userId(ctx));
+    if (ctx.match[0] === 'peek') {
+      await acknowledgeTap(ctx, pending?.plan ? 'The plan is in the message above.' : 'That merge plan expired.');
+      return;
+    }
+    if (!pending?.plan) {
+      await acknowledgeTap(ctx, 'That merge plan expired. Run /merge again.', { alert: true });
+      await ctx.editMessageReplyMarkup?.(null)?.catch?.(() => {});
+      return;
+    }
+    await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+    if (ctx.match[0] === 'no') {
+      await acknowledgeTap(ctx, 'Merge cancelled');
+      await ctx.editMessageText(`${ctx.message?.text || ''}\n\nCancelled — nothing was merged.`).catch(() => {});
+      return;
+    }
+    const outcome = await applyMergePlan({ bot, repository, config, plan: pending.plan });
+    await acknowledgeTap(ctx, outcome.error ? 'This merge could not be applied' : `Merged ${outcome.moved?.length || 0} post(s)`);
+    if (outcome.error) {
+      await ctx.reply(`${outcome.error}\nNothing else was changed.`);
+      return;
+    }
+    await ctx.editMessageReplyMarkup?.(null)?.catch?.(() => {});
+    await replyBatchDiagnostics(ctx, [mergeResultText(outcome, config)]);
   });
 
   bot.command('posts', async (ctx) => {

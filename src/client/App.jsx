@@ -8,7 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
+import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
@@ -415,14 +415,16 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
           <div><Eyebrow>SMART EPISODE INDEX</Eyebrow><h2 id="episode-guide-title">Episode <em>guide.</em></h2></div>
           <span>{item.episodeCount || item.episodeGroups.length} indexed episode{(item.episodeCount || item.episodeGroups.length) === 1 ? '' : 's'}</span>
         </div>
-        <div className="episode-grid">
-          {groups.episodes.map((group) => <Link className="episode-card" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
-            <span className="episode-card__number">EP {formatEpisodeNumber(group.start)}</span>
-            <strong>{group.label}</strong>
-            <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
-            <Icon name="arrow" size={15} />
-          </Link>)}
-        </div>
+        {/* A card spanning seasons shows one labelled block per season; a single
+            season renders the same flat grid it always did. */}
+        {(groups.seasons.length ? groups.seasons : [null]).map((block) => block ? <div className="episode-season" key={block.season}>
+          <p className="episode-season__title"><Icon name="layers" size={13} /> {block.seasonLabel}<span>{block.episodes.length} episode{block.episodes.length === 1 ? '' : 's'}</span></p>
+          <div className="episode-grid">
+            {block.episodes.map((group) => <EpisodeCard item={item} group={group} key={`${group.season}-${group.start}-${group.end}`} />)}
+          </div>
+        </div> : <div className="episode-grid" key="all-episodes">
+          {groups.episodes.map((group) => <EpisodeCard item={item} group={group} key={`${group.start}-${group.end}`} />)}
+        </div>)}
         <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Select an episode to open its own delivery page and compare every available file option.</p>
       </section> : null}
 
@@ -432,9 +434,10 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
           <span>{groups.packs.length} combined upload{groups.packs.length === 1 ? '' : 's'}</span>
         </div>
         <div className="episode-grid episode-grid--packs">
-          {groups.packs.map((group) => <Link className="episode-card episode-card--pack" to={episodePagePath(item, group)} key={`${group.start}-${group.end}`} aria-label={`View delivery options for ${group.label}`}>
+          {groups.packs.map((group) => <Link className="episode-card episode-card--pack" to={episodePagePath(item, group)} key={`${group.season ?? 0}-${group.start}-${group.end}`} aria-label={`View delivery options for ${group.seasonLabel ? `${group.seasonLabel} ${group.label}` : group.label}`}>
             <span className="episode-card__number episode-card__number--range">{formatEpisodeNumber(group.start)}–{formatEpisodeNumber(group.end)}</span>
-            <strong>{group.label}</strong>
+            {/* Two seasons can pack the same range, so the block name belongs in the label. */}
+            <strong>{group.seasonLabel ? `${group.seasonLabel} · ${group.label}` : group.label}</strong>
             <small>{group.fileCount} combined file{group.fileCount === 1 ? '' : 's'} · episodes {group.start} to {group.end} in one upload</small>
             <Icon name="arrow" size={15} />
           </Link>)}
@@ -449,8 +452,25 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
   );
 }
 
+/**
+ * One card of the episode guide. Its look is deliberately unchanged: a season
+ * adds a heading above the row and the season name inside the label, never a
+ * different card.
+ */
+function EpisodeCard({ item, group }) {
+  return <Link className="episode-card" to={episodePagePath(item, group)} aria-label={`View delivery options for ${group.seasonLabel ? `${group.seasonLabel} ${group.label}` : group.label}`}>
+    <span className="episode-card__number">EP {formatEpisodeNumber(group.start)}</span>
+    {/* The season is the heading above the row, so the card itself still reads
+        exactly as it always did. */}
+    <strong>{group.label}</strong>
+    <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
+    <Icon name="arrow" size={15} />
+  </Link>;
+}
+
 function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category, slug, episodeRange } = useParams();
+  const [searchParams] = useSearchParams();
   const requestedAdultCategory = category === 'adult';
   const release = useRemote(
     () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
@@ -462,9 +482,12 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
   if (adultLocked) {
     return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
   }
-  const requestedEpisode = parseEpisodeRoute(episodeRange);
-  const matchingGroup = item?.episodeGroups?.find((group) => group.start === requestedEpisode?.start && group.end === requestedEpisode?.end);
+  // ?s=N says which season this number belongs to. A merged card holds more than
+  // one Episode 01, so the number alone cannot pick the right block.
+  const requestedEpisode = parseEpisodeRoute(episodeRange, searchParams.get('s'));
+  const matchingGroup = findEpisodeGroup(item?.episodeGroups, requestedEpisode);
   const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
+  const routeSeason = episodeSeasonNumber(item, requestedEpisode);
   const isPack = Boolean(matchingGroup && matchingGroup.start !== matchingGroup.end);
   // Only this episode's own uploads are listed. A combined file that spans this
   // episode belongs to its pack page, not to every episode it touches.
@@ -496,6 +519,7 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
             <h1>{episodeLabel} <span>for</span> <em>{item.title}</em></h1>
             <p>Choose one version below. Each Telegram link delivers only that selected file, so you can pick the quality or upload that suits you.</p>
             <div className="episode-page-hero__facts">
+              {matchingGroup?.seasonLabel || routeSeason ? <span><Icon name="layers" size={15} /> {matchingGroup?.seasonLabel || `Season ${routeSeason}`}</span> : null}
               <span><Icon name="layers" size={15} /> {choices.length} file option{choices.length === 1 ? '' : 's'}</span>
               {isPack ? <span><Icon name="layers" size={15} /> Combined upload</span> : null}
               {item.languages.length ? <span><Icon name="check" size={15} /> {item.languages.join(' · ')}</span> : null}
@@ -522,6 +546,7 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
 
 function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category, slug, episodeRange } = useParams();
+  const [searchParams] = useSearchParams();
   const requestedAdultCategory = category === 'adult';
   const release = useRemote(
     () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
@@ -533,7 +558,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   );
   const item = release.data?.item;
   const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
-  const requestedEpisode = parseEpisodeRoute(episodeRange);
+  const requestedEpisode = parseEpisodeRoute(episodeRange, searchParams.get('s'));
   const allEntries = item?.stream?.entries || [];
   // A generic /watch page is reserved for intentional release-level players.
   // An episode route sees only players attached to that episode.

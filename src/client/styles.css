@@ -343,6 +343,12 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .episode-packs { padding-top: 34px; }
 .episode-packs .episode-section__heading { margin-bottom: 18px; }
 .episode-packs .episode-section__heading p { max-width: 560px; margin: 8px 0 0; color: #929dab; font-size: 10px; line-height: 1.6; }
+/* Season blocks on a card that spans several seasons (after /merge). The cards
+   themselves are untouched: only the heading above each row is new. */
+.episode-season + .episode-season { margin-top: 24px; }
+.episode-season__title { display: flex; align-items: center; gap: 7px; margin: 0 0 11px; color: #dbe4ec; font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.episode-season__title svg { flex: 0 0 auto; color: var(--lime); }
+.episode-season__title span { color: #7e8998; font-family: 'DM Mono', monospace; font-size: 9px; font-weight: 500; letter-spacing: .03em; text-transform: none; }
 .episode-grid--packs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .episode-card--pack { border-color: rgba(177,147,255,.28); background: linear-gradient(145deg, rgba(177,147,255,.1), rgba(255,255,255,.017)); }
 .episode-card--pack::after { border-color: rgba(177,147,255,.22); box-shadow: 0 0 0 14px rgba(177,147,255,.028); }

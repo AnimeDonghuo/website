@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
@@ -83,22 +83,33 @@ function serializeDate(value) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+/**
+ * The episode index a visitor sees. A card that spans seasons (after /merge, or
+ * an upload of several seasons in one release) carries the season number so the
+ * page can put each block under its own heading and never read Season 2's
+ * Episode 01 as Season 1's. A single-season card keeps `season: null`, which is
+ * how the guide stays exactly as it was.
+ */
 function publicEpisodeGroups(value) {
   if (!Array.isArray(value)) return [];
   return value
     .map((group) => {
       const start = Number(group?.start);
       const end = Number(group?.end);
+      const season = Number(group?.season);
+      const seasonNumber = Number.isInteger(season) && season >= 1 && season <= 99 ? season : null;
       return {
         start,
         end,
         label: cleanText(group?.label, 50),
         combined: Number.isInteger(start) && Number.isInteger(end) && end > start,
-        fileCount: Math.max(1, Number(group?.fileCount) || 1)
+        fileCount: Math.max(1, Number(group?.fileCount) || 1),
+        season: seasonNumber,
+        seasonLabel: seasonNumber ? `Season ${seasonNumber}` : null
       };
     })
     .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
-    .sort((first, second) => first.start - second.start || first.end - second.end);
+    .sort((first, second) => (first.season || 0) - (second.season || 0) || first.start - second.start || first.end - second.end);
 }
 
 function publicLanguages(content) {
@@ -179,8 +190,13 @@ function publicFileChoices(files, config, shareCode, content) {
   if (!Array.isArray(files)) return [];
   // A published detail page intentionally lists every uploaded file: selecting
   // one must never force a visitor to receive a different quality or episode.
+  // Season attribution comes from the same helper the catalog grouping uses, so
+  // a file listed under Season 2 on the card is still Season 2 on its episode
+  // page. A card with one season gets nulls and behaves as before.
+  const attributedSeasons = attributeUploadSeasons(files).entries.map((entry) => entry.season ?? null);
   const choices = files.map((file, index) => {
     const episode = publicEpisodeGroups([file?.episode])[0] || null;
+    const season = attributedSeasons[index] ?? null;
     const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.sourceLabel || file?.displayName });
     const label = publicFileChoiceLabel(file, content, index);
     const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
@@ -196,6 +212,7 @@ function publicFileChoices(files, config, shareCode, content) {
       quality: quality ? normalizeQualityLabel(quality) : null,
       size: formatBytes(Number(file?.size) || 0),
       kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
+      season,
       episode,
       telegramUrl,
       deliveryUrl,
@@ -207,6 +224,10 @@ function publicFileChoices(files, config, shareCode, content) {
   // random upload order, grouped per episode so a series list still walks
   // through its episodes in sequence.
   return choices.sort((first, second) => {
+    // Seasons walk in order first, so a merged card lists Season 1's episodes
+    // before Season 2's instead of interleaving them by episode number.
+    const seasonOrder = (Number(first?.season) || 0) - (Number(second?.season) || 0);
+    if (seasonOrder !== 0) return seasonOrder;
     const firstEpisode = Number(first?.episode?.start);
     const secondEpisode = Number(second?.episode?.start);
     const firstKnown = Number.isInteger(firstEpisode) && firstEpisode >= 1;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episodeStreamEntries, fileChoicesForEpisode, hasReleaseLevelWatch, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
+import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
 
 function episode(number) {
   return { start: number, end: number, label: `Episode ${String(number).padStart(2, '0')}` };
@@ -86,7 +86,48 @@ test('detail pages split single episodes from batch packs', () => {
   ]);
   assert.deepEqual(groups.episodes.map((group) => group.label), ['Episode 01', 'Episode 02']);
   assert.deepEqual(groups.packs.map((group) => group.label), ['Episodes 01\\u201303']);
-  assert.deepEqual(splitEpisodeGroups(undefined), { episodes: [], packs: [] });
+  assert.deepEqual(splitEpisodeGroups(undefined), { episodes: [], packs: [], seasons: [] });
+  // Season blocks appear only when a card really spans several seasons, so an
+  // ordinary single-season guide is untouched.
+  const flat = splitEpisodeGroups([{ start: 1, end: 1, label: 'Episode 01', season: 1 }]);
+  assert.deepEqual(flat.seasons, [], 'one season is not a block worth a heading');
+  const merged = splitEpisodeGroups([
+    { start: 1, end: 1, label: 'Episode 01', season: 1, seasonLabel: 'Season 1' },
+    { start: 2, end: 4, label: 'Episodes 02\u201304', season: 1, seasonLabel: 'Season 1' },
+    { start: 1, end: 1, label: 'Episode 01', season: 2, seasonLabel: 'Season 2' }
+  ]);
+  assert.deepEqual(merged.seasons.map((block) => block.seasonLabel), ['Season 1', 'Season 2']);
+  assert.deepEqual(merged.seasons[0].episodes.map((g) => g.label), ['Episode 01']);
+  assert.deepEqual(merged.seasons[0].packs.map((g) => g.label), ['Episodes 02\u201304'], 'a pack stays out of the single-episode row');
+  assert.deepEqual(merged.seasons[1].episodes.map((g) => g.label), ['Episode 01'], 'Season 2 keeps its own Episode 01');
+
+  const item = { category: 'donghua', slug: 'bleach', episodeGroups: [
+    { start: 1, end: 1, label: 'Episode 01', season: 1 },
+    { start: 1, end: 1, label: 'Episode 01', season: 2 }
+  ] };
+  assert.equal(episodePagePath(item, { start: 1, end: 1, season: 2 }), '/donghua/bleach/episode/1?s=2');
+  assert.equal(episodePagePath(item, { start: 1, end: 1 }), '/donghua/bleach/episode/1', 'an unseasoned card keeps its old link');
+  assert.equal(watchPagePath(item, { start: 1, end: 1, season: 2 }), '/donghua/bleach/watch/episode/1?s=2');
+  assert.deepEqual(parseEpisodeRoute('1', '2'), { start: 1, end: 1, season: 2, label: 'Episode 01' });
+  assert.deepEqual(parseEpisodeRoute('1', null), { start: 1, end: 1, season: null, label: 'Episode 01' });
+  assert.deepEqual(parseEpisodeRoute('1', 'abc'), { start: 1, end: 1, season: null, label: 'Episode 01' });
+  assert.equal(findEpisodeGroup(item.episodeGroups, { start: 1, end: 1, season: 2 }).season, 2);
+  assert.equal(findEpisodeGroup(item.episodeGroups, { start: 1, end: 1 }).season, 1, 'no season on the route reads the first block');
+  assert.equal(findEpisodeGroup([{ start: 5, end: 5, label: 'Episode 05' }], { start: 5, end: 5, season: 3 }).start, 5, 'an older unseasoned card still resolves');
+  assert.equal(findEpisodeGroup(item.episodeGroups, { start: 9, end: 9, season: 2 }), null);
+
+  // Files of the same number in another season never leak onto this episode page.
+  const choices = [
+    { id: 's1e1', episode: { start: 1, end: 1 }, season: 1 },
+    { id: 's2e1', episode: { start: 1, end: 1 }, season: 2 }
+  ];
+  assert.deepEqual(fileChoicesForEpisode(choices, { start: 1, end: 1, season: 2 }).map((f) => f.id), ['s2e1']);
+  assert.deepEqual(fileChoicesForEpisode(choices, { start: 1, end: 1 }).map((f) => f.id), ['s1e1', 's2e1']);
+  assert.deepEqual(
+    fileChoicesForEpisode([{ id: 'plain', episode: { start: 1, end: 1 } }], { start: 1, end: 1, season: 4 }).map((f) => f.id),
+    ['plain'],
+    'a card without season data is never emptied by a season route'
+  );
 });
 
 test('players are named after their provider, never as an anonymous number', () => {

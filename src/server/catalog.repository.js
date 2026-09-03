@@ -7,6 +7,9 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
 const BACKUP_RECOVERY_TTL_MS = 1000 * 60 * 15;
 const STREAM_IMPORT_TTL_MS = 1000 * 60 * 15;
+// A /merge plan waits for the publisher's confirmation button for the same short
+// window, and never survives a backup restore.
+const MERGE_PLAN_TTL_MS = STREAM_IMPORT_TTL_MS;
 const POSTER_FLOW_TTL_MS = 1000 * 60 * 15;
 const MAX_ADMIN_CONTENT_RESULTS = 100;
 const MAX_REQUEST_RESULTS = 200;
@@ -337,8 +340,11 @@ function isSupersededBy(replacements, file) {
   return incoming.languages.has(replacement.languages);
 }
 
-function contentFileAppendPatch(content, additionalFiles) {
-  const files = uniqueFiles(content?.files || [], additionalFiles, { supersedeExisting: true });
+// `supersedeExisting` is how a re-upload replaces its own slot. A merge passes
+// false: its files come from other seasons and other cards, so Season 2
+// Episode 1 must land beside Season 1 Episode 1 instead of replacing it.
+function contentFileAppendPatch(content, additionalFiles, { supersedeExisting = true } = {}) {
+  const files = uniqueFiles(content?.files || [], additionalFiles, { supersedeExisting });
   const episodeSummary = summarizeEpisodes(files);
   const uploadLanguages = summarizeUploadLanguages(files);
   const uploadSubtitleLanguages = summarizeSubtitleLanguages(files);
@@ -559,6 +565,7 @@ export class MemoryCatalogRepository {
     this.backupRecoveries = new Map();
     this.streamImports = new Map();
     this.posterFlows = new Map();
+    this.mergePlans = new Map();
     this.botUsers = new Map();
     this.siteVisitors = new Map();
     this.siteVisits = [];
@@ -623,6 +630,40 @@ export class MemoryCatalogRepository {
       automationKey: saved.automationKey || normalizedMergeKey(mergeKey),
       automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
     });
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  /**
+   * /merge absorbs another post's files. The moved records are appended to this
+   * post and its episode groups, counts, and languages are rebuilt from the
+   * whole list, so a merged-in season keeps its own numbering. Absorbed merge
+   * keys are recorded so a later upload of the old season title lands here
+   * instead of creating a second card.
+   */
+  async appendFilesToContentByAdminId(adminId, additionalFiles = [], aliases = [], options = {}) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    Object.assign(saved, contentFileAppendPatch(saved, additionalFiles, { supersedeExisting: options.supersede !== false }), {
+      automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, ...(Array.isArray(aliases) ? aliases : [])])
+    });
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  /**
+   * Replace a post's file list outright, which is how /merge removes one season
+   * or a few episodes that were attached to the wrong card. Private storage
+   * messages are never touched, so a removed file can be re-added later.
+   */
+  async replaceContentFilesByAdminId(adminId, files = []) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    Object.assign(saved, contentFileAppendPatch({ ...saved, files: [] }, Array.isArray(files) ? files : []));
     this.contents.set(saved.slug, saved);
     return clone(saved);
   }
@@ -1130,6 +1171,35 @@ export class MemoryCatalogRepository {
     this.streamImports.delete(sessionKey(chatId, ownerId));
   }
 
+  async startMergePlan({ chatId, ownerId, plan = null, expiresAt = new Date(Date.now() + MERGE_PLAN_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      plan: plan && typeof plan === 'object' ? clone(plan) : null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + MERGE_PLAN_TTL_MS).toISOString()
+    };
+    this.mergePlans.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findMergePlan(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.mergePlans.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.mergePlans.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteMergePlan(chatId, ownerId) {
+    this.mergePlans.delete(sessionKey(chatId, ownerId));
+  }
+
   async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
     if (!['completed', 'rejected'].includes(status)) return [];
     const ids = safeRequestIds(requestIds);
@@ -1294,6 +1364,7 @@ export class MemoryCatalogRepository {
     // Clear any pre-recovery prompt so it cannot attach a stale manifest to a
     // restored catalog.
     this.streamImports.clear();
+    this.mergePlans.clear();
     this.contents = new Map(collections.content.map((item) => [String(item.slug), clone(item)]));
     this.sessions = new Map(collections.upload_sessions.map((item) => [sessionKey(item.chatId, item.ownerId), clone(item)]));
     this.requests = new Map(collections.requests.map((item) => [String(item.id), clone(item)]));
@@ -1377,6 +1448,7 @@ export class MongoCatalogRepository {
     this.backupRecoveries = db.collection('backup_recoveries');
     this.streamImports = db.collection('stream_imports');
     this.posterFlows = db.collection('poster_flows');
+    this.mergePlans = db.collection('merge_plans');
     this.botUsers = db.collection('bot_users');
     this.siteVisitors = db.collection('site_visitors');
     this.siteVisits = db.collection('site_visits');
@@ -1413,6 +1485,8 @@ export class MongoCatalogRepository {
       this.streamImports.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.posterFlows.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
       this.posterFlows.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.mergePlans.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.mergePlans.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.botUsers.createIndex({ id: 1 }, { unique: true }),
       this.botUsers.createIndex({ lastSeenAt: -1 }),
       this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
@@ -1534,6 +1608,33 @@ export class MongoCatalogRepository {
     };
     return this.contents.findOneAndUpdate(
       { _id: content._id, ...(normalizedCategory ? { category: normalizedCategory } : {}) },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async appendFilesToContentByAdminId(adminId, additionalFiles = [], aliases = [], options = {}) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    const patch = {
+      ...contentFileAppendPatch(content, additionalFiles, { supersedeExisting: options.supersede !== false }),
+      automationKeys: uniqueKeys([
+        ...(content.automationKeys || []), content.automationKey, ...(Array.isArray(aliases) ? aliases : [])
+      ])
+    };
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async replaceContentFilesByAdminId(adminId, files = []) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    const patch = contentFileAppendPatch({ ...content, files: [] }, Array.isArray(files) ? files : []);
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
       { $set: patch },
       { returnDocument: 'after', includeResultMetadata: false }
     );
@@ -2053,6 +2154,34 @@ export class MongoCatalogRepository {
 
   async deleteStreamImport(chatId, ownerId) {
     await this.streamImports.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startMergePlan({ chatId, ownerId, plan = null, expiresAt = new Date(Date.now() + MERGE_PLAN_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.mergePlans.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          plan: plan && typeof plan === 'object' ? plan : null,
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + MERGE_PLAN_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findMergePlan(chatId, ownerId) {
+    return this.mergePlans.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteMergePlan(chatId, ownerId) {
+    await this.mergePlans.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
   }
 
   async startPosterFlow({
