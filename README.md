@@ -51,6 +51,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - `/cmd SB-… ep 1 <player URL>` attaches one approved player to **Episode 1** immediately, `ep 2-7 <URL>` covers a whole range, and several links in the same message (space separated, one per line, a bullet list, or Telegram’s Markdown `[link](url)` form) are all saved at once. A second player added to an episode that already has one **stays beside it** rather than replacing it, so Dailymotion and Rumble can both serve the same episode. `/cmd SB-…` then accepts a small JSON/CSV provider export for a full season, and `/cmd` can exact-match an exported `Title` or per-row `postId`; SeekStreaming’s `Embed Link`/`Embed Code` fields work directly. Dailymotion and Rumble **page** links are converted to the embeddable player path automatically, because the watch page itself refuses to be framed. `/players SB-…` lists what is attached with Remove buttons, and `/cmd SB-… del 2`, `del 2, 4`, `del ep 5`, `del ep 2-7`, or `del all` removes them again. Episode players surface only beside the matching episode file’s Telegram action; they never become a misleading release-wide Watch button, and `ep` is omitted only for an intentional release-wide/main player. This creates/updates the existing in-site Watch page only—no new catalog post, video transfer, transcoding, or Telegram announcement occurs. Approved SeekStreaming/embedseek, Dailymotion, and Rumble embeds are supported by default; `STREAMING_ALLOWED_HOSTS` can add another trusted host.
 - Publisher controls are locked behind `/login <passcode>` and can also be restricted by `TELEGRAM_ADMIN_IDS`
 - Public `/request` messages are stored in MongoDB and mirrored into the private request/database channel; `/requests` opens a multi-select publisher workflow that marks selected requests **Completed** or **Rejected** and immediately notifies each requester
+- `/category`, `/lang`, `/subtitles`, `/genres`, `/year`, `/release`, and `/status` accept a **list of Post IDs** before the value (`/category SB-0123ABCDEF, SB-1122334455 anime`), so one mislabelled batch is corrected in a single line; every named post is updated, each post’s existing Telegram announcement is edited in place, unknown IDs are reported and skipped, and a restricted 18+ post in the list is left alone instead of failing the whole command. Titles, synopses, and artwork stay one-post-at-a-time because they are per-release identity
 - Unlimited announcement channels can be managed with `/addchannel`; each new post gets a professional poster, metadata card, and website detail-page button
 - Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards. Authorized publisher command scopes are registered on startup and when an allowed owner opens/logs into the bot, so `/posts`, `/postid`, and other publisher commands remain visible through Telegram menu caching
 - `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…` (or `/p`, `/imgdd`), `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
@@ -297,13 +298,13 @@ Useful commands:
 | `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category (for example, `/batch adult \| Title` for the isolated adult store) |
 | `/auto` | Show persistent ON/OFF controls for direct database-channel auto-publishing |
 | `/title Title` | Replace a draft title and re-run provider lookup; `/title SB-… Corrected title` edits an existing card without changing its delivery identity |
-| `/lang Hindi, English` | Set draft audio labels; `/lang SB-… Hindi, English` edits an existing card (`/lan` and `/lam` are compatible aliases) |
-| `/subtitles English` | Set draft subtitle labels; `/subtitles SB-… English, Hindi` edits an existing card (`/subs` is an alias) |
-| `/year 2026` | Set draft year; `/year SB-… 2026` corrects an existing card |
-| `/genres Action, Fantasy` | Set draft genres; prefix with `SB-…` to edit a published card |
+| `/lang Hindi, English` | Set draft audio labels; `/lang SB-… Hindi, English` edits an existing card, and `/lang SB-…, SB-… Hindi, English` corrects every named card at once (`/lan` and `/lam` are compatible aliases) |
+| `/subtitles English` | Set draft subtitle labels; `/subtitles SB-… English, Hindi` edits an existing card, or list several Post IDs to correct them all (`/subs` is an alias) |
+| `/year 2026` | Set draft year; `/year SB-… 2026` corrects an existing card, or `SB-…, SB-…` for many |
+| `/genres Action, Fantasy` | Set draft genres; prefix with one or more `SB-…` IDs to edit published cards |
 | `/description …` | Set a draft synopsis; prefix with `SB-…` to edit a published card |
 | `/poster`, `/p`, `/imgdd` | Set artwork. `/poster https://…` overrides draft artwork and `/poster SB-… https://…` mirrors a replacement poster to ImgBB before changing a published card (the original style). `/poster SB-… Exact Title` searches AniList/TMDB/OMDb artwork and returns up to 10 **Poster** buttons — tapping one mirrors that exact image and updates the card. A bare `/poster` asks which style you want and the conversation stays open for 15 minutes |
-| `/category SB-… anime`, `/release SB-… Label`, `/status SB-… Updated` | Edit a published card's category, release label, or status; bare `/status` still shows the active draft |
+| `/category SB-… anime`, `/release SB-… Label`, `/status SB-… Updated` | Edit a published card’s category, release label, or status — one Post ID or a list of them; bare `/status` still shows the active draft |
 | `/teststorage` | Send a harmless test message to verify the configured database channel |
 | `/cancel` | Discard the active draft or a pending `/recover` prompt |
 | `/done` | Mirror poster, create MongoDB record, announce to every configured channel, and return share + Post ID |
@@ -410,6 +411,21 @@ When a target Post ID is supplied, provider exports may omit `postId`; their `Ti
 `/cmd` updates only `stream` metadata on the existing record. It preserves the `SB-…` ID, slug, delivery links, files, category, and announcement history, and **never sends an announcement**. The public release details page shows a **Watch** button above delivery actions. Its `/watch` page embeds the approved provider player, offers available episode/source choices beneath it, and shows related releases in the same category.
 
 By default only HTTPS hosts under `seekstreaming.com`, `embedseek.com`, `dailymotion.com`, `dai.ly`, and `rumble.com` are accepted and included in the site's iframe Content Security Policy. To intentionally approve another provider, add only its trusted hostname to Koyeb (for example `STREAMING_ALLOWED_HOSTS=player.example.com`) and redeploy. The document is capped at 512 KiB with a 15-second download timeout by default; `STREAMING_MANIFEST_MAX_BYTES` and `STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS` may be lowered or adjusted within their safe limits. No video byte passes through the SoraBox/Koyeb process.
+
+### Correct many published posts at once
+
+Metadata edits take one Post ID or as many as needed, separated by commas, spaces, or semicolons:
+
+```text
+/category SB-0123ABCDEF, SB-1122334455, SB-9876543210 anime
+/lang SB-0123ABCDEF, SB-1122334455 Hindi, English
+/subtitles SB-0123ABCDEF, SB-1122334455 English
+/status SB-0123ABCDEF, SB-1122334455 Ongoing
+```
+
+Only the Post IDs at the very front of the message are read as targets, so a value that contains commas (`Hindi, English`) or a file name that merely starts with `SB-` is never mistaken for another ID. The reply names each post it changed, lists any ID it could not find, and reports how many announcement messages were edited. A category change into or out of 18+ is refused for that one post (its storage channel and age gate must stay separate) while the rest of the list is still corrected.
+
+`/title`, `/description`, and `/poster` intentionally do **not** accept a list: a title, synopsis, and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
 
 ### Manage requests, post IDs, and publisher analytics
 

@@ -190,21 +190,21 @@ export const PUBLISHER_COMMANDS = [
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
-  { command: 'lang', description: 'Set draft or post audio languages' },
+  { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
   { command: 'lan', description: 'Alias for /lang' },
   { command: 'lam', description: 'Alias for /lang' },
-  { command: 'subtitles', description: 'Set draft or post subtitle languages' },
+  { command: 'subtitles', description: 'Set subtitle languages: draft, post, or many posts' },
   { command: 'subs', description: 'Alias for /subtitles' },
-  { command: 'year', description: 'Set draft or post year' },
-  { command: 'genres', description: 'Set draft or post genres' },
+  { command: 'year', description: 'Set year on one or many posts' },
+  { command: 'genres', description: 'Set genres on one or many posts' },
   { command: 'description', description: 'Set draft or post synopsis' },
   { command: 'poster', description: 'Set artwork: old link style or search & pick' },
   { command: 'p', description: 'Short alias for /poster' },
   { command: 'imgdd', description: 'Add artwork with the same old/new poster flow' },
-  { command: 'category', description: 'Set a published post category' },
-  { command: 'release', description: 'Set a published post release label' },
+  { command: 'category', description: 'Set the category of one or many posts' },
+  { command: 'release', description: 'Set a release label on one or many posts' },
   { command: 'done', description: 'Publish current draft' },
-  { command: 'status', description: 'Show current draft' },
+  { command: 'status', description: 'Show current draft, or set post status' },
   { command: 'teststorage', description: 'Check the storage channel connection' },
   { command: 'cancel', description: 'Discard current upload draft' },
   { command: 'delete', description: 'Delete one or more post IDs' },
@@ -509,21 +509,62 @@ function parseDelimitedList(value) {
     .slice(0, 8);
 }
 
-/** Parse `/field SB-ABC… value` without confusing an active-draft value. */
+/**
+ * Parse `/field SB-ABC… value` without confusing an active-draft value, and the
+ * many-at-once form `/field SB-ABC…, SB-DEF… value`. Only a leading run of post
+ * IDs is consumed, so a value that itself contains commas ("Hindi, English") or
+ * a word that merely starts with SB- stays part of the value.
+ */
 export function parsePublishedPostEdit(value) {
-  const match = String(value || '').trim().match(/^(SB-[A-F0-9]{10})(?=$|\s|[,;:])(?:\s+|\s*[,;:]\s*)?([\s\S]*)$/i);
-  if (!match) return null;
+  const text = String(value || '').trim();
+  const ids = [];
+  let rest = text;
+  const leadingId = /^\s*[,;:]?\s*(SB-[A-F0-9]{10})(?=$|[\s,;:])\s*[,;:]?\s*/i;
+  let match = rest.match(leadingId);
+  while (match && ids.length < 50) {
+    const adminId = match[1].toUpperCase();
+    if (!ids.includes(adminId)) ids.push(adminId);
+    rest = rest.slice(match[0].length);
+    match = rest.match(leadingId);
+  }
+  if (!ids.length) return null;
   return {
-    adminId: match[1].toUpperCase(),
-    value: cleanText(match[2], 1_600)
+    adminId: ids[0],
+    adminIds: ids,
+    value: cleanText(rest, 1_600)
   };
 }
 
-async function updatePublishedPost({ ctx, repository, argument, field, value, fieldLabel }) {
+/**
+ * Fields that describe how a release is labelled can be set across posts at
+ * once; a title or synopsis is unique to one release, so those stay singular.
+ */
+const MULTI_POST_EDITABLE_FIELDS = new Set([
+  'category', 'languages', 'subtitleLanguages', 'genres', 'status', 'releaseLabel', 'year'
+]);
+
+/**
+ * Apply one metadata edit to every post the publisher named. A correction that
+ * spans several releases (a wrong category, a missing subtitle language) used
+ * to mean repeating the command once per post ID and re-editing each
+ * announcement; now it is one line, and each affected announcement is still
+ * updated in place.
+ *
+ * `guard(content)` may refuse one targeted post (the 18+ storage boundary)
+ * without blocking the rest of the batch.
+ */
+export async function updatePublishedPost({ ctx, repository, argument, field, value, fieldLabel, guard = null }) {
   const target = parsePublishedPostEdit(argument);
   if (!target) return null;
+  const multi = MULTI_POST_EDITABLE_FIELDS.has(field);
+  if (target.adminIds.length > 1 && !multi) {
+    await ctx.reply(`${fieldLabel} is set one post at a time, because every release needs its own ${fieldLabel.toLowerCase()}. Send /${field} ${target.adminIds[0]} …`);
+    return { handled: true, content: null };
+  }
   if (!target.value && value === undefined) {
-    await ctx.reply(`Add a ${fieldLabel} after the post ID. Example: /${field} ${target.adminId} value`);
+    await ctx.reply(multi
+      ? `Add a ${fieldLabel} after the post ID${target.adminIds.length > 1 ? 's' : ''}. Example: /${field} ${target.adminIds[0]}${multi ? ', SB-SECONDID' : ''} value`
+      : `Add a ${fieldLabel} after the post ID. Example: /${field} ${target.adminId} value`);
     return { handled: true, content: null };
   }
   if (typeof repository.updateContentByAdminId !== 'function') {
@@ -531,16 +572,57 @@ async function updatePublishedPost({ ctx, repository, argument, field, value, fi
     return { handled: true, content: null };
   }
   const patchValue = value === undefined ? target.value : value;
-  const updated = await repository.updateContentByAdminId(target.adminId, { [field]: patchValue });
-  if (!updated) {
-    await ctx.reply(`No published catalog post was found for ${target.adminId}. Use /posts or /postid to find an ID.`);
+  const contents = [];
+  const missing = [];
+  const blocked = [];
+  const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
+  for (const adminId of target.adminIds) {
+    if (guard) {
+      const existing = await repository.findContentByAdminId?.(adminId);
+      if (!existing) {
+        missing.push(adminId);
+        continue;
+      }
+      const refusal = guard(existing);
+      if (refusal) {
+        blocked.push({ adminId, title: existing.title, reason: refusal });
+        continue;
+      }
+    }
+    const updated = await repository.updateContentByAdminId(adminId, { [field]: patchValue });
+    if (!updated) {
+      missing.push(adminId);
+      continue;
+    }
+    contents.push(updated);
+    // Anything the announcement channel shows must stay in sync, so the same
+    // edit is applied to the posted message instead of leaving it stale.
+    const postSync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated });
+    for (const key of Object.keys(sync)) sync[key] += postSync?.[key] || 0;
+  }
+  if (!contents.length) {
+    if (missing.length) {
+      await ctx.reply(`No published catalog post was found for ${missing.join(', ')}. Use /posts or /postid to find an ID.`);
+    } else if (blocked.length) {
+      await ctx.reply(`No post was changed. ${blocked[0].reason}.`);
+    }
     return { handled: true, content: null };
   }
-  // Anything the announcement channel actually shows must stay in sync, so the
-  // same edit is applied to the posted message instead of leaving it stale.
-  const sync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated });
-  await ctx.reply([`${fieldLabel} updated for ${updated.adminId} · ${updated.title}.`, announcementSyncNote(sync)].join('\n'));
-  return { handled: true, content: updated, announcementSync: sync };
+  const lines = contents.length === 1
+    ? [`${fieldLabel} updated for ${contents[0].adminId} · ${contents[0].title}.`]
+    : [
+      `${fieldLabel} updated for ${contents.length} posts:`,
+      ...contents.map((content) => `▪ ${content.adminId} · ${cleanText(content.title, 70)}`)
+    ];
+  if (blocked.length) {
+    lines.push(`${blocked.length} post${blocked.length === 1 ? ' was' : 's were'} left alone: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}`);
+  }
+  if (missing.length) {
+    lines.push(`Not found and skipped: ${missing.join(', ')}.`);
+  }
+  lines.push(announcementSyncNote(sync));
+  await ctx.reply(lines.join('\n'));
+  return { handled: true, content: contents[0], contents, announcementSync: sync };
 }
 
 /* ---------------------------------------------------------------------------
@@ -3478,7 +3560,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
-          'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
+          'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
@@ -3551,7 +3633,7 @@ export async function launchTelegramBot({ config, repository }) {
     if (postTarget) {
       const languages = parseDelimitedList(postTarget.value);
       if (!languages.length) {
-        await ctx.reply(`Usage: /lang ${postTarget.adminId} Hindi, English`);
+        await ctx.reply(`Usage: /lang ${postTarget.adminIds.join(', ')} Hindi, English\nSeveral posts at once: /lang SB-0123ABCDEF, SB-1122334455 Hindi, English`);
         return;
       }
       await updatePublishedPost({
@@ -3567,7 +3649,7 @@ export async function launchTelegramBot({ config, repository }) {
     const languages = parseDelimitedList(argument);
     const session = await repository.findSession(chatId(ctx), userId(ctx));
     if (!session || !languages.length) {
-      await ctx.reply('Usage: /lang Hindi, English\nEdit an existing post: /lang SB-0123ABCDEF Hindi, English');
+      await ctx.reply('Usage: /lang Hindi, English\nEdit an existing post: /lang SB-0123ABCDEF Hindi, English\nSeveral posts at once: /lang SB-0123ABCDEF, SB-1122334455 Hindi, English');
       return;
     }
     const overrides = { ...(session.overrides || {}), languages };
@@ -3582,7 +3664,9 @@ export async function launchTelegramBot({ config, repository }) {
     const postTarget = parsePublishedPostEdit(argument);
     const languages = parseDelimitedList(postTarget ? postTarget.value : argument);
     if (!languages.length) {
-      await ctx.reply(postTarget ? `Usage: /subtitles ${postTarget.adminId} English, Hindi` : 'Usage: /subtitles English, Hindi\nEdit an existing post: /subtitles SB-0123ABCDEF English, Hindi');
+      await ctx.reply(postTarget
+        ? `Usage: /subtitles ${postTarget.adminIds.join(', ')} English, Hindi\nSeveral posts at once: /subtitles SB-0123ABCDEF, SB-1122334455 English, Hindi`
+        : 'Usage: /subtitles English, Hindi\nEdit an existing post: /subtitles SB-0123ABCDEF English, Hindi\nSeveral posts at once: /subtitles SB-0123ABCDEF, SB-1122334455 English, Hindi');
       return;
     }
     if (postTarget) {
@@ -3606,7 +3690,9 @@ export async function launchTelegramBot({ config, repository }) {
     const postTarget = parsePublishedPostEdit(argument);
     const suppliedYear = Number.parseInt(postTarget ? postTarget.value : argument, 10);
     if (!Number.isInteger(suppliedYear) || suppliedYear < 1888 || suppliedYear > new Date().getFullYear() + 5) {
-      await ctx.reply(postTarget ? `Usage: /year ${postTarget.adminId} 2026` : 'Usage: /year 2026\nEdit an existing post: /year SB-0123ABCDEF 2026');
+      await ctx.reply(postTarget
+        ? `Usage: /year ${postTarget.adminIds.join(', ')} 2026\nSeveral posts at once: /year SB-0123ABCDEF, SB-1122334455 2026`
+        : 'Usage: /year 2026\nEdit an existing post: /year SB-0123ABCDEF 2026\nSeveral posts at once: /year SB-0123ABCDEF, SB-1122334455 2026');
       return;
     }
     if (postTarget) {
@@ -3636,7 +3722,9 @@ export async function launchTelegramBot({ config, repository }) {
     const postTarget = parsePublishedPostEdit(argument);
     const genres = parseDelimitedList(postTarget ? postTarget.value : argument);
     if (!genres.length) {
-      await ctx.reply(postTarget ? `Usage: /genres ${postTarget.adminId} Action, Fantasy` : 'Usage: /genres Action, Fantasy\nEdit an existing post: /genres SB-0123ABCDEF Action, Fantasy');
+      await ctx.reply(postTarget
+        ? `Usage: /genres ${postTarget.adminIds.join(', ')} Action, Fantasy\nSeveral posts at once: /genres SB-0123ABCDEF, SB-1122334455 Action, Fantasy`
+        : 'Usage: /genres Action, Fantasy\nEdit an existing post: /genres SB-0123ABCDEF Action, Fantasy\nSeveral posts at once: /genres SB-0123ABCDEF, SB-1122334455 Action, Fantasy');
       return;
     }
     if (postTarget) {
@@ -3698,6 +3786,13 @@ export async function launchTelegramBot({ config, repository }) {
 
     const postTarget = parsePublishedPostEdit(argument);
     const posterValue = postTarget ? postTarget.value : argument;
+
+    // Artwork is per-release identity, so a list of post IDs is refused here
+    // instead of quietly changing only the first one.
+    if (postTarget && postTarget.adminIds.length > 1) {
+      await ctx.reply(`Poster artwork is set one post at a time, because every release keeps its own image. Send /poster ${postTarget.adminIds[0]} <image link or title>${postTarget.adminIds.length > 2 ? ` (and repeat it for ${postTarget.adminIds.slice(1).join(', ')})` : ''}. Category, languages, subtitles, genres, year, release, and status do accept a list.`);
+      return;
+    }
 
     // Old style: an explicit image link is validated, mirrored, and saved.
     if (posterValue.startsWith('https://')) {
@@ -3771,15 +3866,22 @@ export async function launchTelegramBot({ config, repository }) {
           ? ADULT_CATEGORY
           : rawCategory;
     if (!target || !PUBLISH_CATEGORIES.includes(category)) {
-      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, adult');
+      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nSeveral posts at once: /category SB-0123ABCDEF, SB-1122334455 anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, adult');
       return;
     }
-    const existing = await repository.findContentByAdminId?.(target.adminId);
-    if (existing && isAdultCategory(existing.category) !== isAdultCategory(category)) {
-      await ctx.reply('Category changes into or out of 18+ are blocked to keep its private storage and age gate isolated. Create the 18+ release through /18db instead.');
-      return;
-    }
-    await updatePublishedPost({ ctx, repository, argument, field: 'category', value: category, fieldLabel: 'Category' });
+    // The 18+ storage boundary is decided per post: one restricted card in a
+    // list must not cancel the rest of the batch, and it must not be moved.
+    await updatePublishedPost({
+      ctx,
+      repository,
+      argument,
+      field: 'category',
+      value: category,
+      fieldLabel: 'Category',
+      guard: (content) => (isAdultCategory(content.category) !== isAdultCategory(category)
+        ? '18+ boundary: use /18db for that release'
+        : null)
+    });
   });
 
   bot.command('release', async (ctx) => {
@@ -3787,7 +3889,7 @@ export async function launchTelegramBot({ config, repository }) {
     const argument = parseCommandArgument(ctx.message.text);
     const target = parsePublishedPostEdit(argument);
     if (!target?.value) {
-      await ctx.reply('Usage: /release SB-0123ABCDEF Season 2 · 12 episodes');
+      await ctx.reply('Usage: /release SB-0123ABCDEF Season 2 · 12 episodes\nSeveral posts at once: /release SB-0123ABCDEF, SB-1122334455 Season 2 · 12 episodes');
       return;
     }
     await updatePublishedPost({ ctx, repository, argument, field: 'releaseLabel', fieldLabel: 'Release label' });
@@ -3799,7 +3901,7 @@ export async function launchTelegramBot({ config, repository }) {
     const target = parsePublishedPostEdit(argument);
     if (target) {
       if (!target.value) {
-        await ctx.reply(`Usage: /status ${target.adminId} New release`);
+        await ctx.reply(`Usage: /status ${target.adminIds.join(', ')} New release\nSeveral posts at once: /status SB-0123ABCDEF, SB-1122334455 Ongoing`);
         return;
       }
       await updatePublishedPost({ ctx, repository, argument, field: 'status', fieldLabel: 'Status' });

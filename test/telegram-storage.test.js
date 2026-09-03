@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, announcementSyncNote, planDraftPublicationGroups, syncPublishedAnnouncements, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parseStreamRemoval, playersList, playersListText, removeAttachedPlayers, splitPlayerLinks, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, announcementSyncNote, planDraftPublicationGroups, syncPublishedAnnouncements, updatePublishedPost, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parseStreamRemoval, playersList, playersListText, removeAttachedPlayers, splitPlayerLinks, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest, publicStreamingData, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
@@ -96,16 +96,78 @@ test('publisher menu exposes post management, backup, and compatible metadata co
     assert.ok(commands.includes(command), `${command} should be available to publisher command scopes`);
   }
   assert.deepEqual(parsePublishedPostEdit('SB-a1b2c3d4e5 Hindi, English'), {
-    adminId: 'SB-A1B2C3D4E5', value: 'Hindi, English'
+    adminId: 'SB-A1B2C3D4E5', adminIds: ['SB-A1B2C3D4E5'], value: 'Hindi, English'
   });
   assert.deepEqual(parsePublishedPostEdit('SB-A1B2C3D4E5: 2026'), {
-    adminId: 'SB-A1B2C3D4E5', value: '2026'
+    adminId: 'SB-A1B2C3D4E5', adminIds: ['SB-A1B2C3D4E5'], value: '2026'
   });
   assert.deepEqual(parsePublishedPostEdit('SB-A1B2C3D4E5'), {
-    adminId: 'SB-A1B2C3D4E5', value: ''
+    adminId: 'SB-A1B2C3D4E5', adminIds: ['SB-A1B2C3D4E5'], value: ''
   });
   assert.equal(parsePublishedPostEdit('Hindi, English'), null);
+  // many post IDs in front of the value, in any separator style, deduplicated
+  assert.deepEqual(parsePublishedPostEdit('SB-0123ABCDEF , sb-00aabbccdd;SB-1122334455 anime').adminIds, [
+    'SB-0123ABCDEF', 'SB-00AABBCCDD', 'SB-1122334455'
+  ]);
+  assert.equal(parsePublishedPostEdit('SB-0123ABCDEF, SB-1122334455 anime').value, 'anime');
+  // a value that happens to contain commas keeps belonging to the last ID
+  assert.equal(parsePublishedPostEdit('SB-0123ABCDEF, SB-1122334455 Hindi, English').value, 'Hindi, English');
+  // text that merely looks like an ID at the start of a draft value is not one
+  assert.equal(parsePublishedPostEdit('SB-112233445 anime'), null);
+  assert.deepEqual(parsePublishedPostEdit('  sb-0123abcdef,anime  ').adminIds, ['SB-0123ABCDEF']);
 });
+
+test('one metadata edit can be applied to every named post at once', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const one = await repository.createContent({ title: 'Donghua A', category: 'movie', files: [{ storageMessageId: 91, name: 'A.1.mkv' }] });
+  const two = await repository.createContent({ title: 'Donghua B', category: 'movie', files: [{ storageMessageId: 92, name: 'B.1.mkv' }] });
+  const adult = await repository.createContent({ title: 'Private C', category: 'adult', files: [{ storageMessageId: 93, name: 'C.1.mkv' }] });
+  const replies = [];
+  const edits = [];
+  const ctx = {
+    async reply(text) { replies.push(text); },
+    telegram: {
+      async editMessageText(chatId, messageId, inlineMessageId, text) { edits.push({ chatId, text }); return {}; }
+    }
+  };
+  await repository.updateContentByAdminId(one.adminId, { announcementRefs: [{ channelId: '-100public', messageId: 31, kind: 'text', websiteUrl: 'https://site.test/movie/donghua-a' }] });
+
+  const outcome = await updatePublishedPost({
+    ctx,
+    repository,
+    field: 'category',
+    value: 'donghua',
+    fieldLabel: 'Category',
+    argument: `${one.adminId}, ${two.adminId}, ${adult.adminId}, SB-9999999999 donghua`,
+    guard: (content) => (isAdultCategoryForTest(content.category) ? '18+ boundary: use /18db for that release' : null)
+  });
+
+  assert.equal(outcome.handled, true);
+  assert.equal(outcome.contents.length, 2);
+  assert.equal((await repository.findContentByAdminId(one.adminId)).category, 'donghua');
+  assert.equal((await repository.findContentByAdminId(two.adminId)).category, 'donghua');
+  assert.equal((await repository.findContentByAdminId(adult.adminId)).category, 'adult', 'a restricted post is never moved by a batch edit');
+  assert.match(replies[0], /Category updated for 2 posts:/);
+  assert.match(replies[0], new RegExp(two.adminId));
+  assert.match(replies[0], /left alone: SB-.+\s\(18\+ boundary/);
+  assert.match(replies[0], /Not found and skipped: SB-9999999999\./);
+  assert.match(replies[0], /1 announcement updated/);
+  // the announcement of the changed post is edited in place, not re-posted
+  assert.deepEqual(edits.map((entry) => entry.chatId), ['-100public']);
+
+  // a value every release must write itself is still refused across posts
+  replies.length = 0;
+  const titles = await updatePublishedPost({
+    ctx, repository, argument: `${one.adminId}, ${two.adminId} Same Title`, field: 'title', fieldLabel: 'Title'
+  });
+  assert.equal(titles.content, null);
+  assert.match(replies[0], /one post at a time/);
+  assert.equal((await repository.findContentByAdminId(one.adminId)).title, 'Donghua A');
+});
+
+function isAdultCategoryForTest(category) {
+  return category === 'adult' || category === '18+';
+}
 
 
 test('direct /cmd input can attach one explicit episode player while preserving intentional main players', () => {
