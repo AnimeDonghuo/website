@@ -7,7 +7,7 @@ import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
-import { inferStreamManifestFormat, mergeStreamingEntries, parseStreamingManifest, safeStreamingUrl } from './streaming-service.js';
+import { extractStreamingUrl, inferStreamManifestFormat, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 const ADULT_CATEGORY = 'adult';
@@ -212,6 +212,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'postid', description: 'Find uploaded post IDs by time' },
   { command: 'stats', description: 'View publisher analytics' },
   { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
+  { command: 'players', description: 'List or remove attached players' },
   { command: 'backup', description: 'Send a signed private data backup' },
   { command: 'recover', description: 'Restore a signed backup file' },
   { command: 'addchannel', description: 'Add an announcement channel' },
@@ -535,8 +536,11 @@ async function updatePublishedPost({ ctx, repository, argument, field, value, fi
     await ctx.reply(`No published catalog post was found for ${target.adminId}. Use /posts or /postid to find an ID.`);
     return { handled: true, content: null };
   }
-  await ctx.reply(`${fieldLabel} updated for ${updated.adminId} · ${updated.title}.`);
-  return { handled: true, content: updated };
+  // Anything the announcement channel actually shows must stay in sync, so the
+  // same edit is applied to the posted message instead of leaving it stale.
+  const sync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated });
+  await ctx.reply([`${fieldLabel} updated for ${updated.adminId} · ${updated.title}.`, announcementSyncNote(sync)].join('\n'));
+  return { handled: true, content: updated, announcementSync: sync };
 }
 
 /* ---------------------------------------------------------------------------
@@ -652,7 +656,12 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
       mirroredAt: new Date().toISOString()
     }
   });
-  return { existing, posterResult, updated };
+  // The artwork is the announcement, so replace the photo in every channel this
+  // post was announced to. A poster nobody chose manually is still a real change.
+  const announcementSync = updated
+    ? await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated, config })
+    : null;
+  return { existing, posterResult, updated, announcementSync };
 }
 
 export async function presentPosterCandidates({ ctx, repository, config, adminId, query }) {
@@ -919,10 +928,10 @@ export function inferBatchCategory({ title = '', files = [] } = {}) {
   if (/\b(?:anime|japanese\s+anime)\b/.test(signals)) return 'anime';
   if (/\b(?:web[\s-]?series|webseries)\b/.test(signals)) return 'web-series';
 
-  // Caption language labels are useful category signals when an uploader has
-  // not written an explicit category word. Apply them only to an episode-based
-  // release so a Chinese/Japanese feature film remains a movie by default.
-  if (summarizeEpisodes(files).count) {
+  // Season packaging is episodic by definition: `Fullmetal Alchemist S1` has no
+  // episode numbers in the filenames, and used to be filed as a movie.
+  const hasSeasonMarkers = files.some((file) => Boolean(detectUploadSeasonForFile(file)));
+  if (summarizeEpisodes(files).count || hasSeasonMarkers) {
     if (/\b(?:chinese|mandarin|cantonese)\b/.test(signals)) return 'donghua';
     if (/\b(?:japanese|jpn)\b/.test(signals)) return 'anime';
     if (/\b(?:korean|kor)\b/.test(signals)) return 'kdrama';
@@ -1507,6 +1516,87 @@ function announcementCaption(content) {
   ].filter((line) => line !== null).join('\n').slice(0, 1000);
 }
 
+function announcementKeyboard(config, content, websiteUrl = null) {
+  const link = websiteUrl || (config ? getContentPageUrl(config, content) : null);
+  return link ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', link)]]) : undefined;
+}
+
+/**
+ * Keep the Telegram announcement of a published post visually identical to the
+ * catalog card. Every edit path (title, languages, genres, synopsis, status,
+ * release label, category, and poster) funnels through here, so an announcement
+ * never keeps showing an old image or old information after /poster or /title.
+ *
+ * Only the messages this bot sent are touched, and only when the post recorded
+ * where they landed; an announcement the publisher deleted manually is simply
+ * forgotten instead of retried forever.
+ */
+export async function syncPublishedAnnouncements({ telegram, repository, content, config = null }) {
+  const refs = Array.isArray(content?.announcementRefs) ? content.announcementRefs : [];
+  const result = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: refs.length };
+  if (!refs.length || !telegram || isAdultCategory(content?.category)) return result;
+  const caption = announcementCaption(content);
+  const kept = [];
+
+  for (const reference of refs) {
+    // Only rewrite the button row when the destination link is actually known;
+    // omitting reply_markup leaves the publisher's existing buttons untouched.
+    const link = (config ? getContentPageUrl(config, content) : null) || reference.websiteUrl || null;
+    const keyboard = link ? announcementKeyboard(config, content, link) : undefined;
+    const replyMarkup = keyboard ? keyboard.reply_markup : undefined;
+    try {
+      if (reference.kind !== 'text' && content.posterUrl) {
+        await telegram.editMessageMedia(
+          reference.channelId,
+          reference.messageId,
+          null,
+          { type: 'photo', media: content.posterUrl, caption, parse_mode: 'HTML' },
+          replyMarkup ? { reply_markup: replyMarkup } : {}
+        );
+        // Some Bot API versions ignore reply_markup on editMessageMedia; a
+        // second call is idempotent and keeps the website button present.
+        if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
+      } else {
+        await telegram.editMessageText(reference.channelId, reference.messageId, null, caption, {
+          parse_mode: 'HTML',
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+        });
+      }
+      kept.push(reference);
+      result.updated += 1;
+    } catch (error) {
+      const description = cleanText(error?.description || error?.message, 200);
+      if (/message is not modified/i.test(description)) {
+        kept.push(reference);
+        result.unchanged += 1;
+        continue;
+      }
+      if (/not found|can't be edited|chat not found|deleted|message to edit/i.test(description)) {
+        result.dropped += 1;
+        continue;
+      }
+      kept.push(reference);
+      result.failed += 1;
+      console.warn('[telegram] announcement sync failed:', reference.channelId, description || 'Unknown error');
+    }
+  }
+
+  if (kept.length !== refs.length && content?.adminId && typeof repository?.updateContentByAdminId === 'function') {
+    await Promise.resolve(repository.updateContentByAdminId(content.adminId, { announcementRefs: kept })).catch(() => {});
+  }
+  return result;
+}
+
+export function announcementSyncNote(sync) {
+  if (!sync?.channels) return 'No Telegram announcement is attached to this post, so nothing else needed updating.';
+  const parts = [];
+  if (sync.updated) parts.push(`${sync.updated} announcement${sync.updated === 1 ? '' : 's'} updated`);
+  if (sync.unchanged) parts.push(`${sync.unchanged} already showing this information`);
+  if (sync.failed) parts.push(`${sync.failed} could not be edited (is the bot still an admin?)`);
+  if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
+  return parts.length ? `Telegram announcements: ${parts.join(', ')}.` : 'The Telegram announcement could not be edited.';
+}
+
 export async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
   // 18+ releases are intentionally never broadcast, even when normal
   // announcement destinations are configured. Their access route is the
@@ -1524,6 +1614,7 @@ export async function announcePublishedContent({ bot, repository, content, websi
   // The public page is where the user can review details and choose Telegram delivery.
   const keyboard = websiteUrl ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', websiteUrl)]]) : undefined;
   const caption = announcementCaption(content);
+  const posts = [];
   let sent = 0;
   let failed = 0;
   let skipped = 0;
@@ -1535,18 +1626,20 @@ export async function announcePublishedContent({ bot, repository, content, websi
       continue;
     }
     try {
-      await bot.telegram.sendPhoto(channel.channelId, content.posterUrl, {
+      const posted = await bot.telegram.sendPhoto(channel.channelId, content.posterUrl, {
         caption,
         parse_mode: 'HTML',
         ...keyboard
       });
+      posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'photo', websiteUrl, postedAt: new Date().toISOString() });
       sent += 1;
     } catch (photoError) {
       try {
-        await bot.telegram.sendMessage(channel.channelId, caption, {
+        const posted = await bot.telegram.sendMessage(channel.channelId, caption, {
           parse_mode: 'HTML',
           ...keyboard
         });
+        posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'text', websiteUrl, postedAt: new Date().toISOString() });
         sent += 1;
       } catch (messageError) {
         failed += 1;
@@ -1555,7 +1648,7 @@ export async function announcePublishedContent({ bot, repository, content, websi
     }
   }
 
-  return { sent, failed, skipped };
+  return { sent, failed, skipped, posts: posts.filter((post) => Number(post.messageId) > 0) };
 }
 
 export async function inspectSessionMediaTracks({ session, bot, repository, config } = {}) {
@@ -1601,15 +1694,24 @@ export function detectUploadSeasonForFile(file) {
  * A mixed batch deliberately returns null: existing posts stay addressable by
  * their title key, while a freshly split upload always knows its own season.
  */
-export function dominantReleaseSeason(files = []) {
+export function dominantReleaseSeason(files = [], { requireEveryFile = false } = {}) {
+  const list = Array.isArray(files) ? files : [];
   const seasons = new Set();
-  for (const file of Array.isArray(files) ? files : []) {
+  let marked = 0;
+  for (const file of list) {
     const season = detectUploadSeasonForFile(file);
-    if (season) seasons.add(season);
+    if (!season) continue;
+    marked += 1;
+    seasons.add(season);
   }
   // One agreement is a season. A mixed or unreadable batch deliberately stays
   // null so an older catalog card can never be reinterpreted by accident.
-  return seasons.size === 1 ? [...seasons][0] : null;
+  if (seasons.size !== 1) return null;
+  // A single stray "S1" file must not rename a whole release: when the label is
+  // being invented rather than handed over by the split planner, every file in
+  // the group has to carry the same season marker.
+  if (requireEveryFile && list.length > 0 && marked !== list.length) return null;
+  return [...seasons][0];
 }
 
 /**
@@ -1636,6 +1738,90 @@ export function withSeasonLabel(value, season, { replace = false } = {}) {
     )
     : title;
   return cleanText(`${cleaned || title} ${label}`, 180);
+}
+
+/**
+ * Group one upload batch by the release each file actually belongs to. Files
+ * are keyed by their cleaned title so a range that holds `RRR`, `Robot 2`, and
+ * 24 `Fullmetal Alchemist` episodes becomes three posts instead of one card
+ * named after whichever file happened to come first. A file whose caption is
+ * unusable follows the file above it, because uploaders send a release together.
+ */
+export function groupFilesByReleaseTitle(files = []) {
+  const entries = (Array.isArray(files) ? files : []).map((file) => {
+    const title = cleanText(inferBatchTitle([file]), 180);
+    return { file, title, key: title ? slugify(title) : '' };
+  });
+  const groups = new Map();
+  let previousKey = null;
+  for (const entry of entries) {
+    const key = entry.key || previousKey;
+    if (!key) {
+      groups.set(slugify(entry.title || 'untitled'), { title: entry.title, files: [entry.file] });
+      previousKey = key;
+      continue;
+    }
+    const current = groups.get(key) || { title: entry.title, files: [] };
+    current.files.push(entry.file);
+    groups.set(key, current);
+    previousKey = key;
+  }
+  if (groups.size < 2) return [];
+  return [...groups.values()]
+    .filter((group) => group.title && group.files.length)
+    .map((group) => ({
+      title: group.title,
+      category: inferBatchCategory({ title: group.title, files: group.files }),
+      files: group.files
+    }));
+}
+
+/**
+ * Decide what one draft should become. Returns [] when the draft is already a
+ * single coherent post, so nothing about the ordinary flow changes.
+ */
+export function planDraftPublicationGroups(session) {
+  const files = Array.isArray(session?.files) ? session.files : [];
+  if (files.length < 2) return [];
+  const seasonGroups = groupFilesBySeason(files);
+  const batchWithoutTitle = session?.workflow === 'batch' && !session?.batch?.titleProvided && !session?.batch?.categoryOverride;
+  const releaseGroups = batchWithoutTitle ? groupFilesByReleaseTitle(files) : [];
+
+  if (!releaseGroups.length) {
+    if (seasonGroups.length < 2) return [];
+    return seasonGroups.map((group) => ({
+      title: withSeasonLabel(session.title, group.season, { replace: true }),
+      category: session.category,
+      season: group.season,
+      files: group.files,
+      reason: 'season'
+    }));
+  }
+
+  const planned = [];
+  for (const group of releaseGroups) {
+    const groupSeasons = groupFilesBySeason(group.files);
+    if (groupSeasons.length > 1) {
+      for (const season of groupSeasons) {
+        planned.push({
+          title: withSeasonLabel(group.title, season.season, { replace: true }),
+          category: group.category,
+          season: season.season,
+          files: season.files,
+          reason: 'season'
+        });
+      }
+      continue;
+    }
+    planned.push({
+      title: withSeasonLabel(group.title, groupSeasons[0]?.season ?? null),
+      category: group.category,
+      season: groupSeasons[0]?.season ?? null,
+      files: group.files,
+      reason: 'release'
+    });
+  }
+  return planned.length > 1 ? planned : [];
 }
 
 export async function publishDraft(ctx, bot, repository, config) {
@@ -1676,52 +1862,63 @@ export async function publishDraft(ctx, bot, repository, config) {
     : '';
   await ctx.reply(`Preparing your draft for publication…${inspectionNote}`);
 
-  // A batch that mixes seasons is split before anything is written. One card
-  // holding Season 1, 4, and 6 together makes every episode list and delivery
-  // page look inconsistent, and a later Season 2 upload could otherwise be
-  // appended into the wrong season.
-  const seasonGroups = groupFilesBySeason(session.files || []);
-  if (seasonGroups.length > 1) {
-    const summary = seasonGroups
-      .map((group) => `${formatSeasonLabel(group.season)} (${group.files.length} file${group.files.length === 1 ? '' : 's'})`)
+  // One draft can legitimately contain several posts: an untitled /batch range
+  // usually holds different releases, and a mixed-season upload must never share
+  // one card. Splitting first keeps every episode list, category, and quality
+  // ladder coherent, and lets a later upload merge into the right post.
+  const plan = planDraftPublicationGroups(session);
+  if (plan.length > 1) {
+    const summary = plan
+      .map((group) => `${group.title} (${group.files.length} file${group.files.length === 1 ? '' : 's'})`)
       .join(', ');
-    await ctx.reply(`${seasonGroups.length} seasons were detected in this upload: ${summary}. Each season is published as its own catalog post so their episode lists never collide.`);
+    const seasonOnly = plan.every((group) => group.reason === 'season');
+    await ctx.reply(seasonOnly
+      ? `${plan.length} seasons were detected in this upload: ${summary}. Each season is published as its own catalog post so their episode lists never collide.`
+      : `${plan.length} separate releases were detected in this upload: ${summary}. Each one becomes its own catalog post with its own category, episode list, and delivery link. Send /title before /done when you really want them combined.`);
 
-    const seasons = [];
-    for (const group of seasonGroups) {
-      // Each season is a separate publishing event with its own announcement,
-      // so sequential work is intentional even though one draft produced it.
+    const published = [];
+    for (const group of plan) {
+      // Each post is a separate publishing event with its own announcement and
+      // metadata lookup, so sequential work is intentional here.
       // eslint-disable-next-line no-await-in-loop
       const result = await publishDraftSession({
         ctx,
         bot,
         repository,
         config,
-        session: { ...session, title: withSeasonLabel(session.title, group.season, { replace: true }), files: group.files },
+        session: { ...session, title: group.title, category: group.category, files: group.files, metadata: null },
         season: group.season,
         deleteSessionOnSuccess: false
       });
-      seasons.push({ ...result, season: group.season });
+      published.push({ ...result, season: group.season, title: group.title, reason: group.reason });
     }
     await repository.deleteSession(chatId(ctx), userId(ctx));
 
-    const succeeded = seasons.filter((entry) => entry.content);
+    const succeeded = published.filter((entry) => entry.content);
     if (!succeeded.length) {
-      const error = seasons.find((entry) => entry.error)?.error || 'No season post could be published.';
+      const error = published.find((entry) => entry.error)?.error || 'Nothing could be published.';
       await ctx.reply(`Nothing was published. ${error}`);
-      return { content: null, error, seasons };
+      return { content: null, error, published, seasons: published };
     }
     const last = succeeded.at(-1).content;
     await ctx.reply([
-      `Published ${succeeded.length} season post${succeeded.length === 1 ? '' : 's'} for “${session.title}”.`,
+      `Published ${succeeded.length} catalog post${succeeded.length === 1 ? '' : 's'} from this upload.`,
       '',
-      ...seasons.map((entry) => (entry.content
-        ? `✓ ${entry.content.title} · ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} · Post ID ${entry.content.adminId}`
-        : `✗ ${withSeasonLabel(session.title, entry.season, { replace: true })} — ${entry.error || 'not published'}`)),
+      ...published.map((entry) => (entry.content
+        ? `\u2713 ${entry.content.title} \u00b7 ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} \u00b7 Post ID ${entry.content.adminId}`
+        : `\u2717 ${entry.title} \u2014 ${entry.error || 'not published'}`)),
       '',
-      'Use /done again only if a season still needs its own files.'
+      'Use /done again only if a post still needs its own files.'
     ].join('\n'), publicationKeyboard(getContentPageUrl(config, last), getTelegramDeliveryUrl(config, last.shareCode)));
-    return { content: last, seasons, multiSeason: true, websiteUrl: getContentPageUrl(config, last), deliveryUrl: getTelegramDeliveryUrl(config, last.shareCode) };
+    return {
+      content: last,
+      published,
+      seasons: published,
+      multiPost: true,
+      multiSeason: seasonOnly,
+      websiteUrl: getContentPageUrl(config, last),
+      deliveryUrl: getTelegramDeliveryUrl(config, last.shareCode)
+    };
   }
 
   return publishDraftSession({ ctx, bot, repository, config, session });
@@ -1745,7 +1942,8 @@ async function publishDraftSession({
   // each group its own season; a plain upload is settled by
   // `dominantReleaseSeason`, which deliberately returns null for a movie or an
   // ambiguous batch so those keep their established merge behaviour.
-  const releaseSeason = readSeason(season) ?? dominantReleaseSeason(session?.files || []);
+  const isMovieRelease = session?.category === 'movie';
+  const releaseSeason = readSeason(season) ?? (isMovieRelease ? null : dominantReleaseSeason(session?.files || [], { requireEveryFile: true }));
 
   const draftTitle = withSeasonLabel(session.title, releaseSeason);
 
@@ -1766,8 +1964,14 @@ async function publishDraftSession({
         if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
         const websiteUrl = getContentPageUrl(config, content);
         const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
+        // The channel post lists how many episodes/files a release carries, so
+        // an append has to refresh it as well.
+        const sync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content, config });
         await ctx.reply(
-          `Added ${session.files.length} new file${session.files.length === 1 ? '' : 's'} to the existing catalog post “${content.title}”. It now has ${content.filesCount} file${content.filesCount === 1 ? '' : 's'} and keeps Post ID ${content.adminId}.`,
+          [
+            `Added ${session.files.length} new file${session.files.length === 1 ? '' : 's'} to the existing catalog post “${content.title}”. It now has ${content.filesCount} file${content.filesCount === 1 ? '' : 's'} and keeps Post ID ${content.adminId}.`,
+            announcementSyncNote(sync)
+          ].join('\n'),
           publicationKeyboard(websiteUrl, deliveryUrl)
         );
         return { content, metadata, merged: true, websiteUrl, deliveryUrl };
@@ -1854,6 +2058,19 @@ async function publishDraftSession({
       } catch (error) {
         console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
         announcements = { sent: 0, failed: 1, skipped: 0, configured: true };
+      }
+    }
+    // Remember where the announcement landed so a later /poster, /title, /lang,
+    // or a new file can edit that same channel message instead of leaving it stale.
+    if (announcements.posts?.length && typeof repository.updateContentByAdminId === 'function') {
+      try {
+        const saved = await repository.updateContentByAdminId(content.adminId, { announcementRefs: announcements.posts });
+        if (saved) {
+          content.announcementRefs = saved.announcementRefs || announcements.posts;
+          announcements.refs = content.announcementRefs;
+        }
+      } catch (error) {
+        console.warn('[telegram] could not remember announcement message IDs for later edits:', error?.message || 'Unknown error');
       }
     }
     const posterNote = posterResult.source === 'generated-fallback'
@@ -2674,18 +2891,74 @@ function directEpisodeLabel(start, end) {
  * manifest. Bare URLs remain intentional release-level players; adding
  * `ep`/`episode` (or a leading number) ties the link to that delivery episode.
  */
+/**
+ * Split one message into separate player links. A publisher commonly pastes a
+ * list ("ep 2 url1 url2" or one link per line, sometimes as Markdown links), and
+ * each pasted link is a player the publisher wants to keep.
+ */
+export function splitPlayerLinks(value, { allowedHosts = [] } = {}) {
+  const candidates = cleanText(value, 4_000)
+    .split(/\r?\n|\s{2,}|[,;]+|\s+(?=https?:\/\/|\[|<iframe)/i)
+    .map((entry) => entry.replace(/^\s*(?:[-*•]\s*|\d{1,3}[.)]\s*)/, '').trim())
+    .filter(Boolean);
+  const urls = [];
+  const rejected = [];
+  for (const candidate of candidates) {
+    if (!/https?:\/\//i.test(candidate) && !/iframe/i.test(candidate)) continue;
+    const link = safeStreamingLink(candidate, { allowedHosts });
+    if (link?.embedUrl || link?.watchUrl) {
+      urls.push(link);
+      continue;
+    }
+    rejected.push(extractStreamingUrl(candidate).slice(0, 80) || cleanText(candidate, 80));
+  }
+  return { urls, rejected };
+}
+
+/**
+ * Parse the removal grammar of /cmd: `del 3`, `del 2, 4`, `del ep 5`,
+ * `del ep 2-7`, or `del all`. Episode ranges remove every player of those
+ * episodes at once, which is how a wrong bulk import is undone.
+ */
+export function parseStreamRemoval(value) {
+  const text = cleanText(value, 120).replace(/^#/, '').trim();
+  if (!text) return { error: 'Say what to remove: /cmd SB-0123ABCDEF del 3, del ep 5, del ep 2-7, or del all.' };
+  if (/^(?:all|everything|every|everythang|the whole list)$/i.test(text)) return { mode: 'all' };
+  const episode = text.match(/^(?:ep|episode|eps)\.?\s*(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?$/i);
+  if (episode) {
+    const start = Number(episode[1]);
+    const end = Number(episode[2] || episode[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+      return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+    }
+    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) } };
+  }
+  if (/^(?:ep|episode|eps)\b/i.test(text)) return { error: 'Use a range such as del ep 5 or del ep 2-7.' };
+  const indexes = [...text.matchAll(/\d{1,4}/g)].map((match) => Number(match[0])).filter((number) => number >= 1);
+  if (!indexes.length) return { error: 'Say which player number to remove, for example /cmd SB-0123ABCDEF del 3.' };
+  return { mode: 'index', indexes: [...new Set(indexes)] };
+}
+
 export function parseDirectStreamingInput(value) {
-  const supplied = cleanText(value, 2_200);
+  const supplied = cleanText(value, 4_000);
+  const removal = supplied.match(/^(?:del|delete|remove|unlink)\b[\s:]*([\s\S]*)$/i);
+  if (removal) {
+    const deletePlan = parseStreamRemoval(removal[1]);
+    return { playerValue: '', urls: [], episode: null, action: 'delete', delete: deletePlan, error: deletePlan.error || null };
+  }
   const match = supplied.match(/^(?:(?:episode|ep)\.?\s*)?(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?\s+([\s\S]+)$/i);
-  if (!match) return { playerValue: supplied, episode: null, error: null };
+  if (!match) return { playerValue: supplied, urls: [], episode: null, action: 'add', delete: null, error: null };
   const start = Number(match[1]);
   const end = Number(match[2] || match[1]);
   if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
-    return { playerValue: '', episode: null, error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+    return { playerValue: '', urls: [], episode: null, action: 'add', delete: null, error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
   }
   return {
-    playerValue: cleanText(match[3], 2_000),
+    playerValue: cleanText(match[3], 3_800),
+    urls: [],
     episode: { start, end, label: directEpisodeLabel(start, end) },
+    action: 'add',
+    delete: null,
     error: null
   };
 }
@@ -2709,11 +2982,14 @@ function streamImportInstructions(targetAdminId = null) {
     target,
     '',
     'For many episodes at once, send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
-    'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL.',
+    'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL, and a pasted Markdown link such as [https://rumble.com/v….html](…) is read like plain text.',
+    'Page links are converted automatically to the URL the site can actually frame, so https://www.dailymotion.com/video/x… and https://rumble.com/v…-title.html work as sent. Each player is named after its provider (Dailymotion server, Rumble server), and a second link for an episode you already filled stays beside the first one instead of replacing it.',
     '',
     'Recommended CSV columns: postId, episode, label, embedUrl, watchUrl',
     armedEpisodeExample,
+    'Several links in one message are all saved: ep 2 <url1> <url2>, one per line, or a bullet list. For a whole range use ep 2-7 <URL>, which is what a multi-episode release needs.',
     'For a release-wide player, omit ep: /cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#your-video',
+    `To undo: del 2 removes one numbered player, del ep 2-7 removes an episode range, del all clears the post. ${targetAdminId ? `Current players and their numbers: /players ${targetAdminId}.` : `Players and their numbers: /players SB-0123ABCDEF.`}`,
     'Use /cmd cancel to stop this import.'
   ].join('\n');
 }
@@ -2759,7 +3035,7 @@ async function resolveStreamImportContent(repository, entry, targetAdminId = nul
  * does not call publication/announcement functions: importing a player link
  * must preserve the post and never create a Telegram announcement.
  */
-export async function applyStreamingManifest({ repository, manifest, targetAdminId = null, config = {} } = {}) {
+export async function applyStreamingManifest({ repository, manifest, targetAdminId = null, config = {}, granularity = 'provider' } = {}) {
   if (!repository?.updateContentStreamByAdminId || !repository?.findContentByAdminId) {
     throw new Error('This catalog store cannot attach manual Watch links.');
   }
@@ -2780,7 +3056,7 @@ export async function applyStreamingManifest({ repository, manifest, targetAdmin
 
   const updated = [];
   for (const group of groups.values()) {
-    const stream = mergeStreamingEntries(group.content.stream, group.entries, streamingOptionsFromConfig(config));
+    const stream = mergeStreamingEntries(group.content.stream, group.entries, { ...streamingOptionsFromConfig(config), granularity });
     if (!stream) {
       rejected.push({ row: '?', error: `could not create a safe player entry for ${group.content.adminId}` });
       continue;
@@ -2799,24 +3075,139 @@ export async function applyStreamingManifest({ repository, manifest, targetAdmin
   };
 }
 
-function directStreamingManifest(targetAdminId, playerUrl, episode = null) {
-  const provider = new URL(playerUrl).hostname.replace(/^www\./i, '');
+/**
+ * Turn one or more pasted player links into manifest entries. Each link keeps
+ * the provider's own name, so the site shows "Dailymotion server" and
+ * "Rumble server" instead of an anonymous "Player 1 / Player 2".
+ */
+function directStreamingManifest(targetAdminId, playerLinks, episode = null) {
+  const links = (Array.isArray(playerLinks) ? playerLinks : [playerLinks]).filter(Boolean);
   return {
-    entries: [{
-      row: 1,
-      postId: targetAdminId,
-      sourceTitle: null,
-      category: null,
-      entry: {
-        label: episode?.label || 'Main player',
-        episode: episode || null,
-        provider,
-        embedUrl: playerUrl,
-        watchUrl: playerUrl
-      }
-    }],
+    entries: links.map((link, index) => {
+      const embedUrl = typeof link === 'string' ? link : link?.embedUrl || null;
+      const watchUrl = typeof link === 'string' ? link : link?.watchUrl || null;
+      const server = streamServerName(embedUrl || watchUrl);
+      const shortName = server.replace(/\s+server$/i, '');
+      return {
+        row: index + 1,
+        postId: targetAdminId,
+        sourceTitle: null,
+        category: null,
+        entry: {
+          label: `${shortName}${episode?.label ? ` · ${episode.label}` : ''}`,
+          episode: episode || null,
+          provider: shortName,
+          server,
+          embedUrl,
+          watchUrl
+        }
+      };
+    }),
     rejected: []
   };
+}
+
+/**
+ * Remove the players a publisher selects by list number, by episode (including
+ * a range), or all of them. Only the existing post is touched — like every
+ * other /cmd action it never publishes, deletes files, or announces.
+ */
+export async function removeAttachedPlayers({ repository, targetAdminId, removal = {}, config = {} } = {}) {
+  const content = await repository.findContentByAdminId?.(String(targetAdminId).toUpperCase());
+  if (!content) return { error: `No published catalog post was found for ${targetAdminId}.` };
+  const entries = Array.isArray(content.stream?.entries) ? content.stream.entries : [];
+  if (!entries.length) return { error: `${content.title} has no player links attached, so nothing was removed.`, removed: 0, remaining: 0 };
+  const total = publicStreamingData(content.stream, streamingOptionsFromConfig(config)).entries.length;
+  const indexes = removal.mode === 'index'
+    ? removal.indexes.filter((index) => index >= 1 && index <= total)
+    : null;
+  if (indexes && !indexes.length) {
+    return { error: `This post has ${total} player${total === 1 ? '' : 's'}. Use a number between 1 and ${total}, or del ep 5 for an episode.`, removed: 0, remaining: total };
+  }
+  const outcome = removeStreamingEntries(content.stream, {
+    indexes,
+    episode: removal.mode === 'episode' ? removal.episode : null,
+    all: removal.mode === 'all'
+  }, streamingOptionsFromConfig(config));
+  if (!outcome.removed) {
+    return { error: 'No attached player matched that episode range, so nothing was removed.', removed: 0, remaining: total };
+  }
+  const saved = await repository.updateContentStreamByAdminId(content.adminId, outcome.stream || null);
+  if (!saved) return { error: 'The player list could not be saved. Nothing was removed.', removed: 0, remaining: total };
+  return {
+    content: saved,
+    removed: outcome.removed,
+    remaining: outcome.remaining,
+    scope: removal.mode === 'episode'
+      ? `${removal.episode.label}`
+      : removal.mode === 'all'
+        ? 'every attached player'
+        : `player${indexes.length === 1 ? '' : 's'} ${indexes.join(', ')}`
+  };
+}
+
+/**
+ * The publisher-facing list of attached players. Numbers shown here are exactly
+ * what `del <number>` and the Remove buttons address, so a mistaken bulk import
+ * can be cleaned up without remembering provider URLs.
+ */
+export function playersList(content, config = {}) {
+  const data = publicStreamingData(content?.stream, streamingOptionsFromConfig(config));
+  return data.entries.map((entry, index) => ({
+    ...entry,
+    number: index + 1,
+    title: entry.label || entry.episode?.label || 'Main player',
+    server: entry.server || streamServerName(entry.embedUrl || entry.watchUrl),
+    url: entry.embedUrl || entry.watchUrl || null
+  }));
+}
+
+export function playersListText(content, entries, config = {}) {
+  const watchUrl = watchPageUrl(config, content, null);
+  if (!entries.length) {
+    return [
+      `▸ ${content.title} (${content.adminId})`,
+      '',
+      'No player is attached to this release yet.',
+      'Add one: /cmd ' + content.adminId + ' ep 1 https://rumble.com/vxxxx-title.html',
+      'Many at once: /cmd ' + content.adminId + ' then send the provider .json or .csv export.'
+    ].join('\n');
+  }
+  const lines = entries.map((entry) => [
+    `${entry.number}. ${entry.server} · ${entry.episode?.label || 'Release-wide'}`,
+    `   → ${entry.url}`
+  ].join('\n'));
+  return [
+    `▸ ${content.title} (${content.adminId}) — ${entries.length} player${entries.length === 1 ? '' : 's'}`,
+    '',
+    ...lines,
+    '',
+    `Remove one: /cmd ${content.adminId} del 1`,
+    `Remove an episode range: /cmd ${content.adminId} del ep 2-7`,
+    `Add another link to the same episode and both stay.`,
+    watchUrl ? `Watch page: ${watchUrl}` : null
+  ].filter(Boolean).join('\n').slice(0, 3_600);
+}
+
+export function playersKeyboard(entries) {
+  if (!entries.length) {
+    // Nothing to remove yet, so the only useful action is to add the first link.
+    return Markup.inlineKeyboard([[Markup.button.callback('Add players', 'ply:add')]]);
+  }
+  const rows = [];
+  for (let index = 0; index < Math.min(entries.length, 20); index += 2) {
+    rows.push(entries.slice(index, index + 2).map((entry) => Markup.button.callback(
+      telegramButtonText(`Remove ${entry.number} · ${entry.server.replace(/\s+server$/i, '')}`),
+      `ply:remove:${entry.number}`
+    )));
+  }
+  const lastRow = [
+    Markup.button.callback('Remove all players', 'ply:remove:all'),
+    Markup.button.callback('Add another', 'ply:add')
+  ];
+  if (entries.length > 20) lastRow.push(Markup.button.callback('Close', 'ply:close'));
+  rows.push(lastRow);
+  return Markup.inlineKeyboard(rows);
 }
 
 function streamImportResultText(result, config) {
@@ -2851,22 +3242,39 @@ async function handleStreamImportUpload(ctx, repository, config) {
       await ctx.reply(directInput.error);
       return true;
     }
-    const playerUrl = directInput
-      ? safeStreamingUrl(directInput.playerValue, streamingOptionsFromConfig(config))
-      : null;
-    if (playerUrl) {
+    if (directInput?.action === 'delete') {
+      const outcome = await removeAttachedPlayers({ repository, targetAdminId: pending.targetAdminId, removal: directInput.delete, config });
+      if (outcome.error) {
+        await ctx.reply(`${outcome.error} Use /players ${pending.targetAdminId} to list the current players with their numbers.`);
+        return true;
+      }
+      await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      await ctx.reply(
+        `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
+        playersKeyboard(playersList(outcome.content, config))
+      );
+      return true;
+    }
+    const links = directInput
+      ? splitPlayerLinks(directInput.playerValue, streamingOptionsFromConfig(config))
+      : { urls: [], rejected: [] };
+    if (links.urls.length) {
       const result = await applyStreamingManifest({
         repository,
         targetAdminId: pending.targetAdminId,
         config,
-        manifest: directStreamingManifest(pending.targetAdminId, playerUrl, directInput.episode)
+        granularity: 'exact',
+        manifest: directStreamingManifest(pending.targetAdminId, links.urls, directInput.episode)
       });
       if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
-      await ctx.reply(streamImportResultText(result, config));
+      const rejectedNote = links.rejected.length
+        ? `\nSkipped ${links.rejected.length} link${links.rejected.length === 1 ? '' : 's'} from an unapproved host: ${links.rejected.slice(0, 3).join(', ')}${links.rejected.length > 3 ? '…' : ''}`
+        : '';
+      await ctx.reply(`${streamImportResultText(result, config)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${pending.targetAdminId}` : ''}`);
       return true;
     }
     await ctx.reply(pending.targetAdminId
-      ? 'Watch-link import is waiting for a .json/.csv document or one approved player URL/iframe. For one episode, send “ep 1 <player URL or iframe>”. Send it now, or use /cmd cancel.'
+      ? 'Watch-link import is waiting for a .json/.csv document or approved player URLs. For one episode, send “ep 1 <player URL or iframe>”; several links in one message are all saved. To remove players, send “del ep 2-7” or “del 3”. Or use /cmd cancel.'
       : 'Watch-link import is waiting for one .json or .csv document. To paste one episode player directly, start with /cmd SB-0123ABCDEF ep 1 <player URL>.');
     return true;
   }
@@ -3071,7 +3479,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
           'Edit a published post by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID.',
-          'Manual Watch pages: /cmd SB-0123ABCDEF <SeekStreaming Embed Link or iframe> saves one player immediately. Or use /cmd SB-0123ABCDEF then send the provider’s small JSON/CSV export. It updates only the existing post, never uploads media through Koyeb and never sends an announcement. /cmd without an ID can match an exact exported Title.',
+          'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
@@ -3503,7 +3911,7 @@ export async function launchTelegramBot({ config, repository }) {
       await ctx.reply('Manual Watch-link import is not available in this catalog store.');
       return;
     }
-    const argument = parseCommandArgument(ctx.message.text, 2_400);
+    const argument = parseCommandArgument(ctx.message.text, 6_000);
     if (/^(?:cancel|stop)$/i.test(argument)) {
       await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
       await ctx.reply('Manual Watch-link import cancelled. No player links were changed.', panelKeyboard());
@@ -3520,11 +3928,11 @@ export async function launchTelegramBot({ config, repository }) {
 
     const target = argument.match(/^(SB-[A-F0-9]{10})(?:\s+([\s\S]+))?$/i);
     if (argument && !target) {
-      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields.');
+      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode (several links in one message are all saved), /cmd SB-0123ABCDEF ep 2-7 <URL> for a range, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, /cmd SB-0123ABCDEF del ep 2-7 to remove players, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields, or /players SB-0123ABCDEF to see what is attached.');
       return;
     }
     const targetAdminId = target?.[1]?.toUpperCase() || null;
-    const directValue = cleanText(target?.[2] || '', 2_200);
+    const directValue = cleanText(target?.[2] || '', 4_800);
     if (targetAdminId) {
       const content = await repository.findContentByAdminId(targetAdminId);
       if (!content) {
@@ -3537,25 +3945,122 @@ export async function launchTelegramBot({ config, repository }) {
           await ctx.reply(directInput.error);
           return;
         }
-        const playerUrl = safeStreamingUrl(directInput.playerValue, streamingOptionsFromConfig(config));
-        if (!playerUrl) {
-          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; add another trusted domain through STREAMING_ALLOWED_HOSTS. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
+        if (directInput.action === 'delete') {
+          const outcome = await removeAttachedPlayers({ repository, targetAdminId, removal: directInput.delete, config });
+          if (outcome.error) {
+            await ctx.reply(`${outcome.error} Use /players ${targetAdminId} to list the current players with their numbers.`);
+            return;
+          }
+          await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+          await ctx.reply(
+            `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
+            playersKeyboard(playersList(outcome.content, config))
+          );
+          return;
+        }
+        const links = splitPlayerLinks(directInput.playerValue, streamingOptionsFromConfig(config));
+        if (!links.urls.length) {
+          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; page links are converted to their embeddable player URL automatically. Add another trusted domain through STREAMING_ALLOWED_HOSTS. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
           return;
         }
         const result = await applyStreamingManifest({
           repository,
           targetAdminId,
           config,
-          manifest: directStreamingManifest(targetAdminId, playerUrl, directInput.episode)
+          // Manual links are added, never silently replaced: a second source for
+          // the same episode is a deliberate choice by the publisher.
+          granularity: 'exact',
+          manifest: directStreamingManifest(targetAdminId, links.urls, directInput.episode)
         });
         await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
-        await ctx.reply(streamImportResultText(result, config));
+        const rejectedNote = links.rejected.length
+          ? `\nSkipped ${links.rejected.length} link${links.rejected.length === 1 ? '' : 's'} from an unapproved host: ${links.rejected.slice(0, 3).join(', ')}${links.rejected.length > 3 ? '…' : ''}`
+          : '';
+        await ctx.reply(`${streamImportResultText(result, config)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${targetAdminId}` : ''}`);
         return;
       }
     }
 
     await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId });
     await ctx.reply(streamImportInstructions(targetAdminId));
+  });
+
+  // ── /players: the list view of attached players, with Remove buttons. The
+  //    numbers here are the numbers `del <n>` uses, so a wrong or bulk import is
+  //    reversible without remembering provider URLs.
+  bot.command('players', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.findContentByAdminId !== 'function') {
+      await ctx.reply('Player management is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 120);
+    const targetAdminId = parsePublisherTargetInput(argument)?.adminId || null;
+    if (!targetAdminId) {
+      const posts = typeof repository.listAdminContent === 'function' ? await repository.listAdminContent(10) : [];
+      await ctx.reply([
+        'Usage: /players SB-0123ABCDEF',
+        'That lists every player attached to a release and lets you remove one, an episode range, or all of them.',
+        posts.length ? `Recent post IDs:\n${posts.map((post) => `▪ ${post.adminId} — ${cleanText(post.title, 60)}`).join('\n')}` : 'No published posts were found in this bot store yet.'
+      ].join('\n'));
+      return;
+    }
+    const content = await repository.findContentByAdminId(targetAdminId);
+    if (!content) {
+      await ctx.reply(`No published catalog post was found for ${targetAdminId}. Use /posts or /postid to find its private ID.`);
+      return;
+    }
+    const entries = playersList(content, config);
+    await ctx.reply(playersListText(content, entries, config), playersKeyboard(entries));
+  });
+
+  bot.action(/^ply:rem:([A-Z0-9-]{4,40}):(all|\d{1,4})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, removalAdminId, rawTarget] = ctx.match;
+    const removal = rawTarget === 'all'
+      ? { mode: 'all' }
+      : { mode: 'index', indexes: [Number(rawTarget)] };
+    let outcome;
+    try {
+      outcome = await removeAttachedPlayers({ repository, targetAdminId: removalAdminId, removal, config });
+    } catch (error) {
+      console.error('[telegram] player removal failed:', error?.message || 'Unknown error');
+      await acknowledgeTap(ctx, 'The player could not be removed. Nothing was changed.', { alert: true });
+      return;
+    }
+    if (outcome.error) {
+      await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
+      return;
+    }
+    const entries = playersList(outcome.content, config);
+    const note = `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached. No announcement was sent and no file was changed.`;
+    const edited = await ctx.editMessageText(playersListText(outcome.content, entries, config), playersKeyboard(entries))
+      .then(() => true)
+      .catch(() => false);
+    if (!edited) await ctx.reply(note, playersKeyboard(entries)).catch(() => {});
+    await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
+  });
+
+  bot.action(/^ply:add:([A-Z0-9-]{4,40})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, addAdminId] = ctx.match;
+    const content = await repository.findContentByAdminId?.(addAdminId);
+    if (!content) {
+      await acknowledgeTap(ctx, 'That post is no longer available. Use /posts to find its current private ID.', { alert: true });
+      return;
+    }
+    if (typeof repository.startStreamImport !== 'function') {
+      await acknowledgeTap(ctx, 'Player links can only be pasted in the private publisher chat.', { alert: true });
+      return;
+    }
+    await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId: content.adminId });
+    await acknowledgeTap(ctx, 'Now paste the player URL or the provider export');
+    await ctx.reply(streamImportInstructions(content.adminId));
+  });
+
+  bot.action(/^ply:close$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    await acknowledgeTap(ctx, 'Player list closed. Use /players SB-0123ABCDEF to show it again.');
   });
 
   bot.command('backup', async (ctx) => {

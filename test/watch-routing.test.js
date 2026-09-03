@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episodeStreamEntries, fileChoicesForEpisode, hasReleaseLevelWatch, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchPagePath } from '../src/client/watch-utils.js';
+import { episodeStreamEntries, fileChoicesForEpisode, hasReleaseLevelWatch, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
 
 function episode(number) {
   return { start: number, end: number, label: `Episode ${String(number).padStart(2, '0')}` };
@@ -87,4 +87,49 @@ test('detail pages split single episodes from batch packs', () => {
   assert.deepEqual(groups.episodes.map((group) => group.label), ['Episode 01', 'Episode 02']);
   assert.deepEqual(groups.packs.map((group) => group.label), ['Episodes 01\\u201303']);
   assert.deepEqual(splitEpisodeGroups(undefined), { episodes: [], packs: [] });
+});
+
+test('players are named after their provider, never as an anonymous number', () => {
+  assert.equal(playerDisplayName({ server: 'Dailymotion server', label: 'Dailymotion · Episode 02' }), 'Dailymotion server');
+  assert.equal(playerShortName({ server: 'Rumble server' }), 'Rumble');
+  // entries stored before server naming existed still read from their label
+  assert.equal(playerDisplayName({ label: 'SeekStreaming HQ' }), 'SeekStreaming HQ');
+  // …and a leftover "Player 2" label falls back to the episode it belongs to
+  assert.equal(playerDisplayName({ label: 'Player 2', episode: episode(7) }), 'Episode 07');
+  assert.equal(playerDisplayName({}), 'Main player');
+});
+
+test('a Watch page names the episode and its season, and a movie only its languages', () => {
+  const item = {
+    category: 'web-series',
+    title: 'Fullmetal Alchemist: Brotherhood S02',
+    episodeGroups: [{ start: 1, end: 24, label: 'Season 2' }],
+    languages: ['Hindi Dubbed', 'English'],
+    subtitleLanguages: ['English']
+  };
+  const single = watchHeading(item, { episode: episode(5), fileLabel: 'Episode 05' });
+  assert.deepEqual(
+    { title: single.title, meta: single.meta, isEpisode: single.isEpisode },
+    { title: 'Fullmetal Alchemist: Brotherhood S02', meta: ['Season 2', 'Episode 05'], isEpisode: true },
+    'a label that is only the episode number does not replace the release name'
+  );
+  const named = watchHeading(item, { episode: episode(9), fileLabel: 'Brotherhood EP 09 Dual Audio' });
+  assert.deepEqual({ title: named.title, meta: named.meta }, { title: 'Brotherhood EP 09 Dual Audio', meta: ['Season 2', 'Episode 09'] });
+  const pack = watchHeading(item, { episode: { start: 3, end: 6, label: 'Episodes 03–06' } });
+  assert.deepEqual(pack.meta, ['Season 2', 'Episodes 03–06']);
+
+  // the season may only be spelled out in the title, and a sequel number is not a season
+  assert.equal(watchHeading({ ...item, episodeGroups: [] }, { episode: episode(3) }).seasonLabel, 'Season 2');
+  assert.equal(watchHeading({ ...item, title: 'Rocky 2', episodeGroups: [] }, { episode: episode(3) }).seasonLabel, null);
+  // a grouped label without a season still shows no invented season
+  assert.deepEqual(watchHeading({ ...item, title: 'Show', episodeGroups: [{ start: 1, end: 12, label: 'Episodes 01–12' }] }, { episode: episode(4) }).meta, ['Episode 04']);
+
+  const movie = { category: 'movie', title: 'RRR', episodeGroups: [], languages: ['Hindi Dubbed', 'Tamil'], subtitleLanguages: ['English'] };
+  const movieHeading = watchHeading(movie, { fileLabel: null });
+  assert.deepEqual(
+    { title: movieHeading.title, meta: movieHeading.meta, isEpisode: movieHeading.isEpisode },
+    { title: 'RRR', meta: ['Hindi Dubbed · Tamil', 'Subtitles: English'], isEpisode: false },
+    'a movie shows its languages and never a season or episode number'
+  );
+  assert.equal(watchHeading(movie, {}).title, 'RRR');
 });

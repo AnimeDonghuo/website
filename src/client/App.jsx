@@ -8,7 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, releaseLevelStreamEntries, splitEpisodeGroups, watchPagePath } from './watch-utils.js';
+import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
@@ -314,15 +314,16 @@ function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
  */
 function EpisodeWatchPanel({ item, episode, entries }) {
   if (!entries?.length) return null;
+  const names = entries.map((entry) => playerDisplayName(entry));
   return <div className="episode-watch-panel">
     <div className="episode-watch-panel__copy">
       <Eyebrow><Icon name="play" size={13} /> AVAILABLE NOW</Eyebrow>
-      <strong>{entries.length === 1 ? 'A player is ready for this episode' : `${entries.length} players are ready for this episode`}</strong>
-      <p>{entries[0]?.label ? <span>Source: {entries[0].label}</span> : null}<span>Streaming opens in the site player. Telegram delivery below stays a separate choice.</span></p>
+      <strong>{entries.length === 1 ? `${names[0]} is ready for this episode` : `${names.length} players are ready for this episode`}</strong>
+      <p><span>Source{names.length > 1 ? 's' : ''}: {names.join(' · ')}</span><span>Streaming opens in the site player. Telegram delivery below stays a separate choice.</span></p>
     </div>
     <div className="episode-watch-panel__actions">
       {entries.map((entry, index) => <Link className={`button ${index === 0 ? 'button--watch' : 'button--secondary'}`} key={entry.id} to={watchPagePath(item, episode)}>
-        <Icon name="play" size={18} /> {entries.length > 1 ? `Watch · Player ${index + 1}` : 'Watch now'}
+        <Icon name="play" size={18} /> {entries.length > 1 ? `Watch on ${playerShortName(entry)}` : 'Watch now'}
       </Link>)}
     </div>
   </div>;
@@ -578,8 +579,15 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>This Watch option is unavailable.</h1><p>The selected player is no longer available. Return to the release to choose another option.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
   }
 
-  const selectedTitle = selected.label || selected.episode?.label || 'Main player';
-  const selectedFileTitle = matchingFiles[0]?.label || (selectedTitle === 'Main player' ? item.title : selectedTitle);
+  const selectedTitle = playerDisplayName(selected);
+  // The Watch page announces the episode and its place in the season, not the
+  // release title repeated; a movie has no season, so its languages are shown.
+  const heading = watchHeading(item, {
+    episode: requestedEpisode || selected.episode || null,
+    fileLabel: requestedEpisode ? matchingFiles[0]?.label || null : null
+  });
+  const selectedFileTitle = heading.title;
+  const externalPlayerUrl = selected.watchUrl && selected.watchUrl !== selected.embedUrl ? selected.watchUrl : null;
   const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
   const hasEpisodeDelivery = matchingFiles.length > 0;
   const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
@@ -592,9 +600,13 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
           <div className="watch-hero__heading">
             <div>
-              <Eyebrow><Icon name="play" size={13} /> WATCH</Eyebrow>
+              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${item.categoryLabel.toUpperCase()}`}</Eyebrow>
               <h1>{selectedFileTitle}</h1>
-              <p className="watch-hero__meta">{episodeContext ? <span className="watch-hero__episode">{episodeContext}</span> : null}<span>Hosted by SoraBox</span></p>
+              <p className="watch-hero__meta">
+                {heading.meta.map((line) => <span className="watch-hero__episode" key={line}>{line}</span>)}
+                {entries.length > 1 ? <span>{entries.length} players available</span> : null}
+                <span>Now playing on {selectedTitle}</span>
+              </p>
             </div>
           </div>
           <div className="watch-player-shell">
@@ -608,6 +620,10 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               allowFullScreen
             /> : <div className="watch-player-shell__fallback"><Icon name="play" size={24} /><strong>This video opens in its approved player.</strong><p>Use the play button to continue.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Play video <Icon name="arrow" size={16} /></a> : null}</div>}
           </div>
+          {externalPlayerUrl ? <div className="watch-player-note">
+            <span>{selected.embedUrl ? 'Player not opening on this device?' : 'This source has no embeddable player URL.'}</span>
+            <a href={externalPlayerUrl} target="_blank" rel="noreferrer">Open on {playerShortName(selected)} <Icon name="arrow" size={14} /></a>
+          </div> : null}
           {(hasEpisodeDelivery || item.deliveryReady) ? <div className="watch-delivery">
             <div>
               <span>{episodeContext || 'TELEGRAM DELIVERY'}</span>
@@ -616,8 +632,8 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
             <button className="button button--telegram" type="button" onClick={() => onGetFiles(item, hasEpisodeDelivery ? { files: matchingFiles, title: deliveryTitle, episodeLabel: episodeContext } : undefined)}><Icon name="telegram" size={18} /> Get files</button>
           </div> : null}
           {entries.length > 1 ? <div className="watch-player-options" aria-label="Player options">
-            <span>Choose a player</span>
-            <div>{entries.map((entry, index) => <button className={entry.id === selected.id ? 'is-active' : ''} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}><Icon name="play" size={13} /> Player {index + 1}</button>)}</div>
+            <span>Choose a server</span>
+            <div>{entries.map((entry) => <button className={entry.id === selected.id ? 'is-active' : ''} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}><Icon name="play" size={13} /> {playerShortName(entry)}{entry.episode?.label && !requestedEpisode ? ` · ${entry.episode.label}` : ''}</button>)}</div>
           </div> : null}
         </div>
       </section>

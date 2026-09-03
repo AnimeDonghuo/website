@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
-import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
-import { parseStreamingManifest } from '../src/server/services/streaming-service.js';
+import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, announcementSyncNote, planDraftPublicationGroups, syncPublishedAnnouncements, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parseStreamRemoval, playersList, playersListText, removeAttachedPlayers, splitPlayerLinks, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
+import { parseStreamingManifest, publicStreamingData, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
@@ -111,19 +111,180 @@ test('publisher menu exposes post management, backup, and compatible metadata co
 test('direct /cmd input can attach one explicit episode player while preserving intentional main players', () => {
   assert.deepEqual(parseDirectStreamingInput('ep 01 https://soraboxs.embedseek.com/#episode-one'), {
     playerValue: 'https://soraboxs.embedseek.com/#episode-one',
+    urls: [],
     episode: { start: 1, end: 1, label: 'Episode 01' },
+    action: 'add',
+    delete: null,
     error: null
   });
   assert.deepEqual(parseDirectStreamingInput('episode 2-4 <iframe src="https://soraboxs.embedseek.com/#episodes-two-four"></iframe>'), {
     playerValue: '<iframe src="https://soraboxs.embedseek.com/#episodes-two-four"></iframe>',
+    urls: [],
     episode: { start: 2, end: 4, label: 'Episodes 02–04' },
+    action: 'add',
+    delete: null,
     error: null
   });
   assert.deepEqual(parseDirectStreamingInput('https://soraboxs.embedseek.com/#release-main'), {
     playerValue: 'https://soraboxs.embedseek.com/#release-main',
+    urls: [],
     episode: null,
+    action: 'add',
+    delete: null,
     error: null
   });
+  // `del ...` is a removal, not a player link, and is reported as such.
+  const removal = parseDirectStreamingInput('del ep 2-7');
+  assert.equal(removal.action, 'delete');
+  assert.deepEqual(removal.delete, { mode: 'episode', episode: { start: 2, end: 7, label: 'Episodes 02–07' } });
+  assert.equal(removal.error, null);
+  // two links after the episode number are two players, not a malformed one
+  const multi = parseDirectStreamingInput('ep 2 https://rumble.com/v1a-one.html https://www.dailymotion.com/video/x1a2b3c');
+  assert.equal(multi.error, null);
+  assert.equal(multi.playerValue.includes('rumble.com/v1a-one.html'), true);
+  assert.equal(multi.playerValue.includes('dailymotion.com/video/x1a2b3c'), true);
+});
+
+test('pasted player lists become one embeddable player each, whatever form they arrive in', () => {
+  const pasted = [
+    '[https://rumble.com/v7exnu4-the-episode.html](https://rumble.com/v7exnu4-the-episode.html)',
+    'https://www.dailymotion.com/video/x8abcde',
+    '- https://soraboxs.embedseek.com/#episode-nine',
+    '<iframe src="https://soraboxs.embedseek.com/#episode-ten" width="100%"></iframe>'
+  ].join('\n');
+  const { urls, rejected } = splitPlayerLinks(pasted, { allowedHosts: [] });
+  assert.equal(rejected.length, 0);
+  assert.deepEqual(urls.map((link) => link.embedUrl), [
+    'https://rumble.com/embed/v7exnu4/',
+    'https://www.dailymotion.com/embed/video/x8abcde',
+    'https://soraboxs.embedseek.com/#episode-nine',
+    'https://soraboxs.embedseek.com/#episode-ten'
+  ]);
+  assert.equal(urls[0].watchUrl, 'https://rumble.com/v7exnu4-the-episode.html');
+  // a page link from a host the site does not trust is never saved, and
+  // executable or non-HTTPS input is refused instead of being rewritten
+  assert.deepEqual(splitPlayerLinks('https://evil.example/player.js\ndailymotion.com/video/x8abcde', { allowedHosts: [] }).rejected, [
+    'https://evil.example/player.js'
+  ]);
+  assert.equal(safeStreamingUrl('javascript:alert(1)'), null);
+  assert.equal(streamServerName('https://rumble.com/embed/v7exnu4/'), 'Rumble server');
+  assert.equal(streamServerName('https://www.dailymotion.com/embed/video/x8abcde'), 'Dailymotion server');
+  assert.equal(streamServerName('https://soraboxs.embedseek.com/#x'), 'Seek server');
+});
+
+test('player removal grammar accepts list numbers, episodes, ranges, and all', () => {
+  assert.deepEqual(parseStreamRemoval('3'), { mode: 'index', indexes: [3] });
+  assert.deepEqual(parseStreamRemoval('#4'), { mode: 'index', indexes: [4] });
+  assert.deepEqual(parseStreamRemoval('2, 4'), { mode: 'index', indexes: [2, 4] });
+  assert.deepEqual(parseStreamRemoval('ep 5'), { mode: 'episode', episode: { start: 5, end: 5, label: 'Episode 05' } });
+  assert.deepEqual(parseStreamRemoval('episode 2 to 7'), { mode: 'episode', episode: { start: 2, end: 7, label: 'Episodes 02–07' } });
+  assert.deepEqual(parseStreamRemoval('all'), { mode: 'all' });
+  assert.match(parseStreamRemoval('').error, /Say what to remove/i);
+  assert.match(parseStreamRemoval('ep nine').error, /Use a range/i);
+});
+
+test('a second player added to one episode stays beside the first, while a provider export still replaces its own slot', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Cascade S01',
+    category: 'web-series',
+    files: [{ storageMessageId: 71, name: 'Cascade.S01E02.mkv' }]
+  });
+  const manual = (entries) => ({ entries: entries.map((entry, index) => ({ row: index + 1, postId: created.adminId, entry })), rejected: [] });
+  // two pasted links for the same episode are both kept, each named by provider
+  const pasted = await applyStreamingManifest({
+    repository,
+    config: { streaming: {} },
+    granularity: 'exact',
+    manifest: manual([
+      {
+        label: 'Dailymotion · Episode 02',
+        provider: 'Dailymotion',
+        episode: { start: 2, end: 2, label: 'Episode 02' },
+        embedUrl: 'https://www.dailymotion.com/embed/video/x8abcde',
+        watchUrl: 'https://www.dailymotion.com/video/x8abcde'
+      },
+      {
+        label: 'Rumble · Episode 02',
+        provider: 'Rumble',
+        episode: { start: 2, end: 2, label: 'Episode 02' },
+        embedUrl: 'https://rumble.com/embed/v7exnu4/',
+        watchUrl: 'https://rumble.com/v7exnu4-the-episode.html'
+      }
+    ])
+  });
+  assert.equal(pasted.rejected.length, 0);
+  const afterPaste = await repository.findContentByAdminId(created.adminId);
+  assert.equal(afterPaste.stream.entries.length, 2);
+  const publicPlayers = publicStreamingData(afterPaste.stream, { allowedHosts: [] }).entries;
+  assert.deepEqual(publicPlayers.map((entry) => entry.server), ['Dailymotion server', 'Rumble server']);
+  assert.deepEqual(publicPlayers.map((entry) => entry.label), ['Dailymotion · Episode 02', 'Rumble · Episode 02']);
+
+  // a corrected provider export for the same slot replaces only that slot
+  const corrected = await applyStreamingManifest({
+    repository,
+    config: { streaming: {} },
+    manifest: {
+      entries: [{
+        row: 9,
+        postId: created.adminId,
+        entry: { episode: { start: 2, end: 2, label: 'Episode 02' }, provider: 'Dailymotion', label: 'Episode 02 · corrected', embedUrl: 'https://www.dailymotion.com/embed/video/xFIXED' }
+      }],
+      rejected: []
+    }
+  });
+  assert.equal(corrected.attachedRows, 1);
+  const afterCorrect = await repository.findContentByAdminId(created.adminId);
+  assert.equal(afterCorrect.stream.entries.length, 2);
+  assert.equal(afterCorrect.stream.entries.filter((entry) => entry.embedUrl.includes('x8abcde')).length, 0);
+  assert.equal(afterCorrect.stream.entries.find((entry) => entry.embedUrl.includes('xFIXED')).label, 'Episode 02 · corrected');
+  // the Rumble source a publisher added by hand is untouched by the export
+  assert.equal(afterCorrect.stream.entries.some((entry) => entry.embedUrl === 'https://rumble.com/embed/v7exnu4/'), true);
+});
+
+test('players can be removed by number, by episode range, or all at once', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Prune S01',
+    category: 'web-series',
+    files: [{ storageMessageId: 72, name: 'Prune.S01E01.mkv' }]
+  });
+  await applyStreamingManifest({
+    repository,
+    config: { streaming: {} },
+    manifest: parseStreamingManifest(JSON.stringify([
+      { Post: created.adminId, Episode: 'S01E01', 'Embed Link': 'https://www.dailymotion.com/video/xONE' },
+      { Post: created.adminId, Episode: 'S01E02', 'Embed Link': 'https://rumble.com/v7twp-two.html' },
+      { Post: created.adminId, Episode: 'S01E03', 'Embed Link': 'https://soraboxs.embedseek.com/#three' }
+    ]), { format: 'json' })
+  });
+  const before = await repository.findContentByAdminId(created.adminId);
+  assert.equal(before.stream.entries.length, 3);
+
+  // the /players list numbers what `del <n>` addresses
+  const listed = playersList(before, {});
+  assert.deepEqual(listed.map((entry) => entry.number), [1, 2, 3]);
+  assert.deepEqual(listed.map((entry) => entry.server), ['Dailymotion server', 'Rumble server', 'Seek server']);
+  const listing = playersListText(before, listed, {});
+  assert.match(listing, /1\. Dailymotion server · Episode 01/);
+  assert.match(listing, /del ep 2-7/);
+  assert.match(listing, /Remove one: \/cmd/);
+
+  const ranged = await removeAttachedPlayers({ repository, targetAdminId: created.adminId, removal: parseStreamRemoval('ep 2-3'), config: {} });
+  assert.equal(ranged.error, undefined);
+  assert.equal(ranged.removed, 2);
+  assert.equal(ranged.remaining, 1);
+  const afterRange = await repository.findContentByAdminId(created.adminId);
+  assert.deepEqual(afterRange.stream.entries.map((entry) => entry.episode?.start), [1]);
+
+  const last = await removeAttachedPlayers({ repository, targetAdminId: created.adminId, removal: parseStreamRemoval('1'), config: {} });
+  assert.equal(last.remaining, 0);
+  const cleared = await repository.findContentByAdminId(created.adminId);
+  // removing every player leaves the release readable but without a Watch page
+  assert.equal(cleared.stream, null);
+  assert.equal(cleared.filesCount, 1);
+  const nothing = await removeAttachedPlayers({ repository, targetAdminId: created.adminId, removal: parseStreamRemoval('all'), config: {} });
+  assert.match(nothing.error, /no player links attached/i);
 });
 
 test('18+ posts never dispatch a Telegram announcement', async () => {
@@ -366,6 +527,130 @@ test('manual /cmd title matching refuses an ambiguous category until the manifes
   const attached = await applyStreamingManifest({ repository, manifest: scoped, config: { streaming: {} } });
   assert.equal(attached.updated[0].content.adminId, series.adminId);
   assert.equal((await repository.findContentByAdminId(movie.adminId)).stream, null);
+});
+
+test('a corrected published post edits the announcement in place instead of posting a second card', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'The Gentlemen',
+    category: 'web-series',
+    posterUrl: 'https://imgbb.test/final-one.png',
+    description: 'Two seasons of a very loud hotel.',
+    files: [{ storageMessageId: 80, name: 'The.Gentlemen.S01E01.mkv' }]
+  });
+  await repository.updateContentByAdminId(created.adminId, {
+    announcementRefs: [
+      { channelId: '-100public', messageId: 11, kind: 'photo', websiteUrl: 'https://site.test/web-series/the-gentlemen' },
+      { channelId: '-100mirror', messageId: 12, kind: 'text', websiteUrl: null },
+      { channelId: '-100gone', messageId: 13, kind: 'photo', websiteUrl: null }
+    ]
+  });
+  const edits = [];
+  const telegram = {
+    async editMessageMedia(chatId, messageId, inlineMessageId, media, extra) {
+      edits.push({ op: 'media', chatId, messageId, media, replyMarkup: extra?.reply_markup });
+      if (chatId === '-100gone') throw { description: 'Bad Request: message to edit is not found' };
+      return { message_id: messageId };
+    },
+    async editMessageText(chatId, messageId, inlineMessageId, text, extra) {
+      edits.push({ op: 'text', chatId, messageId, text, replyMarkup: extra?.reply_markup });
+      return { message_id: messageId };
+    },
+    async editMessageReplyMarkup() {
+      edits.push({ op: 'markup' });
+    },
+    async sendMessage() {
+      throw new Error('a correction must never post a new announcement');
+    }
+  };
+  const renamed = await repository.updateContentByAdminId(created.adminId, { title: 'The Gentlemen S01' });
+  const sync = await syncPublishedAnnouncements({ telegram, repository, content: renamed });
+
+  assert.equal(sync.updated, 2);
+  assert.equal(sync.dropped, 1);
+  assert.deepEqual(edits.filter((entry) => entry.op === 'media').map((entry) => entry.chatId), ['-100public', '-100gone']);
+  const photo = edits.find((entry) => entry.chatId === '-100public');
+  assert.equal(photo.media.type, 'photo');
+  assert.equal(photo.media.media, 'https://imgbb.test/final-one.png');
+  assert.match(photo.media.caption, /The Gentlemen S01/);
+  // the text-only mirror keeps the same corrected copy
+  const text = edits.find((entry) => entry.op === 'text');
+  assert.match(text.text, /NEW WEB SERIES DROP/);
+  assert.match(text.text, /The Gentlemen S01/);
+  // the remembered detail-page link keeps the buttons pointing at the site
+  const buttons = JSON.stringify(photo.replyMarkup || {});
+  assert.match(buttons, /https:\/\/site\.test\/web-series\/the-gentlemen/);
+  // a reference without a known link leaves the existing buttons untouched
+  assert.equal(text.replyMarkup, undefined);
+  // a dead reference is pruned, so later edits do not keep chasing it
+  const stored = await repository.findContentByAdminId(created.adminId);
+  assert.deepEqual(stored.announcementRefs.map((ref) => ref.messageId), [11, 12]);
+  assert.equal(announcementSyncNote(sync), 'Telegram announcements: 2 announcements updated, 1 deleted announcement forgotten.');
+});
+
+test('an unchanged announcement is not counted as a failure and 18+ posts are never touched', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({ title: 'Quiet', category: 'movie', files: [{ storageMessageId: 81, name: 'Quiet.mkv' }] });
+  await repository.updateContentByAdminId(created.adminId, { announcementRefs: [{ channelId: '-100public', messageId: 21, kind: 'text', websiteUrl: null }] });
+  let calls = 0;
+  const same = await syncPublishedAnnouncements({
+    repository,
+    content: await repository.findContentByAdminId(created.adminId),
+    telegram: { async editMessageText() { calls += 1; throw { description: 'Bad Request: message is not modified: specified new content is the same' }; } }
+  });
+  assert.deepEqual({ updated: same.updated, failed: same.failed, unchanged: same.unchanged }, { updated: 0, failed: 0, unchanged: 1 });
+  assert.equal(calls, 1);
+
+  const adult = await repository.createContent({ title: 'Private', category: 'adult', files: [{ storageMessageId: 82, name: 'Private.mkv' }] });
+  await repository.updateContentByAdminId(adult.adminId, { announcementRefs: [{ channelId: '-100public', messageId: 22, kind: 'text', websiteUrl: null }] });
+  let adultCalls = 0;
+  const skipped = await syncPublishedAnnouncements({
+    repository,
+    content: await repository.findContentByAdminId(adult.adminId),
+    telegram: { async editMessageText() { adultCalls += 1; return {}; } }
+  });
+  assert.equal(adultCalls, 0);
+  assert.deepEqual({ updated: skipped.updated, channels: skipped.channels }, { updated: 0, channels: 1 });
+});
+
+test('an untitled /batch range containing several releases becomes one post per release and season', () => {
+  const files = [
+    { name: 'RRR.2022.1080p.WEB-DL.mkv', displayName: 'RRR (2022) Hindi 1080p @chan' },
+    { name: 'Entha.Andhra.Robots.2023.Telugu.720p.mkv', displayName: 'Robots (2023) Telugu 720p @chan' },
+    { name: 'ams.2024.hindi.1080p.mkv', displayName: 'AMS (2024) Hindi 1080p @chan' },
+    { name: 'Fullmetal.Alchemist.S01E01.1080p.mkv', displayName: 'Fullmetal Alchemist S01E01 Hindi @chan' },
+    { name: 'Fullmetal.Alchemist.S01E02.1080p.mkv', displayName: 'Fullmetal Alchemist S01E02 Hindi @chan' },
+    { name: 'Fullmetal.Alchemist.S03E01.720p.mkv', displayName: 'Fullmetal Alchemist S03E01 English @chan' }
+  ];
+  const plan = planDraftPublicationGroups({ workflow: 'batch', files, batch: {} });
+
+  assert.deepEqual(plan.map((group) => ({
+    title: group.title,
+    category: group.category,
+    season: group.season,
+    files: group.files.length,
+    reason: group.reason
+  })), [
+    { title: 'RRR', category: 'movie', season: null, files: 1, reason: 'release' },
+    { title: 'Robots', category: 'movie', season: null, files: 1, reason: 'release' },
+    { title: 'AMS', category: 'movie', season: null, files: 1, reason: 'release' },
+    { title: 'Fullmetal Alchemist Season 1', category: 'web-series', season: 1, files: 2, reason: 'season' },
+    { title: 'Fullmetal Alchemist Season 3', category: 'web-series', season: 3, files: 1, reason: 'season' }
+  ], 'each release is identified separately, and only the one with real seasons is split');
+
+  // a named batch keeps the publisher's own title for the whole range: it may
+  // still split seasons, but it is never re-cut by guessed release titles
+  const titled = planDraftPublicationGroups({ workflow: 'batch', title: 'Collection Drop', category: 'web-series', files, batch: { titleProvided: true } });
+  assert.deepEqual(titled.map((group) => ({ title: group.title, category: group.category, files: group.files.length })), [
+    { title: 'Collection Drop Season 1', category: 'web-series', files: 5 },
+    { title: 'Collection Drop Season 3', category: 'web-series', files: 1 }
+  ]);
+  // one release with several seasons still splits by season, without touching movies
+  assert.deepEqual(
+    planDraftPublicationGroups({ workflow: 'batch', title: 'Fullmetal Alchemist', files: files.slice(3), batch: {} }).map((group) => group.title),
+    ['Fullmetal Alchemist Season 1', 'Fullmetal Alchemist Season 3']
+  );
+  assert.deepEqual(planDraftPublicationGroups({ workflow: 'batch', title: 'RRR', files: files.slice(0, 1), batch: {} }), []);
 });
 
 test('post ID time windows use India calendar boundaries for publisher filters', () => {

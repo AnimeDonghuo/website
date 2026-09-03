@@ -109,6 +109,89 @@ export function hasReleaseLevelWatch(stream) {
   return releaseLevelStreamEntries(stream?.entries).length > 0;
 }
 
+/**
+ * Providers are what a viewer recognises. "Player 1" tells nobody which link is
+ * which, so a player is named after the service that hosts it, falling back to
+ * the publisher's own label and finally to the episode it belongs to.
+ */
+export function playerDisplayName(entry) {
+  const server = String(entry?.server || '').trim();
+  if (server) return server;
+  const label = String(entry?.label || '').trim();
+  if (label && !/^player\s*\d+$/i.test(label)) return label;
+  return String(entry?.episode?.label || 'Main player').trim();
+}
+
+/** The same name without the trailing word, for a compact button label. */
+export function playerShortName(entry) {
+  return playerDisplayName(entry).replace(/\s+server$/i, '');
+}
+
+function seasonFromLabel(label) {
+  const text = String(label || '');
+  const spelled = text.match(/\bseason\s*0*(\d{1,2})\b/i);
+  if (spelled) return Number(spelled[1]);
+  const compact = text.match(/\bs\s*0*(\d{1,2})(?!\d)(?![a-df-z])/i);
+  return compact ? Number(compact[1]) : null;
+}
+
+/**
+ * The season a viewer should be told about, if any. The season of the episode
+ * group wins, then a season spelled out in the release title. A movie with
+ * neither shows no season at all rather than an invented "Season 1".
+ */
+export function episodeSeasonNumber(item, episode) {
+  const range = episodeRange(episode);
+  if (!range) return null;
+  for (const group of Array.isArray(item?.episodeGroups) ? item.episodeGroups : []) {
+    const start = Number(group?.start);
+    const end = Number(group?.end) || start;
+    if (!Number.isInteger(start) || range.start < start || range.start > end) continue;
+    const season = seasonFromLabel(group?.label);
+    if (season) return season;
+  }
+  return seasonFromLabel(item?.title);
+}
+
+/**
+ * What a Watch page announces: the episode's own name first, then season plus
+ * episode number only when the release really is seasonal. A movie instead
+ * lists the languages, which is the choice a viewer actually makes there.
+ */
+export function watchHeading(item, { episode = null, fileLabel = null, playerLabel = null } = {}) {
+  const range = episodeRange(episode);
+  const season = episodeSeasonNumber(item, episode);
+  const supplied = String(episode?.label || '').trim();
+  const episodeLabel = range
+    ? (supplied && !/^player\s*\d+$/i.test(supplied)
+      ? supplied
+      : (range.start === range.end
+        ? `Episode ${formatEpisodeNumber(range.start)}`
+        : `Episodes ${formatEpisodeNumber(range.start)}–${formatEpisodeNumber(range.end)}`))
+    : null;
+  const languages = (Array.isArray(item?.languages) ? item.languages : []).filter(Boolean);
+  const subtitles = (Array.isArray(item?.subtitleLanguages) ? item.subtitleLanguages : []).filter(Boolean);
+  const cleanedLabel = String(fileLabel || '').trim();
+  // A label that is nothing but the episode number repeats the line under the
+  // heading, so the release name keeps the heading in that case.
+  const bareNumber = /^(?:ep|eps?|episode)\.?\s*\d{1,3}(?:\s*(?:-|–|to)\s*\d{1,3})?$/i;
+  const title = cleanedLabel && !bareNumber.test(cleanedLabel)
+    ? cleanedLabel
+    : (playerLabel || item?.title || 'Watch');
+  const meta = range
+    ? [season ? `Season ${season}` : null, episodeLabel].filter(Boolean)
+    : [languages.length ? languages.join(' · ') : null, subtitles.length ? `Subtitles: ${subtitles.join(' · ')}` : null].filter(Boolean);
+  return {
+    title,
+    seasonLabel: season ? `Season ${season}` : null,
+    episodeLabel,
+    meta,
+    isEpisode: Boolean(range),
+    languages,
+    subtitles
+  };
+}
+
 export function watchPagePath(item, episode = null) {
   const base = `/${item.category}/${item.slug}/watch`;
   const range = episodeRange(episode);

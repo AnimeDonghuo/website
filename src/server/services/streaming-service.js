@@ -68,9 +68,11 @@ function allowedHost(hostname, hosts) {
 }
 
 /**
- * Restrict provider links to HTTPS and an explicit allow-list. This protects
- * the public iframe from javascript/data URLs and prevents a manifest from
- * turning the catalog into an arbitrary embedding surface.
+ * Pull one usable URL out of whatever the publisher pasted: a naked link, a
+ * Markdown link such as `[https://rumble.com/v1.html](https://rumble.com/v1.html)`,
+ * a copied `<iframe>` snippet, or a link sitting inside a sentence. Telegram
+ * frequently wraps copied links this way, and a rejected paste is what made
+ * "the Rumble link cannot be added" look like a broken feature.
  */
 export function extractStreamingUrl(value) {
   const raw = String(value || '').trim()
@@ -79,15 +81,105 @@ export function extractStreamingUrl(value) {
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"');
   if (!raw || raw.length > 8_000) return '';
+  // A Markdown link keeps its target, which is the only half we can embed.
+  const markdown = raw.match(/\[[^\]]*\]\(\s*(?:<|")?\s*(https?:\/\/[^)\s>"]+)/i);
+  const candidate = markdown?.[1] || raw;
   // SeekStreaming's dashboard can export either a naked player URL or a full
   // iframe snippet. Accept both forms, but persist only the URL—not arbitrary
   // markup—so it can never inject HTML into a public catalog page.
-  const iframeMatch = raw.match(/<iframe\b[^>]*\bsrc\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))/i);
+  const iframeMatch = candidate.match(/<iframe\b[^>]*\bsrc\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))/i);
   const iframeSource = iframeMatch?.[2] || iframeMatch?.[3];
-  return String(iframeSource || raw).trim();
+  if (iframeSource) return String(iframeSource).trim();
+  // Otherwise take the first HTTP(S) token, ignoring quotes and stray prose.
+  const bare = candidate.match(/https?:\/\/[^\s"'<>\])]+/i);
+  return String(bare?.[0] || candidate).trim().replace(/[.,;:]+$/, '');
+}
+
+/**
+ * A provider's watch page refuses to be framed, so an embed needs the player
+ * path instead. Dailymotion answers `www.dailymotion.com/video/…` with
+ * "refused to connect", and Rumble serves its page with framing headers that
+ * block playback; both publish a dedicated embed route for the same video.
+ * The original page stays as the external link, so a publisher can always open
+ * the video on the provider even if a specific embed is unavailable.
+ */
+export function embeddablePlayerUrl(value) {
+  const raw = extractStreamingUrl(value);
+  if (!raw) return null;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./i, '').toLowerCase();
+
+  if (host === 'dai.ly') {
+    const id = url.pathname.match(/^\/([A-Za-z0-9]+)/)?.[1];
+    if (!id) return { embedUrl: null, watchUrl: url.toString() };
+    return {
+      embedUrl: `https://www.dailymotion.com/embed/video/${id}`,
+      watchUrl: `https://www.dailymotion.com/video/${id}`
+    };
+  }
+
+  if (host === 'dailymotion.com' || host.endsWith('.dailymotion.com')) {
+    const embedMatch = url.pathname.match(/\/embed\/video\/([A-Za-z0-9]+)/i);
+    if (embedMatch) return { embedUrl: url.toString(), watchUrl: `https://www.dailymotion.com/video/${embedMatch[1]}` };
+    const videoMatch = url.pathname.match(/\/video\/([A-Za-z0-9]+)/i) || url.pathname.match(/^\/([A-Za-z0-9]{6,})\/?$/i);
+    if (!videoMatch) return { embedUrl: null, watchUrl: url.toString() };
+    const suffix = url.search || '';
+    return {
+      embedUrl: `https://www.dailymotion.com/embed/video/${videoMatch[1]}${suffix}`,
+      watchUrl: `https://www.dailymotion.com/video/${videoMatch[1]}`
+    };
+  }
+
+  if (host === 'rumble.com' || host.endsWith('.rumble.com')) {
+    const embedMatch = url.pathname.match(/\/embed\/(?:VS)?([A-Za-z0-9.]+)/i);
+    if (embedMatch) return { embedUrl: url.toString(), watchUrl: `https://rumble.com/${embedMatch[1]}.html` };
+    // Page URLs look like /v7exnu4-title-slug.html; the video id is the v-token.
+    const pageMatch = url.pathname.match(/\/(v[A-Za-z0-9]{4,})(?:-[^/]*)?\.?[a-z]*/i);
+    if (!pageMatch) return { embedUrl: null, watchUrl: url.toString() };
+    return {
+      embedUrl: `https://rumble.com/embed/${pageMatch[1]}/`,
+      watchUrl: url.toString()
+    };
+  }
+
+  return { embedUrl: url.toString(), watchUrl: url.toString() };
+}
+
+/**
+ * Publishers recognise the service people quote, not a raw hostname. Numbered
+ * "Player 1 / Player 2" labels told nobody which link was which, so every
+ * entry carries a stable server name derived from its own URL.
+ */
+export function streamServerName(value) {
+  let host = '';
+  try {
+    host = new URL(String(value || '')).hostname.replace(/^www\./i, '').toLowerCase();
+  } catch {
+    host = String(value || '').toLowerCase();
+  }
+  if (host.includes('dailymotion') || host === 'dai.ly') return 'Dailymotion server';
+  if (host.includes('rumble')) return 'Rumble server';
+  if (host.includes('embedseek') || host.includes('seekstreaming')) return 'Seek server';
+  const base = host.split('.')[0];
+  if (!base || base === 'provider') return 'Direct player';
+  return `${base.charAt(0).toUpperCase()}${base.slice(1)} server`;
 }
 
 export function safeStreamingUrl(value, { allowedHosts = DEFAULT_STREAMING_HOSTS } = {}) {
+  return safeStreamingLink(value, { allowedHosts })?.embedUrl || null;
+}
+
+/**
+ * Validate a publisher link and return both halves: the frameable `embedUrl`
+ * and the provider `watchUrl`. Returns null when the host is not approved, so
+ * the allow-list check happens before any provider-specific rewriting.
+ */
+export function safeStreamingLink(value, { allowedHosts = DEFAULT_STREAMING_HOSTS } = {}) {
   const raw = extractStreamingUrl(value);
   if (!raw || raw.length > 2_000) return null;
   let url;
@@ -98,7 +190,17 @@ export function safeStreamingUrl(value, { allowedHosts = DEFAULT_STREAMING_HOSTS
   }
   const hosts = normalizeStreamingHosts(allowedHosts);
   if (url.protocol !== 'https:' || url.username || url.password || !allowedHost(url.hostname, hosts)) return null;
-  return url.toString();
+  const link = embeddablePlayerUrl(url.toString());
+  if (!link?.embedUrl && !link?.watchUrl) return null;
+  return {
+    embedUrl: link.embedUrl ? truncate(link.embedUrl) : null,
+    watchUrl: link.watchUrl ? truncate(link.watchUrl) : null
+  };
+}
+
+function truncate(value) {
+  const text = String(value || '');
+  return text.length <= 2_000 ? text : null;
 }
 
 export function streamingFrameSources(streaming = {}) {
@@ -123,11 +225,24 @@ function parseEpisode(columns) {
   let start = explicitStart;
   let end = explicitEnd;
   if (!start && raw) {
-    // A dedicated Episode column may safely contain a bare number/range.
-    const match = raw.match(/(?:episode|ep)?\s*(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?/i);
-    if (match) {
-      start = positiveEpisode(match[1]);
-      end = positiveEpisode(match[2]) || start;
+    // A dedicated Episode column may hold a bare number or range ("4", "2-7"),
+    // or the compact marker a provider export uses ("S01E03", "1x03"). Each form
+    // is anchored, so the season of "S01E03" can never be read as episode 1 -
+    // that collapse is what merged a season-long export onto a single player. A
+    // loose match is only allowed when an explicit episode marker is present.
+    const seasonEpisode = raw.match(/^s\s*0*(\d{1,2})\s*[ex]\s*0*(\d{1,3})(?:\s*(?:-|–|to)\s*(?:e\s*x?\s*)?0*(\d{1,3}))?$/i)
+      || raw.match(/^0*(\d{1,2})\s*x\s*0*(\d{1,3})(?:\s*(?:-|–|to)\s*\d*x\s*0*(\d{1,3}))?$/i);
+    if (seasonEpisode) {
+      start = positiveEpisode(seasonEpisode[2]);
+      end = positiveEpisode(seasonEpisode[3]) || start;
+    } else {
+      const plain = raw.match(/^(?:episode|ep\.?|e)?\s*0*(\d{1,3})(?:\s*(?:-|–|to)\s*0*(\d{1,3}))?$/i)
+        || raw.match(/\b(?:episode|ep\.?)\s*0*(\d{1,3})(?:\s*(?:-|–|to)\s*0*(\d{1,3}))?/i)
+        || raw.match(/\bs\s*0*\d{1,2}\s*[ex]\s*0*(\d{1,3})(?:\s*(?:-|–|to)\s*(?:e\s*x?\s*)?0*(\d{1,3}))?/i);
+      if (plain) {
+        start = positiveEpisode(plain[1]);
+        end = positiveEpisode(plain[2]) || start;
+      }
     }
   }
   if (!start) {
@@ -148,7 +263,16 @@ function parseEpisode(columns) {
   return { start, end, label };
 }
 
-function streamEntryIdentity(entry) {
+/**
+ * `provider` grouping is what a corrected CSV/JSON export needs: re-importing
+ * the same provider row for the same episode overwrites that player, so a fixed
+ * link replaces the broken one instead of accumulating duplicates.
+ * `exact` grouping is what a manual /cmd link needs: two different videos added
+ * to the same episode are two players, and both must survive.
+ */
+export const STREAM_IDENTITY_MODES = ['provider', 'exact'];
+
+function streamEntryIdentity(entry, granularity = 'provider') {
   let host = 'provider';
   try {
     host = new URL(entry?.embedUrl || entry?.watchUrl || '').hostname.toLowerCase() || host;
@@ -159,19 +283,39 @@ function streamEntryIdentity(entry) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'main';
-  // Keep alternate providers for the same episode instead of overwriting them.
-  // Re-importing the same host + episode replaces just that player URL. For
-  // provider exports with no episode column, a VideoID/title also keeps every
-  // separately exported video rather than retaining only the last row.
-  if (entry?.episode?.start) return `episode:${entry.episode.start}-${entry.episode.end || entry.episode.start}:${host}`;
-  return `default:${host}:${labelKey}`;
+  const videoKey = cleanText(entry?.videoId, 100).toLowerCase() || labelKey;
+  // A provider-mode row without an explicit video id is identified by its slot
+  // only, exactly as before, so a corrected export still overwrites its player.
+  const slotKey = entry?.videoId ? videoKey : (granularity === 'exact' ? (urlIdentity(entry) || labelKey) : 'main');
+  if (entry?.episode?.start) return `episode:${entry.episode.start}-${entry.episode.end || entry.episode.start}:${host}:${slotKey}`;
+  return `default:${host}:${slotKey}`;
+}
+
+function urlIdentity(entry) {
+  // The path (plus a short query) is the only stable per-video marker a
+  // publisher-supplied URL always has: /embed/video/x8ab, /embed/v7exnu4/,
+  // or SeekStreaming's /#episode-1 fragment.
+  const raw = entry?.embedUrl || entry?.watchUrl || '';
+  try {
+    const url = new URL(raw);
+    const fragment = url.hash ? `#${url.hash.slice(1)}` : '';
+    return `${url.pathname}${url.search}${fragment}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90);
+  } catch {
+    return '';
+  }
 }
 
 function compareStreamEntries(first, second) {
   const firstEpisode = first?.episode?.start || Number.MAX_SAFE_INTEGER;
   const secondEpisode = second?.episode?.start || Number.MAX_SAFE_INTEGER;
   if (firstEpisode !== secondEpisode) return firstEpisode - secondEpisode;
-  return streamEntryIdentity(first).localeCompare(streamEntryIdentity(second));
+  // Same episode: order by provider name so the list reads alphabetically and
+  // never reshuffles between reads. /players numbering and button indices must
+  // stay identical across reads, because deletion is addressed by that number.
+  const serverOrder = String(first?.server || first?.provider || '').localeCompare(String(second?.server || second?.provider || ''));
+  if (serverOrder) return serverOrder;
+  return streamEntryIdentity(first, 'exact').localeCompare(streamEntryIdentity(second, 'exact')) ||
+    String(first?.label || '').localeCompare(String(second?.label || ''));
 }
 
 function manifestCategory(value) {
@@ -212,9 +356,11 @@ function normalizedStreamFields(row, { allowedHosts = DEFAULT_STREAMING_HOSTS, r
     return { error: 'requires an HTTPS player/embed or watch URL from an allowed streaming host' };
   }
   const episode = parseEpisode(columns);
-  const label = cleanText(firstValue(columns, ['label', 'videoTitle', 'video_title', 'name', 'title']), 100)
-    || episode?.label
-    || 'Main player';
+  const server = streamServerName(embedUrl || watchUrl);
+  const suppliedLabel = cleanText(firstValue(columns, ['label', 'videoTitle', 'video_title', 'name', 'title']), 100);
+  const label = suppliedLabel && !/^player\s*\d+$/i.test(suppliedLabel)
+    ? suppliedLabel
+    : `${server.replace(/\s+server$/i, '')}${episode?.label ? ` · ${episode.label}` : ''}`;
   return {
     postId,
     sourceTitle: sourceTitle || null,
@@ -223,7 +369,8 @@ function normalizedStreamFields(row, { allowedHosts = DEFAULT_STREAMING_HOSTS, r
       label,
       episode,
       videoId: cleanText(firstValue(columns, ['videoId', 'video_id', 'id']), 100) || null,
-      provider: cleanText(firstValue(columns, ['provider', 'host']), 60) || 'SeekStreaming',
+      provider: cleanText(firstValue(columns, ['provider', 'host']), 60) || server,
+      server,
       embedUrl,
       watchUrl
     }
@@ -349,11 +496,15 @@ function normalizedStoredEntry(entry, { allowedHosts = DEFAULT_STREAMING_HOSTS }
   } else {
     episode = parseEpisode(columns);
   }
+  const server = streamServerName(embedUrl || watchUrl);
   return {
     label: cleanText(object.label, 100) || episode?.label || 'Main player',
     episode,
     videoId: cleanText(object.videoId, 100) || null,
-    provider: cleanText(object.provider, 60) || 'SeekStreaming',
+    provider: cleanText(object.provider, 60) || server,
+    // Derived from the URL on every read, so links saved before server naming
+    // existed display correctly without touching stored data.
+    server,
     embedUrl,
     watchUrl
   };
@@ -364,15 +515,22 @@ function normalizedStoredEntry(entry, { allowedHosts = DEFAULT_STREAMING_HOSTS }
  * That makes re-importing a corrected CSV/JSON idempotent without deleting
  * other episode links attached to the release.
  */
-export function mergeStreamingEntries(existingStream, incomingEntries, { allowedHosts = DEFAULT_STREAMING_HOSTS, updatedAt = new Date().toISOString() } = {}) {
+export function mergeStreamingEntries(existingStream, incomingEntries, { allowedHosts = DEFAULT_STREAMING_HOSTS, granularity = 'provider', updatedAt = new Date().toISOString() } = {}) {
+  const mode = STREAM_IDENTITY_MODES.includes(granularity) ? granularity : 'provider';
   const merged = new Map();
+  const keys = new Map();
+  const put = (entry) => {
+    const key = streamEntryIdentity(entry, mode);
+    merged.set(key, entry);
+    keys.set(key, streamEntryIdentity(entry, 'exact'));
+  };
   for (const existing of Array.isArray(existingStream?.entries) ? existingStream.entries : []) {
     const safe = normalizedStoredEntry(existing, { allowedHosts });
-    if (safe) merged.set(streamEntryIdentity(safe), safe);
+    if (safe) put(safe);
   }
   for (const candidate of Array.isArray(incomingEntries) ? incomingEntries : []) {
     const safe = normalizedStoredEntry(candidate?.entry || candidate, { allowedHosts });
-    if (safe) merged.set(streamEntryIdentity(safe), safe);
+    if (safe) put(safe);
   }
   const entries = [...merged.values()].sort(compareStreamEntries).slice(0, MAX_STREAM_ENTRIES_PER_POST);
   if (!entries.length) return null;
@@ -391,10 +549,11 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
     .sort(compareStreamEntries)
     .slice(0, MAX_STREAM_ENTRIES_PER_POST)
     .map((entry) => ({
-      id: streamEntryIdentity(entry),
+      id: streamEntryIdentity(entry, 'exact'),
       label: entry.label,
       episode: entry.episode,
       provider: entry.provider,
+      server: entry.server,
       embedUrl: entry.embedUrl || null,
       watchUrl: entry.watchUrl || null
     }));
@@ -403,5 +562,47 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
     provider: cleanText(stream?.provider, 60) || entries[0]?.provider || null,
     entries,
     updatedAt: stream?.updatedAt && !Number.isNaN(new Date(stream.updatedAt).getTime()) ? new Date(stream.updatedAt).toISOString() : null
+  };
+}
+
+/**
+ * Remove publisher-chosen players: one listed entry, every player of an episode
+ * range, or the whole release. Deletion is explicit because a corrected export
+ * intentionally leaves other sources for the same episode in place.
+ */
+export function removeStreamingEntries(stream, { indexes = null, ids = null, episode = null, all = false } = {}, { allowedHosts = DEFAULT_STREAMING_HOSTS } = {}) {
+  const entries = (Array.isArray(stream?.entries) ? stream.entries : [])
+    .map((entry) => ({ entry: normalizedStoredEntry(entry, { allowedHosts }), raw: entry }))
+    .filter((item) => item.entry);
+  if (!entries.length) return { stream: null, removed: 0, remaining: 0, unmatched: 0 };
+
+  const wantedIndexes = new Set((Array.isArray(indexes) ? indexes : []).map((value) => Number(value)).filter(Number.isInteger));
+  const wantedIds = new Set((Array.isArray(ids) ? ids : []).map((value) => String(value || '')).filter(Boolean));
+  const range = episode && Number.isInteger(Number(episode.start))
+    ? { start: Number(episode.start), end: Number(episode.end) || Number(episode.start) }
+    : null;
+
+  const kept = [];
+  let removed = 0;
+  entries.forEach((item, index) => {
+    const entryRange = item.entry.episode
+      ? { start: item.entry.episode.start, end: item.entry.episode.end || item.entry.episode.start }
+      : null;
+    const matchesRange = Boolean(range && entryRange && entryRange.start <= range.end && entryRange.end >= range.start);
+    const hit = all
+      || (wantedIndexes.size ? wantedIndexes.has(index + 1) : false)
+      || (wantedIds.size ? wantedIds.has(streamEntryIdentity(item.entry, 'exact')) : false)
+      || (range && !wantedIndexes.size && !wantedIds.size ? matchesRange : false);
+    if (hit) removed += 1;
+    else kept.push(item.raw);
+  });
+  if (!removed) return { stream, removed: 0, remaining: entries.length, unmatched: entries.length };
+
+  const remaining = mergeStreamingEntries(null, kept, { allowedHosts, granularity: 'exact' });
+  return {
+    stream: remaining,
+    removed,
+    remaining: remaining?.entries?.length || 0,
+    unmatched: 0
   };
 }

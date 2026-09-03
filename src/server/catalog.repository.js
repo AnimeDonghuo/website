@@ -207,6 +207,30 @@ function storageReferenceChannel(value) {
   return cleanText(value, 80);
 }
 
+/**
+ * Announcement messages this post already sent, so a later publisher edit can
+ * update the very same channel posts instead of leaving stale artwork or
+ * metadata in public Telegram channels.
+ */
+export function normalizeAnnouncementRefs(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => ({
+      channelId: cleanText(entry?.channelId, 60),
+      messageId: Number.parseInt(entry?.messageId, 10) || 0,
+      kind: entry?.kind === 'text' ? 'text' : 'photo',
+      // The detail-page link the button carried when the card was posted. It is
+      // remembered so a later correction can rebuild the same button even when
+      // the edit path has no site config in hand; anything but a plain http(s)
+      // link is dropped, because this value is written back onto a Telegram
+      // button.
+      websiteUrl: /^https?:\/\//i.test(String(entry?.websiteUrl || '')) ? cleanText(entry.websiteUrl, 300) : null,
+      postedAt: cleanText(entry?.postedAt, 40) || null
+    }))
+    .filter((entry) => entry.channelId && Number.isInteger(entry.messageId) && entry.messageId > 0)
+    .slice(0, 100);
+}
+
 function sanitizeStoredFileRecord(file) {
   if (!file || typeof file !== 'object' || Array.isArray(file)) return file;
   const sourceLabel = cleanText(stripTelegramAttribution(file.sourceLabel, 500), 500);
@@ -412,6 +436,7 @@ function contentMetadataPatch(content, requested = {}) {
     backdropUrl,
     ...(requested.category === undefined ? {} : { art: { ...(content.art || {}), tone: categoryDetails(category).tone } }),
     ...(requested.poster === undefined ? {} : { poster: requested.poster || null }),
+    ...(requested.announcementRefs === undefined ? {} : { announcementRefs: normalizeAnnouncementRefs(requested.announcementRefs) }),
     titleKey,
     automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey, looseTitleKey]),
     searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres]
@@ -483,6 +508,7 @@ function normalizeContent(input) {
     // Manually imported player links are normalized/validated by the streaming
     // service before persistence. No media bytes are held by this field.
     stream: input.stream && typeof input.stream === 'object' ? clone(input.stream) : null,
+    announcementRefs: normalizeAnnouncementRefs(input.announcementRefs),
     // titleKey makes same-title merging work for manual, batch, and older
     // records. Automation keeps raw and internet-verified aliases so slightly
     // different upload labels still converge on one catalog record.

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeStreamingEntries, parseStreamingManifest, publicStreamingData, safeStreamingUrl } from '../src/server/services/streaming-service.js';
+import { mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingUrl } from '../src/server/services/streaming-service.js';
 
 test('manual JSON streaming manifests accept authorized SeekStreaming players and episode data', () => {
   const result = parseStreamingManifest(JSON.stringify({
@@ -95,4 +95,54 @@ test('stream manifest re-import replaces only its matching episode and public da
   assert.equal(publicData.entries.length, 4);
   assert.equal(publicData.privateProviderToken, undefined);
   assert.deepEqual(publicData.entries.map((entry) => entry.episode?.start), [1, 1, 1, 2]);
+});
+
+test('compact provider episode markers address one player per episode and keep their server names', () => {
+  const manifest = parseStreamingManifest(JSON.stringify([
+    { Post: 'SB-0123ABCDEF', Episode: 'S01E01', 'Embed Link': 'https://www.dailymotion.com/video/xAAA' },
+    { Post: 'SB-0123ABCDEF', Episode: 'S01E02', 'Embed Link': 'https://rumble.com/v7exnu4-second.html' },
+    { Post: 'SB-0123ABCDEF', Episode: 'S01E03', 'Embed Link': 'https://soraboxs.embedseek.com/#third' }
+  ]), { format: 'json' });
+
+  assert.equal(manifest.rejected.length, 0);
+  // the season digits of "S01E02" must not be read as episode 1, which is how a
+  // season-long export used to collapse onto a single player
+  assert.deepEqual(manifest.entries.map((entry) => entry.entry.episode?.start), [1, 2, 3]);
+  // pasted page links are stored as the URL the site can actually frame
+  assert.deepEqual(manifest.entries.map((entry) => entry.entry.embedUrl), [
+    'https://www.dailymotion.com/embed/video/xAAA',
+    'https://rumble.com/embed/v7exnu4/',
+    'https://soraboxs.embedseek.com/#third'
+  ]);
+
+  const merged = mergeStreamingEntries(null, manifest.entries);
+  assert.equal(merged.entries.length, 3);
+  assert.deepEqual(publicStreamingData(merged).entries.map((entry) => entry.server), [
+    'Dailymotion server',
+    'Rumble server',
+    'Seek server'
+  ]);
+});
+
+test('a pasted Rumble or Dailymotion list keeps every link, and players can be dropped by number or episode range', () => {
+  const stream = mergeStreamingEntries(null, [
+    { entry: { label: 'Dailymotion · Episode 01', episode: { start: 1, end: 1, label: 'Episode 01' }, embedUrl: 'https://www.dailymotion.com/embed/video/xAAA' } },
+    { entry: { label: 'Rumble · Episode 02', episode: { start: 2, end: 2, label: 'Episode 02' }, embedUrl: 'https://rumble.com/embed/v7exnu4/' } },
+    { entry: { label: 'Seek · Episode 03', episode: { start: 3, end: 3, label: 'Episode 03' }, embedUrl: 'https://soraboxs.embedseek.com/#third' } }
+  ]);
+  assert.equal(stream.entries.length, 3);
+
+  const ranged = removeStreamingEntries(stream, { episode: { start: 2, end: 3 } });
+  assert.equal(ranged.removed, 2);
+  assert.deepEqual(ranged.remaining, 1);
+  assert.deepEqual(ranged.stream.entries.map((entry) => entry.embedUrl), ['https://www.dailymotion.com/embed/video/xAAA']);
+
+  const numbered = removeStreamingEntries(stream, { indexes: [1] });
+  assert.equal(numbered.removed, 1);
+  assert.deepEqual(numbered.stream.entries.map((entry) => entry.episode.start), [2, 3]);
+
+  const cleared = removeStreamingEntries(stream, { all: true });
+  assert.equal(cleared.removed, 3);
+  assert.equal(cleared.stream, null);
+  assert.equal(removeStreamingEntries(stream, { indexes: [9] }).removed, 0);
 });
