@@ -209,10 +209,81 @@ export function episodeSeasonNumber(item, episode) {
   return seasonFromLabel(item?.title);
 }
 
+// The pieces of an upload caption that are not the episode's name: emoji, source
+// and quality tags, audio tracks, and a number written as "Ep 176".
+const EPISODE_DECORATION = /[\p{Extended_Pictographic}\p{So}\p{Sk}]/gu;
+const QUALITY_TOKEN = /\b(\d{3,4}p|4k|8k|fhd|uhd|web[- ]?dl|hdtv|bluray|remux|x26[45]|hevc|av1|10[- ]?bit|dd?p?5\.1|aac\d?(\.\d)?|dts)\b/gi;
+const BARE_EPISODE_TEXT = /^(?:ep|eps?|episode|ch|chapter|cap)?\.?\s*\d{1,3}(?:\s*(?:-|–|to|of|\/)\s*\d{1,3})?$/i;
+// Everything a Telegram caption carries that is not the episode's name: audio
+// tracks, source tags, and the uploader's own decoration.
+const CAPTION_NOISE = /\b(?:hindi|english|tamil|telugu|malayalam|kannada|bengali|marathi|gujarati|punjabi|spanish|japanese|chinese|korean|dub(?:bed)?|sub(?:s|bed)?|esubs|multi\s*audio|dual\s*audio|audio|hd|sd|hq|new|latest|quality|complete|completed|collection|batch|pack|s\d{1,3}(?:e\d{1,3})?|e\d{1,3}|amp|web|dl|nf|amzn|attp|dsny|hulu|max)\b/gi;
+
+/** Letters and digits only, so "Shrouding.the.Heavens" and "Shrouding the Heavens" compare equal. */
+function squashed(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 /**
- * What a Watch page announces: the episode's own name first, then season plus
- * episode number only when the release really is seasonal. A movie instead
- * lists the languages, which is the choice a viewer actually makes there.
+ * A file caption is written for Telegram, not for a page heading: it repeats the
+ * release name, carries emoji, and ends in "Quality: ✅". What a viewer would
+ * call this episode is pulled out of it here, and a quality tag is returned
+ * separately, so the wording is never lost - only placed where it reads well.
+ */
+export function episodeNameFromLabel(label, releaseTitle) {
+  let text = String(label || '').replace(EPISODE_DECORATION, ' ').replace(/\s+/g, ' ').trim();
+  if (!text) return { name: null, quality: null };
+  const qualityMatch = [...text.matchAll(QUALITY_TOKEN)];
+  const quality = qualityMatch.length ? qualityMatch[0][1].toUpperCase() : null;
+
+  // The release name belongs to the page, so a caption that repeats it at the
+  // front ("Shrouding the Heavens Ep 176", "Shrouding.the.Heavens.176…") has that
+  // prefix removed even when it is written with dots and no spaces.
+  const release = squashed(releaseTitle);
+  if (release) {
+    const letters = squashed(text);
+    if (letters.startsWith(release) && release.length >= 3) {
+      let seen = 0;
+      let cut = 0;
+      for (let index = 0; index < text.length && seen < release.length; index += 1) {
+        if (/[a-z0-9]/i.test(text[index])) seen += 1;
+        cut = index + 1;
+      }
+      text = text.slice(cut);
+    }
+  }
+
+  text = text
+    .replace(QUALITY_TOKEN, ' ')
+    .replace(CAPTION_NOISE, ' ')
+    // A leading or trailing episode number is the page's own label, and a caption
+    // left with nothing but it has no name of its own.
+    .replace(BARE_EPISODE_TEXT, ' ')
+    .replace(/\b(?:ep|eps|episode|chapter|cap)\.?\s*\d{1,3}\b/gi, ' ')
+    .replace(/\bquality\b\s*[:\-]?/gi, ' ')
+    .replace(/\s*[:\-]\s*$/g, '')
+    .replace(/^\s*[-–:.#,|]+|[-–:.#,|]+\s*$/g, '')
+    .replace(/\s*[.:|#]\s*[.:|#]\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  // Two letters in a row is the shortest thing that can read as a title; a stray
+  // "2" or "dub" left behind is not. Nor is the release's own name written with
+  // dots and a number, or a fragment of it ("… Brotherhood EP 09") - comparing the
+  // letters alone sees through the punctuation the uploader used.
+  const releaseLetters = squashed(releaseTitle).replace(/\d+/g, '');
+  const textLetters = squashed(text).replace(/\d+/g, '');
+  const isReleaseItself = textLetters.length >= 3 && releaseLetters.includes(textLetters);
+  if (!text || text.length < 3 || !/[a-z]{2}/i.test(text) || BARE_EPISODE_TEXT.test(text) || isReleaseItself) {
+    return { name: null, quality };
+  }
+  return { name: text.slice(0, 90), quality };
+}
+
+/**
+ * What a Watch page announces: the release name once, then the episode number -
+ * never the raw upload caption. The season appears only when the release really
+ * is seasonal, and a movie lists its languages instead, which is the choice a
+ * viewer actually makes there.
  */
 export function watchHeading(item, { episode = null, fileLabel = null, playerLabel = null } = {}) {
   const range = episodeRange(episode);
@@ -227,20 +298,31 @@ export function watchHeading(item, { episode = null, fileLabel = null, playerLab
     : null;
   const languages = (Array.isArray(item?.languages) ? item.languages : []).filter(Boolean);
   const subtitles = (Array.isArray(item?.subtitleLanguages) ? item.subtitleLanguages : []).filter(Boolean);
-  const cleanedLabel = String(fileLabel || '').trim();
-  // A label that is nothing but the episode number repeats the line under the
-  // heading, so the release name keeps the heading in that case.
-  const bareNumber = /^(?:ep|eps?|episode)\.?\s*\d{1,3}(?:\s*(?:-|–|to)\s*\d{1,3})?$/i;
-  const title = cleanedLabel && !bareNumber.test(cleanedLabel)
-    ? cleanedLabel
+  const caption = episodeNameFromLabel(fileLabel, item?.title);
+  const quality = caption.quality;
+  // The heading is the release name plus what the episode is called. A caption
+  // that only repeated the show, its number, emoji, and a quality tag is not a
+  // name, so the canonical "Episode 176" is used instead.
+  const episodeName = range ? (caption.name || episodeLabel) : null;
+  const title = range
+    ? [item?.title, episodeName].filter(Boolean).join(' · ')
     : (playerLabel || item?.title || 'Watch');
+  // The episode chip is only useful when the heading carries a name instead of the
+  // number; repeating "Episode 176" twice reads like a template.
   const meta = range
-    ? [season ? `Season ${season}` : null, episodeLabel].filter(Boolean)
+    ? [
+      season ? `Season ${season}` : null,
+      caption.name ? episodeLabel : null,
+      quality ? `Quality: ${quality}` : null
+    ].filter(Boolean)
     : [languages.length ? languages.join(' · ') : null, subtitles.length ? `Subtitles: ${subtitles.join(' · ')}` : null].filter(Boolean);
   return {
     title,
     seasonLabel: season ? `Season ${season}` : null,
     episodeLabel,
+    // The name a caption gave this episode, when it gave one at all.
+    episodeName,
+    quality,
     meta,
     isEpisode: Boolean(range),
     languages,

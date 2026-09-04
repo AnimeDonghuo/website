@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
+import { episodeNameFromLabel, episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
 
 function episode(number) {
   return { start: number, end: number, label: `Episode ${String(number).padStart(2, '0')}` };
@@ -151,19 +151,32 @@ test('a Watch page names the episode and its season, and a movie only its langua
   const single = watchHeading(item, { episode: episode(5), fileLabel: 'Episode 05' });
   assert.deepEqual(
     { title: single.title, meta: single.meta, isEpisode: single.isEpisode },
-    { title: 'Fullmetal Alchemist: Brotherhood S02', meta: ['Season 2', 'Episode 05'], isEpisode: true },
-    'a label that is only the episode number does not replace the release name'
+    { title: 'Fullmetal Alchemist: Brotherhood S02 · Episode 05', meta: ['Season 2'], isEpisode: true },
+    'the heading is the release name once, then the episode number'
   );
-  const named = watchHeading(item, { episode: episode(9), fileLabel: 'Brotherhood EP 09 Dual Audio' });
-  assert.deepEqual({ title: named.title, meta: named.meta }, { title: 'Brotherhood EP 09 Dual Audio', meta: ['Season 2', 'Episode 09'] });
+  // A caption written for Telegram is never pasted into the heading whole: its
+  // repeated show name, emoji, and "Quality: ✅" are decoration, not a title.
+  const messy = watchHeading(item, { episode: episode(176), fileLabel: 'Fullmetal Alchemist: Brotherhood S02 Ep 176 🔥 Quality: ✅' });
+  assert.deepEqual({ title: messy.title, meta: messy.meta }, { title: 'Fullmetal Alchemist: Brotherhood S02 · Episode 176', meta: ['Season 2'] });
+  // …and a dotted file name keeps its real information as a chip instead.
+  const fileish = watchHeading(item, { episode: episode(176), fileLabel: 'Fullmetal.Alchemist.Brotherhood.176.1080p.WEB-DL.Hindi' });
+  assert.deepEqual({ title: fileish.title, meta: fileish.meta }, { title: 'Fullmetal Alchemist: Brotherhood S02 · Episode 176', meta: ['Season 2', 'Quality: 1080P'] });
+  // A caption that actually names the episode is used as the name.
+  const named = watchHeading(item, { episode: episode(9), fileLabel: 'Reunion of Shadows' });
+  assert.deepEqual({ title: named.title, meta: named.meta }, { title: 'Fullmetal Alchemist: Brotherhood S02 · Reunion of Shadows', meta: ['Season 2', 'Episode 09'] });
+  // A leftover fragment of the show's own title is not a new name.
+  const partial = watchHeading(item, { episode: episode(9), fileLabel: 'Brotherhood EP 09 Dual Audio' });
+  assert.deepEqual({ title: partial.title, meta: partial.meta }, { title: 'Fullmetal Alchemist: Brotherhood S02 · Episode 09', meta: ['Season 2'] });
   const pack = watchHeading(item, { episode: { start: 3, end: 6, label: 'Episodes 03–06' } });
-  assert.deepEqual(pack.meta, ['Season 2', 'Episodes 03–06']);
+  assert.deepEqual({ title: pack.title, meta: pack.meta }, { title: 'Fullmetal Alchemist: Brotherhood S02 · Episodes 03–06', meta: ['Season 2'] });
 
   // the season may only be spelled out in the title, and a sequel number is not a season
   assert.equal(watchHeading({ ...item, episodeGroups: [] }, { episode: episode(3) }).seasonLabel, 'Season 2');
   assert.equal(watchHeading({ ...item, title: 'Rocky 2', episodeGroups: [] }, { episode: episode(3) }).seasonLabel, null);
   // a grouped label without a season still shows no invented season
-  assert.deepEqual(watchHeading({ ...item, title: 'Show', episodeGroups: [{ start: 1, end: 12, label: 'Episodes 01–12' }] }, { episode: episode(4) }).meta, ['Episode 04']);
+  const numbered = watchHeading({ ...item, title: 'Show', episodeGroups: [{ start: 1, end: 12, label: 'Episodes 01–12' }] }, { episode: episode(4) });
+  assert.deepEqual({ title: numbered.title, meta: numbered.meta }, { title: 'Show · Episode 04', meta: [] });
+  assert.equal(episodeNameFromLabel('Show S01 Complete 1080p', 'Show').name, null, 'a season pack is not one episode');
 
   const movie = { category: 'movie', title: 'RRR', episodeGroups: [], languages: ['Hindi Dubbed', 'Tamil'], subtitleLanguages: ['English'] };
   const movieHeading = watchHeading(movie, { fileLabel: null });
