@@ -3362,29 +3362,72 @@ function playersCoversEpisodeNumber(content, number) {
  * meant by it: on a card that has an Episode 176, `/players SB-… 176` opens that
  * episode; on any other card the same number pages through the list.
  */
+/**
+ * Read the tail of `/players SB-… [view]` into a view: nothing (the paged list), an
+ * episode or episode range, `missing`, a `#row`, or a page number. A bare number is the
+ * episode when the card actually has that episode and a page otherwise, because a
+ * publisher reads `176` as "the one I am looking for". A page may follow the view it
+ * narrows, so `ep 176 2` and `missing 3` work the way a scrolled list is re-asked.
+ */
 export function parsePlayersView(value, content = null) {
-  const text = cleanText(value, 80).trim();
-  if (!text) return { mode: 'all', episode: null, page: 1, focus: null };
-  const lowered = text.toLowerCase();
-  if (/^(?:all|everything|every|full|list)$/.test(lowered)) return { mode: 'all', episode: null, page: 1, focus: null };
-  if (/^(?:miss|missing|gaps|uncovered)$/.test(lowered)) return { mode: 'missing', episode: null, page: 1, focus: null };
+  const flat = { mode: 'all', episode: null, page: 1, focus: null };
+  const text = cleanText(value, 80).trim().replace(/[.,;:!?]+$/, '');
+  if (!text) return flat;
+  let tokens = text.toLowerCase().replace(/\s+/g, ' ').split(' ').filter(Boolean);
+  const words = 'all|everything|every|full|list|miss|missing|gaps|uncovered';
+  const episodeShape = '(?:ep|eps|episode|e)\\.?\\s*0*\\d{1,3}(?:\\s*(?:-|\\u2013|to)\\s*0*\\d{1,3})?';
+  const rowShape = '(?:#|row\\s+|n\\s+)?\\.?\\s*0*\\d{1,4}(?:-0*\\d{1,4})?';
+  let page = 1;
+  if (tokens.length > 1) {
+    const tail = tokens[tokens.length - 1].match(/^(?:p|page)?0*(\d{1,4})$/);
+    const head = tokens.slice(0, -1).join(' ');
+    if (tail && new RegExp(`^(?:${words}|${episodeShape}|${rowShape})$`).test(head)) {
+      tokens = tokens.slice(0, -1);
+      page = Math.max(1, Number(tail[1]));
+    }
+  }
+  // A row number already says which page holds it, so an added page is ignored there.
+  const withPage = (view) => (view.error || view.focus || page === 1 ? view : { ...view, page });
+
+  const lowered = tokens.join(' ');
+  if (/^(?:all|everything|every|full|list)$/.test(lowered)) return withPage({ ...flat });
+  if (/^(?:miss|missing|gaps|uncovered)$/.test(lowered)) return withPage({ mode: 'missing', episode: null, page: 1, focus: null });
 
   const bare = lowered.match(/^(#|row|n)?\.?\s*0*(\d{1,4})$/);
   if (bare) {
     const number = Number(bare[2]);
     const explicitRow = Boolean(bare[1]);
     if (!explicitRow && playersCoversEpisodeNumber(content, number)) {
-      return { mode: 'episode', episode: { start: number, end: number, label: directEpisodeLabel(number, number) }, page: 1, focus: null };
+      return withPage({
+        mode: 'episode',
+        episode: { start: number, end: number, label: directEpisodeLabel(number, number) },
+        page: 1,
+        focus: null
+      });
     }
     if (explicitRow) {
       // `#12` is the row they are reading, so it opens the page holding it.
-      return { mode: 'all', episode: null, page: Math.floor((Math.max(1, number) - 1) / PLAYERS_PAGE_SIZE) + 1, focus: number || null };
+      return withPage({
+        mode: 'all',
+        episode: null,
+        page: Math.floor((Math.max(1, number) - 1) / PLAYERS_PAGE_SIZE) + 1,
+        focus: number || null
+      });
     }
-    return { mode: 'all', episode: null, page: Math.max(1, number || 1), focus: null };
+    if (page > 1) {
+      return {
+        error: `${content && content.title ? content.title : 'This release'} has no Episode ${number} to page through. Use /players ${content ? content.adminId : 'SB-0123ABCDEF'} ${number} for page ${number} of the list, or ep 1-<end> with a page after it.`
+      };
+    }
+    return { ...flat, page: Math.max(1, number || 1) };
   }
 
-  const page = lowered.match(/^(?:page|p)\s*0*(\d{1,4})$/);
-  if (page) return { mode: 'all', episode: null, page: Math.max(1, Number(page[1])), focus: null };
+  // A range needs no `ep` to be understood: two numbers joined are episodes, never pages.
+  const bareRange = lowered.match(/^0*(\d{1,3})\s*(?:-|\u2013|to)\s*0*(\d{1,3})$/);
+  if (bareRange) return withPage(parsePlayersView(`ep ${Number(bareRange[1])}-${Number(bareRange[2])}`, content));
+
+  const pageOnly = lowered.match(/^(?:page|p)\s*0*(\d{1,4})$/);
+  if (pageOnly) return { ...flat, page: Math.max(1, Number(pageOnly[1])) };
 
   const episode = lowered.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?$/);
   if (episode) {
@@ -3393,9 +3436,11 @@ export function parsePlayersView(value, content = null) {
     if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < start || end > 999) {
       return { error: 'Episode numbers run from 1 to 999, with the end no earlier than the start. Example: /players SB-0123ABCDEF ep 176' };
     }
-    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null };
+    return withPage({ mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null });
   }
-  return { error: 'Use /players SB-0123ABCDEF ep 176 for one episode, ep 170-180 for a range, missing for the episodes with no player, or a page number.' };
+  return {
+    error: 'Use /players SB-0123ABCDEF ep 176 for one episode, ep 170-180 for a range, missing for the episodes with no player, #12 for a row, or a page number — and a page may follow any of them, as in ep 176 2.'
+  };
 }
 
 /** The view travels inside the button data, so an older message stays usable. */
@@ -3564,6 +3609,38 @@ export function playersMissingText(content, entries = [], config = {}, view = { 
     `Fill one: ${playersGapCommand(content.adminId, gaps[0])}`,
     '\u25aa Tap a gap below to open the view that prints the command filling it.'
   ].filter(Boolean).join('\n').slice(0, 3_600);
+}
+
+/**
+ * Re-render a `/players` message in place after a button tap.
+ *
+ * The context has to come from the caller: a callback handler owns the update, and a
+ * helper declared beside them that reaches for a `ctx` of its own compiles happily and
+ * throws `ctx is not defined` at runtime, which Telegram reports as a generic failure.
+ * An edit that changes nothing (Telegram answers 400 "message is not modified") and a
+ * message that no longer exists are both normal here, so they are folded into the
+ * return value instead of the error path.
+ */
+export async function renderPlayersMessage(ctx, repository, config, adminId, view = { mode: 'all', page: 1 }, fallbackNote = null) {
+  const content = await repository.findContentByAdminId?.(adminId);
+  if (!content) {
+    if (fallbackNote) await ctx.reply(fallbackNote).catch(() => {});
+    return 'gone';
+  }
+  const entries = playersList(content, config);
+  const text = view.mode === 'missing'
+    ? playersMissingText(content, entries, config, view)
+    : playersListText(content, entries, config, view);
+  const keyboard = playersKeyboard(content, entries, view);
+  try {
+    await ctx.editMessageText(text, keyboard);
+    return 'edited';
+  } catch (error) {
+    const description = String(error?.description || error?.message || '');
+    if (/message is not modified|no change/i.test(description)) return 'unchanged';
+    await ctx.reply(text, keyboard).catch(() => {});
+    return 'replied';
+  }
 }
 
 export function playersKeyboard(content, entries = [], view = { mode: 'all', page: 1 }) {
@@ -5036,18 +5113,6 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(playersListText(content, entries, config, view), playersKeyboard(content, entries, view));
   });
 
-  const renderPlayersMessage = async (adminId, playersView) => {
-    const latest = await repository.findContentByAdminId?.(adminId);
-    if (!latest) return 'gone';
-    const latestEntries = playersList(latest, config);
-    const text = playersView.mode === 'missing'
-      ? playersMissingText(latest, latestEntries, config, playersView)
-      : playersListText(latest, latestEntries, config, playersView);
-    return ctx.editMessageText(text, playersKeyboard(latest, latestEntries, playersView))
-      .then(() => 'edited')
-      .catch(() => 'reply');
-  };
-
   bot.action(/^ply:rem:([A-Z0-9-]{4,40}):(all|\d{1,4})(?::([a-z0-9-]{1,16}):(\d{1,4}))?$/, async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
     const [, removalAdminId, rawTarget, rawView, rawPage] = ctx.match;
@@ -5067,18 +5132,12 @@ export async function launchTelegramBot({ config, repository }) {
       await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
       return;
     }
-    const entries = playersList(outcome.content, config);
     const note = `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached. No announcement was sent and no file was changed.`;
     // The same view comes back, so clearing one episode's players never throws the
     // publisher to page one of everything they were not looking at.
-    const pages = Math.max(1, Math.ceil(entries.length / PLAYERS_PAGE_SIZE));
-    const nextView = { ...view, page: entries.length ? Math.min(view.page || 1, pages) : 1 };
-    const rendered = await renderPlayersMessage(outcome.content.adminId, nextView);
-    if (rendered === 'reply') {
-      await ctx.reply(playersListText(outcome.content, entries, config, nextView), playersKeyboard(outcome.content, entries, nextView)).catch(() => {});
-    } else if (rendered === 'gone') {
-      await ctx.reply(note).catch(() => {});
-    }
+    const pages = Math.max(1, Math.ceil(outcome.remaining / PLAYERS_PAGE_SIZE));
+    const nextView = { ...view, page: outcome.remaining ? Math.min(view.page || 1, pages) : 1 };
+    await renderPlayersMessage(ctx, repository, config, outcome.content.adminId, nextView, note);
     await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
   });
 
@@ -5093,14 +5152,7 @@ export async function launchTelegramBot({ config, repository }) {
       await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
       return;
     }
-    const rendered = await renderPlayersMessage(episodeAdminId, view);
-    if (rendered === 'reply') {
-      const content = await repository.findContentByAdminId?.(episodeAdminId);
-      if (content) {
-        const entries = playersList(content, config);
-        await ctx.reply(playersListText(content, entries, config, view), playersKeyboard(content, entries, view)).catch(() => {});
-      }
-    }
+    await renderPlayersMessage(ctx, repository, config, episodeAdminId, view, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached.`);
     await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
   });
 
@@ -5108,19 +5160,9 @@ export async function launchTelegramBot({ config, repository }) {
     if (!(await isPublisher(ctx, repository, config))) return;
     const [, pageAdminId, rawView, rawPage] = ctx.match;
     const view = { ...playersViewFromKey(rawView), page: Number(rawPage) || 1 };
-    const rendered = await renderPlayersMessage(pageAdminId, view);
+    const rendered = await renderPlayersMessage(ctx, repository, config, pageAdminId, view);
     if (rendered === 'gone') {
       await acknowledgeTap(ctx, 'That post is no longer available. Use /posts to find its current private ID.', { alert: true });
-      return;
-    }
-    if (rendered === 'reply') {
-      const content = await repository.findContentByAdminId?.(pageAdminId);
-      if (content) {
-        const entries = playersList(content, config);
-        await ctx.reply(view.mode === 'missing'
-          ? playersMissingText(content, entries, config, view)
-          : playersListText(content, entries, config, view), playersKeyboard(content, entries, view)).catch(() => {});
-      }
       return;
     }
     await acknowledgeTap(ctx, view.mode === 'episode' ? view.episode.label : view.mode === 'missing' ? 'Episodes without a player' : `Page ${view.page}`);

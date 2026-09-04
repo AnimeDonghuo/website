@@ -7,6 +7,7 @@ import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { applyMergeDrop, applyMergePlan, buildManualPlayerManifest, manualPlayerGroups, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan, POST_EDIT_ARGUMENT_LIMIT } from '../src/server/services/telegram-bot.js';
 import { parseCommandArgument } from '../src/server/lib/strings.js';
 import { parsePlayersView, playersCoverage, playersKeyboard, playersMissingText } from '../src/server/services/telegram-bot.js';
+import { renderPlayersMessage } from '../src/server/services/telegram-bot.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
 const posterConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
@@ -1966,4 +1967,110 @@ test('a player list of hundreds still reaches one episode, and its buttons fire'
     `ply:pag:${created.adminId}:all:1`
   ]);
   assert.equal(missingButtons.some((button) => button.callback_data.startsWith('ply:rem:')), false);
+});
+
+test('a /players button redraws the message it was pressed on, whatever Telegram answers', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Redraw S01',
+    category: 'web-series',
+    files: [{ storageMessageId: 81, name: 'Redraw.S01E01.mkv' }, { storageMessageId: 82, name: 'Redraw.S01E02.mkv' }]
+  });
+  await applyStreamingManifest({
+    repository,
+    config: { streaming: {} },
+    manifest: parseStreamingManifest(JSON.stringify([
+      { Post: created.adminId, Episode: 'S01E01', 'Embed Link': 'https://www.dailymotion.com/video/xONE' },
+      { Post: created.adminId, Episode: 'S01E02', 'Embed Link': 'https://rumble.com/v7twp-two.html' }
+    ]), { format: 'json' })
+  });
+
+  // the renderer owns no context of its own: it is the callback handler's ctx or nothing
+  const edited = [];
+  const ctx = {
+    editMessageText: async (text, markup) => {
+      edited.push({ text, buttons: markup.reply_markup.inline_keyboard.flat().map((button) => button.callback_data) });
+      return { message_id: 900 };
+    },
+    reply: async () => {
+      throw new Error('reply should not be needed');
+    }
+  };
+  assert.equal(await renderPlayersMessage(ctx, repository, {}, created.adminId, { mode: 'episode', episode: { start: 1, end: 1, label: 'Episode 01' }, page: 1, focus: null }), 'edited');
+  assert.match(edited[0].text, /\u25aa Episode 01: 1 of 2 players \u00b7 page 1 of 1/, 'the filtered view survives the redraw');
+  assert.match(edited[0].text, /Back to every player: \/players SB-[A-Z0-9]+ all/);
+  assert.deepEqual(edited[0].buttons.filter((data) => data.startsWith('ply:rem:')), [`ply:rem:${created.adminId}:1:1-1:1`]);
+
+  // an unchanged redraw is Telegram's 400, and answering it with a new message would
+  // spam the chat every time a publisher taps the page they are already on
+  const quiet = {
+    editMessageText: async () => {
+      throw Object.assign(new Error('400'), { code: 400, description: 'Bad Request: message is not modified: specified new message content is the same as the current one' });
+    },
+    reply: async () => {
+      throw new Error('a no-op tap must not send a message');
+    }
+  };
+  assert.equal(await renderPlayersMessage(quiet, repository, {}, created.adminId, { mode: 'all', page: 1, focus: null }), 'unchanged');
+
+  // a card deleted in another chat is reported where the button was, not by a crash
+  const vanishedRepository = { findContentByAdminId: async () => null };
+  const sent = [];
+  const vanishedCtx = {
+    editMessageText: async () => {
+      throw new Error('never reached');
+    },
+    reply: async (text) => {
+      sent.push(text);
+      return { message_id: 901 };
+    }
+  };
+  assert.equal(await renderPlayersMessage(vanishedCtx, vanishedRepository, {}, 'SB-GONE', { mode: 'all', page: 1 }, 'Removed 1 player'), 'gone');
+  assert.deepEqual(sent, ['Removed 1 player']);
+
+  // an old message whose edit is refused entirely still gets its list, as a new reply
+  const stale = {
+    editMessageText: async () => {
+      throw Object.assign(new Error('400'), { code: 400, description: 'Bad Request: message can not be edited' });
+    },
+    replies: [],
+    async reply(text) {
+      this.replies.push(text);
+      return { message_id: 902 };
+    }
+  };
+  assert.equal(await renderPlayersMessage(stale, repository, {}, created.adminId, { mode: 'missing', page: 1 }), 'replied');
+  assert.match(stale.replies[0], /All 2 of its episodes have a player\. Nothing is missing\./);
+});
+
+test('a /players view survives how publishers actually type it', () => {
+  const content = { adminId: 'SB-VIEW01', episodeGroups: [{ start: 1, end: 300, label: 'Episodes 01–300', fileCount: 300 }] };
+  const cases = [
+    ['', { mode: 'all', page: 1, focus: null }],
+    ['176', { mode: 'episode', page: 1, focus: null }],
+    ['Ep 176 1', { mode: 'episode', page: 1, focus: null }],
+    ['episode 170-180 2', { mode: 'episode', page: 2, focus: null }],
+    ['170-180', { mode: 'episode', page: 1, focus: null }],
+    ['missing', { mode: 'missing', page: 1, focus: null }],
+    ['missing 3', { mode: 'missing', page: 3, focus: null }],
+    ['all 2', { mode: 'all', page: 2, focus: null }],
+    ['#12', { mode: 'all', page: 2, focus: 12 }],
+    ['page 3', { mode: 'all', page: 3, focus: null }]
+  ];
+  for (const [value, expected] of cases) {
+    const view = parsePlayersView(value, content);
+      assert.equal(view.error, undefined, value + ' should parse');
+    assert.equal(view.mode, expected.mode, value);
+    assert.equal(view.page, expected.page, value);
+    assert.equal(view.focus, expected.focus, value);
+  }
+  assert.equal(parsePlayersView('ep 176', content).episode.label, 'Episode 176');
+  assert.equal(parsePlayersView('ep 170 to 180', content).episode.label, 'Episodes 170–180');
+  // two numbers where the first is neither an episode nor a page is a question, not a guess
+  assert.match(parsePlayersView('400 2', content).error, /has no Episode 400/);
+  assert.match(parsePlayersView('nonsense', content).error, /ep 176 2/);
+  assert.match(parsePlayersView('ep 9-3', content).error, /1 to 999/);
+  // without the card in hand a bare number stays a page, which is what a typed list means
+  assert.equal(parsePlayersView('176').mode, 'all');
+  assert.equal(parsePlayersView('176').page, 176);
 });

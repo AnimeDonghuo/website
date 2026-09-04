@@ -417,9 +417,12 @@ A card that runs to hundreds of episodes is **narrowed rather than scrolled**, a
 /players SB-0123ABCDEF missing      the episodes that have no player yet
 /players SB-0123ABCDEF #12          jump to the page holding row twelve
 /players SB-0123ABCDEF 3            page three of the whole list
+/players SB-0123ABCDEF ep 176 2     page two of that episode's players
 ```
 
-The header of the full list states the coverage (`28 of 30 episodes have a player · page 1 of 4`) and names the oldest gap with the command that fills it. `missing` counts a player only when the link covers that episode, so a release-wide link never hides a hole; tapping a gap in that view opens the episode view that prints `/cmd SB-0123ABCDEF ep 13-14 <player URL>` ready to paste. Paging, filtering, and removal all re-render the same message in place, and **Remove all N** is offered only on the unfiltered list — a filtered view offers `✕ Remove all 2 for Episodes 01–02`, which cannot reach the rest of the card.
+Any view accepts a page after it (`ep 176 2`, `missing 3`), and two numbers where the first is neither an episode of that card nor a real page is answered with a question rather than a guess.
+
+The header of the full list states the coverage (`28 of 30 episodes have a player · page 1 of 4`) and names the oldest gap with the command that fills it. `missing` counts a player only when the link covers that episode, so a release-wide link never hides a hole; tapping a gap in that view opens the episode view that prints `/cmd SB-0123ABCDEF ep 13-14 <player URL>` ready to paste. Paging, filtering, and removal all re-render the same message in place (a redraw that would change nothing is swallowed instead of answered with a duplicate message), and **Remove all N** is offered only on the unfiltered list — a filtered view offers `✕ Remove all 2 for Episodes 01–02`, which cannot reach the rest of the card.
 
 When a target Post ID is supplied, provider exports may omit `postId`; their `Title`, `Embed Link`, `Embed Code`, `VideoID`, `Download Link`, and `Size` fields can remain exactly as exported. With bare `/cmd`, each row must contain `postId`/`adminId`, or a `Title` that exactly matches one catalog post (ambiguous titles are rejected rather than choosing the wrong category). Re-importing the same provider + episode replaces that player entry, while another approved provider for the same episode remains available as an alternative on the Watch page. An export’s `Episode` column accepts a bare number or range (`4`, `2-7`) as well as `S01E03`/`1x03` markers, so a season-long export addresses one player per episode instead of collapsing onto the first one.
 
