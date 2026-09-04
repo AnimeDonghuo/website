@@ -6,6 +6,7 @@ import { parseStreamingManifest, publicStreamingData, safeStreamingUrl, streamSe
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { applyMergeDrop, applyMergePlan, buildManualPlayerManifest, manualPlayerGroups, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan, POST_EDIT_ARGUMENT_LIMIT } from '../src/server/services/telegram-bot.js';
 import { parseCommandArgument } from '../src/server/lib/strings.js';
+import { parsePlayersView, playersCoverage, playersKeyboard, playersMissingText } from '../src/server/services/telegram-bot.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
 const posterConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
@@ -330,9 +331,9 @@ test('players can be removed by number, by episode range, or all at once', async
   assert.deepEqual(listed.map((entry) => entry.number), [1, 2, 3]);
   assert.deepEqual(listed.map((entry) => entry.server), ['Dailymotion server', 'Rumble server', 'Seek server']);
   const listing = playersListText(before, listed, {});
-  assert.match(listing, /1\. Dailymotion server · Episode 01/);
-  assert.match(listing, /del ep 2-7/);
-  assert.match(listing, /Remove one: \/cmd/);
+  assert.match(listing, /\u25aa 1\. Episode 01 · Dailymotion server/, 'the episode is what a publisher searches for, so it leads the line');
+  assert.match(listing, /del ep 1-6 for a range/, 'the Remove hint quotes rows that are actually on screen');
+  assert.match(listing, /Remove: \/cmd SB-[A-Z0-9]+ del 1 for that line/);
 
   const ranged = await removeAttachedPlayers({ repository, targetAdminId: created.adminId, removal: parseStreamRemoval('ep 2-3'), config: {} });
   assert.equal(ranged.error, undefined);
@@ -1859,4 +1860,110 @@ test('one manual paste builds one manifest row per labelled episode', () => {
   assert.equal(empty.links, 0);
   assert.equal(empty.manifest.entries.length, 0);
 });
+test('a player list of hundreds still reaches one episode, and its buttons fire', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const files = [];
+  for (let number = 1; number <= 12; number += 1) {
+    files.push({ storageMessageId: 200 + number, name: `Long.Show.S01E${String(number).padStart(2, '0')}.mkv` });
+  }
+  const created = await repository.createContent({ title: 'Long Show', category: 'donghua', files });
+  await applyStreamingManifest({
+    repository,
+    config: { streaming: {} },
+    manifest: parseStreamingManifest(JSON.stringify([1, 2, 3, 4, 7, 8, 9, 10, 11, 12].map((number) => ({
+      Post: created.adminId,
+      Episode: `S01E${String(number).padStart(2, '0')}`,
+      'Embed Link': `https://www.dailymotion.com/video/x${number}`
+    }))), { format: 'json' })
+  });
+  const content = await repository.findContentByAdminId(created.adminId);
+  const listed = playersList(content, {});
+  assert.equal(listed.length, 10);
 
+  // which episodes are still bare, and the command that fills the first gap
+  const coverage = playersCoverage(content, listed);
+  assert.equal(coverage.total, 12);
+  assert.equal(coverage.covered, 10);
+  assert.deepEqual(coverage.missing, [{ start: 5, end: 6 }]);
+  const gaps = playersMissingText(content, listed, {});
+  assert.match(gaps, /Ep 05–06 · 2 episodes with no player/);
+  assert.match(gaps, new RegExp(`/cmd ${created.adminId} ep 5-6 <player URL>`));
+
+  // a bare number is the episode on a card that has it, a page number on one that does not
+  const oneEpisode = parsePlayersView('5', content);
+  assert.equal(oneEpisode.mode, 'episode');
+  assert.deepEqual(oneEpisode.episode, { start: 5, end: 5, label: 'Episode 05' });
+  assert.equal(parsePlayersView('99', content).mode, 'all');
+  assert.equal(parsePlayersView('99', content).page, 99);
+  assert.equal(parsePlayersView('#9', content).focus, 9);
+  assert.equal(parsePlayersView('#9', content).page, 2);
+  assert.match(parsePlayersView('nonsense', content).error, /ep 176/);
+  assert.match(playersListText(content, listed, {}, oneEpisode), /No player is attached to Episode 05 yet/);
+  assert.match(playersListText(content, listed, {}, oneEpisode), /ep 5 <player URL>/);
+
+  // the range view reaches both gaps at once and keeps the global numbering
+  const ranged = playersListText(content, listed, {}, parsePlayersView('ep 4-7', content));
+  assert.match(ranged, /▪ 4\. Episode 04 · Dailymotion server/);
+  assert.match(ranged, /▪ 5\. Episode 07 · Dailymotion server/);
+  assert.doesNotMatch(ranged, /▪ 1\. Episode 01/);
+
+  // the flat list pages instead of turning into a wall of buttons
+  const firstPage = playersListText(content, listed, {}, { mode: 'all', page: 1 });
+  assert.match(firstPage, /10 of 12 episodes have a player/);
+  assert.match(firstPage, /page 1 of 2/);
+  assert.match(firstPage, /▪ 8\. Episode 10/);
+  assert.doesNotMatch(firstPage, /▪ 9\. Episode 11/);
+  assert.match(playersListText(content, listed, {}, { mode: 'all', page: 2 }), /▪ 9\. Episode 11/);
+  // a page number past the end lands on the last page instead of an empty message
+  assert.match(playersListText(content, listed, {}, { mode: 'all', page: 40 }), /page 2 of 2/);
+
+  const buttons = (keyboard) => keyboard.reply_markup.inline_keyboard.flat();
+
+  // a button whose data no bot.action() pattern matches is a dead button, and
+  // Telegram stays silent about it, so the contract is asserted here instead.
+  const liveKeyboard = playersKeyboard(content, listed, { mode: 'all', page: 1 });
+  const removals = buttons(liveKeyboard).filter((button) => /^ply:rem:[A-Z0-9-]+:\d+:/.test(button.callback_data));
+  assert.equal(removals.length, 8);
+  for (const button of removals) {
+    assert.match(
+      button.callback_data,
+      new RegExp(`^ply:rem:${created.adminId}:(\\d{1,4}):all:1$`),
+      'the card, the row, the view and the page all travel inside the callback'
+    );
+  }
+  assert.equal(removals[0].text, '✕ Episode 01 · Dailymotion');
+  assert.equal(removals.some((button) => button.text.includes('Episode 11')), false, 'page 2 is not offered on page 1');
+  const addPlayer = buttons(liveKeyboard).find((button) => button.callback_data.startsWith('ply:add:'));
+  assert.equal(addPlayer.callback_data, `ply:add:${created.adminId}`);
+
+  // tapping the Remove button for Episode 07 removes exactly that entry
+  const tapped = removals.find((button) => button.text.includes('Episode 07'));
+  const [, , tappedAdminId, tappedNumber] = tapped.callback_data.split(':');
+  assert.equal(tappedAdminId, created.adminId);
+  const afterTap = await removeAttachedPlayers({
+    repository,
+    targetAdminId: tappedAdminId,
+    removal: { mode: 'index', indexes: [Number(tappedNumber)] },
+    config: {}
+  });
+  assert.equal(afterTap.removed, 1);
+  assert.equal(afterTap.scope, 'player 5');
+  const remaining = await repository.findContentByAdminId(created.adminId);
+  assert.equal(remaining.stream.entries.some((entry) => entry.embedUrl.includes('/x7')), false);
+  assert.deepEqual(remaining.stream.entries.map((entry) => entry.episode?.start), [1, 2, 3, 4, 8, 9, 10, 11, 12]);
+
+  // inside an episode view, "remove all" can only ever mean what is on screen
+  const episodeButtons = buttons(playersKeyboard(content, listed, parsePlayersView('ep 1-2', content)));
+  assert.equal(episodeButtons.some((button) => /^Remove all \d+$/.test(button.text)), false);
+  const removeEpisode = episodeButtons.find((button) => button.callback_data.startsWith('ply:remep:'));
+  assert.match(removeEpisode.callback_data, /^ply:remep:([A-Z0-9-]{4,40}):(\d{1,3})-(\d{1,3})$/);
+  assert.equal(removeEpisode.text, '✕ Remove all 2 for Episodes 01–02');
+
+  // a gap has nothing to remove, so its buttons jump to the view that prints the command
+  const missingButtons = buttons(playersKeyboard(content, listed, { mode: 'missing', page: 1 }));
+  assert.deepEqual(missingButtons.map((button) => button.callback_data).filter((data) => data.startsWith('ply:pag:')), [
+    `ply:pag:${created.adminId}:5-6:1`,
+    `ply:pag:${created.adminId}:all:1`
+  ]);
+  assert.equal(missingButtons.some((button) => button.callback_data.startsWith('ply:rem:')), false);
+});

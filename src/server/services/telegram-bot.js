@@ -3338,51 +3338,299 @@ export function playersList(content, config = {}) {
   }));
 }
 
-export function playersListText(content, entries, config = {}) {
+/**
+ * A release can hold hundreds of players, so the list is a window and not a dump:
+ * the publisher narrows it to one episode or range, jumps to the episodes that have
+ * no player yet, or pages through everything. Numbers always come from the stored
+ * order, so a number printed here is the number `/cmd SB-… del <n>` addresses, and
+ * the Remove buttons carry the card they belong to.
+ */
+export const PLAYERS_PAGE_SIZE = 8;
+
+function playersEpisodeGroups(content) {
+  return (Array.isArray(content?.episodeGroups) ? content.episodeGroups : [])
+    .map((group) => ({ start: Number(group?.start), end: Number(group?.end ?? group?.start) }))
+    .filter((group) => Number.isInteger(group.start) && group.start >= 1);
+}
+
+function playersCoversEpisodeNumber(content, number) {
+  return playersEpisodeGroups(content).some((group) => number >= group.start && number <= (Number.isInteger(group.end) ? group.end : group.start));
+}
+
+/**
+ * The view a publisher asked for. `content` lets a bare number mean what they
+ * meant by it: on a card that has an Episode 176, `/players SB-… 176` opens that
+ * episode; on any other card the same number pages through the list.
+ */
+export function parsePlayersView(value, content = null) {
+  const text = cleanText(value, 80).trim();
+  if (!text) return { mode: 'all', episode: null, page: 1, focus: null };
+  const lowered = text.toLowerCase();
+  if (/^(?:all|everything|every|full|list)$/.test(lowered)) return { mode: 'all', episode: null, page: 1, focus: null };
+  if (/^(?:miss|missing|gaps|uncovered)$/.test(lowered)) return { mode: 'missing', episode: null, page: 1, focus: null };
+
+  const bare = lowered.match(/^(#|row|n)?\.?\s*0*(\d{1,4})$/);
+  if (bare) {
+    const number = Number(bare[2]);
+    const explicitRow = Boolean(bare[1]);
+    if (!explicitRow && playersCoversEpisodeNumber(content, number)) {
+      return { mode: 'episode', episode: { start: number, end: number, label: directEpisodeLabel(number, number) }, page: 1, focus: null };
+    }
+    if (explicitRow) {
+      // `#12` is the row they are reading, so it opens the page holding it.
+      return { mode: 'all', episode: null, page: Math.floor((Math.max(1, number) - 1) / PLAYERS_PAGE_SIZE) + 1, focus: number || null };
+    }
+    return { mode: 'all', episode: null, page: Math.max(1, number || 1), focus: null };
+  }
+
+  const page = lowered.match(/^(?:page|p)\s*0*(\d{1,4})$/);
+  if (page) return { mode: 'all', episode: null, page: Math.max(1, Number(page[1])), focus: null };
+
+  const episode = lowered.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?$/);
+  if (episode) {
+    const start = Number(episode[1]);
+    const end = Number(episode[2] || episode[1]);
+    if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < start || end > 999) {
+      return { error: 'Episode numbers run from 1 to 999, with the end no earlier than the start. Example: /players SB-0123ABCDEF ep 176' };
+    }
+    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null };
+  }
+  return { error: 'Use /players SB-0123ABCDEF ep 176 for one episode, ep 170-180 for a range, missing for the episodes with no player, or a page number.' };
+}
+
+/** The view travels inside the button data, so an older message stays usable. */
+export function playersViewKey(view = {}) {
+  if (view.mode === 'episode' && view.episode) return `${view.episode.start}-${view.episode.end}`;
+  return view.mode === 'missing' ? 'miss' : 'all';
+}
+
+export function playersViewFromKey(key) {
+  const range = String(key || '').match(/^(\d{1,3})-(\d{1,3})$/);
+  if (range) {
+    const start = Number(range[1]);
+    const end = Number(range[2]);
+    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null };
+  }
+  return { mode: key === 'miss' ? 'missing' : 'all', episode: null, page: 1, focus: null };
+}
+
+function playersRangesOverlap(first, second) {
+  const leftStart = Number(first?.start);
+  const leftEnd = Number(first?.end ?? first?.start);
+  const rightStart = Number(second?.start);
+  const rightEnd = Number(second?.end ?? second?.start);
+  if (!Number.isInteger(leftStart) || !Number.isInteger(rightStart)) return false;
+  return leftStart <= (Number.isInteger(rightEnd) ? rightEnd : rightStart)
+    && (Number.isInteger(leftEnd) ? leftEnd : leftStart) >= rightStart;
+}
+
+/**
+ * Which episodes the card actually has a player for. A release-wide link is
+ * deliberately not counted: the site offers a player on an episode page only when
+ * a link covers that episode, so counting it would hide a real gap.
+ */
+export function playersCoverage(content, entries = []) {
+  const groups = playersEpisodeGroups(content);
+  const list = Array.isArray(entries) ? entries : [];
+  const episodic = list.filter((entry) => Number.isInteger(Number(entry?.episode?.start)));
+  const missing = [];
+  let covered = 0;
+  for (const group of groups) {
+    const end = Number.isInteger(group.end) && group.end >= group.start ? group.end : group.start;
+    const span = Math.min(400, end - group.start + 1);
+    let hit = 0;
+    for (let offset = 0; offset < span; offset += 1) {
+      const number = group.start + offset;
+      if (episodic.some((entry) => playersRangesOverlap(entry.episode, { start: number, end: number }))) hit += 1;
+    }
+    if (!hit) {
+      const last = missing[missing.length - 1];
+      if (last && group.start === last.end + 1) last.end = end;
+      else missing.push({ start: group.start, end });
+    }
+    covered += hit;
+  }
+  const total = groups.reduce((sum, group) => sum + Math.min(400, (Number.isInteger(group.end) ? group.end : group.start) - group.start + 1), 0);
+  return { total, covered, missing, releaseWide: list.length - episodic.length };
+}
+
+function playersGapLabel(range) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return range.start === range.end ? `Ep ${pad(range.start)}` : `Ep ${pad(range.start)}\u2013${pad(range.end)}`;
+}
+
+function playersGapCommand(adminId, range) {
+  if (!range) return `/cmd ${adminId} ep 1 <player URL>`;
+  return `/cmd ${adminId} ep ${range.start === range.end ? range.start : `${range.start}-${range.end}`} <player URL>`;
+}
+
+function selectPlayersEntries(entries, view) {
+  if (view.mode !== 'episode') return entries;
+  return entries.filter((entry) => playersRangesOverlap(entry?.episode, view.episode));
+}
+
+export function playersListText(content, entries = [], config = {}, view = { mode: 'all', page: 1 }) {
   const watchUrl = watchPageUrl(config, content, null);
-  if (!entries.length) {
+  const all = Array.isArray(entries) ? entries : [];
+  if (!all.length) {
     return [
-      `▸ ${content.title} (${content.adminId})`,
+      `\u25b8 ${content.title} (${content.adminId})`,
       '',
       'No player is attached to this release yet.',
       'Add one: /cmd ' + content.adminId + ' ep 1 https://rumble.com/vxxxx-title.html',
-      'Many at once: /cmd ' + content.adminId + ' then send the provider .json or .csv export.'
+      'Many at once: /cmd ' + content.adminId + ' then send the provider .json or .csv export.',
+      'Several episodes in one message: put "ep 176 <link>" and "ep 177 <link>" on their own lines.'
     ].join('\n');
   }
-  const lines = entries.map((entry) => [
-    `${entry.number}. ${entry.server} · ${entry.episode?.label || 'Release-wide'}`,
-    `   → ${entry.url}`
+
+  const coverage = playersCoverage(content, all);
+  const selected = selectPlayersEntries(all, view);
+  const pages = Math.max(1, Math.ceil(selected.length / PLAYERS_PAGE_SIZE));
+  const wanted = Math.max(1, Number(view.page) || 1);
+  const page = Math.min(wanted, pages);
+  const shown = selected.slice((page - 1) * PLAYERS_PAGE_SIZE, page * PLAYERS_PAGE_SIZE);
+
+  const header = [`\u25b8 ${content.title} (${content.adminId}) \u2014 ${all.length} player${all.length === 1 ? '' : 's'}`];
+  if (view.mode === 'episode') {
+    header.push(`\u25aa ${view.episode.label}: ${selected.length} of ${all.length} players${selected.length ? ` \u00b7 page ${page} of ${pages}` : ''}`);
+  } else if (coverage.total) {
+    const episodeWord = coverage.total === 1 ? 'episode has' : 'episodes have';
+    header.push(`\u25aa ${coverage.covered} of ${coverage.total} ${episodeWord} a player \u00b7 page ${page} of ${pages}`);
+  } else {
+    header.push(`\u25aa page ${page} of ${pages}`);
+  }
+  if (page !== wanted) {
+    // A number that is neither an episode of this card nor a real page is a typo,
+    // and silently landing somewhere else would be worse than saying so.
+    header.push(`\u25aa There ${pages === 1 ? 'is only 1 page' : `are only ${pages} pages`} of ${all.length} players${coverage.total && wanted > coverage.total ? `, and this release runs to ${directEpisodeLabel(1, coverage.total)}` : ''} \u2014 showing page ${page}.`);
+  }
+
+  const lines = shown.map((entry) => [
+    `${view.focus && entry.number === view.focus ? '\u25b6' : '\u25aa'} ${entry.number}. ${entry.episode?.label || 'Release-wide'} \u00b7 ${entry.server}`,
+    `   \u2192 ${entry.url}`
   ].join('\n'));
+
+  const tail = [];
+  if (view.mode === 'episode' && !selected.length) {
+    const beyond = coverage.total > 0 && view.episode.start > coverage.total;
+    tail.push(beyond
+      ? `This release runs to ${directEpisodeLabel(1, coverage.total)}, so ${view.episode.label} does not exist on it. Nothing was changed.`
+      : `No player is attached to ${view.episode.label} yet. Add one: ${playersGapCommand(content.adminId, view.episode)}`);
+    tail.push(beyond
+      ? `\u25aa /players ${content.adminId} missing lists the episodes that still need a player.`
+      : 'After that this same page shows it, with its Remove button.');
+  }
+  if (view.mode !== 'episode' && coverage.missing.length) {
+    tail.push(`\u25aa With no player yet: ${coverage.missing.slice(0, 8).map(playersGapLabel).join(', ')}${coverage.missing.length > 8 ? ` \u00b7 +${coverage.missing.length - 8} more` : ''}`);
+    tail.push(`   Fill the first gap: ${playersGapCommand(content.adminId, coverage.missing[0])}`);
+  }
+  if (view.mode === 'episode') {
+    tail.push(`\u25aa Back to every player: /players ${content.adminId} all`);
+  } else if (all.length > PLAYERS_PAGE_SIZE && view.mode !== 'missing') {
+    tail.push(`\u25aa Narrow it: /players ${content.adminId} ep 176 for one episode, ep 170-180 for a range, missing for the gaps, #12 for row twelve, 3 for page three \u2014 or use the buttons below.`);
+  }
+  const episodeHint = view.episode?.start ?? shown[0]?.episode?.start ?? 1;
+  tail.push([
+    `\u25aa Remove: /cmd ${content.adminId} del ${shown[0]?.number ?? 1} for that line`,
+    `/cmd ${content.adminId} del ep ${episodeHint} for that whole episode`,
+    `/cmd ${content.adminId} del ep ${episodeHint}-${episodeHint + 5} for a range`
+  ].join(' \u00b7 '));
+  if (coverage.releaseWide) {
+    tail.push(`\u25aa ${coverage.releaseWide} release-wide link${coverage.releaseWide === 1 ? '' : 's'} sit${coverage.releaseWide === 1 ? 's' : ''} on the release page only, not on an episode page.`);
+  }
+  if (watchUrl) tail.push(`Watch page: ${watchUrl}`);
+
+  return [...header, '', ...lines, '', ...tail.filter(Boolean)].join('\n').slice(0, 3_600);
+}
+
+export function playersMissingText(content, entries = [], config = {}, view = { mode: 'missing', page: 1 }) {
+  const coverage = playersCoverage(content, entries);
+  if (!coverage.total) {
+    return `\u25b8 ${content.title} (${content.adminId})\n\nThis card numbers no episodes, so there is nothing to check. It has ${entries.length} player${entries.length === 1 ? '' : 's'} attached.`;
+  }
+  if (!coverage.missing.length) {
+    return `\u25b8 ${content.title} (${content.adminId})\n\nAll ${coverage.total} of its episodes have a player${coverage.releaseWide ? ` (${coverage.releaseWide} release-wide link${coverage.releaseWide === 1 ? '' : 's'} as well)` : ''}. Nothing is missing.`;
+  }
+  const gapPages = Math.max(1, Math.ceil(coverage.missing.length / PLAYERS_PAGE_SIZE));
+  const gapPage = Math.min(Math.max(1, Number(view.page) || 1), gapPages);
+  const gaps = coverage.missing.slice((gapPage - 1) * PLAYERS_PAGE_SIZE, gapPage * PLAYERS_PAGE_SIZE);
   return [
-    `▸ ${content.title} (${content.adminId}) — ${entries.length} player${entries.length === 1 ? '' : 's'}`,
+    `\u25b8 ${content.title} (${content.adminId}) \u2014 ${coverage.covered} of ${coverage.total} episodes covered`,
     '',
-    ...lines,
+    ...gaps.map((gap) => `\u25aa ${playersGapLabel(gap)} \u00b7 ${gap.end - gap.start + 1} episode${gap.end === gap.start ? '' : 's'} with no player`),
+    gapPages > 1 ? `\u25aa Gap page ${gapPage} of ${gapPages}` : null,
+    coverage.missing.length > gapPage * PLAYERS_PAGE_SIZE ? `\u2026 ${coverage.missing.length - gapPage * PLAYERS_PAGE_SIZE} more gap${coverage.missing.length - gapPage * PLAYERS_PAGE_SIZE === 1 ? '' : 's'} on the next page` : null,
     '',
-    `Remove one: /cmd ${content.adminId} del 1`,
-    `Remove an episode range: /cmd ${content.adminId} del ep 2-7`,
-    `Add another link to the same episode and both stay.`,
-    watchUrl ? `Watch page: ${watchUrl}` : null
+    `Fill one: ${playersGapCommand(content.adminId, gaps[0])}`,
+    '\u25aa Tap a gap below to open the view that prints the command filling it.'
   ].filter(Boolean).join('\n').slice(0, 3_600);
 }
 
-export function playersKeyboard(entries) {
-  if (!entries.length) {
+export function playersKeyboard(content, entries = [], view = { mode: 'all', page: 1 }) {
+  const adminId = String(content?.adminId || '').toUpperCase();
+  const all = (Array.isArray(entries) ? entries : []).filter((entry) => Number.isInteger(entry?.number));
+  if (!all.length) {
     // Nothing to remove yet, so the only useful action is to add the first link.
-    return Markup.inlineKeyboard([[Markup.button.callback('Add players', 'ply:add')]]);
+    return Markup.inlineKeyboard([[Markup.button.callback('Add players', `ply:add:${adminId}`)]]);
+  }
+  const selected = selectPlayersEntries(all, view);
+  const pages = Math.max(1, Math.ceil(selected.length / PLAYERS_PAGE_SIZE));
+  const page = Math.min(Math.max(1, Number(view.page) || 1), pages);
+  const shown = selected.slice((page - 1) * PLAYERS_PAGE_SIZE, page * PLAYERS_PAGE_SIZE);
+  const key = playersViewKey(view);
+  const shortName = (entry) => String(entry.server || 'player').replace(/\s+server$/i, '');
+
+  if (view.mode === 'missing') {
+    const gaps = playersCoverage(content, all).missing;
+    const gapPages = Math.max(1, Math.ceil(gaps.length / PLAYERS_PAGE_SIZE));
+    const gapPage = Math.min(Math.max(1, Number(view.page) || 1), gapPages);
+    const shownGaps = gaps.slice((gapPage - 1) * PLAYERS_PAGE_SIZE, gapPage * PLAYERS_PAGE_SIZE);
+    const gapRows = [];
+    for (let index = 0; index < shownGaps.length; index += 2) {
+      gapRows.push(shownGaps.slice(index, index + 2).map((gap) => Markup.button.callback(
+        telegramButtonText(`\u2192 ${playersGapLabel(gap)} \u00b7 ${gap.end - gap.start + 1} missing`),
+        `ply:pag:${adminId}:${gap.start === gap.end ? gap.start : `${gap.start}-${gap.end}`}:1`
+      )));
+    }
+    const gapNav = [];
+    if (gapPage > 1) gapNav.push(Markup.button.callback(`\u25c0 ${gapPage - 1}`, `ply:pag:${adminId}:miss:${gapPage - 1}`));
+    if (gapPage < gapPages) gapNav.push(Markup.button.callback(`${gapPage + 1} \u25b6`, `ply:pag:${adminId}:miss:${gapPage + 1}`));
+    if (gapNav.length) gapRows.push(gapNav);
+    gapRows.push([
+      Markup.button.callback('All players', `ply:pag:${adminId}:all:1`),
+      Markup.button.callback('Add players', `ply:add:${adminId}`)
+    ]);
+    return Markup.inlineKeyboard(gapRows);
   }
   const rows = [];
-  for (let index = 0; index < Math.min(entries.length, 20); index += 2) {
-    rows.push(entries.slice(index, index + 2).map((entry) => Markup.button.callback(
-      telegramButtonText(`Remove ${entry.number} · ${entry.server.replace(/\s+server$/i, '')}`),
-      `ply:remove:${entry.number}`
+  for (let index = 0; index < shown.length; index += 2) {
+    rows.push(shown.slice(index, index + 2).map((entry) => Markup.button.callback(
+      telegramButtonText(`\u2715 ${entry.episode?.label || 'Release'} \u00b7 ${shortName(entry)}`),
+      `ply:rem:${adminId}:${entry.number}:${key}:${page}`
     )));
   }
-  const lastRow = [
-    Markup.button.callback('Remove all players', 'ply:remove:all'),
-    Markup.button.callback('Add another', 'ply:add')
-  ];
-  if (entries.length > 20) lastRow.push(Markup.button.callback('Close', 'ply:close'));
-  rows.push(lastRow);
+  if (view.mode === 'episode' && selected.length) {
+    rows.push([Markup.button.callback(
+      telegramButtonText(`\u2715 Remove all ${selected.length} for ${view.episode.label}`),
+      `ply:remep:${adminId}:${view.episode.start}-${view.episode.end}`
+    )]);
+  }
+  const navigation = [];
+  if (page > 1) navigation.push(Markup.button.callback(`\u25c0 ${page - 1}`, `ply:pag:${adminId}:${key}:${page - 1}`));
+  if (page < pages) navigation.push(Markup.button.callback(`${page + 1} \u25b6`, `ply:pag:${adminId}:${key}:${page + 1}`));
+  navigation.push(Markup.button.callback(
+    view.mode === 'missing' ? 'All players' : 'Missing episodes',
+    `ply:pag:${adminId}:${view.mode === 'missing' ? 'all' : 'miss'}:1`
+  ));
+  if (view.mode === 'episode') navigation.push(Markup.button.callback('All players', `ply:pag:${adminId}:all:1`));
+  rows.push(navigation);
+  const footer = [Markup.button.callback('Add players', `ply:add:${adminId}`)];
+  if (view.mode === 'all') {
+    footer.push(Markup.button.callback(`Remove all ${all.length}`, `ply:rem:${adminId}:all:${key}:${page}`));
+  }
+  rows.push(footer);
+  // Telegram caps an inline keyboard at 100 buttons and a wall of them is
+  // unreadable anyway, which is why the list pages instead of growing.
   return Markup.inlineKeyboard(rows);
 }
 
@@ -3886,7 +4134,7 @@ async function handleStreamImportUpload(ctx, repository, config) {
       await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
       await ctx.reply(
         `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
-        playersKeyboard(playersList(outcome.content, config))
+        playersKeyboard(outcome.content, playersList(outcome.content, config))
       );
       return true;
     }
@@ -4706,7 +4954,7 @@ export async function launchTelegramBot({ config, repository }) {
           await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
           await ctx.reply(
             `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
-            playersKeyboard(playersList(outcome.content, config))
+            playersKeyboard(outcome.content, playersList(outcome.content, config))
           );
           return;
         }
@@ -4756,11 +5004,18 @@ export async function launchTelegramBot({ config, repository }) {
     }
     const argument = parseCommandArgument(ctx.message.text, 120);
     const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    const scoped = targetAdminId ? cleanText(String(argument).replace(targetAdminId, ' '), 80) : String(argument || '');
+    let view = parsePlayersView(scoped);
+    if (view.error) {
+      await ctx.reply(view.error);
+      return;
+    }
     if (!targetAdminId) {
       const posts = typeof repository.listAdminContent === 'function' ? await repository.listAdminContent(10) : [];
       await ctx.reply([
         'Usage: /players SB-0123ABCDEF',
         'That lists every player attached to a release and lets you remove one, an episode range, or all of them.',
+        'A card with many episodes is easier to narrow than to scroll: /players SB-0123ABCDEF 176 (that episode), ep 170-180 (a range), missing (the episodes nobody has filled yet), #12 (row twelve), or 3 (page three). The buttons below the list do the same, and a Remove button always names the card it acts on.',
         posts.length ? `Recent post IDs:\n${posts.map((post) => `▪ ${post.adminId} — ${cleanText(post.title, 60)}`).join('\n')}` : 'No published posts were found in this bot store yet.'
       ].join('\n'));
       return;
@@ -4770,13 +5025,33 @@ export async function launchTelegramBot({ config, repository }) {
       await ctx.reply(`No published catalog post was found for ${targetAdminId}. Use /posts or /postid to find its private ID.`);
       return;
     }
+    // Re-read with the card in hand: a bare number means the episode they are
+    // looking for on a card that has it, and a page number on one that does not.
+    view = parsePlayersView(scoped, content);
     const entries = playersList(content, config);
-    await ctx.reply(playersListText(content, entries, config), playersKeyboard(entries));
+    if (view.mode === 'missing') {
+      await ctx.reply(playersMissingText(content, entries, config), playersKeyboard(content, entries, { mode: 'missing', page: 1 }));
+      return;
+    }
+    await ctx.reply(playersListText(content, entries, config, view), playersKeyboard(content, entries, view));
   });
 
-  bot.action(/^ply:rem:([A-Z0-9-]{4,40}):(all|\d{1,4})$/, async (ctx) => {
+  const renderPlayersMessage = async (adminId, playersView) => {
+    const latest = await repository.findContentByAdminId?.(adminId);
+    if (!latest) return 'gone';
+    const latestEntries = playersList(latest, config);
+    const text = playersView.mode === 'missing'
+      ? playersMissingText(latest, latestEntries, config, playersView)
+      : playersListText(latest, latestEntries, config, playersView);
+    return ctx.editMessageText(text, playersKeyboard(latest, latestEntries, playersView))
+      .then(() => 'edited')
+      .catch(() => 'reply');
+  };
+
+  bot.action(/^ply:rem:([A-Z0-9-]{4,40}):(all|\d{1,4})(?::([a-z0-9-]{1,16}):(\d{1,4}))?$/, async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
-    const [, removalAdminId, rawTarget] = ctx.match;
+    const [, removalAdminId, rawTarget, rawView, rawPage] = ctx.match;
+    const view = rawView ? { ...playersViewFromKey(rawView), page: Number(rawPage) || 1 } : { mode: 'all', page: 1 };
     const removal = rawTarget === 'all'
       ? { mode: 'all' }
       : { mode: 'index', indexes: [Number(rawTarget)] };
@@ -4794,11 +5069,61 @@ export async function launchTelegramBot({ config, repository }) {
     }
     const entries = playersList(outcome.content, config);
     const note = `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached. No announcement was sent and no file was changed.`;
-    const edited = await ctx.editMessageText(playersListText(outcome.content, entries, config), playersKeyboard(entries))
-      .then(() => true)
-      .catch(() => false);
-    if (!edited) await ctx.reply(note, playersKeyboard(entries)).catch(() => {});
+    // The same view comes back, so clearing one episode's players never throws the
+    // publisher to page one of everything they were not looking at.
+    const pages = Math.max(1, Math.ceil(entries.length / PLAYERS_PAGE_SIZE));
+    const nextView = { ...view, page: entries.length ? Math.min(view.page || 1, pages) : 1 };
+    const rendered = await renderPlayersMessage(outcome.content.adminId, nextView);
+    if (rendered === 'reply') {
+      await ctx.reply(playersListText(outcome.content, entries, config, nextView), playersKeyboard(outcome.content, entries, nextView)).catch(() => {});
+    } else if (rendered === 'gone') {
+      await ctx.reply(note).catch(() => {});
+    }
     await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
+  });
+
+  bot.action(/^ply:remep:([A-Z0-9-]{4,40}):(\d{1,3})-(\d{1,3})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, episodeAdminId, rawStart, rawEnd] = ctx.match;
+    const start = Number(rawStart);
+    const end = Number(rawEnd) || start;
+    const view = { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1 };
+    const outcome = await removeAttachedPlayers({ repository, targetAdminId: episodeAdminId, removal: { mode: 'episode', episode: view.episode }, config });
+    if (outcome.error) {
+      await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
+      return;
+    }
+    const rendered = await renderPlayersMessage(episodeAdminId, view);
+    if (rendered === 'reply') {
+      const content = await repository.findContentByAdminId?.(episodeAdminId);
+      if (content) {
+        const entries = playersList(content, config);
+        await ctx.reply(playersListText(content, entries, config, view), playersKeyboard(content, entries, view)).catch(() => {});
+      }
+    }
+    await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
+  });
+
+  bot.action(/^ply:pag:([A-Z0-9-]{4,40}):([a-z0-9-]{1,16}):(\d{1,4})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, pageAdminId, rawView, rawPage] = ctx.match;
+    const view = { ...playersViewFromKey(rawView), page: Number(rawPage) || 1 };
+    const rendered = await renderPlayersMessage(pageAdminId, view);
+    if (rendered === 'gone') {
+      await acknowledgeTap(ctx, 'That post is no longer available. Use /posts to find its current private ID.', { alert: true });
+      return;
+    }
+    if (rendered === 'reply') {
+      const content = await repository.findContentByAdminId?.(pageAdminId);
+      if (content) {
+        const entries = playersList(content, config);
+        await ctx.reply(view.mode === 'missing'
+          ? playersMissingText(content, entries, config, view)
+          : playersListText(content, entries, config, view), playersKeyboard(content, entries, view)).catch(() => {});
+      }
+      return;
+    }
+    await acknowledgeTap(ctx, view.mode === 'episode' ? view.episode.label : view.mode === 'missing' ? 'Episodes without a player' : `Page ${view.page}`);
   });
 
   bot.action(/^ply:add:([A-Z0-9-]{4,40})$/, async (ctx) => {
