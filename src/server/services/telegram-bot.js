@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
-import { categoryDetails, cleanText, formatBytes, parseCommandArgument, slugify } from '../lib/strings.js';
-import { attributeUploadSeasons, cleanMediaName, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, slugify } from '../lib/strings.js';
+import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
@@ -522,7 +522,7 @@ export function parsePublishedPostEdit(value) {
   let rest = text;
   const leadingId = /^\s*[,;:]?\s*(SB-[A-F0-9]{10})(?=$|[\s,;:])\s*[,;:]?\s*/i;
   let match = rest.match(leadingId);
-  while (match && ids.length < 50) {
+  while (match && ids.length < 1_000) {
     const adminId = match[1].toUpperCase();
     if (!ids.includes(adminId)) ids.push(adminId);
     rest = rest.slice(match[0].length);
@@ -1077,15 +1077,25 @@ function normalizeChannelId(value) {
   return null;
 }
 
+// A metadata edit can name as many posts as fit in one Telegram message, so the
+// argument is read at nearly the full 4 096-character limit instead of the
+// default 180. `parsePublishedPostEdit` and `postIdsFromCommand` deliberately
+// impose no batch cap of their own.
+export const POST_EDIT_ARGUMENT_LIMIT = 3_800;
+
 function postIdsFromCommand(value) {
   return [...new Set(
     [...String(value || '').toUpperCase().matchAll(/\bSB-[A-F0-9]{10}\b/g)].map((match) => match[0])
-  )].slice(0, 50);
+  )].slice(0, 1_000);
 }
 
-function episodeUploadNote(file) {
-  if (!file.episode?.label) return '';
-  return ` · ${file.episode.label} detected from ${file.episode.source}`;
+function episodeUploadNote(file, { episodic = false } = {}) {
+  if (file.episode?.label) return ` · ${file.episode.label} detected from ${file.episode.source}`;
+  // A file with no episode number never reaches the episode index. Saying so in
+  // the upload reply is the only moment the caption can still be fixed.
+  return episodic
+    ? ' · no episode number was found in this file’s name or caption, so it stays out of the episode index — send it again with a caption like “Ep 12”'
+    : '';
 }
 
 async function updateTitleAndMetadata({ ctx, repository, config, title }) {
@@ -3022,6 +3032,88 @@ export function parseStreamRemoval(value) {
   return { mode: 'index', indexes: [...new Set(indexes)] };
 }
 
+/**
+ * One manual player paste can name the episode in front of every link:
+ *
+ *   Ep 176 https://www.dailymotion.com/embed/video/one
+ *   Ep 177 https://www.dailymotion.com/embed/video/two
+ *
+ * Lines without their own label continue the episode above them, so several
+ * sources for one episode are still pasted as plain lines, and labels packed onto
+ * a single line are read as separate episodes too — otherwise every link after
+ * the first label would land on that one episode and the rest stay empty.
+ */
+export function manualPlayerGroups(value) {
+  const groups = [];
+  let current = null;
+  for (const line of String(value || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    for (const part of trimmed.split(/\s+(?=(?:ep|eps|episode|e)\.?\s*0*\d{1,3}\b)/i)) {
+      const labeled = part.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?\b[:\-]?\s*([\s\S]*)$/i);
+      if (labeled) {
+        const start = Number(labeled[1]);
+        const end = Number(labeled[2] || labeled[1]);
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+          if (current) {
+            current.text = `${current.text}\n${part}`.trim();
+            continue;
+          }
+          return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+        }
+        current = { episode: { start, end, label: directEpisodeLabel(start, end) }, text: String(labeled[3] || '').trim() };
+        groups.push(current);
+        continue;
+      }
+      if (!current) {
+        current = { episode: null, text: '' };
+        groups.push(current);
+      }
+      current.text = `${current.text}\n${part}`.trim();
+    }
+  }
+  return { groups: groups.filter((group) => group.text) };
+}
+
+/**
+ * Turn one manual player paste into manifest rows, honouring an episode label in
+ * front of every link. `/cmd SB-… <links>` and a follow-up message in an armed
+ * import chat go through this, so the same paste behaves the same way in both.
+ */
+export function buildManualPlayerManifest(targetAdminId, value, config) {
+  const directInput = parseDirectStreamingInput(value);
+  if (directInput.error) return { error: directInput.error };
+  // A removal instruction is never a link list; the caller handles it separately.
+  if (directInput.action === 'delete') {
+    return { delete: directInput.delete, manifest: { entries: [], rejected: [] }, links: 0, rejected: [], episodes: [] };
+  }
+  const manual = manualPlayerGroups(value);
+  if (manual.error) return { error: manual.error };
+  const options = streamingOptionsFromConfig(config);
+  const groups = manual.groups.length
+    ? manual.groups
+    : [{ episode: directInput.episode, text: directInput.playerValue }];
+  const entries = [];
+  const rejected = [];
+  for (const group of groups) {
+    const found = splitPlayerLinks(group.text, options);
+    rejected.push(...found.rejected);
+    entries.push(...directStreamingManifest(targetAdminId, found.urls, group.episode).entries);
+  }
+  entries.forEach((entry, index) => { entry.row = index + 1; });
+  return {
+    manifest: { entries, rejected },
+    links: entries.length,
+    rejected,
+    episodes: [...new Set(entries.map((entry) => entry.entry?.episode?.label).filter(Boolean))]
+  };
+}
+
+function episodeCoverageNote(episodes, groupCount) {
+  if (!episodes.length || (groupCount <= 1 && episodes.length === 1)) return '';
+  return `\nEpisodes covered: ${episodes.slice(0, 12).join(', ')}${episodes.length > 12 ? ` … (+${episodes.length - 12} more)` : ''}`;
+}
+
 export function parseDirectStreamingInput(value) {
   const supplied = cleanText(value, 4_000);
   const removal = supplied.match(/^(?:del|delete|remove|unlink)\b[\s:]*([\s\S]*)$/i);
@@ -3064,6 +3156,7 @@ function streamImportInstructions(targetAdminId = null) {
     'Manual Watch-link import is armed for 15 minutes.',
     target,
     '',
+    'For several episodes in one message, put the episode in front of each link on its own line: ep 176 https://… then ep 177 https://… Every link is attached to the episode named beside it, and a line with no label continues the episode above it.',
     'For many episodes at once, send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
     'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL, and a pasted Markdown link such as [https://rumble.com/v….html](…) is read like plain text.',
     'Page links are converted automatically to the URL the site can actually frame, so https://www.dailymotion.com/video/x… and https://rumble.com/v…-title.html work as sent. Each player is named after its provider (Dailymotion server, Rumble server), and a second link for an episode you already filled stays beside the first one instead of replacing it.',
@@ -3407,8 +3500,16 @@ export async function resolveMergePlan({ repository, parsed = {} }) {
   }
   const target = await repository.findContentByAdminId(parsed.targetAdminId);
   if (!target) return { error: `No published catalog post was found for ${parsed.targetAdminId}. Use /posts 50 to copy the exact target ID.` };
-  if (parsed.label && titleIdentityKey(parsed.label) !== titleIdentityKey(target.title)) {
-    return { error: `“${parsed.label}” is not the name of ${target.adminId} (“${target.title}”). I stopped so the files cannot land on the wrong card — check the target ID with /posts 50.` };
+  // The named title is a safety check, not a search: it has to agree with the
+  // card the publisher pointed at, but a shorter form of the same name ("bleach
+  // movie" under "Bleach Movie 2024") must not refuse an intended merge.
+  if (parsed.label) {
+    const wanted = titleIdentityKey(parsed.label);
+    const actual = titleIdentityKey(target.title);
+    const agrees = wanted && (wanted === actual || actual.includes(wanted) || wanted.includes(actual));
+    if (!agrees) {
+      return { error: `“${cleanText(parsed.label, 60)}” is not the name of ${target.adminId} (“${target.title}”). I stopped so the files cannot land on the wrong card — check the target ID with /posts 50, or drop the name and rely on the ID alone.` };
+    }
   }
 
   const sources = [];
@@ -3529,6 +3630,12 @@ export function mergeInstructions() {
   ].join('\n');
 }
 
+/** A file name the publisher recognises, kept from its tail where the number is. */
+function shortFileName(file) {
+  const raw = cleanText(file?.name || file?.displayName || file?.sourceLabel || 'unnamed file', 160).replace(/\.[a-z0-9]{2,4}$/i, '');
+  return raw.length > 42 ? `…${raw.slice(-41)}` : raw;
+}
+
 export function mergeResultText(outcome, config = {}) {
   if (outcome.error) return outcome.error;
   const content = outcome.content || {};
@@ -3536,6 +3643,9 @@ export function mergeResultText(outcome, config = {}) {
   const totalFiles = (Array.isArray(content?.files) ? content.files : []).length;
   // One line per season block the website now shows, so the publisher can read
   // the same structure a visitor sees without opening the page.
+  const cardFiles = Array.isArray(content?.files) ? content.files : [];
+  const isEpisodicMerge = String(content?.category || '').trim().toLowerCase() !== 'movie';
+  const unnumbered = isEpisodicMerge ? cardFiles.filter((file) => !hasEpisodeRange(file)) : [];
   const perSeason = new Map();
   for (const group of Array.isArray(content?.episodeGroups) ? content.episodeGroups : []) {
     if (!group.seasonLabel) continue;
@@ -3549,6 +3659,12 @@ export function mergeResultText(outcome, config = {}) {
     `▪ ${totalFiles} file${totalFiles === 1 ? '' : 's'} on this card · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'}.`,
     seasonLines.length ? `▪ Season blocks on the website:\n${seasonLines.join('\n')}` : null,
     outcome.playersMerged ? `▪ ${outcome.playersMerged} player${outcome.playersMerged === 1 ? '' : 's'} moved to /players ${content.adminId}.${multiSeason ? ' Players are matched by episode number only, so check each season keeps its own link.' : ''}` : null,
+    // Files whose episode number cannot be read at all are listed rather than
+    // left invisible, because "the merge lost my episodes" is otherwise the only
+    // thing a publisher can conclude.
+    unnumbered.length
+      ? `▪ ${unnumbered.length} moved file${unnumbered.length === 1 ? '' : 's'} ${unnumbered.length === 1 ? 'has' : 'have'} no episode number and ${unnumbered.length === 1 ? 'stays' : 'stay'} outside the episode index (${unnumbered.slice(0, 3).map((file) => shortFileName(file)).join(', ')}${unnumbered.length > 3 ? `, +${unnumbered.length - 3} more` : ''}). ${unnumbered.length === 1 ? 'It' : 'They'} ${unnumbered.length === 1 ? 'is' : 'are'} still on the card and delivered as files — re-send ${unnumbered.length === 1 ? 'it' : 'them'} with a caption like “Ep 12” to place ${unnumbered.length === 1 ? 'it' : 'them'} in the index.`
+      : null,
     moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
     outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
       ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
@@ -3774,26 +3890,32 @@ async function handleStreamImportUpload(ctx, repository, config) {
       );
       return true;
     }
-    const links = directInput
-      ? splitPlayerLinks(directInput.playerValue, streamingOptionsFromConfig(config))
-      : { urls: [], rejected: [] };
-    if (links.urls.length) {
+    // A follow-up message may name the episode on every line, exactly like the
+    // /cmd form, so one paste fills a whole run of episodes.
+    const manual = pending.targetAdminId && ctx.message?.text
+      ? buildManualPlayerManifest(pending.targetAdminId, ctx.message.text, config)
+      : null;
+    if (manual?.error) {
+      await ctx.reply(manual.error);
+      return true;
+    }
+    if (manual?.links) {
       const result = await applyStreamingManifest({
         repository,
         targetAdminId: pending.targetAdminId,
         config,
         granularity: 'exact',
-        manifest: directStreamingManifest(pending.targetAdminId, links.urls, directInput.episode)
+        manifest: manual.manifest
       });
       if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
-      const rejectedNote = links.rejected.length
-        ? `\nSkipped ${links.rejected.length} link${links.rejected.length === 1 ? '' : 's'} from an unapproved host: ${links.rejected.slice(0, 3).join(', ')}${links.rejected.length > 3 ? '…' : ''}`
+      const rejectedNote = manual.rejected.length
+        ? `\nSkipped ${manual.rejected.length} link${manual.rejected.length === 1 ? '' : 's'} from an unapproved host: ${manual.rejected.slice(0, 3).join(', ')}${manual.rejected.length > 3 ? '…' : ''}`
         : '';
-      await ctx.reply(`${streamImportResultText(result, config)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${pending.targetAdminId}` : ''}`);
+      await ctx.reply(`${streamImportResultText(result, config)}${episodeCoverageNote(manual.episodes, manual.links)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${pending.targetAdminId}` : ''}`);
       return true;
     }
     await ctx.reply(pending.targetAdminId
-      ? 'Watch-link import is waiting for a .json/.csv document or approved player URLs. For one episode, send “ep 1 <player URL or iframe>”; several links in one message are all saved. To remove players, send “del ep 2-7” or “del 3”. Or use /cmd cancel.'
+      ? 'Watch-link import is waiting for a .json/.csv document or approved player URLs. For one episode, send “ep 1 <player URL or iframe>”; several links in one message are all saved, and each line can carry its own “ep 176 …” label. To remove players, send “del ep 2-7” or “del 3”. Or use /cmd cancel.'
       : 'Watch-link import is waiting for one .json or .csv document. To paste one episode player directly, start with /cmd SB-0123ABCDEF ep 1 <player URL>.');
     return true;
   }
@@ -4042,7 +4164,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('title', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     if (postTarget) {
       if (!postTarget.value) {
@@ -4066,7 +4188,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   const handleLanguageCommand = async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     if (postTarget) {
       const languages = parseDelimitedList(postTarget.value);
@@ -4098,7 +4220,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   const handleSubtitleCommand = async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     const languages = parseDelimitedList(postTarget ? postTarget.value : argument);
     if (!languages.length) {
@@ -4124,7 +4246,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('year', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     const suppliedYear = Number.parseInt(postTarget ? postTarget.value : argument, 10);
     if (!Number.isInteger(suppliedYear) || suppliedYear < 1888 || suppliedYear > new Date().getFullYear() + 5) {
@@ -4156,7 +4278,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('genres', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     const genres = parseDelimitedList(postTarget ? postTarget.value : argument);
     if (!genres.length) {
@@ -4293,7 +4415,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('category', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const target = parsePublishedPostEdit(argument);
     const rawCategory = String(target?.value || '').trim().toLowerCase().replace(/[\s_-]+/g, '-');
     const category = rawCategory === 'webseries'
@@ -4324,7 +4446,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('release', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const target = parsePublishedPostEdit(argument);
     if (!target?.value) {
       await ctx.reply('Usage: /release SB-0123ABCDEF Season 2 · 12 episodes\nSeveral posts at once: /release SB-0123ABCDEF, SB-1122334455 Season 2 · 12 episodes');
@@ -4335,7 +4457,7 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('status', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text);
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const target = parsePublishedPostEdit(argument);
     if (target) {
       if (!target.value) {
@@ -4541,7 +4663,7 @@ export async function launchTelegramBot({ config, repository }) {
       await ctx.reply('Manual Watch-link import is not available in this catalog store.');
       return;
     }
-    const argument = parseCommandArgument(ctx.message.text, 6_000);
+    const argument = parseMultilineCommandArgument(ctx.message.text, 6_000);
     if (/^(?:cancel|stop)$/i.test(argument)) {
       await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
       await ctx.reply('Manual Watch-link import cancelled. No player links were changed.', panelKeyboard());
@@ -4558,11 +4680,11 @@ export async function launchTelegramBot({ config, repository }) {
 
     const target = argument.match(/^(SB-[A-F0-9]{10})(?:\s+([\s\S]+))?$/i);
     if (argument && !target) {
-      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode (several links in one message are all saved), /cmd SB-0123ABCDEF ep 2-7 <URL> for a range, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, /cmd SB-0123ABCDEF del ep 2-7 to remove players, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields, or /players SB-0123ABCDEF to see what is attached.');
+      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode (several links in one message are all saved), /cmd SB-0123ABCDEF ep 2-7 <URL> for a range, /cmd SB-0123ABCDEF with \u201cep 176 <URL>\u201d and \u201cep 177 <URL>\u201d on separate lines for several episodes at once, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, /cmd SB-0123ABCDEF del ep 2-7 to remove players, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields, or /players SB-0123ABCDEF to see what is attached.');
       return;
     }
     const targetAdminId = target?.[1]?.toUpperCase() || null;
-    const directValue = cleanText(target?.[2] || '', 4_800);
+    const directValue = cleanMultilineText(target?.[2] || '', 4_800);
     if (targetAdminId) {
       const content = await repository.findContentByAdminId(targetAdminId);
       if (!content) {
@@ -4588,7 +4710,15 @@ export async function launchTelegramBot({ config, repository }) {
           );
           return;
         }
-        const links = splitPlayerLinks(directInput.playerValue, streamingOptionsFromConfig(config));
+        // Each labeled line becomes its own episode group, and every link of a
+        // group is attached to that group's episode.
+        const manual = buildManualPlayerManifest(targetAdminId, directValue, config);
+        if (manual.error) {
+          await ctx.reply(manual.error);
+          return;
+        }
+        const { manifest } = manual;
+        const links = { urls: manifest.entries, rejected: manual.rejected };
         if (!links.urls.length) {
           await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; page links are converted to their embeddable player URL automatically. Add another trusted domain through STREAMING_ALLOWED_HOSTS. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
           return;
@@ -4600,13 +4730,13 @@ export async function launchTelegramBot({ config, repository }) {
           // Manual links are added, never silently replaced: a second source for
           // the same episode is a deliberate choice by the publisher.
           granularity: 'exact',
-          manifest: directStreamingManifest(targetAdminId, links.urls, directInput.episode)
+          manifest
         });
         await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
         const rejectedNote = links.rejected.length
           ? `\nSkipped ${links.rejected.length} link${links.rejected.length === 1 ? '' : 's'} from an unapproved host: ${links.rejected.slice(0, 3).join(', ')}${links.rejected.length > 3 ? '…' : ''}`
           : '';
-        await ctx.reply(`${streamImportResultText(result, config)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${targetAdminId}` : ''}`);
+        await ctx.reply(`${streamImportResultText(result, config)}${episodeCoverageNote(manual.episodes, manifest.entries.length)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${targetAdminId}` : ''}`);
         return;
       }
     }
@@ -4625,7 +4755,7 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
     const argument = parseCommandArgument(ctx.message.text, 120);
-    const targetAdminId = parsePublisherTargetInput(argument)?.adminId || null;
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
     if (!targetAdminId) {
       const posts = typeof repository.listAdminContent === 'function' ? await repository.listAdminContent(10) : [];
       await ctx.reply([
@@ -5003,7 +5133,11 @@ export async function launchTelegramBot({ config, repository }) {
       const size = formatBytes(last.size);
       const fallbackNote = stored.method === 'file-id-fallback' ? ' Stored with Telegram’s file-ID fallback.' : '';
       await ctx.reply(
-        `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last)}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
+        `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last, {
+          // The release is episodic when its other files already found their
+          // number, which is when a missing one is worth complaining about.
+          episodic: (updated.files || []).some((entry) => entry !== last && entry?.episode?.start)
+        })}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
         uploadKeyboard()
       );
       return;

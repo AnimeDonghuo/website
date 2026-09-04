@@ -4,7 +4,8 @@ import { getTelegramFileDeliveryUrl } from '../src/server/config.js';
 import { DELIVERY_FILE_DELETE_AFTER_MS, PUBLISHER_COMMANDS, announcePublishedContent, announcementSyncNote, planDraftPublicationGroups, syncPublishedAnnouncements, updatePublishedPost, applyStreamingManifest, automationGroupKey, automationMergeKeys, autoPublishStoragePost, cleanStorageCaption, deliverContent, fileFromMessage, importStorageRange, inferBatchCategory, inferBatchTitle, parseDeliveryPayload, parseDirectStreamingInput, parseStreamRemoval, playersList, playersListText, removeAttachedPlayers, splitPlayerLinks, parsePrivateStorageMessageLink, parsePublishedPostEdit, postIdKeyboard, postIdTimeWindow, processQueuedAutomationSessions, publishDraft, releaseMergeKeys, requestManagerKeyboard, requestResolutionNotificationText, scheduleDeliveredFileDeletion, storageErrorHint, storeMediaInChannel, synchronizeDeliveryBotUsername } from '../src/server/services/telegram-bot.js';
 import { parseStreamingManifest, publicStreamingData, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
-import { applyMergeDrop, applyMergePlan, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan } from '../src/server/services/telegram-bot.js';
+import { applyMergeDrop, applyMergePlan, buildManualPlayerManifest, manualPlayerGroups, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan, POST_EDIT_ARGUMENT_LIMIT } from '../src/server/services/telegram-bot.js';
+import { parseCommandArgument } from '../src/server/lib/strings.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
 const posterConfig = { telegram: { botUsername: 'DeliveryBot' }, imgbbApiKey: 'test-imgbb-key', mediaInfo: { enabled: false } };
@@ -1703,5 +1704,159 @@ test('a pending merge is remembered for one publisher chat and forgotten on canc
   const expired = await repository.startMergePlan({ chatId: 642, ownerId: 642, plan: { targetAdminId: 'SB-0123ABCDEF' }, expiresAt: new Date(Date.now() - 1000) });
   assert.equal(expired.plan.targetAdminId, 'SB-0123ABCDEF');
   assert.equal(await repository.findMergePlan(642, 642), null, 'an unread merge plan lapses instead of waiting to be confirmed by accident');
+});
+
+// ── manual players, long ID lists, and files the index must not lose ───────
+test('a manual player paste keeps each link on the episode it was labelled with', () => {
+  const pasted = 'Ep 176 https://www.dailymotion.com/embed/video/k40kzv\n\nEp 177 https://www.dailymotion.com/embed/video/k1934IH';
+  const groups = manualPlayerGroups(pasted).groups;
+  assert.deepEqual(groups.map((group) => group.episode.label), ['Episode 176', 'Episode 177']);
+  assert.deepEqual(groups.map((group) => group.text.split('/').pop()), ['k40kzv', 'k1934IH']);
+
+  // The same two lines flattened onto one line (which is what a collapsed paste
+  // looks like) still separate, because every link after the first label would
+  // otherwise be attached to that one episode.
+  const flat = manualPlayerGroups('Ep 176 https://a/1 Ep 177 https://b/2').groups;
+  assert.deepEqual(flat.map((group) => [group.episode.start, group.text]), [[176, 'https://a/1'], [177, 'https://b/2']]);
+
+  // An unlabelled list stays one group with every link in it, and a range label
+  // covers everything written under it.
+  assert.deepEqual(manualPlayerGroups('https://a/1\nhttps://b/2').groups.map((group) => [group.episode, group.text.split('\n').length]), [[null, 2]]);
+  assert.deepEqual(manualPlayerGroups('ep 2-7\nhttps://a/1\nhttps://b/2').groups.map((group) => [group.episode.label, group.text.split('\n').length]), [['Episodes 02–07', 2]]);
+  assert.deepEqual(manualPlayerGroups('').groups, []);
+  assert.match(manualPlayerGroups('Ep 0 https://a/1').error, /between 1 and 999/);
+});
+
+test('several labelled links reach their own episodes on the catalog post', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Shrouding the Heavens',
+    category: 'donghua',
+    files: [{ storageMessageId: 1, name: 'Shrouding.the.Heavens.EP.176.mkv' }]
+  });
+  const groups = manualPlayerGroups('Ep 176 https://www.dailymotion.com/embed/video/kAAA\nEp 177 https://rumble.com/v7twp-two.html').groups;
+  const entries = [];
+  for (const group of groups) {
+    for (const url of group.text.split('\n')) {
+      entries.push({
+        row: entries.length + 1,
+        postId: created.adminId,
+        entry: { label: 'x', episode: group.episode, embedUrl: url.trim() }
+      });
+    }
+  }
+  const result = await applyStreamingManifest({ repository, manifest: { entries, rejected: [] }, targetAdminId: created.adminId, config: { streaming: {} }, granularity: 'exact' });
+  assert.equal(result.attachedRows, 2);
+  const after = await repository.findContentByAdminId(created.adminId);
+  assert.deepEqual(after.stream.entries.map((entry) => [entry.episode.label, entry.embedUrl]), [
+    ['Episode 176', 'https://www.dailymotion.com/embed/video/kAAA'],
+    ['Episode 177', 'https://rumble.com/embed/v7twp/']
+  ]);
+});
+
+test('a metadata edit accepts every Post ID in the message, not the first dozen', () => {
+  const ids = Array.from({ length: 24 }, (unused, index) => `SB-${String(index + 1).padStart(10, '0').replace(/\d/g, (digit) => 'ABCDEF0123'[Number(digit)])}`);
+  const line = `/lang ${ids.join(', ')} Hindi, English`;
+  const argument = parseCommandArgument(line, POST_EDIT_ARGUMENT_LIMIT);
+  const target = parsePublishedPostEdit(argument);
+  assert.equal(target.adminIds.length, 24, 'no batch cap is applied to a list of posts');
+  assert.equal(target.value, 'Hindi, English', 'the value survives instead of being cut off mid-list');
+  assert.deepEqual(parseCommandArgument(line).split(', ').length < 24 ? 'truncated' : 'kept', 'truncated', 'the old default really was too short — that is why the limit is passed');
+});
+
+test('a series numbers its files from the wording the uploader chose', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const file = (number, extra = '') => ({
+    storageMessageId: number,
+    name: `Everything.Is.Fine.With.The.Emperor.${number}${extra}.mkv`,
+    sourceLabel: `Everything Is Fine With The Emperor ${number}${extra}`,
+    displayName: `Everything Is Fine With The Emperor ${number}${extra}`
+  });
+  const created = await repository.createContent({
+    title: 'Everything Is Fine With The Emperor',
+    category: 'donghua',
+    files: [file(3), file(4, ' 480p')]
+  });
+  assert.deepEqual(created.episodeGroups.map((group) => group.label), ['Episode 03', 'Episode 04']);
+
+  // Episodes 1 and 2 appended afterwards are added, not treated as a second copy
+  // of the same slot: the release name plus quality alone once collapsed them and
+  // the pair silently replaced 3 and 4.
+  const appended = await repository.appendFilesToContentByAdminId(created.adminId, [file(1, ' 480p'), file(2, ' 480p')], []);
+  assert.equal(appended.files.length, 4);
+  assert.equal(appended.episodeCount, 4);
+  assert.deepEqual(appended.episodeGroups.map((group) => group.label), ['Episode 01', 'Episode 02', 'Episode 03', 'Episode 04']);
+
+  // A film is never given an invented number, and a season pack is not reduced to
+  // the one episode its digits happen to look like.
+  const movie = await repository.createContent({ title: 'Cocktail', category: 'movie', files: [{ storageMessageId: 9, name: 'Cocktail.2.1080p.mkv' }] });
+  assert.deepEqual(movie.episodeGroups, []);
+  assert.equal(movie.releaseLabel, 'Feature');
+  const withPack = await repository.appendFilesToContentByAdminId(created.adminId, [{ storageMessageId: 77, name: 'Everything.Is.Fine.With.The.Emperor.S01.Complete.1080p.mkv' }], []);
+  assert.equal(withPack.files.length, 5, 'the pack file is kept as a file');
+  assert.equal(withPack.episodeCount, 4, 'but it is not read as one episode');
+
+  // A file no parser can number is reported by a merge instead of being dropped
+  // from the index in silence.
+  const trailer = await repository.createContent({ title: 'Emperor Trailer', category: 'donghua', files: [{ storageMessageId: 88, name: 'emperor behind the scenes.mp4' }] });
+  const { plan } = await resolveMergePlan({ repository, parsed: parseMergeCommand(`${created.adminId} ${trailer.adminId}`) });
+  const outcome = await applyMergePlan({ bot: { telegram: { async deleteMessage() { return true; }, async editMessageText() { return true; } } }, repository, config: {}, plan });
+  const note = mergeResultText(outcome, {});
+  // The trailer and the season pack are both named: one cannot be numbered at
+  // all, the other is intentionally a whole season rather than one episode.
+  assert.match(note, /2 moved files have no episode number and stay outside the episode index/);
+  assert.match(note, /emperor behind the scenes/);
+  assert.match(note, /S01\.Complete\.1080p/);
+  assert.match(note, /still on the card and delivered as files/);
+});
+
+test('a merge accepts a shorter form of the target name and refuses a different one', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const target = await repository.createContent({ title: 'Bleach Movie 2024', category: 'movie', files: [{ storageMessageId: 1, name: 'Bleach.Movie.2024.mkv' }] });
+  const source = await repository.createContent({ title: 'Bleach Movie', category: 'movie', files: [{ storageMessageId: 2, name: 'Bleach.Movie.Part.2.mkv' }] });
+
+  const short = await resolveMergePlan({ repository, parsed: parseMergeCommand(`bleach movie ${target.adminId} ${source.adminId}`) });
+  assert.equal(short.error, undefined, 'an abbreviated name is the same release, not a mistake');
+  assert.equal(short.plan.sources.length, 1);
+
+  const wrong = await resolveMergePlan({ repository, parsed: parseMergeCommand(`naruto ${target.adminId} ${source.adminId}`) });
+  assert.match(wrong.error, /is not the name of/);
+  assert.match(wrong.error, /drop the name and rely on the ID alone/);
+});
+
+test('an extra beside a series is not mistaken for an episode', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Read The Time',
+    category: 'anime',
+    files: [
+      { storageMessageId: 1, name: 'Read.The.Time.4.mp4', displayName: 'Read The Time 4 1080p' },
+      { storageMessageId: 2, name: 'Read.The.Time.Trailer.2.mp4', displayName: 'Read The Time Trailer 2' }
+    ]
+  });
+  assert.deepEqual(created.episodeGroups.map((group) => group.label), ['Episode 04'], 'the trailer keeps its files and its own name');
+  assert.equal(created.files.length, 2);
+  assert.equal(created.files[1].episode?.start, undefined);
+});
+
+test('one manual paste builds one manifest row per labelled episode', () => {
+  const paste = 'Ep 176 https://www.dailymotion.com/embed/video/kAAA https://rumble.com/v7twp-two.html\nEp 177 https://www.dailymotion.com/embed/video/kBBB\nhttps://not-allowed.example/x.mp4';
+  const built = buildManualPlayerManifest('SB-098C73DC38', paste, {});
+  assert.deepEqual(built.manifest.entries.map((item) => [item.row, item.entry.episode.label, item.entry.embedUrl]), [
+    [1, 'Episode 176', 'https://www.dailymotion.com/embed/video/kAAA'],
+    [2, 'Episode 176', 'https://rumble.com/embed/v7twp/'],
+    [3, 'Episode 177', 'https://www.dailymotion.com/embed/video/kBBB']
+  ], 'both links written beside Episode 176 stay on 176, and 177 gets its own row');
+  assert.deepEqual(built.episodes, ['Episode 176', 'Episode 177']);
+  assert.equal(built.links, 3);
+  assert.equal(built.manifest.rejected.length, 1, 'the unapproved host is reported, never saved');
+  assert.equal(built.manifest.entries.some((item) => item.entry.embedUrl.includes('not-allowed')), false);
+
+  // A removal line is not a link list, and a paste with no usable link is refused
+  // by the caller with the host explanation rather than saving nothing quietly.
+  assert.deepEqual(buildManualPlayerManifest('SB-098C73DC38', 'del ep 2-7', {}).delete, { mode: 'episode', episode: { start: 2, end: 7, label: 'Episodes 02–07' } });
+  const empty = buildManualPlayerManifest('SB-098C73DC38', 'ep 5 nothing here', {});
+  assert.equal(empty.links, 0);
+  assert.equal(empty.manifest.entries.length, 0);
 });
 

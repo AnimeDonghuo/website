@@ -56,6 +56,27 @@ export function parseCommandArgument(text, maxLength = 180) {
   return cleanText(String(text || '').replace(/^\/\S+\s*/, ''), maxLength);
 }
 
+/**
+ * The same argument, but with the publisher's line breaks kept: a player paste
+ * names its episode on each line, and collapsing the lines would move every
+ * link after the first label onto that one episode.
+ */
+export function cleanMultilineText(value, maxLength = 2_000) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, ' ')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]{2,}/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
+export function parseMultilineCommandArgument(text, maxLength = 2_000) {
+  return cleanMultilineText(String(text || '').replace(/^\/\S+\s*/, ''), maxLength);
+}
+
 export function titleInitials(title) {
   const initials = String(title || '')
     .split(/\s+/)

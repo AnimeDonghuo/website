@@ -1,7 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { cleanMediaName, fileReplacementKey, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, fileReplacementKey, repairEpisodeGaps, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -343,8 +343,25 @@ function isSupersededBy(replacements, file) {
 // `supersedeExisting` is how a re-upload replaces its own slot. A merge passes
 // false: its files come from other seasons and other cards, so Season 2
 // Episode 1 must land beside Season 1 Episode 1 instead of replacing it.
+/**
+ * A feature film has no episode numbering to repair; every series category does.
+ * Reading the number off the file's own wording is therefore safe for a series
+ * and deliberately off for a movie.
+ */
+function isEpisodicCategory(category) {
+  return String(category || '').trim().toLowerCase() !== 'movie';
+}
+
 function contentFileAppendPatch(content, additionalFiles, { supersedeExisting = true } = {}) {
-  const files = uniqueFiles(content?.files || [], additionalFiles, { supersedeExisting });
+  // Both sides are re-read for an episode number before anything is compared, so
+  // appending a season's early episodes can never leave them off the index, and a
+  // card saved with unnumbered files heals as its list is rebuilt.
+  const episodic = isEpisodicCategory(content?.category);
+  const files = uniqueFiles(
+    repairEpisodeGaps(content?.files || [], { episodic }),
+    repairEpisodeGaps(additionalFiles, { episodic }),
+    { supersedeExisting }
+  );
   const episodeSummary = summarizeEpisodes(files);
   const uploadLanguages = summarizeUploadLanguages(files);
   const uploadSubtitleLanguages = summarizeSubtitleLanguages(files);
@@ -457,7 +474,14 @@ function normalizeContent(input) {
   const now = new Date().toISOString();
   const title = cleanText(input.title, 180) || 'Untitled release';
   const category = CATEGORY_IDS.has(input.category) ? input.category : 'movie';
-  const files = Array.isArray(input.files) ? input.files.map(sanitizeStoredFileRecord).filter(Boolean) : [];
+  // Stored once, read by every page: the episode index is rebuilt from the same
+  // repaired list, so a file whose number was missed at upload time still shows
+  // up beside its siblings instead of silently living only in the file list.
+  const files = repairEpisodeGaps(Array.isArray(input.files) ? input.files : [], {
+    episodic: isEpisodicCategory(input.category)
+  })
+    .map(sanitizeStoredFileRecord)
+    .filter(Boolean);
   const parsedYear = Number.parseInt(input.year, 10);
   const languages = Array.isArray(input.languages)
     ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)

@@ -340,6 +340,20 @@ export function publicFileDisplayName(value) {
 }
 
 /**
+ * The highest episode-looking number in a file's own wording, ignoring quality
+ * tags and years. Used only to tell two unnumbered files of one release apart.
+ */
+export function trailingEpisodeHint(file) {
+  const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`;
+  const scrubbed = raw
+    .replace(/\b(?:240|360|480|720|1080|1440|2160)[pPiI]?\b/g, ' ')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+    .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts)\b/gi, ' ');
+  const numbers = [...scrubbed.matchAll(/\b0*(\d{1,3})\b/g)].map((match) => Number(match[1]));
+  return numbers.length ? Math.max(...numbers) : null;
+}
+
+/**
  * Two files describe the same delivery slot when a later upload should replace
  * the earlier one. Episode ranges ignore quality on purpose: re-uploading a
  * corrected Episode 1 should refresh every older Episode 1 variant instead of
@@ -368,7 +382,12 @@ export function fileReplacementKey(file) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!titleKey) return null;
-  return { key: `name:${titleKey}|${quality.toLowerCase()}`, languages };
+  // cleanMediaName drops the episode wording, which is right for grouping but
+  // wrong for identity: two files of the same release whose episode number never
+  // parsed (a bare "Title 1.mp4" and "Title 2.mp4") would otherwise share one
+  // slot and delete each other on append. The number itself is kept in the key.
+  const hint = trailingEpisodeHint(file);
+  return { key: `name:${titleKey}|${quality.toLowerCase()}${hint ? `|${hint}` : ''}`, languages };
 }
 
 /**
@@ -683,4 +702,81 @@ export function summarizeEpisodes(files = []) {
     : null;
 
   return { groups: publicGroups, count, detectedFiles, releaseLabel };
+}
+
+/**
+ * Fill in an episode number a stored file record never received. A caption that
+ * arrived without one, or a record saved before the parser understood its
+ * wording, is re-read from the very inputs the uploader typed, so the first two
+ * episodes of a release cannot hide from the episode index forever. Nothing is
+ * invented: a file with no readable number is returned untouched.
+ */
+export function reparseFileEpisode(file) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) return file;
+  const start = Number(file?.episode?.start);
+  const end = Number(file?.episode?.end ?? file?.episode?.start);
+  if (validEpisode(start) && validEpisode(end) && end >= start) return file;
+  const detected = detectUploadEpisode({
+    caption: file?.displayName || file?.sourceLabel,
+    filename: file?.name
+  });
+  const found = Number(detected?.start);
+  if (!validEpisode(found)) return file;
+  const detectedEnd = Number(detected?.end || detected?.start);
+  return {
+    ...file,
+    episode: {
+      start: found,
+      end: validEpisode(detectedEnd) && detectedEnd >= found ? detectedEnd : found,
+      label: detected.label,
+      source: detected.source
+    },
+    season: validSeason(Number(file?.season))
+      ? Number(file.season)
+      : (validSeason(Number(detected?.season)) ? Number(detected.season) : (file?.season ?? null)),
+    seasonSource: file?.seasonSource || detected.seasonSource || null
+  };
+}
+
+/** True when a file record carries a usable episode range. */
+export function hasEpisodeRange(file) {
+  const start = Number(file?.episode?.start);
+  const end = Number(file?.episode?.end ?? file?.episode?.start);
+  return validEpisode(start) && validEpisode(end) && end >= start;
+}
+
+// Extras and whole-season files are never given an episode number by guesswork:
+// "S01 Complete" means the season, and "Trailer 2" is not Episode 02.
+const SEASON_PACK_TEXT = /\b(?:complete|completed|collection|box\s*set|all\s*episodes?|pack|batch|volume)\b|\bs(?:eason)?\.?\s*0*\d{1,2}\s*(?:$|[^\d])/i;
+const EXTRA_TEXT = /\b(?:trailer|teaser|preview|bonus|ost|soundtrack|wallpaper|poster|scan|credits|opening|ending)\b/i;
+
+/**
+ * Heal the file list of a release before it is stored. Files whose episode never
+ * parsed are re-read from their own caption and name, and a file that carries a
+ * plain number (Show.01.mkv, Show 5 480p) receives that episode instead of
+ * vanishing from the episode index — which is how a series usually is named on
+ * Telegram. A feature film is never given an invented number, so "Cocktail 2"
+ * stays one movie, and a season-pack wording is never reduced to one episode.
+ */
+export function repairEpisodeGaps(files = [], { episodic = true } = {}) {
+  const list = (Array.isArray(files) ? files : []).map((file) => reparseFileEpisode(file));
+  const numbered = list.filter((file) => hasEpisodeRange(file)).length;
+  const allowBareNumbers = episodic && !numbered;
+  if (numbered === list.length || (!numbered && !allowBareNumbers)) return list;
+  return list.map((file) => {
+    if (hasEpisodeRange(file)) return file;
+    const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`;
+    if (SEASON_PACK_TEXT.test(raw) || EXTRA_TEXT.test(raw)) return file;
+    const hint = trailingEpisodeHint(file);
+    if (!hint) return file;
+    return {
+      ...file,
+      episode: {
+        start: hint,
+        end: hint,
+        label: `Episode ${paddedEpisode(hint)}`,
+        source: 'filename number'
+      }
+    };
+  });
 }
