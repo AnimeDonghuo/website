@@ -211,6 +211,7 @@
 [data-theme='light'] .watch-hero__episode { color: #285161; }
 [data-theme='light'] .watch-delivery > div > span { color: #0e5c7b; }
 [data-theme='light'] .watch-delivery strong { color: #255265; }
+[data-theme='light'] .watch-player-controls button { color: #1f2224; border: 1px solid rgba(18, 24, 36, 0.055); background: rgba(18, 24, 36, 0.065); }
 [data-theme='light'] .watch-player-note { border: 1px dashed rgba(18, 24, 36, 0.067); background: rgba(18, 24, 36, 0.052); }
 [data-theme='light'] .watch-player-note span { color: #3e4247; }
 [data-theme='light'] .watch-player-note a { color: var(--lime-ink); }

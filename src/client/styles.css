@@ -346,6 +346,12 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .watch-delivery > div > span { color: #8fcfe8; font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; letter-spacing: .07em; text-transform: uppercase; }
 .watch-delivery strong { color: #edf4f7; font-size: 11px; font-weight: 800; }
 .watch-delivery .button { flex: 0 0 auto; min-height: 39px; padding-inline: 15px; font-size: 10px; }
+.watch-player-controls { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
+.watch-player-controls button { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 11px; color: #c1cbd2; border: 1px solid rgba(255,255,255,.13); border-radius: 999px; background: rgba(255,255,255,.035); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 600; letter-spacing: .04em; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
+.watch-player-controls button:hover, .watch-player-controls button[aria-pressed='true'] { color: #17210a; border-color: var(--lime); background: var(--lime); }
+/* The frame is the fullscreen element, so the browser sizes it; these two lines are what
+   keeps the site's own rounding and letterbox colour from following it onto the screen. */
+.watch-player-shell__frame:fullscreen { width: 100vw; height: 100vh; border: 0; border-radius: 0; background: #04070b; }
 .watch-player-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; padding: 9px 13px; border: 1px dashed rgba(255,255,255,.16); border-radius: 10px; background: rgba(255,255,255,.028); }
 .watch-player-note span { color: #93a0ae; font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .03em; }
 .watch-player-note a { display: inline-flex; align-items: center; gap: 6px; color: var(--lime); font-size: 10px; font-weight: 800; text-decoration: none; white-space: nowrap; }

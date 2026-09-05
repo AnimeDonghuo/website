@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
 import { confirmAdultAccess, getConfig, getContent, getContentBySlug } from './api.js';
 import AdultGate from './components/AdultGate.jsx';
@@ -595,9 +595,42 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     : [];
   const [selectedId, setSelectedId] = useState(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
-  // The framed provider owns the only controls a visitor needs here. What the box can do
-  // is give that row room to lay itself out in one line (see .watch-player-shell) and let
-  // the frame ask for the playback-only player chrome (see dailymotionPlayerUrl).
+  // The framed provider owns its controls; this is the one thing our side has to offer,
+  // because a framed player cannot ask the browser for a screen of its own. It is asked of
+  // the iframe element, so the browser leaves the page — and its own bar — behind exactly
+  // as the provider's full-screen button does, instead of growing a box inside the layout.
+  const playerFrame = useRef(null);
+  const [fullScreen, setFullScreen] = useState(false);
+  const canFullScreen = typeof Element === 'function' && ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen', 'mozRequestFullScreen'].some((name) => typeof Element.prototype[name] === 'function');
+  useEffect(() => {
+    function syncFullScreen() {
+      setFullScreen(Boolean(playerFrame.current) && [document.fullscreenElement, document.webkitFullscreenElement, document.mozFullScreenElement].includes(playerFrame.current));
+    }
+    document.addEventListener('fullscreenchange', syncFullScreen);
+    document.addEventListener('webkitfullscreenchange', syncFullScreen);
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFullScreen);
+      document.removeEventListener('webkitfullscreenchange', syncFullScreen);
+    };
+  }, []);
+  function toggleFullScreen() {
+    const frame = playerFrame.current;
+    if (!frame) return;
+    const active = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement;
+    if (active) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.webkitCancelFullScreen || document.mozCancelFullScreen;
+      Promise.resolve(exit?.call(document)).catch(() => { /* already leaving, or the browser kept its own state */ });
+      return;
+    }
+    const enter = frame.requestFullscreen || frame.webkitRequestFullscreen || frame.webkitRequestFullScreen || frame.mozRequestFullScreen;
+    if (!enter) return;
+    // navigationUI: 'hide' is the part that makes it real rather than decorative — the
+    // browser's own address bar goes with it, which the legacy spellings simply ignore.
+    Promise.resolve(enter.call(frame, { navigationUI: 'hide' })).catch(() => {
+      // A gesture that expired on the way here, or a browser that will not let this frame
+      // take the screen. The provider's own button is still inside the player in that case.
+    });
+  }
   const relatedItems = useMemo(() => {
     if (!item) return [];
     return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
@@ -637,7 +670,11 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     fileLabel: requestedEpisode ? matchingFiles[0]?.label || null : null
   });
   const selectedFileTitle = heading.title;
-  const externalPlayerUrl = selected.watchUrl && selected.watchUrl !== selected.embedUrl ? selected.watchUrl : null;
+  // Nothing here sends a visitor to the provider to watch: the framed player is the whole
+  // experience, and its URL already carries the playback-only chrome the frame needs. The
+  // external link stays for a source that publishes no embeddable player at all (an OK.ru
+  // live broadcast), where a link is the only way to watch rather than a way to leave.
+  const externalPlayerUrl = selected.embedUrl ? null : selected.watchUrl || null;
   const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
   const hasEpisodeDelivery = matchingFiles.length > 0;
   const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
@@ -662,6 +699,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <div className="watch-player-shell">
             {selected.embedUrl ? <iframe
               key={selected.id}
+              ref={playerFrame}
               className="watch-player-shell__frame"
               src={selected.embedUrl}
               title={`${item.title} — ${selectedFileTitle}`}
@@ -670,8 +708,13 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               allowFullScreen
             /> : <div className="watch-player-shell__fallback"><Icon name="play" size={24} /><strong>This video opens in its approved player.</strong><p>Use the play button to continue.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Play video <Icon name="arrow" size={16} /></a> : null}</div>}
           </div>
+          {selected.embedUrl && canFullScreen ? <div className="watch-player-controls">
+            <button type="button" onClick={toggleFullScreen} aria-pressed={fullScreen} title="Fill the screen with the player, as its own full-screen button would">
+              <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
+            </button>
+          </div> : null}
           {externalPlayerUrl ? <div className="watch-player-note">
-            <span>{selected.embedUrl ? 'Player not opening on this device?' : 'This source has no embeddable player URL.'}</span>
+            <span>This source has no embeddable player URL.</span>
             <a href={externalPlayerUrl} target="_blank" rel="noreferrer">Open on {playerShortName(selected)} <Icon name="arrow" size={14} /></a>
           </div> : null}
           {(hasEpisodeDelivery || item.deliveryReady) ? <div className="watch-delivery">
