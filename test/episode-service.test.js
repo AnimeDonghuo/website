@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanDeliveryFileName, cleanMediaName, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
+import { cleanDeliveryFileName, cleanMediaName, seasonPackOf, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -155,4 +155,29 @@ test('public file labels keep the uploader wording that identifies the file', ()
     'Demon Slayer S01E05 1080p WEB-DL Hindi'
   );
   assert.equal(publicFileDisplayName('https://t.me/promo Perfect World EP 01 4K'), 'Perfect World EP 01 4K');
+});
+
+test('a file naming a season and no episode is that season complete', () => {
+  const pack = (name, extra = {}) => seasonPackOf({ name, ...extra });
+
+  assert.deepEqual(pack('The.Simpsons.S01.1080p.DSNP.WEBRip.x264.mkv'), { season: 1, label: 'Season 1', wholeSeason: true });
+  assert.equal(pack('Breaking.Point.S02.1080p.WEB-DL.Hindi')?.season, 2);
+  assert.equal(pack('Show S03 Complete 1080p.mkv')?.season, 3);
+  assert.equal(pack('Show.Season.5.Box.Set.720p.mkv')?.season, 5);
+  assert.equal(pack('Show S02 720p x264 [Batch].mkv')?.season, 2);
+
+  // a caption is read the same way as a file name, because that is where the
+  // uploader writes the season
+  assert.equal(seasonPackOf({ name: 'file.mkv', displayName: 'The Simpsons S01 1080p DSNP WEBRip [English]' })?.season, 1);
+
+  // nothing is invented: an episode anywhere in the wording, an extra, a film, or a
+  // season the card merely attributes to an unnamed file all stay out of this class
+  assert.equal(pack('The.Simpsons.S01E05.1080p.mkv'), null);
+  assert.equal(pack('The.Simpsons.S01E05.1080p.mkv', { episode: { start: 5, end: 5, label: 'Episode 05' } }), null);
+  assert.equal(pack('The.Simpsons.Trailer.2.1080p.mkv'), null);
+  assert.equal(pack('Some.Movie.1999.1080p.mkv'), null);
+  assert.equal(pack('Show.1080p.mkv', { season: 2 }), null, 'an inherited season alone cannot claim to be a whole season');
+  assert.equal(pack('Show S02 Episode 7 1080p.mkv'), null);
+  assert.equal(seasonPackOf(null), null);
+  assert.equal(seasonPackOf({}), null);
 });

@@ -280,7 +280,10 @@ function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
         ? file.episode.start === file.episode.end
           ? `EP ${formatEpisodeNumber(file.episode.start)}`
           : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
-        : `FILE ${String(file.position).padStart(2, '0')}`;
+        : file.seasonPack
+          // A season pack says which season it is rather than pretending to be file 07.
+          ? `S${String(file.seasonPack).padStart(2, '0')}`
+          : `FILE ${String(file.position).padStart(2, '0')}`;
       const deliveryHref = file.deliveryUrl || file.telegramUrl;
       // An episode row deliberately ignores release-level players. Only a
       // player attached to this episode earns a Watch action beside it.
@@ -342,6 +345,22 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
   );
   const item = release.data?.item;
   const groups = useMemo(() => splitEpisodeGroups(item?.episodeGroups), [item?.episodeGroups]);
+  // A card uploaded as complete seasons has no episode index, so its file list is
+  // grouped per season instead of leaving twenty season packs in one column. A card
+  // with a single season, or with numbered episodes, keeps the list it always had.
+  const seasonFileBlocks = useMemo(() => {
+    const bySeason = new Map();
+    for (const choice of item?.fileChoices || []) {
+      const season = Number(choice?.season);
+      if (!Number.isInteger(season) || season < 1) continue;
+      const entry = bySeason.get(season) || { season, label: `Season ${season}`, choices: [], packs: 0 };
+      entry.choices.push(choice);
+      if (choice.seasonPack) entry.packs += 1;
+      bySeason.set(season, entry);
+    }
+    const blocks = [...bySeason.values()].sort((first, second) => first.season - second.season);
+    return blocks.length > 1 ? blocks : [];
+  }, [item?.fileChoices]);
   const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
   const relatedItems = useMemo(() => {
     if (!item) return [];
@@ -404,10 +423,13 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
 
       {item.fileChoices?.length && !item.episodeGroups?.length ? <section className="file-choice-section page-width" aria-labelledby="file-choice-title">
         <div className="file-choice-section__heading">
-          <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.</p></div>
+          <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>{seasonFileBlocks.length ? 'This release arrived as complete seasons, so the files are grouped by season. Every choice opens its own Telegram delivery link.' : 'Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.'}</p></div>
           <button className="button button--secondary" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get all {item.filesCount} files</button>
         </div>
-        <FileChoiceList item={item} choices={item.fileChoices} onGetFiles={onGetFiles} />
+        {seasonFileBlocks.length ? seasonFileBlocks.map((block) => <div className="episode-season" key={block.season}>
+          <p className="episode-season__title"><Icon name="layers" size={13} /> {block.label}<span>{block.choices.length} file{block.choices.length === 1 ? '' : 's'}{block.packs === block.choices.length ? ' · complete season' : ''}</span></p>
+          <FileChoiceList item={item} choices={block.choices} onGetFiles={onGetFiles} />
+        </div>) : <FileChoiceList item={item} choices={item.fileChoices} onGetFiles={onGetFiles} />}
       </section> : null}
 
       {groups.episodes.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">

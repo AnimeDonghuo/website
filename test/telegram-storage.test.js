@@ -1804,12 +1804,15 @@ test('a series numbers its files from the wording the uploader chose', async () 
   const { plan } = await resolveMergePlan({ repository, parsed: parseMergeCommand(`${created.adminId} ${trailer.adminId}`) });
   const outcome = await applyMergePlan({ bot: { telegram: { async deleteMessage() { return true; }, async editMessageText() { return true; } } }, repository, config: {}, plan });
   const note = mergeResultText(outcome, {});
-  // The trailer and the season pack are both named: one cannot be numbered at
-  // all, the other is intentionally a whole season rather than one episode.
-  assert.match(note, /2 moved files have no episode number and stay outside the episode index/);
+  // The extra that cannot be numbered at all is warned about; the season pack is
+  // reported as what it is, because a whole season in one file is not a mistake.
+  assert.match(note, /▪ Filed as 1 complete season \(S1\) — each of those files is a whole season/);
+  assert.equal(note.includes('Season blocks on the website'), false, 'a card of nothing but season packs gets the summary, not twenty lines');
+  assert.match(note, /1 moved file has no episode number and stays outside the episode index/);
   assert.match(note, /emperor behind the scenes/);
-  assert.match(note, /S01\.Complete\.1080p/);
-  assert.match(note, /still on the card and delivered as files/);
+  assert.match(note, /still on the card and delivered as a file — re-send it/);
+  assert.equal(note.includes('S01.Complete.1080p'), false, 'a season pack is never listed as a file that lost its number');
+  assert.equal(note.includes('re-send them with a caption'), false);
 });
 
 test('a merge accepts a shorter form of the target name and refuses a different one', async () => {
@@ -2073,4 +2076,40 @@ test('a /players view survives how publishers actually type it', () => {
   // without the card in hand a bare number stays a page, which is what a typed list means
   assert.equal(parsePlayersView('176').mode, 'all');
   assert.equal(parsePlayersView('176').page, 176);
+});
+
+test('a merged card of complete-season files is reported as seasons, not as missing episodes', () => {
+  const pack = (season) => ({
+    name: `The.Simpsons.S${String(season).padStart(2, '0')}.1080p.DSNP.WEBRip.mkv`,
+    sourceLabel: `The Simpsons S${String(season).padStart(2, '0')} 1080p DSNP WEBRip [English]`
+  });
+  const note = (files, extra = {}) => mergeResultText({
+    content: { adminId: 'SB-SIMPSONS01', title: 'The Simpsons', category: 'cartoon', files, episodeCount: 0, episodeGroups: [], ...extra },
+    moved: [{ adminId: 'SB-SOURCE0001' }],
+    plan: { sources: [{}], targetAdminId: 'SB-SIMPSONS01', targetTitle: 'The Simpsons' }
+  }, {});
+
+  const whole = note([pack(1), pack(2), pack(3)]);
+  assert.match(whole, /▪ 3 files on this card · 0 episodes\./);
+  assert.match(whole, /▪ Filed as 3 complete seasons \(S1, S2, S3\) — each of those files is a whole season, so it gets its own season block on the card instead of an episode number\./);
+  assert.equal(whole.includes('outside the episode index'), false, 'nothing here needs fixing');
+  assert.equal(whole.includes('Ep 12'), false);
+
+  // several files in one season are counted, and a long season list is folded
+  const many = note(Array.from({ length: 20 }, (_, index) => pack(index + 1)));
+  assert.match(many, /Filed as 20 complete seasons \(S1, S2, S3, S4, S5, S6, \+14 more\)/);
+  assert.equal(many.includes('• Season 7:'), false);
+
+  // a mixed card keeps its episode index and lists the blocks, capped
+  const mixed = note([pack(1), { name: 'Show.S02E03.1080p.mkv', episode: { start: 3, end: 3, label: 'Episode 03' } }], {
+    episodeCount: 1,
+    episodeGroups: [{ start: 3, end: 3, label: 'Episode 03', season: 2, seasonLabel: 'Season 2', count: 1, fileCount: 1 }]
+  });
+  assert.match(mixed, /Season blocks on the website:\n   • Season 2: 1 episode\n   • Season 1: complete season in 1 file/);
+  assert.match(mixed, /The rest of the card keeps its episode index\./);
+
+  // a file with neither an episode nor a season still earns the warning
+  const orphan = note([pack(1), { name: 'scanned artwork.zip' }]);
+  assert.match(orphan, /▪ 1 moved file has no episode number and stays outside the episode index \(scanned artwork\)\. It is still on the card and delivered as a file — re-send it with a caption like “Ep 12” to place it in the index\./);
+  assert.match(orphan, /▪ Filed as 1 complete season \(S1\)/);
 });

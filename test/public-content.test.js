@@ -214,3 +214,26 @@ test('a card that spans seasons publishes its season blocks, and a single season
   assert.equal(single.fileChoices[0].season, null);
 });
 
+test('a complete-season upload is exposed as a season pack instead of an unindexed file', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'The Simpsons Season 1',
+    category: 'cartoon',
+    files: [
+      { storageMessageId: 10, name: 'The.Simpsons.S01.1080p.DSNP.WEBRip.x264.mkv', sourceLabel: 'The Simpsons S01 1080p DSNP WEBRip [English]', kind: 'document' },
+      { storageMessageId: 11, name: 'The.Simpsons.S02.1080p.DSNP.WEBRip.x264.mkv', sourceLabel: 'The Simpsons S02 1080p DSNP WEBRip [English]', kind: 'document' }
+    ]
+  });
+  assert.deepEqual(created.episodeGroups, [], 'no episode is invented for a whole season');
+
+  const record = toPublicContent(created, config);
+  assert.equal(record.fileChoices.length, 2);
+  assert.deepEqual(record.fileChoices.map((choice) => choice.seasonPack), [1, 2]);
+  assert.deepEqual(record.fileChoices.map((choice) => choice.season), [1, 2]);
+  for (const choice of record.fileChoices) {
+    assert.match(choice.deliveryUrl, /^\/deliver\//);
+    assert.ok(choice.deliveryReady, 'a season pack is still deliverable');
+    // the uploader's own wording survives on the row
+    assert.match(choice.fileName, /The Simpsons S0\d 1080p DSNP WEBRip/);
+  }
+});

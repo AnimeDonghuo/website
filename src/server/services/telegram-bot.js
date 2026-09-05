@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, slugify } from '../lib/strings.js';
-import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
@@ -1091,6 +1091,12 @@ function postIdsFromCommand(value) {
 
 function episodeUploadNote(file, { episodic = false } = {}) {
   if (file.episode?.label) return ` · ${file.episode.label} detected from ${file.episode.source}`;
+  const pack = seasonPackOf(file);
+  if (pack) {
+    // A whole season in one file is indexed by season, not by episode, so this is the
+    // correct outcome rather than something the publisher has to fix.
+    return ` · ${formatSeasonLabel(pack.season)} complete season in one file (no episode number needed)`;
+  }
   // A file with no episode number never reaches the episode index. Saying so in
   // the upload reply is the only moment the caption can still be fixed.
   return episodic
@@ -3970,25 +3976,47 @@ export function mergeResultText(outcome, config = {}) {
   // the same structure a visitor sees without opening the page.
   const cardFiles = Array.isArray(content?.files) ? content.files : [];
   const isEpisodicMerge = String(content?.category || '').trim().toLowerCase() !== 'movie';
-  const unnumbered = isEpisodicMerge ? cardFiles.filter((file) => !hasEpisodeRange(file)) : [];
+  // A file naming a season with no episode number is that whole season in one
+  // upload, and the card files it by season. Only a file with neither belongs in a
+  // warning, so a complete-season pack is never told to come back with "Ep 12".
+  const unnumberedAll = isEpisodicMerge ? cardFiles.filter((file) => !hasEpisodeRange(file)) : [];
+  const classified = unnumberedAll.map((file) => ({ file, pack: seasonPackOf(file) }));
+  const seasonPacks = classified.map((entry) => entry.pack).filter(Boolean);
+  const unnumbered = classified.filter((entry) => !entry.pack).map((entry) => entry.file);
   const perSeason = new Map();
   for (const group of Array.isArray(content?.episodeGroups) ? content.episodeGroups : []) {
     if (!group.seasonLabel) continue;
     const current = perSeason.get(group.seasonLabel) || 0;
     perSeason.set(group.seasonLabel, current + (group.count || 1));
   }
-  const seasonLines = [...perSeason.entries()].map(([label, count]) => `   • ${label}: ${count} episode${count === 1 ? '' : 's'}`);
-  const multiSeason = perSeason.size > 1;
+  const episodeSeasonLines = [...perSeason.entries()].map(([label, count]) => `   • ${label}: ${count} episode${count === 1 ? '' : 's'}`);
+  const packSeasons = new Map();
+  for (const pack of seasonPacks) packSeasons.set(pack.season, (packSeasons.get(pack.season) || 0) + 1);
+  const packOrder = [...packSeasons.entries()].sort((first, second) => first[0] - second[0]);
+  // A card made only of season packs says so in one summary line; repeating
+  // "complete season in 1 file" twenty times would push the real news off screen.
+  const packSeasonLines = perSeason.size
+    ? packOrder.map(([season, count]) => `   • ${formatSeasonLabel(season)}: complete season in ${count} file${count === 1 ? '' : 's'}`)
+    : [];
+  const seasonLines = [...episodeSeasonLines, ...packSeasonLines];
+  const shownSeasonLines = seasonLines.length > 8
+    ? [...seasonLines.slice(0, 7), `   • +${seasonLines.length - 7} more season${seasonLines.length - 7 === 1 ? '' : 's'}`]
+    : seasonLines;
+  const multiSeason = perSeason.size + packSeasons.size > 1;
+  const packSummary = packOrder.length
+    ? `▪ Filed as ${packOrder.length} complete season${packOrder.length === 1 ? '' : 's'} (${packOrder.slice(0, 6).map(([season, count]) => `S${season}${count > 1 ? ` ×${count}` : ''}`).join(', ')}${packOrder.length > 6 ? `, +${packOrder.length - 6} more` : ''}) — each of those files is a whole season, so it gets its own season block on the card instead of an episode number.${perSeason.size ? ' The rest of the card keeps its episode index.' : ''}`
+    : null;
   return [
     `Merged ${moved.length || outcome.plan?.sources?.length || 0} post${(moved.length || 0) === 1 ? '' : 's'} into ${content.adminId || outcome.plan?.targetAdminId} · ${content.title || outcome.plan?.targetTitle}.`,
     `▪ ${totalFiles} file${totalFiles === 1 ? '' : 's'} on this card · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'}.`,
-    seasonLines.length ? `▪ Season blocks on the website:\n${seasonLines.join('\n')}` : null,
+    shownSeasonLines.length ? `▪ Season blocks on the website:\n${shownSeasonLines.join('\n')}` : null,
+    packSummary,
     outcome.playersMerged ? `▪ ${outcome.playersMerged} player${outcome.playersMerged === 1 ? '' : 's'} moved to /players ${content.adminId}.${multiSeason ? ' Players are matched by episode number only, so check each season keeps its own link.' : ''}` : null,
     // Files whose episode number cannot be read at all are listed rather than
     // left invisible, because "the merge lost my episodes" is otherwise the only
     // thing a publisher can conclude.
     unnumbered.length
-      ? `▪ ${unnumbered.length} moved file${unnumbered.length === 1 ? '' : 's'} ${unnumbered.length === 1 ? 'has' : 'have'} no episode number and ${unnumbered.length === 1 ? 'stays' : 'stay'} outside the episode index (${unnumbered.slice(0, 3).map((file) => shortFileName(file)).join(', ')}${unnumbered.length > 3 ? `, +${unnumbered.length - 3} more` : ''}). ${unnumbered.length === 1 ? 'It' : 'They'} ${unnumbered.length === 1 ? 'is' : 'are'} still on the card and delivered as files — re-send ${unnumbered.length === 1 ? 'it' : 'them'} with a caption like “Ep 12” to place ${unnumbered.length === 1 ? 'it' : 'them'} in the index.`
+      ? `▪ ${unnumbered.length} moved file${unnumbered.length === 1 ? '' : 's'} ${unnumbered.length === 1 ? 'has' : 'have'} no episode number and ${unnumbered.length === 1 ? 'stays' : 'stay'} outside the episode index (${unnumbered.slice(0, 3).map((file) => shortFileName(file)).join(', ')}${unnumbered.length > 3 ? `, +${unnumbered.length - 3} more` : ''}). ${unnumbered.length === 1 ? 'It' : 'They'} ${unnumbered.length === 1 ? 'is' : 'are'} still on the card and delivered as ${unnumbered.length === 1 ? 'a file' : 'files'} — re-send ${unnumbered.length === 1 ? 'it' : 'them'} with a caption like “Ep 12” to place ${unnumbered.length === 1 ? 'it' : 'them'} in the index.`
       : null,
     moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
     outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
-import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
@@ -212,6 +212,9 @@ function publicFileChoices(files, config, shareCode, content) {
       quality: quality ? normalizeQualityLabel(quality) : null,
       size: formatBytes(Number(file?.size) || 0),
       kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
+      // A complete-season upload is labelled as such so the card can group it by
+      // season instead of showing it as a file that failed to be indexed.
+      seasonPack: seasonPackOf(file)?.season ?? null,
       season,
       episode,
       telegramUrl,

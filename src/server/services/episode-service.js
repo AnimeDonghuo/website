@@ -749,6 +749,31 @@ export function hasEpisodeRange(file) {
 // "S01 Complete" means the season, and "Trailer 2" is not Episode 02.
 const SEASON_PACK_TEXT = /\b(?:complete|completed|collection|box\s*set|all\s*episodes?|pack|batch|volume)\b|\bs(?:eason)?\.?\s*0*\d{1,2}\s*(?:$|[^\d])/i;
 const EXTRA_TEXT = /\b(?:trailer|teaser|preview|bonus|ost|soundtrack|wallpaper|poster|scan|credits|opening|ending)\b/i;
+const SEASON_WORD = /\b(?:complete|completed|collection|box\s*set|all\s*episodes?|pack|batch|season)\b/i;
+
+/**
+ * A file that names a season and no episode is that season *complete* — how a
+ * whole-season upload arrives (`The.Simpsons.S01.1080p.WEB-DL`). It is not a file that
+ * lost its number, so it must never be reported as sitting outside the index or asked to
+ * be re-sent with an `Ep 12` caption. Nothing is invented here: the season has to be
+ * readable from this file's own caption or name, an extra is never a season, and any
+ * wording that points at a single episode (`S01E05`, `Episode 7`) disqualifies it.
+ */
+export function seasonPackOf(file) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) return null;
+  if (hasEpisodeRange(file)) return null;
+  const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`.trim();
+  if (!raw || EXTRA_TEXT.test(raw)) return null;
+  if (/\bS\d{1,2}[\s._-]*E\d/i.test(raw) || /\b(?:ep|eps|episode)\.?\s*0*\d/i.test(raw) || /\b\d{1,3}\s*[xX]\s*\d/.test(raw)) return null;
+  const detected = detectUploadSeason({ caption: file?.displayName || file?.sourceLabel, filename: file?.name });
+  const season = Number(detected.season);
+  if (validSeason(season)) return { season, label: `Season ${season}`, wholeSeason: true };
+  // Only a file that says so itself may claim to be a whole season; a season the card
+  // merely attributes to it cannot turn an unparsed episode into a pack.
+  const stored = Number(file?.season);
+  if (SEASON_WORD.test(raw) && validSeason(stored)) return { season: stored, label: `Season ${stored}`, wholeSeason: true };
+  return null;
+}
 
 /**
  * Heal the file list of a release before it is stored. Files whose episode never
