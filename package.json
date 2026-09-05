@@ -13,6 +13,8 @@
     "dev:client": "vite --host 0.0.0.0",
     "build": "vite build",
     "start": "node src/server/index.js",
+    "theme:build": "node scripts/build-light-theme.mjs",
+    "theme:check": "node scripts/build-light-theme.mjs --check",
     "test": "node --test",
     "check": "npm run build && npm test"
   },

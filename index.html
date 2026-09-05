@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#080b12" />
+    <script>
+      // The day/night choice is read here rather than in the bundle: a stylesheet imported
+      // by React arrives too late, and the visitor would watch the page repaint from black.
+      try {
+        if (window.localStorage.getItem('sorabox:theme') === 'light') {
+          document.documentElement.dataset.theme = 'light';
+          document.documentElement.style.colorScheme = 'light';
+          document.querySelector('meta[name=theme-color]').setAttribute('content', '#f7f8f5');
+        }
+      } catch (error) { /* no storage: the dark default stands, which is always valid */ }
+    </script>
     <meta name="description" content="A polished Telegram-delivered catalog for media you are authorized to share." />
     <title>SoraBox — Your next watch, delivered</title>
   </head>

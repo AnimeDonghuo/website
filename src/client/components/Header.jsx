@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { Icon } from './Icons.jsx';
+import { applyTheme, currentTheme, readStoredTheme, THEME_EVENT } from '../theme.js';
 
 const desktopLinks = [
   { label: 'Discover', to: '/' },
@@ -30,6 +31,7 @@ export default function Header() {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [theme, setTheme] = useState(() => currentTheme());
   const searchInput = useRef(null);
 
   useEffect(() => {
@@ -46,6 +48,28 @@ export default function Header() {
     document.addEventListener('keydown', focusSearch);
     return () => document.removeEventListener('keydown', focusSearch);
   }, []);
+
+  useEffect(() => {
+    // The inline script in index.html has already chosen the theme before the first paint;
+    // this only re-states it so the button, the mobile address-bar colour, and a stored
+    // first visit agree — and keeps the two in step when another tab switches themes.
+    setTheme(applyTheme(readStoredTheme()));
+    function sync() {
+      setTheme(currentTheme());
+    }
+    window.addEventListener('storage', sync);
+    window.addEventListener(THEME_EVENT, sync);
+    return () => {
+      window.removeEventListener('storage', sync);
+      window.removeEventListener(THEME_EVENT, sync);
+    };
+  }, []);
+
+  function toggleTheme() {
+    const next = applyTheme(theme === 'light' ? 'dark' : 'light');
+    setTheme(next);
+    window.dispatchEvent(new CustomEvent(THEME_EVENT, { detail: next }));
+  }
 
   function submitSearch(event) {
     event.preventDefault();
@@ -86,6 +110,16 @@ export default function Header() {
             <Icon name="telegram" size={18} />
             <span>Delivery</span>
           </Link>
+          <button
+            className="theme-toggle"
+            type="button"
+            onClick={toggleTheme}
+            aria-pressed={theme === 'light'}
+            title={theme === 'light' ? 'Switch back to the night theme' : 'Switch to the day theme'}
+          >
+            <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
+            <span>{theme === 'light' ? 'Night' : 'Day'}</span>
+          </button>
           <button className="menu-toggle" type="button" aria-label={open ? 'Close menu' : 'Open menu'} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
             <Icon name={open ? 'close' : 'menu'} size={22} />
           </button>
