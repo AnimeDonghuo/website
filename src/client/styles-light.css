@@ -217,8 +217,6 @@
 [data-theme='light'] .watch-player-note a:hover { color: #567f0a; }
 [data-theme='light'] .watch-player-options > span { color: #3d4247; }
 [data-theme='light'] .watch-player-options button { color: #1f2224; border: 1px solid rgba(18, 24, 36, 0.055); background: rgba(18, 24, 36, 0.065); }
-[data-theme='light'] .watch-player-controls > span { color: #3e4247; }
-[data-theme='light'] .watch-player-controls button { color: #1f2224; border: 1px solid rgba(18, 24, 36, 0.055); background: rgba(18, 24, 36, 0.065); }
 [data-theme='light'] .delivery-file-link { color: #285362; }
 [data-theme='light'] .delivery-file-link small { color: #354855; }
 [data-theme='light'] .delivery-file-link b { color: #0a607f; }

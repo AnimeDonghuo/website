@@ -313,7 +313,10 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
    given. A 16:9 box on a narrow phone is shorter than that row needs, so the bar squeezes
    itself and its last buttons fall outside a rounded corner: hence a floor under the
    height (the provider letterboxes inside it, which is its own normal behaviour) and a
-   near-square bottom edge, so nothing of CC, audio, or full screen is ever clipped. */
+   near-square bottom edge, so nothing of CC, audio, or full screen is ever clipped. The
+   rest is the provider's own to decide: those buttons live inside its frame, so the embed
+   is asked for plain playback chrome by parameter — see dailymotionPlayerUrl — instead of
+   this site drawing a second set of controls underneath. */
 .watch-player-shell { position: relative; overflow: hidden; width: 100%; min-height: clamp(230px, 24vw, 430px); max-height: 78vh; border: 1px solid rgba(255,255,255,.16); border-radius: 14px 14px 3px 3px; background: #06090e; box-shadow: 0 30px 75px rgba(0,0,0,.38), inset 0 0 0 1px rgba(197,248,106,.04); aspect-ratio: 16 / 9; }
 .watch-player-shell::before { content: 'HOSTED BY SORABOX'; position: absolute; z-index: 0; left: 17px; top: 13px; color: rgba(197,248,106,.36); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 600; letter-spacing: .12em; }
 .watch-player-shell__frame { position: relative; z-index: 1; display: block; width: 100%; height: 100%; border: 0; background: #070a0f; }
@@ -352,21 +355,8 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .watch-player-options > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .watch-player-options button { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 9px; color: #c1cbd2; border: 1px solid rgba(255,255,255,.13); border-radius: 999px; background: rgba(255,255,255,.035); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
 .watch-player-options button:hover, .watch-player-options button.is-active { color: #17210a; border-color: var(--lime); background: var(--lime); }
-.watch-player-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; }
-.watch-player-controls > span { color: #93a0ae; font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
-.watch-player-controls > div { display: flex; gap: 6px; }
-.watch-player-controls button { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 10px; color: #c1cbd2; border: 1px solid rgba(255,255,255,.13); border-radius: 999px; background: rgba(255,255,255,.035); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 600; letter-spacing: .04em; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
-.watch-player-controls button:hover, .watch-player-controls button[aria-pressed='true'] { color: #17210a; border-color: var(--lime); background: var(--lime); }
-/* A quarter turn swaps which edge is long, so the box and the frame exchange their
-   proportions: 177.78% of the width is the height it needs sideways, and vice versa. */
-.watch-player-shell--side { width: min(100%, calc(78vh * 0.5625)); min-height: 0; max-height: none; margin-inline: auto; aspect-ratio: 9 / 16; }
-.watch-player-shell__frame.is-side { position: absolute; top: 50%; left: 50%; width: 177.78%; height: 56.25%; transform: translate(-50%, -50%) rotate(var(--player-turn, 90deg)); }
-.watch-player-shell__frame.is-turned { transform: rotate(180deg); }
-.watch-player-shell:fullscreen { width: 100vw; height: 100vh; max-height: none; border: 0; border-radius: 0; background: #04070b; }
-.watch-player-shell:fullscreen .watch-player-shell__frame.is-side { width: 100vh; height: 100vw; }
 @media (max-width: 760px) {
   .theme-toggle { width: 38px; padding: 0; justify-content: center; }.theme-toggle span { display: none; }
-  .watch-player-controls { flex-direction: column; align-items: flex-start; gap: 7px; }
 }
 .file-choice-section--watch { padding-top: 54px; padding-bottom: 83px; }
 

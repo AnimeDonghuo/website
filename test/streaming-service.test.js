@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { embeddablePlayerUrl, mergeStreamingEntries, oneClickDownloadHost, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
+import { dailymotionPlayerUrl, embeddablePlayerUrl, mergeStreamingEntries, oneClickDownloadHost, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 
 test('manual JSON streaming manifests accept authorized SeekStreaming players and episode data', () => {
   const result = parseStreamingManifest(JSON.stringify({
@@ -199,4 +199,62 @@ test('approved hosts enter the allow-list and the frame policy, one-click hosts 
   assert.equal(oneClickDownloadHost('https://abyss.to/file/abc'), 'abyss.to');
   assert.equal(oneClickDownloadHost('<iframe src="https://dood.pm/f/abc" allowfullscreen></iframe>'), null);
   assert.equal(oneClickDownloadHost('not a url'), null);
+});
+
+test('a Dailymotion frame is asked for plain playback chrome so its control row fits', () => {
+  // Dailymotion drops volume, subtitles, and full screen before it shrinks that row, and
+  // the buttons it keeps are its own; the fix is to stop asking for them, not to draw a
+  // second set of controls. Documented query parameters, so nothing is invented here.
+  const tidied = new URL(dailymotionPlayerUrl('https://www.dailymotion.com/embed/video/x8ab9c')).searchParams;
+  assert.equal(tidied.get('sharing-enable'), '0');
+  assert.equal(tidied.get('queue-enable'), '0');
+  assert.equal(tidied.get('queue-autoplay-next'), '0');
+  assert.equal(tidied.get('reporter-enable'), '0');
+  assert.equal(tidied.get('ui-logo'), '0');
+  assert.equal(tidied.get('ui-start-screen-info'), '0');
+  assert.equal(tidied.get('ui-highlight'), 'c5f86a');
+
+  // a publisher's own value always wins, and the page link is never rewritten
+  const typed = new URL(dailymotionPlayerUrl('https://www.dailymotion.com/embed/video/x8ab9c?sharing-enable=1&queue-enable=1&autoplay=1')).searchParams;
+  assert.equal(typed.get('sharing-enable'), '1');
+  assert.equal(typed.get('queue-enable'), '1');
+  assert.equal(typed.get('autoplay'), '1');
+  assert.equal(dailymotionPlayerUrl('https://www.dailymotion.com/video/x8ab9c'), 'https://www.dailymotion.com/video/x8ab9c');
+  assert.equal(dailymotionPlayerUrl('https://rumble.com/embed/v7exnu4/'), 'https://rumble.com/embed/v7exnu4/');
+  assert.equal(dailymotionPlayerUrl(''), null);
+  assert.equal(dailymotionPlayerUrl(null), null);
+});
+
+test('the stored link stays as pasted while the visitor receives the tidied frame', () => {
+  const pasted = 'https://www.dailymotion.com/embed/video/x8ab9c';
+  const stored = { entries: [{ embedUrl: pasted, watchUrl: 'https://www.dailymotion.com/video/x8ab9c', label: 'Ep 209' }] };
+  const published = publicStreamingData(stored);
+  assert.match(published.entries[0].embedUrl, /sharing-enable=0/);
+  assert.match(published.entries[0].embedUrl, /ui-start-screen-info=0/);
+  assert.equal(published.entries[0].watchUrl, 'https://www.dailymotion.com/video/x8ab9c');
+
+  // what a publisher saved is untouched, so /players still reads back their own link
+  const saved = mergeStreamingEntries(null, [{ entry: { label: 'Ep 209', provider: 'Dailymotion', embedUrl: pasted, watchUrl: 'https://www.dailymotion.com/video/x8ab9c' } }]);
+  assert.equal(saved.entries[0].embedUrl, pasted);
+});
+
+test('a source with no embeddable player still reaches the Watch page as its own link', () => {
+  // An OK.ru live broadcast publishes no embed path. Before, the entry was validated, found
+  // to have no embeddable URL, and dropped — so a publisher's careful attachment vanished
+  // from the site while remaining in /players. It now arrives as a watch-only entry.
+  const published = publicStreamingData({
+    entries: [{ embedUrl: null, watchUrl: 'https://ok.ru/live/1530522920786', label: 'Live premiere' }]
+  });
+  assert.equal(published.available, true);
+  assert.equal(published.entries.length, 1);
+  assert.equal(published.entries[0].embedUrl, null);
+  assert.equal(published.entries[0].watchUrl, 'https://ok.ru/live/1530522920786');
+  assert.equal(published.entries[0].server, 'OK.ru server');
+
+  // and the fallback link beside a framed player is the provider's page, not its embed
+  const framed = publicStreamingData({
+    entries: [{ embedUrl: 'https://www.dailymotion.com/embed/video/x8ab9c', watchUrl: 'https://www.dailymotion.com/video/x8ab9c', label: 'Ep 209' }]
+  });
+  assert.equal(framed.entries[0].watchUrl, 'https://www.dailymotion.com/video/x8ab9c');
+  assert.match(framed.entries[0].embedUrl, /^https:\/\/www\.dailymotion\.com\/embed\/video\/x8ab9c\?/);
 });

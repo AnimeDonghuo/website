@@ -34,9 +34,7 @@ export function Icon({ name, size = 20, stroke = 1.9, className = '' }) {
     filter: <><path d="M4 6h16M7 12h10M10 18h4" /></>,
     clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3.5 2" /></>,
     sun: <><circle cx="12" cy="12" r="4.2" /><path d="M12 3v2.4M12 18.6V21M3 12h2.4M18.6 12H21M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M18.4 5.6l-1.7 1.7M7.3 16.7l-1.7 1.7" /></>,
-    moon: <path d="M20 14.4A8.4 8.4 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4Z" />,
-    rotate: <><path d="M20.5 12a8.5 8.5 0 1 1-2.9-6.4" /><path d="M20.5 4v5h-5" /></>,
-    expand: <><path d="M9 3H3v6" /><path d="M15 21h6v-6" /><path d="M3 15v6h6" /><path d="M21 9V3h-6" /></>
+    moon: <path d="M20 14.4A8.4 8.4 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4Z" />
   };
 
   return <svg {...common}>{paths[name] || paths.spark}</svg>;

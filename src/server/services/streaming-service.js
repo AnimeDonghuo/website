@@ -139,6 +139,46 @@ export function extractStreamingUrl(value) {
  * The original page stays as the external link, so a publisher can always open
  * the video on the provider even if a specific embed is unavailable.
  */
+/**
+ * Dailymotion lays its control bar out inside the frame it is handed, and on a phone that
+ * row has more buttons than the width allows: it drops volume, subtitles, and full screen
+ * rather than shrinking them. What it keeps are Dailymotion's own buttons — share, report,
+ * up-next, its logo, the uploader's title on the start screen — and every one of them is a
+ * query parameter away, so the embed is asked for plain playback chrome instead. Documented
+ * at developer.dailymotion.com/player#player-parameters; a value the publisher already typed
+ * wins, and the site's own highlight colour is offered so the scrubber matches the page.
+ *
+ * This is applied to the payload a visitor receives, never to what a publisher pasted: the
+ * stored entry stays their exact link (so `/players` still reads back what was typed), and a
+ * player attached months ago gets the same frame as one attached today, without a re-save.
+ */
+const DAILYMOTION_PLAYBACK_PARAMS = {
+  'sharing-enable': '0',
+  'reporter-enable': '0',
+  'queue-enable': '0',
+  'queue-autoplay-next': '0',
+  'ui-logo': '0',
+  'ui-start-screen-info': '0',
+  'ui-highlight': 'c5f86a'
+};
+
+export function dailymotionPlayerUrl(value) {
+  if (!value || typeof value !== 'string') return value || null;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return value;
+  }
+  const host = url.hostname.replace(/^www\./i, '').toLowerCase();
+  const framed = host === 'dailymotion.com' || host.endsWith('.dailymotion.com') || host === 'dai.ly';
+  if (!framed || !/\/embed\/video\/[A-Za-z0-9]+/i.test(url.pathname)) return value;
+  for (const [name, setting] of Object.entries(DAILYMOTION_PLAYBACK_PARAMS)) {
+    if (!url.searchParams.has(name)) url.searchParams.set(name, setting);
+  }
+  return url.toString();
+}
+
 export function embeddablePlayerUrl(value) {
   const raw = extractStreamingUrl(value);
   if (!raw) return null;
@@ -562,14 +602,20 @@ function normalizedStoredEntry(entry, { allowedHosts = DEFAULT_STREAMING_HOSTS }
   if (!object) return null;
   const columns = valuesByColumn(object);
   const genericUrl = firstValue(columns, ['url', 'videoUrl', 'video_url']);
-  const embedUrl = safeStreamingUrl(
-    firstValue(columns, ['embedUrl', 'embed_url', 'embed', 'playerUrl', 'player_url', 'player', 'iframeUrl', 'iframe_url']) || genericUrl,
-    { allowedHosts }
+  const link = (value) => (value ? safeStreamingLink(value, { allowedHosts }) : null);
+  const embedLink = link(
+    firstValue(columns, ['embedUrl', 'embed_url', 'embed', 'playerUrl', 'player_url', 'player', 'iframeUrl', 'iframe_url']) || genericUrl
   );
-  const watchUrl = safeStreamingUrl(
-    firstValue(columns, ['watchUrl', 'watch_url', 'watch', 'link', 'externalUrl', 'external_url']) || genericUrl,
-    { allowedHosts }
+  const watchLink = link(
+    firstValue(columns, ['watchUrl', 'watch_url', 'watch', 'link', 'externalUrl', 'external_url']) || genericUrl
   );
+  const embedUrl = embedLink?.embedUrl || null;
+  // The external link is the provider's own page, where its whole control set — subtitles,
+  // audio track, full screen — is laid out for a browser tab instead of a small frame. The
+  // embed path only stands in when an entry never named a page, and a source with no
+  // embeddable player at all (an OK.ru live broadcast) keeps its link rather than silently
+  // disappearing from the Watch page.
+  const watchUrl = watchLink?.watchUrl || watchLink?.embedUrl || embedLink?.watchUrl || null;
   if (!embedUrl && !watchUrl) return null;
   let episode = null;
   if (asObject(object.episode)) {
@@ -643,7 +689,9 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
       episode: entry.episode,
       provider: entry.provider,
       server: entry.server,
-      embedUrl: entry.embedUrl || null,
+      // Identity above is computed from the stored URL; the frame policy the visitor
+      // receives is tidied here, so players attached before this change behave the same.
+      embedUrl: dailymotionPlayerUrl(entry.embedUrl || null),
       watchUrl: entry.watchUrl || null
     }));
   return {

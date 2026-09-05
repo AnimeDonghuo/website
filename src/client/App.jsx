@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
 import { confirmAdultAccess, getConfig, getContent, getContentBySlug } from './api.js';
 import AdultGate from './components/AdultGate.jsx';
@@ -595,34 +595,9 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     : [];
   const [selectedId, setSelectedId] = useState(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
-  // A framed provider draws its own controls inside the iframe, and it will not shrink
-  // them politely, so the shell gives that row room (see .watch-player-shell). What the
-  // provider cannot do for us — straighten a sideways or upside-down source, or fill the
-  // screen — gets its own buttons on our side of the frame instead.
-  const [playerTurn, setPlayerTurn] = useState(0);
-  const [fullScreen, setFullScreen] = useState(false);
-  const playerShell = useRef(null);
-  const canFullScreen = typeof Element !== 'undefined' && typeof Element.prototype.requestFullscreen === 'function';
-  const sideTurn = playerTurn % 180 !== 0;
-  useEffect(() => {
-    setPlayerTurn(0);
-  }, [selected?.id]);
-  useEffect(() => {
-    function syncFullScreen() {
-      setFullScreen(document.fullscreenElement === playerShell.current);
-    }
-    document.addEventListener('fullscreenchange', syncFullScreen);
-    return () => document.removeEventListener('fullscreenchange', syncFullScreen);
-  }, []);
-  function turnPlayer() {
-    setPlayerTurn((value) => (value + 90) % 360);
-  }
-  function toggleFullScreen() {
-    const node = playerShell.current;
-    if (!node) return;
-    if (document.fullscreenElement) document.exitFullscreen?.();
-    else node.requestFullscreen?.();
-  }
+  // The framed provider owns the only controls a visitor needs here. What the box can do
+  // is give that row room to lay itself out in one line (see .watch-player-shell) and let
+  // the frame ask for the playback-only player chrome (see dailymotionPlayerUrl).
   const relatedItems = useMemo(() => {
     if (!item) return [];
     return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
@@ -684,10 +659,10 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               </p>
             </div>
           </div>
-          <div className={`watch-player-shell${sideTurn ? ' watch-player-shell--side' : ''}`} ref={playerShell} style={{ '--player-turn': `${playerTurn}deg` }}>
+          <div className="watch-player-shell">
             {selected.embedUrl ? <iframe
               key={selected.id}
-              className={`watch-player-shell__frame${sideTurn ? ' is-side' : ''}${playerTurn === 180 ? ' is-turned' : ''}`}
+              className="watch-player-shell__frame"
               src={selected.embedUrl}
               title={`${item.title} — ${selectedFileTitle}`}
               allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
@@ -695,17 +670,6 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               allowFullScreen
             /> : <div className="watch-player-shell__fallback"><Icon name="play" size={24} /><strong>This video opens in its approved player.</strong><p>Use the play button to continue.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Play video <Icon name="arrow" size={16} /></a> : null}</div>}
           </div>
-          {selected.embedUrl ? <div className="watch-player-controls" role="group" aria-label="Player view">
-            <span>Player view</span>
-            <div>
-              <button type="button" onClick={turnPlayer} title={playerTurn ? 'Turn the player a quarter turn further' : 'Turn the player if the video is sideways or upside down'}>
-                <Icon name="rotate" size={13} /> {playerTurn ? `${playerTurn}\u00b0` : 'Rotate'}
-              </button>
-              {canFullScreen ? <button type="button" onClick={toggleFullScreen} aria-pressed={fullScreen} title="Fill the screen with the player">
-                <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
-              </button> : null}
-            </div>
-          </div> : null}
           {externalPlayerUrl ? <div className="watch-player-note">
             <span>{selected.embedUrl ? 'Player not opening on this device?' : 'This source has no embeddable player URL.'}</span>
             <a href={externalPlayerUrl} target="_blank" rel="noreferrer">Open on {playerShortName(selected)} <Icon name="arrow" size={14} /></a>
