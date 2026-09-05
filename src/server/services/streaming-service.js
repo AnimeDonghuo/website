@@ -2,15 +2,39 @@ import { cleanText } from '../lib/strings.js';
 
 // This feature deliberately imports only a small publisher-supplied manifest.
 // It never downloads, buffers, transcodes, or relays video through Koyeb.
-// SeekStreaming exports iframe URLs from embedseek.com. Dailymotion and Rumble
-// are included as manual, publisher-supplied alternatives; more approved hosts
-// can be added with STREAMING_ALLOWED_HOSTS without changing source code.
+// SeekStreaming exports iframe URLs from embedseek.com. The other defaults are
+// hosts that publish a real embeddable player path, so a pasted page link can be
+// turned into it automatically. Anything else a publisher trusts is added through
+// STREAMING_ALLOWED_HOSTS without changing source code.
 export const DEFAULT_STREAMING_HOSTS = [
   'seekstreaming.com',
   'embedseek.com',
   'dailymotion.com',
   'dai.ly',
-  'rumble.com'
+  'rumble.com',
+  'vimeo.com',
+  'ok.ru',
+  // File hosts whose own embed code is the player page; framing that path is what
+  // they publish, so their links work without any rewriting beyond the allow-list.
+  'dood.pm',
+  'doo.sh',
+  'streamwish.to',
+  'mixdrop.to',
+  'streamtape.com'
+];
+
+// One-click download hosts are a different product: the page a visitor lands on is
+// a wait-a-timer form, not a player, and they send headers that refuse framing.
+// Accepting one as a Watch player would ship a blank frame, so it is named instead.
+export const ONE_CLICK_DOWNLOAD_HOSTS = [
+  'mega.nz',
+  'gofile.io',
+  'gofile.me',
+  'abyss.to',
+  'krakenfiles.com',
+  'pixeldrain.com',
+  'd.tube',
+  'dtube.nl'
 ];
 export const MAX_STREAM_MANIFEST_ROWS = 1_000;
 export const MAX_STREAM_ENTRIES_PER_POST = 500;
@@ -60,6 +84,18 @@ export function normalizeStreamingHosts(value = []) {
   return [...new Set([...DEFAULT_STREAMING_HOSTS, ...supplied]
     .map(safeHost)
     .filter(Boolean))];
+}
+
+/** The one-click host inside a pasted link, when the link points at one. */
+export function oneClickDownloadHost(value) {
+  const raw = String(value || '');
+  let host = '';
+  try {
+    host = new URL(extractStreamingUrl(raw) || raw).hostname.replace(/^www\./i, '').toLowerCase();
+  } catch {
+    return null;
+  }
+  return ONE_CLICK_DOWNLOAD_HOSTS.find((candidate) => host === candidate || host.endsWith(`.${candidate}`)) || null;
 }
 
 function allowedHost(hostname, hosts) {
@@ -136,6 +172,16 @@ export function embeddablePlayerUrl(value) {
   }
 
   if (host === 'rumble.com' || host.endsWith('.rumble.com')) {
+    // Rumble's Share dialog hands out https://rumble.com/embedJS/u3385.v7exnu4/?url=…
+    // and the u-code (the publisher number) exists only inside that URL: it cannot be
+    // rebuilt from a page link. A pasted embedJS code is therefore stored exactly as
+    // given, because it is the form that plays when the short /embed/<id>/ path is
+    // refused for a channel whose embed settings differ.
+    const embedJsMatch = url.pathname.match(/\/embedJS\/((?:u\d+\.)?v[A-Za-z0-9]+(?:\.\d+)?)\/?$/i);
+    if (embedJsMatch) {
+      const videoId = embedJsMatch[1].includes('.') ? embedJsMatch[1].split('.').pop() : embedJsMatch[1];
+      return { embedUrl: url.toString(), watchUrl: `https://rumble.com/${videoId}.html` };
+    }
     const embedMatch = url.pathname.match(/\/embed\/(?:VS)?([A-Za-z0-9.]+)/i);
     if (embedMatch) return { embedUrl: url.toString(), watchUrl: `https://rumble.com/${embedMatch[1]}.html` };
     // Page URLs look like /v7exnu4-title-slug.html; the video id is the v-token.
@@ -147,6 +193,43 @@ export function embeddablePlayerUrl(value) {
     };
   }
 
+  if (host === 'vimeo.com' || host.endsWith('.vimeo.com')) {
+    // player.vimeo.com/video/ID is the frameable half, so a page link becomes it and a
+    // pasted player URL is kept whole — including the `?h=` token a privacy-protected or
+    // embed-only video needs, which is the difference between a player and a frame that
+    // reports the video as unavailable.
+    const idMatch = url.pathname.match(/^\/(\d{6,})(?:\/|$)/)
+      || url.pathname.match(/\/(?:channels|groups)\/[^/]+\/(?:videos?\/)?(\d{6,})/i)
+      || url.pathname.match(/\/album\/[^/]+\/video\/(\d{6,})/i)
+      || url.pathname.match(/\/video\/(\d{6,})(?:\/|$)/i);
+    const id = idMatch?.[1];
+    if (!id) return { embedUrl: null, watchUrl: url.toString() };
+    const token = url.search.match(/[?&](h=[A-Za-z0-9-]+)/i)?.[1];
+    const fromPlayerPage = host === 'player.vimeo.com';
+    return {
+      embedUrl: fromPlayerPage ? url.toString() : `https://player.vimeo.com/video/${id}${token ? `?${token}` : ''}`,
+      watchUrl: fromPlayerPage ? `https://vimeo.com/${id}` : url.toString()
+    };
+  }
+
+  if (host === 'ok.ru' || host.endsWith('.ok.ru')) {
+    // Odnoklassniki serves the same video framed at /videoembed/<id> while the /video/
+    // page refuses it. A live broadcast has no embed path at all, so it stays an
+    // external link instead of a frame that would never play.
+    const embedMatch = url.pathname.match(/\/videoembed\/(\d{4,})/i);
+    if (embedMatch) return { embedUrl: url.toString(), watchUrl: `https://ok.ru/video/${embedMatch[1]}` };
+    if (/\/live\//i.test(url.pathname)) return { embedUrl: null, watchUrl: url.toString() };
+    const pageMatch = url.pathname.match(/\/video\/(\d{4,})/i) || url.search.match(/[?&]v=(\d{4,})/i);
+    if (!pageMatch) return { embedUrl: null, watchUrl: url.toString() };
+    return {
+      embedUrl: `https://ok.ru/videoembed/${pageMatch[1]}`,
+      watchUrl: url.toString()
+    };
+  }
+
+  // Every other approved host is already an embed path the provider published
+  // (dood's and StreamWish's own /f/<id>, a copied <iframe src>, a SeekStreaming
+  // export), so the URL is stored as given and framed as-is.
   return { embedUrl: url.toString(), watchUrl: url.toString() };
 }
 
@@ -165,6 +248,12 @@ export function streamServerName(value) {
   if (host.includes('dailymotion') || host === 'dai.ly') return 'Dailymotion server';
   if (host.includes('rumble')) return 'Rumble server';
   if (host.includes('embedseek') || host.includes('seekstreaming')) return 'Seek server';
+  if (host === 'ok.ru' || host.endsWith('.ok.ru')) return 'OK.ru server';
+  if (host.includes('dood')) return 'Dood server';
+  if (host.includes('streamwish')) return 'StreamWish server';
+  if (host.includes('streamtape')) return 'StreamTape server';
+  if (host.includes('mixdrop')) return 'Mixdrop server';
+  if (host.includes('vimeo')) return 'Vimeo server';
   const base = host.split('.')[0];
   if (!base || base === 'provider') return 'Direct player';
   return `${base.charAt(0).toUpperCase()}${base.slice(1)} server`;

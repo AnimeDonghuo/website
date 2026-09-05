@@ -7,7 +7,7 @@ import { findMetadata, searchPosterCandidates } from './metadata-service.js';
 import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
-import { extractStreamingUrl, inferStreamManifestFormat, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
+import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
 const ADULT_CATEGORY = 'adult';
@@ -188,6 +188,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'series', description: 'New web series draft' },
   { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
+  { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
   { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
@@ -4472,6 +4473,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
+          'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
@@ -5073,7 +5075,10 @@ export async function launchTelegramBot({ config, repository }) {
         const { manifest } = manual;
         const links = { urls: manifest.entries, rejected: manual.rejected };
         if (!links.urls.length) {
-          await ctx.reply('That player URL or iframe is not an approved HTTPS streaming source. SeekStreaming Embed Link/Embed Code, Dailymotion, and Rumble are accepted by default; page links are converted to their embeddable player URL automatically. Add another trusted domain through STREAMING_ALLOWED_HOSTS. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
+          const oneClickHost = oneClickDownloadHost(directValue);
+          await ctx.reply(oneClickHost
+            ? `${oneClickHost} is a one-click download host, not a player: a visitor lands on a wait-and-continue page that also refuses to be framed, so it cannot become a Watch player. Keep those links in the post's file list for delivery. Hosts that publish a real embed — Dailymotion, Rumble, Vimeo, OK.ru, Dood, StreamWish, Mixdrop, StreamTape, SeekStreaming — are accepted automatically, and any other one works after you add its domain to STREAMING_ALLOWED_HOSTS. If a host gives you an <iframe …> embed code, paste the whole code and it is read from that.`
+            : 'That player URL or iframe is not an approved HTTPS streaming source. Accepted by default: SeekStreaming Embed Link/Embed Code, Dailymotion, Rumble, Vimeo, OK.ru, Dood, StreamWish, Mixdrop, and StreamTape — page links are converted to their embeddable player URL automatically. Add another trusted domain through STREAMING_ALLOWED_HOSTS, or paste the provider’s own <iframe …> embed code. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
           return;
         }
         const result = await applyStreamingManifest({
@@ -5096,6 +5101,60 @@ export async function launchTelegramBot({ config, repository }) {
 
     await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId });
     await ctx.reply(streamImportInstructions(targetAdminId));
+  });
+
+  // ── /repair: re-run today's indexing rules over cards indexed by an older build.
+  // A card is parsed once, when it is written, so a rule shipped later never reaches
+  // the cards published before it. This is the one command that catches the whole
+  // site up after a deploy, without re-uploading a single file.
+  const repairReportText = async ({ dryRun, adminId = null }) => {
+    const report = await repository.reindexContent({ dryRun, adminId });
+    if (adminId && !report.checked) {
+      return `No published catalog post was found for ${adminId}. Use /posts or /postid to find its current ID.`;
+    }
+    const lines = [];
+    lines.push(`▸ ${dryRun ? 'Preview · ' : ''}${report.checked} published card${report.checked === 1 ? '' : 's'} checked — ${report.updated} ${dryRun ? 'would be re-indexed' : 're-indexed'}.`);
+    for (const card of report.cards.slice(0, 10)) {
+      lines.push([
+        `▪ ${cleanText(card.title, 48)} (${card.adminId})`,
+        card.notes.length ? card.notes.join(' · ') : 'index rebuilt',
+        card.unindexed.length ? `${card.unindexed.length} file${card.unindexed.length === 1 ? '' : 's'} still unnumbered` : null
+      ].filter(Boolean).join(' — '));
+    }
+    if (report.cards.length > 10) lines.push(`▪ +${report.cards.length - 10} more card${report.cards.length - 10 === 1 ? '' : 's'} not listed here.`);
+    const seasonWord = report.seasonPacks
+      ? ` ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} on these cards ${report.seasonPacks === 1 ? 'is' : 'are'} filed by season, and`
+      : ' and';
+    lines.push(report.updated
+      ? `▪ Nothing was dropped${seasonWord} ${report.unindexed} file${report.unindexed === 1 ? ' has' : 's have'} no episode number at all.${dryRun ? ' Re-send those with a caption like “Ep 12” only if a number was really missed.' : ' They stay in the card’s file list and are delivered as files.'}`
+      : `▪ Every card already matches the indexing rules in this build${report.seasonPacks ? `, including ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} filed by season` : ''}. Nothing was written.`);
+    lines.push('Titles, Post IDs, slugs, posters, players, delivery links, and announcement messages were not touched, and no file was re-uploaded.');
+    if (dryRun && report.updated) lines.push('To apply it: /repair go');
+    if (dryRun && !report.updated) lines.push('To apply it anyway: /repair go');
+    return lines.join('\n').slice(0, 3_800);
+  };
+
+  bot.command('repair', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.reindexContent !== 'function') {
+      await ctx.reply('Re-indexing is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 60).trim();
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    if (!targetAdminId && argument && !/^(?:go|run|apply|all|preview|check)$/i.test(argument)) {
+      await ctx.reply([
+        'Usage:',
+        '/repair — shows what today’s rules would change, writes nothing',
+        '/repair go — applies it to every published card',
+        '/repair SB-0123ABCDEF — re-indexes that one card now',
+        'A card is indexed when it is published, so a rule added later never reaches older cards. This is how they catch up after a deploy without re-uploading anything.'
+      ].join('\n'));
+      return;
+    }
+    await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
+    const dryRun = !targetAdminId && (!argument || /^(?:preview|check)$/i.test(argument));
+    await ctx.reply(await repairReportText({ dryRun, adminId: targetAdminId }));
   });
 
   // ── /players: the list view of attached players, with Remove buttons. The

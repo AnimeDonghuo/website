@@ -1,7 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { cleanMediaName, fileReplacementKey, repairEpisodeGaps, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -565,6 +565,52 @@ function normalizeContent(input) {
   };
 }
 
+/**
+ * Fields an episode index is made of. Everything here is derived from the stored file
+ * records, so re-running the current rules over a card reproduces exactly what a fresh
+ * upload of the same files would have produced — and nothing a publisher typed by hand
+ * (title, languages, poster, players, announcement references, delivery identity) is
+ * touched. This is what `/repair` writes.
+ */
+const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery'];
+
+/**
+ * Re-derive a stored card's episode index with today's parsing rules.
+ *
+ * A card is indexed once, when it is written, so a rule shipped later — a filename
+ * pattern that now yields a number, complete-season files that are now filed by season
+ * instead of dropped — never reaches the cards published before it. Rather than ask a
+ * publisher to re-upload a season, this runs the record back through the same
+ * `normalizeContent` a fresh post goes through and reports what moved.
+ */
+export function reindexContentRecord(content) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content, changed: false, patch: {}, notes: [], unindexed: [], seasonPacks: 0 };
+  }
+  const rebuilt = normalizeContent({ ...clone(content), updatedAt: content.updatedAt, publishedAt: content.publishedAt });
+  const patchFields = {};
+  const notes = [];
+  for (const field of REINDEX_FIELDS) {
+    if (JSON.stringify(rebuilt[field] ?? null) === JSON.stringify(content[field] ?? null)) continue;
+    patchFields[field] = rebuilt[field];
+    if (field === 'episodeCount') notes.push(`episodes ${(Number(content.episodeCount) || 0)} → ${(Number(rebuilt.episodeCount) || 0)}`);
+    else if (field === 'episodeGroups') notes.push(`${(Array.isArray(content.episodeGroups) || []).length} → ${(rebuilt.episodeGroups || []).length} index blocks`);
+    else if (field === 'files') notes.push(`${(content.files || []).length} file records re-parsed`);
+    else if (field === 'releaseLabel') notes.push(`label “${content.releaseLabel || '—'}” → “${rebuilt.releaseLabel || '—'}”`);
+  }
+  const files = Array.isArray(patchFields.files) ? patchFields.files : (Array.isArray(content.files) ? content.files : []);
+  const unindexed = files.filter((file) => !hasEpisodeRange(file) && !seasonPackOf(file)).map((file) => file?.name || file?.displayName || 'unnamed file');
+  const seasonPacks = files.filter((file) => seasonPackOf(file)).length;
+  return {
+    content: Object.keys(patchFields).length ? { ...content, ...patchFields } : content,
+    changed: Boolean(Object.keys(patchFields).length),
+    patch: patchFields,
+    notes,
+    unindexed,
+    seasonPacks
+  };
+}
+
 export class MemoryCatalogRepository {
   constructor(seed = demoContent) {
     this.kind = 'memory';
@@ -753,6 +799,24 @@ export class MemoryCatalogRepository {
     Object.assign(saved, contentMetadataPatch(saved, patch));
     this.contents.set(saved.slug, saved);
     return clone(saved);
+  }
+
+  async reindexContent({ dryRun = false, limit = 5_000, adminId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [], unindexed: 0, seasonPacks: 0 };
+    for (const [slug, saved] of [...this.contents.entries()]) {
+      if (wanted && saved.adminId !== wanted) continue;
+      if (report.checked >= Math.max(1, Number(limit) || 5_000)) break;
+      report.checked += 1;
+      const result = reindexContentRecord(saved);
+      report.seasonPacks += result.seasonPacks;
+      report.unindexed += result.unindexed.length;
+      if (!result.changed) continue;
+      if (!dryRun) this.contents.set(slug, { ...result.content, updatedAt: new Date().toISOString() });
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
+    }
+    return report;
   }
 
   async createContent(input) {
@@ -1737,6 +1801,28 @@ export class MongoCatalogRepository {
       { $set: contentMetadataPatch(content, patch) },
       { returnDocument: 'after', includeResultMetadata: false }
     );
+  }
+
+  async reindexContent({ dryRun = false, limit = 5_000, adminId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [], unindexed: 0, seasonPacks: 0 };
+    const cursor = this.contents.find(wanted ? { adminId: wanted } : {}, { limit: Math.max(1, Number(limit) || 5_000) });
+    for await (const saved of cursor) {
+      report.checked += 1;
+      const result = reindexContentRecord(saved);
+      report.seasonPacks += result.seasonPacks;
+      report.unindexed += result.unindexed.length;
+      if (!result.changed) continue;
+      if (!dryRun) {
+        await this.contents.updateOne(
+          { _id: saved._id },
+          { $set: { ...result.patch, updatedAt: new Date().toISOString() } }
+        );
+      }
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
+    }
+    return report;
   }
 
   async createContent(input) {

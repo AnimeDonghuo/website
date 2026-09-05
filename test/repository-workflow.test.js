@@ -365,3 +365,68 @@ test('a different audio language of one episode is a separate delivery slot', as
   }]);
   assert.deepEqual(merged.files.map((file) => file.storageMessageId), [1, 2]);
 });
+
+test('a card indexed by an older build catches up without re-uploading', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'Long March',
+    category: 'donghua',
+    files: [
+      { storageMessageId: 1, name: 'Long.March.S01E01.1080p.WEB-DL.mkv' },
+      { storageMessageId: 2, name: 'Long.March.S01E02.1080p.WEB-DL.mkv' }
+    ],
+    stream: {
+      provider: 'SeekStreaming',
+      entries: [{ label: 'Seek', embedUrl: 'https://soraboxs.embedseek.com/#one', episode: { start: 1, end: 1, label: 'Episode 01' } }],
+      updatedAt: new Date().toISOString()
+    }
+  });
+
+  // Exactly what a card looks like when it was published before today's rules: the
+  // file records carry no number and the index is empty.
+  const saved = repository.contents.get(created.slug);
+  saved.files = saved.files.map((file) => ({ ...file, episode: undefined }));
+  saved.episodeGroups = [];
+  saved.episodeCount = 0;
+
+  const preview = await repository.reindexContent({ dryRun: true });
+  assert.equal(preview.checked, 1);
+  assert.equal(preview.updated, 1, 'the preview sees the difference');
+  assert.match(preview.cards[0].notes.join(' · '), /episodes 0 → 2/);
+  const untouched = await repository.findContentByAdminId(created.adminId);
+  assert.equal(untouched.episodeCount, 0, 'a preview writes nothing');
+
+  const applied = await repository.reindexContent({});
+  assert.equal(applied.updated, 1);
+  const fixed = await repository.findContentByAdminId(created.adminId);
+  assert.deepEqual(fixed.episodeGroups.map((group) => group.label), ['Episode 01', 'Episode 02']);
+  assert.equal(fixed.episodeCount, 2);
+  // nothing a publisher chose is disturbed by re-indexing
+  assert.equal(fixed.slug, created.slug);
+  assert.equal(fixed.adminId, created.adminId);
+  assert.equal(fixed.shareCode, created.shareCode);
+  assert.equal(fixed.stream.entries.length, 1);
+  assert.equal(fixed.stream.entries[0].embedUrl, 'https://soraboxs.embedseek.com/#one');
+
+  const again = await repository.reindexContent({});
+  assert.equal(again.updated, 0, 'a second run has nothing left to do');
+
+  const one = await repository.reindexContent({ adminId: 'SB-NOSUCHCARD' });
+  assert.equal(one.checked, 0);
+});
+
+test('complete-season files are counted as seasons, not as files that lost a number', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const created = await repository.createContent({
+    title: 'The Simpsons',
+    category: 'cartoon',
+    files: [
+      { storageMessageId: 10, name: 'The.Simpsons.S01.1080p.DSNP.WEBRip.mkv' },
+      { storageMessageId: 11, name: 'The.Simpsons.S02.1080p.DSNP.WEBRip.mkv' },
+      { storageMessageId: 12, name: 'scanned poster artwork.zip' }
+    ]
+  });
+  const report = await repository.reindexContent({ dryRun: true });
+  assert.equal(report.seasonPacks, 2, 'two whole seasons are on the card');
+  assert.equal(report.unindexed, 1, 'only the scan is genuinely unnumbered');
+});

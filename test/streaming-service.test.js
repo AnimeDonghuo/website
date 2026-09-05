@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingUrl } from '../src/server/services/streaming-service.js';
+import { embeddablePlayerUrl, mergeStreamingEntries, oneClickDownloadHost, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingUrl, streamServerName } from '../src/server/services/streaming-service.js';
 
 test('manual JSON streaming manifests accept authorized SeekStreaming players and episode data', () => {
   const result = parseStreamingManifest(JSON.stringify({
@@ -145,4 +145,58 @@ test('a pasted Rumble or Dailymotion list keeps every link, and players can be d
   assert.equal(cleared.removed, 3);
   assert.equal(cleared.stream, null);
   assert.equal(removeStreamingEntries(stream, { indexes: [9] }).removed, 0);
+});
+
+test('Vimeo, OK.ru, and Rumble page links become the frame that actually plays', () => {
+  const embed = (value) => embeddablePlayerUrl(value);
+
+  assert.deepEqual(embed('https://vimeo.com/76979871'), {
+    embedUrl: 'https://player.vimeo.com/video/76979871',
+    watchUrl: 'https://vimeo.com/76979871'
+  });
+  assert.equal(embed('https://vimeo.com/channels/staffpicks/76979871').embedUrl, 'https://player.vimeo.com/video/76979871');
+  assert.equal(embed('https://vimeo.com/album/4321/video/76979871').embedUrl, 'https://player.vimeo.com/video/76979871');
+  // a pasted player URL is kept whole, because the h= token is what lets an
+  // embed-only or privacy-protected video play at all
+  assert.equal(embed('https://player.vimeo.com/video/76979871?h=AbC123').embedUrl, 'https://player.vimeo.com/video/76979871?h=AbC123');
+  assert.equal(embed('https://vimeo.com/manage/videos/76979871').embedUrl, null, 'an admin page is not a video link');
+
+  assert.deepEqual(embed('https://ok.ru/video/5145652956508'), {
+    embedUrl: 'https://ok.ru/videoembed/5145652956508',
+    watchUrl: 'https://ok.ru/video/5145652956508'
+  });
+  assert.equal(embed('https://ok.ru/videoembed/5145652956508').embedUrl, 'https://ok.ru/videoembed/5145652956508');
+  // a live broadcast has no embed path, so it stays an external link instead of a
+  // frame that would sit there black forever
+  const live = embed('https://ok.ru/live/1530522920786');
+  assert.equal(live.embedUrl, null);
+  assert.equal(live.watchUrl, 'https://ok.ru/live/1530522920786');
+
+  // Rumble's own Share code carries a publisher token that no page link contains,
+  // so it is stored verbatim instead of being rebuilt into the short form
+  const share = 'https://rumble.com/embedJS/u3385.v7exnu4/?url=https%3A%2F%2Frumble.com%2Fv7exnu4-x.html';
+  assert.equal(embed(share).embedUrl, share);
+  assert.equal(embed(share).watchUrl, 'https://rumble.com/v7exnu4.html');
+  assert.equal(embed('https://rumble.com/embed/v7exnu4.01/').embedUrl, 'https://rumble.com/embed/v7exnu4.01/');
+  assert.equal(embed('https://rumble.com/v7exnu4-some-title.html').embedUrl, 'https://rumble.com/embed/v7exnu4/');
+
+  // a file host that publishes its own embed path needs no rewriting at all
+  assert.equal(embed('https://dood.pm/f/abc123xyz').embedUrl, 'https://dood.pm/f/abc123xyz');
+  assert.equal(streamServerName('https://ok.ru/videoembed/1'), 'OK.ru server');
+  assert.equal(streamServerName('https://player.vimeo.com/video/1'), 'Vimeo server');
+  assert.equal(streamServerName('https://streamwish.to/f/1'), 'StreamWish server');
+  assert.equal(streamServerName('https://streamtape.com/e/1'), 'StreamTape server');
+});
+
+test('approved hosts enter the allow-list and the frame policy, one-click hosts do not', () => {
+  assert.equal(safeStreamingUrl('https://dood.pm/f/abc123'), 'https://dood.pm/f/abc123');
+  assert.equal(safeStreamingUrl('https://player.vimeo.com/video/76979871'), 'https://player.vimeo.com/video/76979871');
+  assert.equal(safeStreamingUrl('https://ok.ru/videoembed/5145652956508'), 'https://ok.ru/videoembed/5145652956508');
+  assert.equal(safeStreamingUrl('https://some-random-player.example/f/1'), null);
+
+  assert.equal(oneClickDownloadHost('https://mega.nz/file/abcd#frag'), 'mega.nz');
+  assert.equal(oneClickDownloadHost('https://www.gofile.io/d/abc'), 'gofile.io');
+  assert.equal(oneClickDownloadHost('https://abyss.to/file/abc'), 'abyss.to');
+  assert.equal(oneClickDownloadHost('<iframe src="https://dood.pm/f/abc" allowfullscreen></iframe>'), null);
+  assert.equal(oneClickDownloadHost('not a url'), null);
 });
