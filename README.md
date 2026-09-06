@@ -485,10 +485,15 @@ A file copied into the database channel keeps the caption it arrived with, and a
 
 - nothing is invented: each message is set to the exact label this catalog already stored for it, so running the sweep twice is safe (Telegram answers `message is not modified`, which counts as already clean);
 - a message whose record carries no caption is skipped rather than given one, and a label that still looks promotional is sanitized on the way out instead of being written raw;
+- a file post saved before the catalog tracked which channel it went to is still reachable: its message ID is resolved through `TELEGRAM_STORAGE_CHANNEL_ID` (and the 18+ channel for adult cards), exactly the way `/batch` reaches it. Without that, an old database looked empty to the sweep — which is what `/sync db` reported while `/batch` kept cleaning the same messages;
+- the preview names what it refused to touch, so "nothing to clean" and "300 file posts stored only a filename" are different answers: no caption (read back by `/batch` instead), no channel, still promotional, and the per-run cap;
 - **a bot can only edit its own messages.** A post written by a human account or another bot is reported as uneditable and then remembered as such, so the next sweep spends no call on it — edit those in the channel yourself, or upload through this bot so the copy is clean from the start;
 - one edit per `ANNOUNCEMENT_SYNC_SPACING_MS`, a `429` waited out and retried, and a caption that never gets through reported to the publisher chat rather than dropped.
 
-`/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone.
+- only a refusal that can never change is remembered. "That is not your message" is cached so the next sweep spends no call on it, while a flood wait or a missing admin right stays a real leftover that is retried and reported. **`/sync db retry`** forgets the cache, for after the bot's rights change or a file is re-uploaded through it;
+- one run touches `STORAGE_CAPTION_SWEEP_LIMIT` messages (80 by default), newest card first, so a large archive is walked a set at a time instead of being abandoned mid-way.
+
+`/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone. A file post whose record never stored a caption can only be cleaned where the caption can be read back from Telegram — which is what `/batch` does while it inspects a message, and the sweep says so rather than claiming it fixed them.
 
 `/batch`, `/lang`, `/category`, `/poster`, `/merge`, and `/repair go` all queue through the same lane, so a bulk command answers its own reply instead of spending a minute editing a channel; the deletion of absorbed posts' announcements does the same, which is why a merge can no longer be spoiled by a channel that will not answer.
 

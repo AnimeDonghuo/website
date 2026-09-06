@@ -4,6 +4,7 @@ import { beforeEach, test } from 'node:test';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import {
   announcementSyncStatus,
+  clearStorageCaptionBlockers,
   listStorageCaptionBlockers,
   listStorageCaptionTargets,
   queueStorageCaptionScrub,
@@ -168,4 +169,106 @@ test('the note and the preview tell the truth about what a sweep touches', async
   assert.match(applied, /One edit per 1\.1s on the announcement lane/);
   assert.match(applied, /safe to run twice/);
   assert.ok(!applied.includes('/sync db SB-0123ABCDEF for one card'), 'a single-card run has nothing left to name');
+});
+
+test('a file post saved before the channel was tracked is still reachable', async () => {
+  const legacy = new MemoryCatalogRepository([
+    {
+      slug: 'bleach',
+      title: 'Bleach',
+      category: 'anime',
+      // exactly what an old record looks like: a storage message ID and no channel of its own
+      files: [{ name: 'Bleach.007.mkv', sourceLabel: 'Bleach 007 Hindi 1080p', storageMessageId: 300 }]
+    },
+    {
+      slug: 'private',
+      title: 'Grown Only',
+      category: 'adult',
+      files: [{ name: 'Grown.001.mkv', sourceLabel: 'Grown Only 01', storageMessageId: 400 }]
+    }
+  ]);
+  await legacy.init();
+
+  const bare = await listStorageCaptionTargets(legacy, {});
+  assert.deepEqual(bare.targets, [], 'with no database channel configured there is genuinely nothing to address');
+  assert.equal(bare.stats.noChannel, 2);
+
+  const configured = await listStorageCaptionTargets(legacy, {
+    config: { telegram: { storageChannelId: '-100db', adultStorageChannelId: '-100adult' } }
+  });
+  assert.deepEqual(configured.targets.map((entry) => `${entry.channel}:${entry.messageId}`).sort(), ['-100adult:400', '-100db:300'], 'each category resolves to its own database channel, the way /batch does');
+  assert.equal(configured.stats.legacyChannel, 2);
+  assert.equal(configured.targets.find((entry) => entry.messageId === 300).legacyChannel, true);
+
+  const preview = storageScrubPreviewText({ targets: configured.targets, cards: 2, stats: configured.stats });
+  assert.match(preview, /2 of them are a file post saved before the catalog tracked which channel it went to — resolved through the configured database channel, the same way \/batch reaches them/);
+
+  const unaddressable = storageScrubPreviewText({ targets: bare.targets, cards: 0, stats: bare.stats });
+  assert.match(unaddressable, /name no database channel and TELEGRAM_STORAGE_CHANNEL_ID is not configured for them/);
+});
+
+test('what a sweep could not use is named rather than left unexplained', async () => {
+  const repository = new MemoryCatalogRepository([
+    {
+      slug: 'show',
+      title: 'Show',
+      category: 'anime',
+      files: [
+        { name: 'Show.001.mkv', sourceLabel: 'Show.001.mkv', storageMessageId: 11, storageChannelId: '-100db' },
+        { name: 'Show.002.mkv', sourceLabel: 'Show 002 clean label', storageMessageId: 12, storageChannelId: '-100db' }
+      ]
+    }
+  ]);
+  await repository.init();
+
+  const listed = await listStorageCaptionTargets(repository, { limit: 1 });
+  assert.equal(listed.targets.length, 1);
+  assert.equal(listed.stats.withoutCaption, 1, 'a file post that only ever had a filename is reported, not silently dropped');
+  assert.equal(listed.stats.capped, true, 'and a run that hit its cap says so');
+
+  const preview = storageScrubPreviewText({ targets: listed.targets, cards: 1, stats: listed.stats });
+  assert.match(preview, /1 file post stored only a filename, so there is no caption to write back/);
+  assert.match(preview, /\/batch cleans it while inspecting each message/);
+  assert.match(preview, /The list is capped at 1 message per run/);
+  assert.match(storageScrubPreviewText({ targets: listed.targets, cards: 1, stats: listed.stats, apply: true }), /This run is capped at 1 message; \/sync db go again for the next set/);
+});
+
+test('only a refusal that can never change is remembered, and retry forgets it', async () => {
+  const calls = [];
+  const telegram = {
+    async editMessageCaption(chatIdArg, messageIdArg) {
+      calls.push(messageIdArg);
+      if (messageIdArg === 95) throw error('Forbidden: bots can only edit their own messages');
+      if (messageIdArg === 97) throw error('Too Many Requests: retry after 3', 3);
+      if (messageIdArg === 98) throw error('Forbidden: bot is not a member of the channel');
+      return {};
+    }
+  };
+  const options = { spacingMs: 0, wait: async () => {}, attempts: 1 };
+  const first = await scrubStorageCaptions({
+    telegram,
+    targets: [target({ messageId: 95 }), target({ messageId: 97 }), target({ messageId: 98 })],
+    options
+  });
+  assert.equal(first.blocked, 1, 'a message that belongs to another sender is a permanent answer');
+  assert.equal(first.failed, 2, 'a flood wait and a missing admin right are not — they are real leftovers');
+  assert.deepEqual(listStorageCaptionBlockers().map((entry) => entry.key), ['-100db:95']);
+  assert.match(storageScrubNote(first), /1 not editable by a bot \(sent by another account\)/);
+  assert.match(storageScrubNote(first), /2 refused by Telegram, still queued for a later round/);
+
+  calls.length = 0;
+  const again = await scrubStorageCaptions({
+    telegram,
+    targets: [target({ messageId: 95 }), target({ messageId: 98 })],
+    options
+  });
+  assert.deepEqual(calls, [98], 'the refused message costs nothing next time, the fixable one is tried again');
+  assert.equal(again.blocked, 1);
+
+  assert.equal(clearStorageCaptionBlockers(), 1, 'retry reports what it forgot');
+  assert.deepEqual(listStorageCaptionBlockers(), [], 'and the cache is genuinely empty after it');
+  calls.length = 0;
+  await scrubStorageCaptions({ telegram, targets: [target({ messageId: 95 })], options });
+  assert.deepEqual(calls, [95], 'after a retry the message is attempted again, because the bot may have been made an editor since');
+  assert.deepEqual(listStorageCaptionBlockers().map((entry) => entry.key), ['-100db:95'], 'a refusal that happens again is remembered again, not forgiven forever');
 });

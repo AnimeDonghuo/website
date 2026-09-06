@@ -2026,7 +2026,11 @@ export async function scrubStorageCaptions({ telegram, targets = [], options = {
         const description = cleanText(error?.description || error?.message, 200);
         if (/message is not modified/i.test(description)) { applied = 'unchanged'; break; }
         if (/no caption|message to edit not found|not found|already deleted|message to edit/i.test(description)) { applied = 'gone'; break; }
-        if (/edit|rights|permissions|forbidden|unauthorized/i.test(description) && !/too many requests|flood/i.test(description)) {
+        // Only "this is not your message" is permanent: a missing admin right or a channel the
+        // bot was removed from is a configuration problem the publisher can fix, so it stays a
+        // failure the lane retries and reports instead of being quietly remembered.
+        if (/own messages|can'?t edit|cannot edit|not allowed to edit|only edit its own|edit messages sent/i.test(description)
+          && !/too many requests|flood/i.test(description)) {
           applied = 'blocked';
           storageCaptionBlockers.set(key, description || 'Telegram refused the edit');
           break;
@@ -2071,10 +2075,35 @@ export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId 
   });
 }
 
-export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT } = {}) {
-  if (typeof repository?.listStorageCaptionTargets !== 'function') return { targets: [], available: false };
-  const targets = await repository.listStorageCaptionTargets({ adminId, limit });
-  return { targets: Array.isArray(targets) ? targets : [], available: true, blocked: storageCaptionBlockers.size };
+/**
+ * The sweep's inputs, read the way `/batch` reads them.
+ *
+ * The channel a file lives in is resolved from the catalog *and* from the configuration, so a
+ * record published before per-file channel tracking still gets its caption cleaned — that was
+ * the whole complaint about `/sync db` finding nothing on an old database.
+ */
+export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT, config = null } = {}) {
+  if (typeof repository?.listStorageCaptionTargets !== 'function') return { targets: [], available: false, stats: null, blocked: 0 };
+  const listed = await repository.listStorageCaptionTargets({
+    adminId,
+    limit,
+    storageChannelId: cleanText(config?.telegram?.storageChannelId, 80) || null,
+    adultStorageChannelId: cleanText(config?.telegram?.adultStorageChannelId, 80) || null
+  });
+  const targets = Array.isArray(listed?.targets) ? listed.targets : (Array.isArray(listed) ? listed : []);
+  return { targets, available: true, stats: listed?.stats || null, blocked: storageCaptionBlockers.size };
+}
+
+/**
+ * Forget the messages Telegram refused to edit. A refusal is remembered so a sweep does not
+ * spend the lane on a post this bot will never own, but that cache must be escapable — after
+ * the bot is made an editor, or after a message is re-uploaded through it, the old answer is
+ * no longer the truth.
+ */
+export function clearStorageCaptionBlockers() {
+  const cleared = storageCaptionBlockers.size;
+  storageCaptionBlockers.clear();
+  return cleared;
 }
 
 export function storageScrubNote(result, { blocked = 0 } = {}) {
@@ -2104,6 +2133,7 @@ export function storageScrubPreviewText({
   targets = [],
   cards = 0,
   blocked = 0,
+  stats = null,
   apply = false,
   single = false,
   spacingMs = ANNOUNCEMENT_SYNC_SPACING_MS
@@ -2120,14 +2150,34 @@ export function storageScrubPreviewText({
   if (blocked) {
     lines.push(`▪ ${plural(blocked, 'message')} ${blocked === 1 ? 'was' : 'were'} refused before because this bot did not send ${blocked === 1 ? 'it' : 'them'}. Telegram only lets a bot edit its own messages, so those captions stay as their sender wrote them — the website label is already clean either way.`);
   }
+  if (stats?.legacyChannel) {
+    lines.push(`▪ ${stats.legacyChannel} of them ${stats.legacyChannel === 1 ? 'is' : 'are'} a file post saved before the catalog tracked which channel it went to — resolved through the configured database channel, the same way /batch reaches them.`);
+  }
+  if (stats?.withoutCaption) {
+    lines.push(`▪ ${stats.withoutCaption} file post${stats.withoutCaption === 1 ? '' : 's'} stored only a filename, so there is no caption to write back${stats.withoutCaption === 1 ? '' : 's'}. /batch cleans ${stats.withoutCaption === 1 ? 'it' : 'them'} while inspecting each message, because there it reads the caption from Telegram instead of from the record.`);
+  }
+  if (stats?.noChannel) {
+    lines.push(`▪ ${stats.noChannel} file post${stats.noChannel === 1 ? '' : 's'} name no database channel and TELEGRAM_STORAGE_CHANNEL_ID is not configured for ${stats.noChannel === 1 ? 'it' : 'them'}, so there is nothing to address.`);
+  }
+  if (stats?.unsanitized) {
+    lines.push(`▪ ${stats.unsanitized} stored label${stats.unsanitized === 1 ? '' : 's'} still carr${stats.unsanitized === 1 ? 'ies' : 'y'} promotion text and were not written back — a sweep never pushes a handle into a channel.`);
+  }
   if (!count) {
     lines.push(blocked
-      ? 'Nothing else can be done from here: the captions that remain are posts a bot is not allowed to edit. Delete or edit those in the channel yourself, or upload through this bot so the copy it stores is clean from the start.'
+      ? 'Nothing else can be done from here: the captions that remain are posts a bot is not allowed to edit. Delete or edit those in the channel yourself, or upload through this bot so the copy it stores is clean from the start. /sync db retry forgets them if that changes.'
       : 'Every database-channel caption this bot sent already reads exactly as the catalog stores it, so there is nothing to send.');
   } else if (apply) {
     const minutes = Math.max(1, Math.ceil((count * spacingMs) / 60_000));
     lines.push(`▪ One edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — roughly ${plural(minutes, 'minute')} of sending. No file is re-uploaded and nothing is invented: each message is set to the exact label the catalog stored for it, so a sweep is safe to run twice.`);
+    if (stats?.capped) {
+      lines.push(`▪ This run is capped at ${plural(count, 'message')}; /sync db go again for the next set, or raise STORAGE_CAPTION_SWEEP_LIMIT for a longer sweep.`);
+    }
   } else {
+    if (stats?.capped) {
+      // A preview that quietly stops at the cap would read like the whole archive, which is
+      // how a sweep ends up looking like "it only did some of them".
+      lines.push(`▪ The list is capped at ${plural(count, 'message')} per run, so an archive is walked a set at a time (STORAGE_CAPTION_SWEEP_LIMIT).`);
+    }
     lines.push(`To apply it: /sync db go${single ? '' : `, or /sync db SB-0123ABCDEF for one card`}.`);
   }
   return lines.join('\n').slice(0, 3_900);
@@ -5652,12 +5702,20 @@ export async function launchTelegramBot({ config, repository }) {
       const rest = storageMode[1].trim();
       const storageAdminId = postIdsFromCommand(rest)[0] || null;
       const only = cleanText(rest.replace(/SB-[A-F0-9]{10}/gi, ' '), 40).trim();
+      if (/^(?:retry|reset|forget|clear)$/i.test(only)) {
+        const cleared = clearStorageCaptionBlockers();
+        await ctx.reply(cleared
+          ? `Forgot ${cleared} refused message${cleared === 1 ? '' : 's'}. /sync db lists them again, and /sync db go will try to edit ${cleared === 1 ? 'it' : 'them'} once more.`
+          : 'No caption was remembered as refused, so there is nothing to forget. /sync db lists what can be cleaned.');
+        return;
+      }
       if (only && !/^(?:go|run|apply|all|preview|check)$/i.test(only)) {
         await ctx.reply([
           'Usage:',
           '/sync db — shows which database-channel captions differ from what the catalog stored, changes nothing',
           '/sync db go — rewrites them, one edit at a time',
           '/sync db SB-0123ABCDEF — that card’s captions now',
+          '/sync db retry — forget the messages Telegram refused, so they are tried again',
           'Nothing is re-uploaded and no caption is invented: each message is set to the exact wording the catalog stored for it. A post this bot did not send cannot be edited by any bot, and is listed rather than retried.'
         ].join('\n'));
         return;
@@ -5667,19 +5725,20 @@ export async function launchTelegramBot({ config, repository }) {
         return;
       }
       const storageApply = Boolean(storageAdminId) || /^(?:go|run|apply|all)$/i.test(only);
-      const { targets: storageTargets } = await listStorageCaptionTargets(repository, { adminId: storageAdminId });
+      const { targets: storageTargets, stats: storageStats } = await listStorageCaptionTargets(repository, { adminId: storageAdminId, config });
       const storageCards = new Set(storageTargets.map((entry) => entry.adminId).filter(Boolean)).size;
       if (!storageApply) {
         await ctx.reply(storageScrubPreviewText({
           targets: storageTargets,
           cards: storageCards,
           blocked: listStorageCaptionBlockers().length,
+          stats: storageStats,
           single: Boolean(storageAdminId)
         }));
         return;
       }
       if (!storageTargets.length) {
-        await ctx.reply(storageScrubPreviewText({ targets: [], cards: 0, blocked: listStorageCaptionBlockers().length, apply: true }));
+        await ctx.reply(storageScrubPreviewText({ targets: [], cards: 0, blocked: listStorageCaptionBlockers().length, stats: storageStats, apply: true }));
         return;
       }
       const storageJob = queueStorageCaptionScrub({ telegram: ctx.telegram, targets: storageTargets, notifyChatId: chatId(ctx) });
@@ -5696,7 +5755,7 @@ export async function launchTelegramBot({ config, repository }) {
       }
       if (storageJob) storageJob.catch(() => {});
       await ctx.reply([
-        storageScrubPreviewText({ targets: storageTargets, cards: storageCards, blocked: listStorageCaptionBlockers().length, apply: true }),
+        storageScrubPreviewText({ targets: storageTargets, cards: storageCards, blocked: listStorageCaptionBlockers().length, stats: storageStats, apply: true }),
         '▪ Queued on the lane: this reply is not waiting for it, and a caption Telegram refuses is retried rather than dropped. You hear again only if something never gets through.'
       ].join('\n'));
       return;
