@@ -835,6 +835,9 @@ test('batch import inspects every message in an inclusive private-storage range 
   assert.deepEqual(forwarded.map((entry) => entry.messageId), [10, 11, 12]);
   assert.deepEqual(session.files.map((file) => file.storageMessageId), [10, 12]);
   assert.deepEqual(session.files.map((file) => file.storageChannelId), ['-1002617067511', '-1002617067511']);
+  // The captions are cleaned on the channel lane now, not inline, so the import never waits on
+  // a Telegram limit — drain it to see the work it queued.
+  await announcementLaneDrained();
   assert.deepEqual(captionEdits, [
     { destination: '-1002617067511', messageId: 10, caption: 'Perfect World Episode 01 Hindi 1080p' },
     { destination: '-1002617067511', messageId: 12, caption: 'Perfect World Episode 02 Hindi 720p' }

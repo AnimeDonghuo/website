@@ -154,30 +154,15 @@ function episodeSearchText(episodeGroups = [], episodeCount = 0) {
 }
 
 /**
- * Which database-channel captions this site is able to rewrite, and with what.
+ * Every database-channel message this catalog knows about, as a caption sweep's work list.
  *
- * A caption that arrives from a publisher's channel usually opens with that channel's own
- * @handle. Every file record stores the *sanitized* form of the caption, which is why the
- * website already reads clean while the message sitting in the database channel keeps the
- * promotion prefix it came with. A sweep can therefore write back exactly what was stored,
- * inventing nothing — and a message whose record carries no caption at all is skipped,
- * because a file that never had a caption must not gain one.
- */
-/**
- * Which database-channel captions this site is able to rewrite, and with what.
- *
- * A caption that arrives from a publisher's channel usually opens with that channel's own
- * @handle. Every file record stores the *sanitized* form of the caption, which is why the
- * website already reads clean while the message sitting in the database channel keeps the
- * promotion prefix it came with. A sweep can therefore write back exactly what was stored,
- * inventing nothing — and a message whose record carries no caption at all is skipped,
- * because a file that never had a caption must not gain one.
- *
- * A file ingested before the catalog began persisting the source channel stores no channel
- * id, which must not make it invisible: `/batch` reaches those messages through the
- * configured database channel, so the sweep resolves the same way. `stats` reports what was
- * refused and why, because "nothing to clean" and "eight hundred files with no caption" are
- * different answers to the same question.
+ * Deliberately *not* filtered by what the record kept as a label. A caption that arrives from a
+ * publisher's channel usually opens with that channel's own @handle, and a file record may or
+ * may not have stored the caption at all — a native video upload keeps its file name instead.
+ * So the sweep is handed the message IDs and reads each caption from Telegram itself, the way
+ * /batch reads a message before importing it, rather than trusting what the catalog remembered.
+ * `stats` reports what could not be addressed at all, because "nothing to clean" and "no channel
+ * to look in" need different answers.
  */
 function storageCaptionTargets(records = [], { limit = 80, storageChannelId = null, adultStorageChannelId = null } = {}) {
   const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
@@ -185,13 +170,18 @@ function storageCaptionTargets(records = [], { limit = 80, storageChannelId = nu
   const adultChannel = cleanText(adultStorageChannelId, 80);
   const seen = new Set();
   const targets = [];
-  const stats = { files: 0, noChannel: 0, withoutCaption: 0, unsanitized: 0, legacyChannel: 0, capped: false };
+  const stats = { files: 0, noChannel: 0, legacyChannel: 0, cards: 0, capped: false };
   for (const record of records) {
     if (!record || record.published === false) continue;
+    // A file posted before the catalog began persisting the source channel carries no channel
+    // of its own, which must not make it invisible: /batch reaches those messages through the
+    // configured database channel, so the sweep resolves the same way.
     const fallback = String(record.category || '').trim().toLowerCase() === 'adult'
       ? (adultChannel || normalChannel)
       : normalChannel;
-    for (const file of Array.isArray(record.files) ? record.files : []) {
+    const files = Array.isArray(record.files) ? record.files : [];
+    let fromThisCard = 0;
+    for (const file of files) {
       const messageId = Number(file?.storageMessageId);
       if (!Number.isSafeInteger(messageId) || messageId < 1) continue;
       stats.files += 1;
@@ -199,19 +189,6 @@ function storageCaptionTargets(records = [], { limit = 80, storageChannelId = nu
       const channel = storedChannel || fallback;
       if (!channel) {
         stats.noChannel += 1;
-        continue;
-      }
-      const label = cleanText(file?.sourceLabel, 1_024);
-      const name = cleanText(file?.name, 1_024);
-      // An identical or filename-prefixed label means the record kept the file name, not a
-      // caption — Telegram truncates neither, so this is the only marker there is.
-      if (!label || label === name || label.startsWith(name)) {
-        stats.withoutCaption += 1;
-        continue;
-      }
-      // Never push an unsanitized string back into a channel, whatever the record claims.
-      if (/@[A-Za-z][A-Za-z0-9_]{2,}|https?:\/\/|\bt\.me\//i.test(label)) {
-        stats.unsanitized += 1;
         continue;
       }
       const key = `${channel}:${messageId}`;
@@ -224,14 +201,16 @@ function storageCaptionTargets(records = [], { limit = 80, storageChannelId = nu
         title: cleanText(record.title, 70),
         channel,
         messageId,
-        label,
         ...(legacyChannel ? { legacyChannel: true } : {})
       });
+      fromThisCard += 1;
       if (targets.length >= ceiling) {
         stats.capped = true;
+        stats.cards += 1;
         return { targets, stats };
       }
     }
+    if (fromThisCard) stats.cards += 1;
   }
   return { targets, stats };
 }
@@ -2031,7 +2010,9 @@ export class MongoCatalogRepository {
     const filter = { published: { $ne: false } };
     if (wanted) filter.adminId = wanted;
     const records = await this.contents
-      .find(filter, { projection: { adminId: 1, title: 1, category: 1, publishedAt: 1, 'files.storageMessageId': 1, 'files.storageChannelId': 1, 'files.sourceLabel': 1, 'files.name': 1 } })
+      // Only the message reference is needed: what the caption says is read from Telegram, and
+      // the title and category only exist so the reply can name the card in the publisher's words.
+      .find(filter, { projection: { adminId: 1, title: 1, category: 1, publishedAt: 1, 'files.storageMessageId': 1, 'files.storageChannelId': 1 } })
       .sort({ publishedAt: -1 })
       .limit(Math.max(20, ceiling * 6))
       .toArray();

@@ -1242,24 +1242,6 @@ async function removeBatchPreview(ctx, message) {
   }
 }
 
-async function scrubExistingStorageCaption(ctx, storageChannelId, storageMessageId, message) {
-  const originalCaption = typeof message?.caption === 'string' ? message.caption : '';
-  if (!originalCaption || typeof ctx?.telegram?.editMessageCaption !== 'function') return false;
-  const original = cleanText(originalCaption, 1_024);
-  const caption = cleanStorageCaption(originalCaption);
-  if (caption === original) return false;
-  try {
-    // /batch may inspect messages written by a human or a different bot. Bot
-    // API only allows editing messages owned by this bot, so this is best
-    // effort; regardless of ownership, the catalog file record is sanitized.
-    await ctx.telegram.editMessageCaption(String(storageChannelId), storageMessageId, undefined, caption);
-    return true;
-  } catch (error) {
-    console.info(`[telegram] batch kept an externally owned storage caption ${storageMessageId}; its catalog label is still sanitized.`);
-    return false;
-  }
-}
-
 function batchReasonRecordsLine(label, records, detailFormatter) {
   if (!records.length) return null;
   return `${label} (${records.length}): ${records.map((record) => detailFormatter(record)).join(', ')}`;
@@ -1389,6 +1371,15 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
   const firstMessageId = Number(batch.firstMessageId);
   const lastMessageId = Number(lastLink.messageId);
   const imported = [];
+  const captionQueue = [];
+  const flushCaptionQueue = () => {
+    if (!captionQueue.length) return 0;
+    // splice, not a clear afterwards: the lane starts this job later, and a job handed the same
+    // array the import is still filling would find nothing to do by the time it ran.
+    const queued = captionQueue.splice(0, captionQueue.length);
+    queueStorageCaptionScrub({ telegram: ctx.telegram, targets: queued, notifyChatId: chatId(ctx) }, { detached: true });
+    return queued.length;
+  };
   const skippedByReason = {
     alreadyPublished: [],
     activeDraft: [],
@@ -1441,7 +1432,12 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
       }
 
       const file = fileFromMessage(preview, storageMessageId, 'existing-storage', sourceStorageChannelId);
-      await scrubExistingStorageCaption(ctx, sourceStorageChannelId, storageMessageId, preview);
+      // The caption is fixed on the lane rather than inline. A flood refusal must neither slow
+      // the import nor lose the fix, and the file is usable either way: nothing is created for
+      // it, the message is only edited.
+      if (captionNeedsScrub(preview?.caption)) {
+        captionQueue.push({ channel: sourceStorageChannelId, messageId: storageMessageId, caption: preview.caption, adminId: null });
+      }
       const updated = await repository.appendSessionFile(chatId(ctx), userId(ctx), file);
       if (!updated?.files?.length) throw new Error('The batch session expired while importing files.');
       imported.push(file);
@@ -1489,6 +1485,7 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
     }
     const allAlreadyPublished = skippedByReason.alreadyPublished.length > 0
       && skippedByReason.alreadyPublished.length === lastMessageId - firstMessageId + 1;
+    const queuedBeforeFailure = flushCaptionQueue();
     await replyBatchDiagnostics(ctx, [
       `No supported new media could be imported from messages ${firstMessageId}–${lastMessageId}.`,
       ...diagnostics,
@@ -1496,8 +1493,9 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
         ? 'Every selected message is already linked to an existing catalog post, so no duplicate delivery records were created. Use /posts 50 to see post IDs, remove unwanted old cards with /delete SB-…, then run /batch again to rebuild the range as one post.'
         : failures.length
           ? 'Check that this bot is an administrator in this exact storage channel. Protected/forward-disabled messages cannot be inspected by Telegram and must be uploaded again directly.'
-          : 'No new catalog post was created. Correct the identified messages or links, then run /batch again.'
-    ]);
+          : 'No new catalog post was created. Correct the identified messages or links, then run /batch again.',
+      batchCaptionQueueNote(queuedBeforeFailure)
+    ].filter(Boolean));
     return { imported: 0, skippedByReason, failures };
   }
 
@@ -1518,11 +1516,13 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
     }
   });
 
+  const queuedCaptions = flushCaptionQueue();
   await replyBatchDiagnostics(ctx, [
     `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.`,
     ...diagnostics,
+    batchCaptionQueueNote(queuedCaptions),
     'Matching metadata and publishing now…'
-  ]);
+  ].filter(Boolean));
   const publication = await publish(ctx, bot, repository, config);
   return { imported: imported.length, skippedByReason, failures, publication };
 }
@@ -1721,6 +1721,10 @@ const announcementLane = {
  * free — and a restart re-checks them, in case the bot was made an editor in between.
  */
 const storageCaptionBlockers = new Map();
+// The other half of the same idea: a message that was read and found clean, or just cleaned, is
+// not looked at again in this process, which is what makes running /sync db twice cheap. Forgetting
+// it is /sync db retry.
+const storageCaptionClean = new Set();
 
 export function listStorageCaptionBlockers() {
   return [...storageCaptionBlockers.entries()].map(([key, reason]) => ({ key, reason }));
@@ -1828,6 +1832,7 @@ export function resetAnnouncementLane() {
   // A test that resets the lane also forgets which captions were refused, so each case starts
   // from the same place a freshly deployed process would.
   storageCaptionBlockers.clear();
+  storageCaptionClean.clear();
 }
 
 /**
@@ -1973,27 +1978,52 @@ export async function deleteAnnouncementMessages({ telegram, references, options
 }
 
 /**
- * Write the catalog's stored label back over a database-channel caption.
+ * Whether a caption carries anything the sanitizer would remove.
  *
- * The point is not to invent new text: every file record already keeps the sanitized caption
- * it was ingested with, which is why the website reads cleanly while the message in the
- * channel still opens with the sender's own @handle. So this writes that stored wording, one
- * message at a time, on the same paced lane as the announcements — and a message the bot is
- * not allowed to edit is remembered as such instead of being retried forever.
+ * This is the test `/batch` applies while it inspects a message, and it is what keeps a sweep
+ * from forwarding and re-editing a caption that is already clean.
+ */
+export function captionNeedsScrub(value) {
+  const original = typeof value === 'string' ? cleanText(value, 1_024) : '';
+  if (!original) return false;
+  return cleanStorageCaption(value) !== original;
+}
+
+/**
+ * Clean the caption on a message in the database channel, reading it from Telegram.
+ *
+ * The catalog's own label is deliberately not the source of truth: a file record may have kept
+ * the file name instead of a caption, and a caption edited by hand since would look unchanged
+ * forever. So each message is read the way `/batch` reads it — forwarded once into the
+ * publisher's chat, inspected, deleted again — and only then edited, to exactly the cleaned form
+ * of what Telegram reported. Nothing is composed, no post is created, and a caption that is
+ * already clean costs no edit at all.
+ *
+ * A target may arrive with its `caption` already known, which is what /batch has in hand while
+ * it inspects a file; then the read step is skipped and the edit is the only work.
  */
 export async function scrubStorageCaptions({ telegram, targets = [], options = {} }) {
   const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
   const wait = typeof options.wait === 'function' ? options.wait : pause;
   const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
   const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
+  // Never forward to look at a message inside the very channel being cleaned: an automation
+  // context is the storage channel itself, and a "preview" there would be another channel post.
+  const inspectChatId = options.inspectChatId === null || options.inspectChatId === undefined
+    ? null
+    : String(options.inspectChatId);
   const list = Array.isArray(targets) ? targets : [];
   const result = {
     updated: 0,
     unchanged: 0,
+    alreadyClean: 0,
+    knownClean: 0,
+    noCaption: 0,
+    unreadable: 0,
     gone: 0,
     blocked: 0,
     failed: 0,
-    skipped: 0,
+    inspected: 0,
     messages: list.length,
     retryAfterMs: 0,
     blockedCards: []
@@ -2001,25 +2031,63 @@ export async function scrubStorageCaptions({ telegram, targets = [], options = {
   if (!list.length || !telegram || typeof telegram.editMessageCaption !== 'function') return result;
 
   for (const target of list) {
-    const key = `${target.channel}:${target.messageId}`;
+    const channel = String(target.channel);
+    const messageId = Number(target.messageId);
+    const key = `${channel}:${messageId}`;
     if (storageCaptionBlockers.has(key)) {
       result.blocked += 1;
-      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId: Number(target.messageId) });
+      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId });
       continue;
     }
-    const caption = cleanStorageCaption(target.label);
-    // An empty or still-promotional label is never sent: the sanitizer is the only thing
-    // standing between a channel post and the handle it arrived with.
-    if (!caption || /@[A-Za-z][A-Za-z0-9_]{2,}|https?:\/\//i.test(caption)) {
-      result.skipped += 1;
+    if (storageCaptionClean.has(key)) { result.knownClean += 1; continue; }
+
+    let original = typeof target.caption === 'string' ? target.caption : null;
+    if (original === null) {
+      if (!inspectChatId || inspectChatId === channel || typeof telegram.forwardMessage !== 'function') {
+        // No safe chat to read through. Reported rather than guessed at from the record.
+        result.unreadable += 1;
+        continue;
+      }
+      let preview = null;
+      try {
+        preview = await telegram.forwardMessage(inspectChatId, channel, messageId, { disable_notification: true });
+        result.inspected += 1;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 160);
+        if (/not found|deleted|can'?t be forwarded|protected/i.test(description)) result.unreadable += 1;
+        else result.failed += 1;
+        continue;
+      } finally {
+        // The preview exists only to be read: it is deleted again per message, so the publisher's
+        // chat never accumulates copies of the file post.
+        if (preview?.message_id && typeof telegram.deleteMessage === 'function') {
+          await Promise.resolve(telegram.deleteMessage(inspectChatId, preview.message_id)).catch(() => {});
+        }
+      }
+      original = typeof preview?.caption === 'string' ? preview.caption : '';
+    }
+
+    if (!original) {
+      // A file post with no caption has nothing to sanitize, and is not given one.
+      result.noCaption += 1;
+      storageCaptionClean.add(key);
+      if (spacingMs) await wait(spacingMs);
       continue;
     }
+    const caption = cleanStorageCaption(original);
+    if (!caption || caption === cleanText(original, 1_024)) {
+      result.alreadyClean += 1;
+      storageCaptionClean.add(key);
+      if (spacingMs) await wait(spacingMs);
+      continue;
+    }
+
     let applied = null;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         // telegraf takes (chat_id, message_id, inline_message_id, caption, extra): a storage
         // post is a channel message, so there is no inline id to pass.
-        await telegram.editMessageCaption(String(target.channel), Number(target.messageId), undefined, caption);
+        await telegram.editMessageCaption(channel, messageId, undefined, caption);
         applied = 'updated';
         break;
       } catch (error) {
@@ -2042,28 +2110,33 @@ export async function scrubStorageCaptions({ telegram, targets = [], options = {
         if (spacingMs) await wait(backoff);
       }
     }
-    if (applied === 'updated') { result.updated += 1; announcementLane.totals.captions += 1; }
-    else if (applied === 'unchanged') result.unchanged += 1;
-    else if (applied === 'gone') result.gone += 1;
+    if (applied === 'updated' || applied === 'unchanged') {
+      result[applied] += 1;
+      // Whatever Telegram shows now is the cleaned form, so this process will not look again.
+      storageCaptionClean.add(key);
+    } else if (applied === 'gone') result.gone += 1;
     else if (applied === 'blocked') {
       result.blocked += 1;
-      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId: Number(target.messageId) });
+      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId });
     } else result.failed += 1;
     if (spacingMs) await wait(spacingMs);
   }
+  announcementLane.totals.captions += result.updated;
   announcementLane.totals.refreshed += result.updated;
-  announcementLane.totals.unchanged += result.unchanged;
+  announcementLane.totals.unchanged += result.unchanged + result.alreadyClean;
   announcementLane.totals.failed += result.failed;
   return result;
 }
 
 /**
- * Queue a caption sweep on the announcement lane. The targets are read first so the command's
- * reply can say how many there are; the sending then happens at the lane's own pace, and a
- * refusal that outlives the reply is reported to the publisher instead of being dropped.
+ * Queue a caption sweep on the announcement lane. Targets are read first so a reply can say how
+ * many there are; the work then happens at the lane's own pace, and a refusal that outlives the
+ * reply is reported to the publisher instead of being dropped.
  */
-export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId = null }, options = {}) {
-  const list = Array.isArray(targets) ? targets : [];
+export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId = null, inspectChatId = null }, options = {}) {
+  // Copied, because the caller's list belongs to a loop that is still running: a queued sweep
+  // must see the messages as they were when it was handed over.
+  const list = Array.isArray(targets) ? targets.slice() : [];
   return enqueueAnnouncementJob({
     key: STORAGE_CAPTION_JOB_KEY,
     label: `Database channel captions (${list.length})`,
@@ -2071,19 +2144,16 @@ export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId 
     telegram,
     stuckNote: 'The website labels were already clean — only the messages in the database channel are behind. /sync db lists them again and /sync db go retries the edit.',
     options,
-    run: (inner) => scrubStorageCaptions({ telegram, targets: list, options: inner })
+    run: (inner) => scrubStorageCaptions({ telegram, targets: list, options: { ...inner, inspectChatId } })
   });
 }
 
 /**
- * The sweep's inputs, read the way `/batch` reads them.
- *
- * The channel a file lives in is resolved from the catalog *and* from the configuration, so a
- * record published before per-file channel tracking still gets its caption cleaned — that was
- * the whole complaint about `/sync db` finding nothing on an old database.
+ * The sweep's inputs. A file post is a candidate because the catalog knows its message ID; what
+ * its caption says is read from Telegram, so nothing depends on which label the record kept.
  */
 export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT, config = null } = {}) {
-  if (typeof repository?.listStorageCaptionTargets !== 'function') return { targets: [], available: false, stats: null, blocked: 0 };
+  if (typeof repository?.listStorageCaptionTargets !== 'function') return { targets: [], available: false, stats: null, blocked: 0, clean: 0 };
   const listed = await repository.listStorageCaptionTargets({
     adminId,
     limit,
@@ -2091,21 +2161,27 @@ export async function listStorageCaptionTargets(repository, { adminId = null, li
     adultStorageChannelId: cleanText(config?.telegram?.adultStorageChannelId, 80) || null
   });
   const targets = Array.isArray(listed?.targets) ? listed.targets : (Array.isArray(listed) ? listed : []);
-  return { targets, available: true, stats: listed?.stats || null, blocked: storageCaptionBlockers.size };
+  return { targets, available: true, stats: listed?.stats || null, blocked: storageCaptionBlockers.size, clean: storageCaptionClean.size };
 }
 
 /**
- * Forget the messages Telegram refused to edit. A refusal is remembered so a sweep does not
- * spend the lane on a post this bot will never own, but that cache must be escapable — after
- * the bot is made an editor, or after a message is re-uploaded through it, the old answer is
- * no longer the truth.
+ * Forget what the sweep decided: which messages Telegram refused to edit, and which it read and
+ * found clean. A refusal is remembered so a sweep does not spend the lane on a post this bot will
+ * never own, and a clean message so that re-running the command is cheap — but after the bot's
+ * rights change, or a file is re-uploaded with a new caption, both answers are stale.
  */
-export function clearStorageCaptionBlockers() {
-  const cleared = storageCaptionBlockers.size;
+export function clearStorageCaptionMemory() {
+  const cleared = { blocked: storageCaptionBlockers.size, clean: storageCaptionClean.size };
   storageCaptionBlockers.clear();
+  storageCaptionClean.clear();
   return cleared;
 }
 
+/**
+ * How a sweep reports itself: what it changed, what it read and found already right, and what it
+ * is not allowed to touch. Every outcome is named, because "nothing to clean" and "I could not
+ * read it" must not sound the same to the publisher.
+ */
 export function storageScrubNote(result, { blocked = 0 } = {}) {
   // The caller usually knows how many messages are uneditable from an earlier run, so the
   // count may arrive either on the result or beside it — the report has to say the same thing.
@@ -2113,16 +2189,31 @@ export function storageScrubNote(result, { blocked = 0 } = {}) {
   if (!result?.messages) {
     return blockedTotal
       ? `Nothing left to rewrite: the remaining ${blockedTotal} message${blockedTotal === 1 ? '' : 's'} in the database channel ${blockedTotal === 1 ? 'is' : 'are'} not posts this bot sent, and Telegram only lets a bot edit its own messages.`
-      : 'Nothing to rewrite: every database-channel caption this bot sent already reads exactly as the catalog stores it.';
+      : 'Nothing to rewrite: every database-channel message this catalog knows about was read and already carries a clean caption.';
   }
   const parts = [];
   if (result.updated) parts.push(`${result.updated} caption${result.updated === 1 ? '' : 's'} rewritten`);
-  if (result.unchanged) parts.push(`${result.unchanged} already clean`);
+  if (result.unchanged) parts.push(`${result.unchanged} already carrying it`);
+  if (result.alreadyClean) parts.push(`${result.alreadyClean} read from Telegram and already clean, so nothing was sent`);
+  if (result.noCaption) parts.push(`${result.noCaption} file post${result.noCaption === 1 ? '' : 's'} with no caption at all, left without one`);
+  if (result.unreadable) parts.push(`${result.unreadable} message${result.unreadable === 1 ? '' : 's'} this bot could not read (protected or deleted)`);
+  if (result.inspected) parts.push(`${result.inspected} read through a one-time preview`);
+  if (result.knownClean) parts.push(`${result.knownClean} already checked in this process`);
   if (result.gone) parts.push(`${result.gone} deleted or captionless message${result.gone === 1 ? '' : 's'} left alone`);
-  if (result.skipped) parts.push(`${result.skipped} message${result.skipped === 1 ? '' : 's'} with no stored caption skipped`);
   if (blockedTotal) parts.push(`${blockedTotal} not editable by a bot (sent by another account)`);
   if (result.failed) parts.push(`${result.failed} refused by Telegram, still queued for a later round`);
   return `Database channel: ${parts.length ? parts.join(', ') : 'nothing changed'}.`;
+}
+
+/**
+ * What a bulk import says when it hands its caption fixes to the lane instead of applying them
+ * inline: the release never waits on a channel edit, and a Telegram limit never loses the edit.
+ */
+export function batchCaptionQueueNote(count) {
+  if (!count) return null;
+  const bullet = String.fromCharCode(9642);
+  const dash = String.fromCharCode(8212);
+  return `${bullet} ${count} storage post${count === 1 ? '' : 's'} arrived with an @channel prefix in its caption. The files were imported as usual and nothing new was created for it ${dash} the caption fix is queued on the channel lane, so a Telegram limit delays the edit and never the release. /sync db lists what is left.`;
 }
 
 /**
@@ -2141,7 +2232,7 @@ export function storageScrubPreviewText({
   const count = targets.length;
   const plural = (value, word) => `${value} ${word}${value === 1 ? '' : 's'}`;
   const lines = [
-    `▸ ${apply ? '' : 'Preview · '}${plural(count, 'database-channel message')} on ${plural(cards || new Set(targets.map((entry) => entry.adminId).filter(Boolean)).size, 'card')} ${apply ? 'queued for rewriting' : 'carry a stored label this bot can write back'}.`
+    `▸ ${apply ? '' : 'Preview · '}${plural(count, 'database-channel message')} on ${plural(cards || new Set(targets.map((entry) => entry.adminId).filter(Boolean)).size, 'card')} ${apply ? 'queued for rewriting' : 'listed for a caption check'}.`
   ];
   for (const target of targets.slice(0, 8)) {
     lines.push(`▪ ${target.adminId || 'unlisted card'} · ${cleanText(target.title, 40) || 'untitled'} — message ${Number(target.messageId)}`);
@@ -2153,22 +2244,23 @@ export function storageScrubPreviewText({
   if (stats?.legacyChannel) {
     lines.push(`▪ ${stats.legacyChannel} of them ${stats.legacyChannel === 1 ? 'is' : 'are'} a file post saved before the catalog tracked which channel it went to — resolved through the configured database channel, the same way /batch reaches them.`);
   }
-  if (stats?.withoutCaption) {
-    lines.push(`▪ ${stats.withoutCaption} file post${stats.withoutCaption === 1 ? '' : 's'} stored only a filename, so there is no caption to write back${stats.withoutCaption === 1 ? '' : 's'}. /batch cleans ${stats.withoutCaption === 1 ? 'it' : 'them'} while inspecting each message, because there it reads the caption from Telegram instead of from the record.`);
+  if (count) {
+    lines.push('▪ Each one is read from Telegram first — the same one-time preview /batch uses — so a file whose record kept no caption is still checked, and a caption that is already clean is never sent. Nothing is composed from the catalog: a message is set to the cleaned form of its own caption.');
   }
   if (stats?.noChannel) {
     lines.push(`▪ ${stats.noChannel} file post${stats.noChannel === 1 ? '' : 's'} name no database channel and TELEGRAM_STORAGE_CHANNEL_ID is not configured for ${stats.noChannel === 1 ? 'it' : 'them'}, so there is nothing to address.`);
   }
-  if (stats?.unsanitized) {
-    lines.push(`▪ ${stats.unsanitized} stored label${stats.unsanitized === 1 ? '' : 's'} still carr${stats.unsanitized === 1 ? 'ies' : 'y'} promotion text and were not written back — a sweep never pushes a handle into a channel.`);
+  if (stats?.files) {
+    const cardNote = stats.cards ? ` — ${plural(stats.cards, 'card')} with something to check` : '';
+    lines.push(`▪ ${plural(stats.files, 'file record')} in this catalog point at a database message${cardNote}.`);
   }
   if (!count) {
     lines.push(blocked
       ? 'Nothing else can be done from here: the captions that remain are posts a bot is not allowed to edit. Delete or edit those in the channel yourself, or upload through this bot so the copy it stores is clean from the start. /sync db retry forgets them if that changes.'
-      : 'Every database-channel caption this bot sent already reads exactly as the catalog stores it, so there is nothing to send.');
+      : 'Every database-channel message this catalog knows about was checked and already reads cleanly, so there is nothing to send.');
   } else if (apply) {
     const minutes = Math.max(1, Math.ceil((count * spacingMs) / 60_000));
-    lines.push(`▪ One edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — roughly ${plural(minutes, 'minute')} of sending. No file is re-uploaded and nothing is invented: each message is set to the exact label the catalog stored for it, so a sweep is safe to run twice.`);
+    lines.push(`▪ One read and, if needed, one edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — roughly ${plural(minutes, 'minute')} of sending. No file is re-uploaded and no caption is invented: a message is set to the cleaned form of its own text, so a sweep is safe to run twice and the second run is cheap.`);
     if (stats?.capped) {
       lines.push(`▪ This run is capped at ${plural(count, 'message')}; /sync db go again for the next set, or raise STORAGE_CAPTION_SWEEP_LIMIT for a longer sweep.`);
     }
@@ -2937,7 +3029,16 @@ export async function autoPublishStoragePost(ctx, bot, repository, config, ignor
       throw new Error('The catalog repository does not support persistent automation groups.');
     }
     const file = fileFromMessage(message, storageMessageId, 'direct-storage', config.telegram.storageChannelId);
-    await scrubExistingStorageCaption(ctx, config.telegram.storageChannelId, storageMessageId, message);
+    // The same rule as /batch: the group is collected and published regardless, and the caption
+    // edit waits its turn on the lane. No inspection here — this context is the channel itself,
+    // so a "preview" would be another post in it.
+    if (captionNeedsScrub(message?.caption)) {
+      queueStorageCaptionScrub({
+        telegram: ctx.telegram,
+        targets: [{ channel: config.telegram.storageChannelId, messageId: storageMessageId, caption: message.caption, adminId: null }],
+        notifyChatId: settings?.notifyChatId || settings?.updatedBy || null
+      }, { detached: true });
+    }
     const title = inferBatchTitle([file]) || `Storage media ${storageMessageId}`;
     const category = inferBatchCategory({ title, files: [file] });
     const groupKey = automationGroupKey(title, storageMessageId);
@@ -5703,20 +5804,21 @@ export async function launchTelegramBot({ config, repository }) {
       const storageAdminId = postIdsFromCommand(rest)[0] || null;
       const only = cleanText(rest.replace(/SB-[A-F0-9]{10}/gi, ' '), 40).trim();
       if (/^(?:retry|reset|forget|clear)$/i.test(only)) {
-        const cleared = clearStorageCaptionBlockers();
-        await ctx.reply(cleared
-          ? `Forgot ${cleared} refused message${cleared === 1 ? '' : 's'}. /sync db lists them again, and /sync db go will try to edit ${cleared === 1 ? 'it' : 'them'} once more.`
-          : 'No caption was remembered as refused, so there is nothing to forget. /sync db lists what can be cleaned.');
+        const forgotten = clearStorageCaptionMemory();
+        const total = forgotten.blocked + forgotten.clean;
+        await ctx.reply(total
+          ? `Forgot ${forgotten.blocked} refused message${forgotten.blocked === 1 ? '' : 's'} and ${forgotten.clean} already-clean message${forgotten.clean === 1 ? '' : 's'}. /sync db reads them all again, and /sync db go will try ${total === 1 ? 'it' : 'them'} once more.`
+          : 'Nothing was remembered from an earlier run, so there is nothing to forget. /sync db lists what can be cleaned.');
         return;
       }
       if (only && !/^(?:go|run|apply|all|preview|check)$/i.test(only)) {
         await ctx.reply([
           'Usage:',
-          '/sync db — shows which database-channel captions differ from what the catalog stored, changes nothing',
+          '/sync db — reads the caption on every database-channel file post and shows which carry an @channel prefix; it changes nothing',
           '/sync db go — rewrites them, one edit at a time',
           '/sync db SB-0123ABCDEF — that card’s captions now',
-          '/sync db retry — forget the messages Telegram refused, so they are tried again',
-          'Nothing is re-uploaded and no caption is invented: each message is set to the exact wording the catalog stored for it. A post this bot did not send cannot be edited by any bot, and is listed rather than retried.'
+          '/sync db retry — forget which messages were refused or already clean, so they are read again',
+          'Nothing is re-uploaded and no caption is invented: a message is only ever set to the cleaned form of the caption Telegram reports for it. A post this bot did not send cannot be edited by any bot, and is listed rather than retried.'
         ].join('\n'));
         return;
       }
@@ -5726,6 +5828,8 @@ export async function launchTelegramBot({ config, repository }) {
       }
       const storageApply = Boolean(storageAdminId) || /^(?:go|run|apply|all)$/i.test(only);
       const { targets: storageTargets, stats: storageStats } = await listStorageCaptionTargets(repository, { adminId: storageAdminId, config });
+      // A single card is a small enough job to read and answer in one go; everything else is
+      // queued so the command's reply is never held up by a channel that is rate limiting.
       const storageCards = new Set(storageTargets.map((entry) => entry.adminId).filter(Boolean)).size;
       if (!storageApply) {
         await ctx.reply(storageScrubPreviewText({
@@ -5741,7 +5845,14 @@ export async function launchTelegramBot({ config, repository }) {
         await ctx.reply(storageScrubPreviewText({ targets: [], cards: 0, blocked: listStorageCaptionBlockers().length, stats: storageStats, apply: true }));
         return;
       }
-      const storageJob = queueStorageCaptionScrub({ telegram: ctx.telegram, targets: storageTargets, notifyChatId: chatId(ctx) });
+      // The publisher's own chat is the safe place to forward a message into for inspection,
+      // exactly as /batch does, and the preview is deleted again per message.
+      const storageJob = queueStorageCaptionScrub({
+        telegram: ctx.telegram,
+        targets: storageTargets,
+        notifyChatId: chatId(ctx),
+        inspectChatId: chatId(ctx)
+      });
       if (storageTargets.length <= 3 && storageJob) {
         const storageResult = await storageJob;
         await ctx.reply([

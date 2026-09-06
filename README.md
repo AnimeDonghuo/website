@@ -328,7 +328,7 @@ Useful commands:
 | `/cmd SB-0123ABCDEF del 3` / `del ep 2-7` / `del all` | Remove specific numbered players, every player of an episode range, or all players of that post |
 | `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no title, player, or delivery link is touched; the channel copy of a card that changed is refreshed on the announcement lane |
 | `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, and what Telegram refused stays listed instead of lost |
-| `/sync db` — then `/sync db go` | The database channel on its own: rewrite the caption of each copied file post to the clean label the catalog stored for it, which is what removes a leftover `@channel` prefix from the channel itself |
+| `/sync db` — then `/sync db go` | The database channel on its own: read the caption of every copied file post and rewrite the ones still carrying a `@channel` prefix, which is what clears the leftover from the channel itself |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
 | `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
@@ -481,19 +481,20 @@ So all channel work now runs on **one lane** inside the process:
 
 A file copied into the database channel keeps the caption it arrived with, and a publisher's channel usually opens every one of them with its own `@handle`. The website was never the problem: the catalog stores the *sanitized* label, so file rows and delivery names already read cleanly — but the message sitting in the channel still shows the prefix.
 
-`/sync db` closes that gap, on the same lane and with the same rule as an announcement edit:
+`/sync db` closes that gap the only way that can reach every post: it reads the captions from Telegram itself, on the same lane and with the same rule as an announcement edit.
 
-- nothing is invented: each message is set to the exact label this catalog already stored for it, so running the sweep twice is safe (Telegram answers `message is not modified`, which counts as already clean);
-- a message whose record carries no caption is skipped rather than given one, and a label that still looks promotional is sanitized on the way out instead of being written raw;
-- a file post saved before the catalog tracked which channel it went to is still reachable: its message ID is resolved through `TELEGRAM_STORAGE_CHANNEL_ID` (and the 18+ channel for adult cards), exactly the way `/batch` reaches it. Without that, an old database looked empty to the sweep — which is what `/sync db` reported while `/batch` kept cleaning the same messages;
-- the preview names what it refused to touch, so "nothing to clean" and "300 file posts stored only a filename" are different answers: no caption (read back by `/batch` instead), no channel, still promotional, and the per-run cap;
+- every database message the catalog knows about is a candidate. The work list is built from `files.storageMessageId` alone, so a record that stored only a filename, a caption someone edited by hand afterwards, and a file posted before channels were tracked are all still found;
+- each one is read through the same one-time preview `/batch` uses — forwarded into the publisher's chat, inspected, deleted again — and then edited to exactly the cleaned form of what Telegram reported. Nothing is composed from the catalog, so a caption that is already clean costs no edit and a file post that never had one is left without one instead of being handed a title;
+- a file post saved before the catalog tracked which channel it went to is addressed through `TELEGRAM_STORAGE_CHANNEL_ID` (and the 18+ channel for adult cards), exactly the way `/batch` reaches it. Without that, an old database looked empty to the sweep — which is what `/sync db` reported while `/batch` kept cleaning the same messages;
+- the reply names what it could not reach, so "nothing to clean" and "I could not look" are different answers: messages this bot cannot read at all (a protected channel refuses the preview), posts with no caption, files naming no channel, and the per-run cap;
 - **a bot can only edit its own messages.** A post written by a human account or another bot is reported as uneditable and then remembered as such, so the next sweep spends no call on it — edit those in the channel yourself, or upload through this bot so the copy is clean from the start;
-- one edit per `ANNOUNCEMENT_SYNC_SPACING_MS`, a `429` waited out and retried, and a caption that never gets through reported to the publisher chat rather than dropped.
-
-- only a refusal that can never change is remembered. "That is not your message" is cached so the next sweep spends no call on it, while a flood wait or a missing admin right stays a real leftover that is retried and reported. **`/sync db retry`** forgets the cache, for after the bot's rights change or a file is re-uploaded through it;
+- one read and, if needed, one edit per `ANNOUNCEMENT_SYNC_SPACING_MS`, a `429` waited out and retried, and a caption that never gets through reported to the publisher chat rather than dropped;
+- only a refusal that can never change is remembered. "That is not your message" is cached so the next sweep spends no call on it, while a flood wait or a missing admin right stays a real leftover that is retried and reported. **`/sync db retry`** forgets both caches — the refusals and the already-read-and-clean list — for after the bot's rights change or a file is re-uploaded through it;
 - one run touches `STORAGE_CAPTION_SWEEP_LIMIT` messages (80 by default), newest card first, so a large archive is walked a set at a time instead of being abandoned mid-way.
 
-`/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone. A file post whose record never stored a caption can only be cleaned where the caption can be read back from Telegram — which is what `/batch` does while it inspects a message, and the sweep says so rather than claiming it fixed them.
+`/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone.
+
+`/batch` and the auto-publisher do their share as they go, and never inline: when an inspected file post still carries a prefix, the import hands the same edit to this lane and keeps importing, so a channel that is rate limiting delays a caption and never the release. Nothing is created for the fix — the message is only edited — and the import's reply says how many it handed over, with `/sync db` as the way to read back what is left.
 
 `/batch`, `/lang`, `/category`, `/poster`, `/merge`, and `/repair go` all queue through the same lane, so a bulk command answers its own reply instead of spending a minute editing a channel; the deletion of absorbed posts' announcements does the same, which is why a merge can no longer be spoiled by a channel that will not answer.
 
