@@ -1,11 +1,25 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import zlib from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { slugify } from '../lib/strings.js';
 
 const IMGBB_UPLOAD_URL = 'https://api.imgbb.com/1/upload';
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
+
+// ImgBB answers a burst of uploads with "Rate limit reached", and a bulk publish (a /batch that
+// split into 89 releases, say) is exactly such a burst. So uploads are paced, a limit is waited
+// out inside one call, and identical artwork is hosted once. Every knob is an env because the
+// honest number depends on the plan behind IMGBB_API_KEY.
+function boundedIntegerEnv(name, fallback, minimum, maximum) {
+  const parsed = Number(process.env[name]);
+  return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+const IMGBB_UPLOAD_SPACING_MS = boundedIntegerEnv('IMGBB_UPLOAD_SPACING_MS', 1_600, 0, 60_000);
+const IMGBB_RATE_LIMIT_ATTEMPTS = boundedIntegerEnv('IMGBB_RATE_LIMIT_ATTEMPTS', 3, 1, 8);
+const IMGBB_RATE_LIMIT_BACKOFF_MS = boundedIntegerEnv('IMGBB_RATE_LIMIT_BACKOFF_MS', 20_000, 1_000, 15 * 60_000);
+const POSTER_UPLOAD_CACHE_LIMIT = 400;
 
 export class PosterHostingError extends Error {
   constructor(message, options = {}) {
@@ -13,6 +27,59 @@ export class PosterHostingError extends Error {
     this.name = 'PosterHostingError';
   }
 }
+
+/**
+ * The one hosting failure a release should survive: the image is fine, the host is simply busy.
+ * Everything else (a broken URL, an oversized file, a rejected key) still stops a publish, because
+ * a card with no artwork at all is a different problem that the publisher has to see.
+ */
+export class PosterRateLimitError extends PosterHostingError {
+  constructor(message = 'ImgBB is rate limiting this server.', options = {}) {
+    super(message, options);
+    this.name = 'PosterRateLimitError';
+    this.retryAfterMs = Number(options.retryAfterMs) || null;
+  }
+}
+
+export function isPosterRateLimit(error) {
+  if (!error) return false;
+  if (error.name === 'PosterRateLimitError' || error.status === 429 || error.statusCode === 429) return true;
+  return /rate limit|too many requests|try again later|quota|429|limit exceeded/i.test(String(error.message || error.description || ''));
+}
+
+const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, Math.max(0, Number(ms) || 0)); });
+// Test seam and an operator seam: the pace, the wait used between attempts, and the clock.
+const posterUploadOptions = {
+  spacingMs: IMGBB_UPLOAD_SPACING_MS,
+  attempts: IMGBB_RATE_LIMIT_ATTEMPTS,
+  backoffMs: IMGBB_RATE_LIMIT_BACKOFF_MS,
+  wait: pause,
+  now: () => Date.now()
+};
+export function configurePosterUploadOptions(next = {}) {
+  for (const key of ['spacingMs', 'attempts', 'backoffMs']) {
+    if (next[key] !== undefined) posterUploadOptions[key] = Math.max(0, Number(next[key]) || 0);
+  }
+  if (typeof next.wait === 'function') posterUploadOptions.wait = next.wait;
+  if (typeof next.now === 'function') posterUploadOptions.now = next.now;
+  return { ...posterUploadOptions, wait: undefined, now: undefined };
+}
+
+// Same bytes, one upload. A mixed release split into several cards, or a re-run after a failure,
+// used to send the identical poster to ImgBB again for no reason at all.
+const posterUploadCache = new Map();
+function cachePosterUpload(key, value) {
+  if (!key) return;
+  posterUploadCache.set(key, value);
+  if (posterUploadCache.size > POSTER_UPLOAD_CACHE_LIMIT) posterUploadCache.delete(posterUploadCache.keys().next().value);
+}
+export function clearPosterUploadCache() {
+  const size = posterUploadCache.size;
+  posterUploadCache.clear();
+  return size;
+}
+let lastPosterUploadAt = 0;
+export function resetPosterUploadPace() { lastPosterUploadAt = 0; }
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -384,45 +451,12 @@ export function createFallbackPosterPng(title, category) {
   ]);
 }
 
-export async function uploadImageToImgBB({ buffer, title, apiKey }) {
-  if (!apiKey) {
-    throw new PosterHostingError('IMGBB_API_KEY is not configured. Add it as a server-side Koyeb secret before publishing.');
-  }
-
-  const form = new FormData();
-  form.set('key', apiKey);
-  form.set('name', `${slugify(title).slice(0, 56)}-poster`);
-  form.set('image', buffer.toString('base64'));
-
-  let response;
-  try {
-    response = await fetch(IMGBB_UPLOAD_URL, {
-      method: 'POST',
-      body: form,
-      signal: AbortSignal.timeout(30_000)
-    });
-  } catch (error) {
-    throw new PosterHostingError('ImgBB could not be reached. Please try publishing again.', { cause: error });
-  }
-
-  let body;
-  try {
-    body = await response.json();
-  } catch {
-    throw new PosterHostingError('ImgBB returned an unexpected response.');
-  }
-
-  if (!response.ok || !body?.success || !body?.data?.url) {
-    throw new PosterHostingError(body?.error?.message || 'ImgBB did not accept the poster.');
-  }
-
-  return {
-    url: body.data.display_url || body.data.url,
-    providerId: body.data.id || null
-  };
-}
-
-export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, title, category, config }) {
+/**
+ * Fetch (or generate) the artwork that is about to be hosted. Kept apart from the upload so a
+ * rate-limited host can be retried later with the same image in hand, without asking the publisher
+ * to re-send anything.
+ */
+export async function preparePosterImage({ sourceUrl = null, sourceIsManual = false, title, category } = {}) {
   let image = null;
   let originalUrl = null;
   let usedFallback = false;
@@ -447,16 +481,108 @@ export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, t
     };
   }
 
+  return {
+    buffer: image.buffer,
+    contentType: image.contentType,
+    sourceUrl: originalUrl,
+    usedFallback
+  };
+}
+
+export async function uploadImageToImgBB({ buffer, title, apiKey } = {}) {
+  if (!apiKey) {
+    throw new PosterHostingError('IMGBB_API_KEY is not configured. Add it as a server-side Koyeb secret before publishing.');
+  }
+
+  const cacheKey = createHash('sha1').update(buffer).digest('hex');
+  const cached = posterUploadCache.get(cacheKey);
+  if (cached) {
+    posterUploadCache.delete(cacheKey);
+    posterUploadCache.set(cacheKey, cached);
+    return { ...cached, cached: true };
+  }
+
+  const { spacingMs, attempts, backoffMs, wait, now } = posterUploadOptions;
+  const form = new FormData();
+  form.set('key', apiKey);
+  form.set('name', `${slugify(title).slice(0, 56)}-poster`);
+  form.set('image', buffer.toString('base64'));
+
+  let lastRateLimit = null;
+  for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
+    // The gap is applied before every attempt, including the ones after a wait: the point of
+    // retrying a limit is not to hit the host again at the same speed.
+    if (spacingMs > 0 && lastPosterUploadAt) {
+      const since = now() - lastPosterUploadAt;
+      if (since < spacingMs) await wait(spacingMs - since);
+    }
+    lastPosterUploadAt = now();
+
+    let response;
+    try {
+      response = await fetch(IMGBB_UPLOAD_URL, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(30_000)
+      });
+    } catch (error) {
+      throw new PosterHostingError('ImgBB could not be reached. Please try publishing again.', { cause: error });
+    }
+
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+
+    const detail = String(body?.error?.message || '');
+    const limited = response.status === 429 || isPosterRateLimit({ message: detail });
+    if (!response.ok || !body?.success || !body?.data?.url) {
+      if (limited) {
+        const retryAfterSeconds = Number(response.headers?.get?.('retry-after')) || Number(body?.error?.retry_after) || 0;
+        const retryAfterMs = retryAfterSeconds > 0 ? retryAfterSeconds * 1_000 : backoffMs * attempt;
+        lastRateLimit = new PosterRateLimitError(detail || 'ImgBB is rate limiting this server.', { retryAfterMs });
+        if (attempt < Math.max(1, attempts)) {
+          await wait(retryAfterMs);
+          continue;
+        }
+        throw lastRateLimit;
+      }
+      throw new PosterHostingError(detail || 'ImgBB did not accept the poster.');
+    }
+
+    const hosted = {
+      url: body.data.display_url || body.data.url,
+      providerId: body.data.id || null
+    };
+    cachePosterUpload(cacheKey, hosted);
+    return hosted;
+  }
+
+  throw lastRateLimit || new PosterHostingError('ImgBB did not accept the poster.');
+}
+
+/**
+ * Host an already-prepared image. Split out of `mirrorPosterToImgBB` so a publish that must not be
+ * lost can keep the artwork it already has and hand this call to a retry queue instead.
+ */
+export async function hostPosterImage({ image, title, config } = {}) {
+  if (!image?.buffer) throw new PosterHostingError('There was no poster image to upload.');
   const hosted = await uploadImageToImgBB({
     buffer: image.buffer,
     title,
-    apiKey: config.imgbbApiKey
+    apiKey: config?.imgbbApiKey
   });
-
   return {
     ...hosted,
-    originalUrl,
-    source: usedFallback ? 'generated-fallback' : 'remote-mirror',
+    originalUrl: image.sourceUrl || null,
+    source: image.usedFallback ? 'generated-fallback' : 'remote-mirror',
     contentType: image.contentType
   };
+}
+
+export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, title, category, config }) {
+  const image = await preparePosterImage({ sourceUrl, sourceIsManual, title, category });
+  return hostPosterImage({ image, title, config });
 }

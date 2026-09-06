@@ -251,6 +251,18 @@ If automatic matching finds no poster, SoraBox generates a branded category-colo
 - **Draft artwork:** send `/poster https://…` or `/poster Title` before `/done`; the choice is stored on the draft and mirrored during publishing.
 - A bare `/poster` (or `/poster help`) asks which style you want and keeps a small pending conversation (`poster_flows`, 15-minute TTL) so you can reply with only the Post ID, then only the link or title. **Cancel** and **Search again** are always offered, and an expired menu says so instead of changing anything.
 
+**A rate-limited image host never loses a release.** A bulk `/done` over a hundred cards uploads a poster per card, and ImgBB answers `Rate limit reached` when that happens quickly. Publishing is now paced and forgiving rather than fatal:
+
+- uploads are spaced by `IMGBB_UPLOAD_SPACING_MS` (1.6 s by default) instead of firing together;
+- a `429` is retried up to `IMGBB_RATE_LIMIT_ATTEMPTS` (3) times inside the same call, waiting `Retry-After` when ImgBB sends one and `IMGBB_RATE_LIMIT_BACKOFF_MS` (20 s) when it does not;
+- **identical artwork is hosted once**: uploads are keyed by the image's SHA-1, so a re-run of `/done` over the same releases reuses the existing ImgBB URL rather than adding a second copy for the same bytes;
+- if the host is still refusing after that, the card is **published anyway** with the artwork it already has, and the mirror moves to a background retry queue — `POSTER_RETRY_INTERVAL_MS` (5 min) apart, doubling per attempt, `POSTER_RETRY_ROUNDS` (8) attempts before the publisher is told once. When a retry lands, the card and its channel post are updated **in place** — the photo itself is edited, not reposted — and the publisher hears about it as **one list per tick** naming the affected Post IDs, never one message per poster: no second post, no re-upload, nothing to resend;
+- `/poster` behaves the same way: a busy host defers your chosen artwork to that queue instead of replying `Poster was not changed`, so a pick is never lost;
+- a poster that fails for a real reason (too large, not an image, host rejected the file) is still reported as a failure — only a rate limit is treated as something to wait out.
+- **`/cancel` stops a run in progress.** The publish loop re-reads the draft between cards, so cancelling (or a `/done` that was interrupted) halts at the next release instead of continuing through the remaining hundred; the report says where it stopped. If a card failed for some other reason, your draft is kept until every group in it is published, and the next `/done` merges into the same cards rather than making second ones.
+
+Because that queue lives in memory, a deploy discards whatever is still waiting; those cards keep their source artwork, and `/poster SB-… <link>` re-hosts any of them on demand.
+
 ### 5. Optional: enable automatic metadata and artwork matching
 
 SoraBox uses a category-aware fallback chain before it generates a fallback poster:
@@ -594,6 +606,11 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `MONGODB_URI` | Secret | Yes | Mongo connection string |
 | `MONGODB_DB` | Plaintext | No | Defaults to `sorabox` |
 | `IMGBB_API_KEY` | Secret | Yes | Never expose it to the browser |
+| `IMGBB_UPLOAD_SPACING_MS` | Plaintext | No | Minimum gap between two ImgBB uploads; default `1600`. Raise it if a bulk publish still trips the host |
+| `IMGBB_RATE_LIMIT_ATTEMPTS` | Plaintext | No | Upload attempts inside one publish before the poster moves to the retry queue; default `3`, up to `8` |
+| `IMGBB_RATE_LIMIT_BACKOFF_MS` | Plaintext | No | Wait when ImgBB sends no `Retry-After`; default `20000` |
+| `POSTER_RETRY_INTERVAL_MS` | Plaintext | No | Gap between background re-host attempts, growing per round; default `300000` (5 min) |
+| `POSTER_RETRY_ROUNDS` | Plaintext | No | Attempts before the queue gives up and says so once; default `8` |
 | `TELEGRAM_BOT_TOKEN` | Secret | Yes | BotFather token |
 | `TELEGRAM_BOT_USERNAME` | Plaintext | Yes | No leading `@` |
 | `TELEGRAM_STORAGE_CHANNEL_ID` | Secret or plaintext | Yes | Normal private channel numeric ID |

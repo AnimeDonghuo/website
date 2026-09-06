@@ -4,7 +4,7 @@ import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../c
 import { categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, slugify } from '../lib/strings.js';
 import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { findMetadata, searchPosterCandidates } from './metadata-service.js';
-import { PosterHostingError, mirrorPosterToImgBB } from './poster-service.js';
+import { PosterHostingError, hostPosterImage, isPosterRateLimit, mirrorPosterToImgBB, preparePosterImage } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
@@ -740,15 +740,28 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
     await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /postid to find an ID.`);
     return null;
   }
-  const posterResult = await mirrorPosterToImgBB({
-    sourceUrl,
-    // A manual pick must fail loudly rather than quietly falling back to a
-    // generated poster the publisher never chose.
-    sourceIsManual: true,
-    title: existing.title,
-    category: existing.category,
-    config
-  });
+  let posterResult = null;
+  try {
+    posterResult = await mirrorPosterToImgBB({
+      sourceUrl,
+      // A manual pick must fail loudly rather than quietly falling back to a
+      // generated poster the publisher never chose.
+      sourceIsManual: true,
+      title: existing.title,
+      category: existing.category,
+      config
+    });
+  } catch (error) {
+    // A busy image host is the one reason an artwork change can wait: the choice is kept in the
+    // retry queue, so the operator never has to pick it again and the card keeps its old poster.
+    if (!isPosterRateLimit(error)) throw error;
+    const image = await preparePosterImage({ sourceUrl, sourceIsManual: true, title: existing.title, category: existing.category });
+    queuePosterRetry({ adminId, title: existing.title, image, notifyChatId: chatId(ctx) });
+    await ctx.reply(
+      `\u25aa ImgBB is rate limiting right now, so ${adminId} keeps its current poster for the moment. The artwork you chose is queued and I will update this card and its channel post as soon as the host takes it \u2014 nothing to resend, and your choice was not lost.`
+    );
+    return null;
+  }
   const updated = await repository.updateContentByAdminId(adminId, {
     posterUrl: posterResult.url,
     backdropUrl: posterResult.url,
@@ -2940,22 +2953,40 @@ export async function publishDraft(ctx, bot, repository, config) {
       : `${plan.length} separate releases were detected in this upload: ${summary}. Each one becomes its own catalog post with its own category, episode list, and delivery link. Send /title before /done when you really want them combined.`);
 
     const published = [];
+    // /cancel has to actually stop a long run. A hundred-card publish used to keep going after the
+    // draft was discarded, because the loop worked from a plan built before the first post.
+    let draftSession = session;
+    let cancelledAt = null;
     for (const group of plan) {
       // Each post is a separate publishing event with its own announcement and
       // metadata lookup, so sequential work is intentional here.
       // eslint-disable-next-line no-await-in-loop
+      if (published.length) {
+        // Reading the draft again is also how a change made between two cards is honoured.
+        const open = await repository.findSession(chatId(ctx), userId(ctx));
+        if (!open) {
+          cancelledAt = group;
+          break;
+        }
+        draftSession = open;
+      }
       const result = await publishDraftSession({
         ctx,
         bot,
         repository,
         config,
-        session: { ...session, title: group.title, category: group.category, files: group.files, metadata: null },
+        session: { ...draftSession, title: group.title, category: group.category, files: group.files, metadata: null },
         season: group.season,
         deleteSessionOnSuccess: false
       });
       published.push({ ...result, season: group.season, title: group.title, reason: group.reason });
     }
-    await repository.deleteSession(chatId(ctx), userId(ctx));
+    const failedGroups = published.filter((entry) => !entry.content);
+    // Deleting the draft while a group is still unpublished is how one transient error turned into
+    // "re-upload the whole range". A retained draft is republished into the same cards, not new ones.
+    if (!failedGroups.length && !cancelledAt) await repository.deleteSession(chatId(ctx), userId(ctx));
+    const notPublished = cancelledAt ? plan.length - published.length : failedGroups.length;
+    const cancelledGroup = cancelledAt ? `${cancelledAt.title}` : null;
 
     const succeeded = published.filter((entry) => entry.content);
     if (!succeeded.length) {
@@ -2964,15 +2995,23 @@ export async function publishDraft(ctx, bot, repository, config) {
       return { content: null, error, published, seasons: published };
     }
     const last = succeeded.at(-1).content;
+    const deferredPosters = published.filter((entry) => entry.content && entry.posterResult?.deferred).length;
     await ctx.reply([
       `Published ${succeeded.length} catalog post${succeeded.length === 1 ? '' : 's'} from this upload.`,
       '',
       ...published.map((entry) => (entry.content
         ? `\u2713 ${entry.content.title} \u00b7 ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} \u00b7 Post ID ${entry.content.adminId}`
         : `\u2717 ${entry.title} \u2014 ${entry.error || 'not published'}`)),
-      '',
-      'Use /done again only if a post still needs its own files.'
-    ].join('\n'), publicationKeyboard(getContentPageUrl(config, last), getTelegramDeliveryUrl(config, last.shareCode)));
+      deferredPosters
+        ? `\u25aa ${deferredPosters} poster${deferredPosters === 1 ? '' : 's'} could not be hosted because ImgBB is rate limiting. Those cards are live with their source artwork and the mirror is retried in the background — nothing needs re-sending.`
+        : null,
+      cancelledAt
+        ? `\u25aa Stopped at ${cancelledGroup}: the draft was cancelled, so ${notPublished} of ${plan.length} releases were not published. Nothing else was touched, and the ${notPublished === 1 ? 'card' : 'cards'} above stand${notPublished === 1 ? 's' : ''} as they are.`
+        : null,
+      failedGroups.length
+        ? `\u25aa ${failedGroups.length} release${failedGroups.length === 1 ? '' : 's'} stayed in your draft instead of being lost. /done again publishes only those, and they merge into the cards above rather than making second ones.`
+        : 'Use /done again only if a post still needs its own files.'
+    ].filter((line) => line !== null).join('\n'), publicationKeyboard(getContentPageUrl(config, last), getTelegramDeliveryUrl(config, last.shareCode)));
     return {
       content: last,
       published,
@@ -2992,6 +3031,167 @@ export async function publishDraft(ctx, bot, repository, config) {
  * automation, and each split season group all share this path so identity,
  * poster mirroring, announcements, and replies stay identical everywhere.
  */
+// How long a poster waits for ImgBB to stop rate limiting before the publisher is told. Each
+// attempt grows the gap (5, 10, 15 … minutes), so a burst of uploads is walked back rather than
+// hammered, and a card is never left without artwork because the image host had a busy hour.
+const POSTER_RETRY_INTERVAL_MS = (() => {
+  const parsed = Number(process.env.POSTER_RETRY_INTERVAL_MS);
+  return Number.isInteger(parsed) && parsed >= 15_000 && parsed <= 30 * 60_000 ? parsed : 5 * 60_000;
+})();
+const POSTER_RETRY_ROUNDS = (() => {
+  const parsed = Number(process.env.POSTER_RETRY_ROUNDS);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 100 ? parsed : 8;
+})();
+const POSTER_RETRY_TICK_MS = 30_000;
+
+let activePosterRetryQueue = null;
+
+/**
+ * Posters ImgBB would not take because it was busy — not because anything is wrong with them.
+ *
+ * A publish is never held up by an image host: the card goes live with the artwork it already has,
+ * and the mirror is retried on this queue until the host accepts it, then updates that card and the
+ * channel post it belongs to. Nothing is created for a deferred poster and no upload is repeated,
+ * which is the same rule the database-caption sweep follows.
+ */
+export function createPosterRetryQueue({
+  repository = null,
+  config = null,
+  host = hostPosterImage,
+  announce = null,
+  notify = async () => {},
+  now = () => Date.now(),
+  intervalMs = POSTER_RETRY_INTERVAL_MS,
+  rounds = POSTER_RETRY_ROUNDS,
+  batchSize = 4
+} = {}) {
+  const pending = new Map();
+  const counters = { hosted: 0, givenUp: 0, lastRunAt: null };
+  const tell = (targetChatId, text) => (targetChatId
+    ? Promise.resolve(notify(targetChatId, text)).catch(() => {})
+    : Promise.resolve());
+  // One report per chat per tick. A hundred-card publish must not turn into a hundred "it is
+  // hosted now" messages any more than it should turn into a hundred failures: the publisher reads
+  // a list naming the cards, once.
+  const reported = new Map();
+  const report = (targetChatId, bucket, line) => {
+    if (!targetChatId) return;
+    if (!reported.has(targetChatId)) reported.set(targetChatId, { hosted: [], gaveUp: [], errored: [] });
+    reported.get(targetChatId)[bucket].push(line);
+  };
+  const flushReports = async () => {
+    const chats = [...reported.entries()];
+    reported.clear();
+    for (const [targetChatId, sections] of chats) {
+      const parts = [];
+      if (sections.hosted.length) {
+        parts.push(`\u2713 ${sections.hosted.length} poster${sections.hosted.length === 1 ? '' : 's'} ImgBB had refused ${sections.hosted.length === 1 ? 'is' : 'are'} hosted now. ${sections.hosted.length === 1 ? 'The card' : 'The cards'} and ${sections.hosted.length === 1 ? 'its' : 'their'} channel post${sections.hosted.length === 1 ? '' : 's'} were updated in place \u2014 nothing to resend:`);
+        parts.push(sections.hosted.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (sections.gaveUp.length) {
+        parts.push(`\u2717 ImgBB kept refusing ${sections.gaveUp.length} poster${sections.gaveUp.length === 1 ? '' : 's'} after ${rounds} attempts, so ${sections.gaveUp.length === 1 ? 'it still uses' : 'they still use'} the source image. ${sections.gaveUp.length === 1 ? 'The card is' : 'The cards are'} published and correct \u2014 /poster can re-host any of them later, and no new post is needed:`);
+        parts.push(sections.gaveUp.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (sections.errored.length) {
+        parts.push(`\u2717 ${sections.errored.length} poster${sections.errored.length === 1 ? '' : 's'} could not be hosted at all. ${sections.errored.length === 1 ? 'That card keeps' : 'Those cards keep'} the artwork it already has, and nothing was created for this:`);
+        parts.push(sections.errored.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (parts.length) await tell(targetChatId, parts.join('\n'));
+    }
+  };
+  return {
+    enqueue(item = {}) {
+      if (!item.adminId || !item.image) return null;
+      const key = String(item.adminId);
+      const previous = pending.get(key);
+      pending.set(key, {
+        title: item.title || null,
+        image: item.image,
+        notifyChatId: item.notifyChatId || null,
+        attempts: previous?.attempts || 0,
+        nextAt: previous?.nextAt || now() + intervalMs
+      });
+      return pending.get(key);
+    },
+    get size() { return pending.size; },
+    list() {
+      return [...pending.entries()].map(([adminId, entry]) => ({
+        adminId, title: entry.title, attempts: entry.attempts, nextAt: entry.nextAt
+      }));
+    },
+    clear() { pending.clear(); },
+    status() { return { ...counters, waiting: pending.size, rounds, intervalMs, attached: true }; },
+    async runDue(at = now()) {
+      counters.lastRunAt = at;
+      const outcome = { hosted: 0, givenUp: 0, deferred: 0, waiting: 0 };
+      let handled = 0;
+      for (const [adminId, entry] of [...pending.entries()]) {
+        if (handled >= Math.max(1, Number(batchSize) || 4)) break;
+        if (entry.nextAt > at) {
+          outcome.deferred += 1;
+          continue;
+        }
+        handled += 1;
+        const named = `${adminId}${entry.title ? ` \u00b7 ${cleanText(entry.title, 48)}` : ''}`;
+        try {
+          const result = await host({ image: entry.image, title: entry.title, config });
+          const saved = typeof repository?.updateContentByAdminId === 'function'
+            ? await repository.updateContentByAdminId(adminId, {
+              posterUrl: result.url,
+              backdropUrl: result.url,
+              poster: {
+                provider: 'imgbb',
+                providerId: result.providerId || null,
+                originalUrl: result.originalUrl || entry.image.sourceUrl || null,
+                source: result.source || 'remote-mirror',
+                mirroredAt: new Date(at).toISOString()
+              }
+            })
+            : null;
+          pending.delete(adminId);
+          counters.hosted += 1;
+          outcome.hosted += 1;
+          // The channel post is still showing the source artwork, so the same lane that handles
+          // /poster refreshes that message — an edit, never a second post.
+          if (saved && typeof announce === 'function') await Promise.resolve(announce(saved, adminId)).catch(() => {});
+          report(entry.notifyChatId, 'hosted', `Poster for ${named} is hosted`);
+        } catch (error) {
+          const diagnostic = automationDiagnostic(error);
+          if (!isPosterRateLimit(error)) {
+            pending.delete(adminId);
+            counters.givenUp += 1;
+            outcome.givenUp += 1;
+            report(entry.notifyChatId, 'errored', `${named} \u2014 ${diagnostic}`);
+            continue;
+          }
+          entry.attempts += 1;
+          entry.nextAt = at + intervalMs * Math.min(rounds, entry.attempts + 1);
+          if (entry.attempts >= rounds) {
+            pending.delete(adminId);
+            counters.givenUp += 1;
+            outcome.givenUp += 1;
+            report(entry.notifyChatId, 'gaveUp', named);
+          }
+        }
+      }
+      await flushReports();
+      outcome.waiting = pending.size;
+      return outcome;
+    }
+  };
+}
+
+function queuePosterRetry(item) {
+  if (!activePosterRetryQueue) return null;
+  return activePosterRetryQueue.enqueue(item);
+}
+
+/** The bot wires its queue here, so any publishing path can defer into it without threading it. */
+export function attachPosterRetryQueue(queue) {
+  activePosterRetryQueue = queue || null;
+  return activePosterRetryQueue;
+}
+
 async function publishDraftSession({
   ctx,
   bot,
@@ -3048,13 +3248,31 @@ async function publishDraftSession({
     const metadataLanguages = (metadata.languages || []).filter((language) => !/^multi(?:\s+language)?$/i.test(String(language || '')));
     const releaseLanguages = overrides.languages?.length ? overrides.languages : uploadedLanguages.length ? uploadedLanguages : metadataLanguages;
     const releaseSubtitleLanguages = overrides.subtitleLanguages?.length ? overrides.subtitleLanguages : uploadedSubtitleLanguages;
-    const posterResult = await mirrorPosterToImgBB({
+    const posterTitle = withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason);
+    const posterImage = await preparePosterImage({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
-      title: withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason),
-      category: session.category,
-      config
+      title: posterTitle,
+      category: session.category
     });
+    let posterResult = null;
+    try {
+      posterResult = await hostPosterImage({ image: posterImage, title: posterTitle, config });
+    } catch (error) {
+      // A rate limit at the image host must not decide whether this release exists. The card is
+      // published with the artwork it already has and the mirror is retried on its own queue, so a
+      // busy ImgBB neither loses a draft nor forces the whole upload to be sent again.
+      if (!isPosterRateLimit(error)) throw error;
+      posterResult = {
+        url: posterImage.sourceUrl || null,
+        providerId: null,
+        originalUrl: posterImage.sourceUrl || null,
+        source: 'pending-host-rate-limit',
+        contentType: posterImage.contentType,
+        deferred: true
+      };
+      console.warn(`[telegram] ImgBB is rate limiting; the poster for ${posterTitle} is served from its source and re-hosted on the retry queue.`);
+    }
 
     // The provider's canonical name wins, but a season boundary is never lost:
     // AniList and TMDB return the same series title for every season.
@@ -3098,6 +3316,7 @@ async function publishDraftSession({
       files: session.files
     });
     if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
+    if (posterResult.deferred) queuePosterRetry({ adminId: content.adminId, title: content.title, image: posterImage, notifyChatId: chatId(ctx) });
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
     const websiteUrl = getContentPageUrl(config, content);
@@ -3136,9 +3355,11 @@ async function publishDraftSession({
         console.warn('[telegram] could not remember announcement message IDs for later edits:', error?.message || 'Unknown error');
       }
     }
-    const posterNote = posterResult.source === 'generated-fallback'
-      ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
-      : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
+    const posterNote = posterResult.deferred
+      ? '▪ ImgBB is rate limiting, so this card uses the poster from its source for now. The mirror is retried on its own queue and updates the card and its channel post when it goes through — nothing was created, and you do not need to publish this again.'
+      : posterResult.source === 'generated-fallback'
+        ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
+        : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
     const episodeNote = episodeSummary.releaseLabel ? `Episode index: ${episodeSummary.releaseLabel}.` : 'No episode labels were found; the post lists delivery files instead.';
     const channelNote = privateAdultPost
       ? 'This 18+ post was not announced to any Telegram channel.'
@@ -5332,6 +5553,23 @@ export async function launchTelegramBot({ config, repository }) {
   }
 
   const bot = new Telegraf(config.telegram.botToken, { handlerTimeout: TELEGRAM_HANDLER_TIMEOUT_MS });
+  // Posters ImgBB refused for being in a hurry live here until the host catches up; a publish is
+  // never failed by the image host, and nothing is re-uploaded or duplicated to fix one.
+  const posterRetries = attachPosterRetryQueue(createPosterRetryQueue({
+    repository,
+    config,
+    notify: async (targetChatId, text) => {
+      try {
+        await bot.telegram.sendMessage(String(targetChatId), text);
+      } catch (error) {
+        console.warn('[telegram] could not report a deferred poster:', automationDiagnostic(error));
+      }
+    },
+    announce: (content, adminId) => queueAnnouncementSync({ telegram: bot.telegram, repository, content, config, adminId })
+  }));
+  setInterval(() => {
+    posterRetries.runDue().catch((error) => console.warn('[telegram] poster retry tick failed:', automationDiagnostic(error)));
+  }, POSTER_RETRY_TICK_MS).unref?.();
   // Long publisher reports are split rather than truncated, and every reply goes through that
   // wrapper, so no command has to remember Telegram's 4096-character ceiling.
   installLongReplyPagination(bot);
