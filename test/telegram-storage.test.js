@@ -7,6 +7,12 @@ import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { applyMergeDrop, applyMergePlan, buildManualPlayerManifest, manualPlayerGroups, mergeInstructions, mergePlanText, mergeResultText, parseMergeCommand, parseMergeDropInstruction, resolveMergePlan, POST_EDIT_ARGUMENT_LIMIT } from '../src/server/services/telegram-bot.js';
 import { parseCommandArgument } from '../src/server/lib/strings.js';
 import { parsePlayersView, playersCoverage, playersKeyboard, playersMissingText } from '../src/server/services/telegram-bot.js';
+// Announcements are edited on a paced lane so a bulk command cannot fire one edit per post
+// per channel at once; a test asserts on the result, so it asks the lane for no gap and
+// awaits its drain instead of a timer.
+import { announcementLaneDrained, announcementSyncStatus, configureAnnouncementSyncSpacing } from '../src/server/services/telegram-bot.js';
+
+configureAnnouncementSyncSpacing(0);
 import { renderPlayersMessage } from '../src/server/services/telegram-bot.js';
 import { handlePosterAction, handlePosterFlowMessage, posterCandidateKeyboard, presentPosterCandidates, readSeason, withSeasonLabel } from '../src/server/services/telegram-bot.js';
 
@@ -155,9 +161,13 @@ test('one metadata edit can be applied to every named post at once', async () =>
   assert.match(replies[0], new RegExp(two.adminId));
   assert.match(replies[0], /left alone: SB-.+\s\(18\+ boundary/);
   assert.match(replies[0], /Not found and skipped: SB-9999999999\./);
-  assert.match(replies[0], /1 announcement updated/);
+  // many posts are queued rather than edited inline, so the command answers at once
+  assert.match(replies[0], /queued on the lane/);
+  await announcementLaneDrained();
   // the announcement of the changed post is edited in place, not re-posted
   assert.deepEqual(edits.map((entry) => entry.chatId), ['-100public']);
+  const [remembered] = (await repository.findContentByAdminId(one.adminId)).announcementRefs;
+  assert.ok(String(remembered.caption).includes('Donghua A'), 'the reference remembers what the channel was sent, so a repeat edit costs nothing');
 
   // a value every release must write itself is still refused across posts
   replies.length = 0;
@@ -1605,10 +1615,11 @@ test('applying a merge moves every file and player, deletes the absorbed cards, 
     parsed: parseMergeCommand(`bleach ${seasonOne.adminId} ${seasonTwo.adminId} ${movie.adminId} SB-9999999999`)
   });
   const outcome = await applyMergePlan({ bot, repository, config: { publicSiteUrl: 'https://site.test' }, plan });
+  await announcementLaneDrained();
 
   assert.equal(outcome.error, undefined);
   assert.deepEqual(outcome.moved.map((entry) => entry.title), ['Bleach Season 2', 'Bleach Movie']);
-  assert.deepEqual(deletes, ['-100anime:101'], 'only the absorbed announcement message is deleted');
+  assert.deepEqual(deletes, ['-100anime:101'], 'only the absorbed announcement message is deleted, and it is deleted on the lane');
   assert.equal(await repository.findContentByAdminId(seasonTwo.adminId), null);
   assert.equal(await repository.findContentByAdminId(movie.adminId), null);
   assert.notEqual(await repository.findContentByAdminId(seasonOne.adminId), null, 'the target keeps its own card');
@@ -1633,7 +1644,7 @@ test('applying a merge moves every file and player, deletes the absorbed cards, 
   assert.match(result, /Season 1: 2 episodes/);
   assert.match(result, /Season 2: 3 episodes/);
   assert.match(result, /Deleted from the website: SB-/);
-  assert.match(result, /Announcement messages: 1 deleted/);
+  assert.match(result, /queued for deletion on the channel lane/);
   assert.match(result, /private storage files were not touched/);
 
   // The card is still announced from its own post, so its own announcement has
@@ -1657,8 +1668,13 @@ test('a merge that cannot delete an announcement still reports it', async () => 
   const { plan } = await resolveMergePlan({ repository, parsed: parseMergeCommand(`bleach ${seasonOne.adminId} ${seasonTwo.adminId}`) });
   const outcome = await applyMergePlan({ bot: refused, repository, config: {}, plan });
   assert.equal(outcome.announcementMessages.deleted, 0);
-  assert.equal(outcome.announcementMessages.failed, 1, 'the card is merged even when Telegram refuses the delete');
-  assert.match(mergeResultText(outcome, {}), /1 could not be deleted \(is the bot an admin in that channel\?\)/);
+  assert.equal(outcome.announcementMessages.queued, 1, 'the merge does not wait on the channel, refused or not');
+  await announcementLaneDrained();
+  assert.match(mergeResultText(outcome, {}), /queued for deletion on the channel lane/);
+  // refused work is not swallowed: it stays on the list /sync reports
+  const status = announcementSyncStatus();
+  assert.equal(status.stale.length, 1, 'the post that could not be deleted is still listed');
+  assert.match(status.stale[0].label, /Bleach/);
 });
 
 test('dropping a season or an episode trims one card without touching storage', async () => {

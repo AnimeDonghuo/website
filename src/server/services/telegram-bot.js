@@ -189,6 +189,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
+  { command: 'sync', description: 'Refresh what the announcement channels show: /sync, then /sync go' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
   { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
@@ -578,6 +579,7 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
   const missing = [];
   const blocked = [];
   const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
+  let queued = 0;
   for (const adminId of target.adminIds) {
     if (guard) {
       const existing = await repository.findContentByAdminId?.(adminId);
@@ -597,10 +599,18 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
       continue;
     }
     contents.push(updated);
-    // Anything the announcement channel shows must stay in sync, so the same
-    // edit is applied to the posted message instead of leaving it stale.
-    const postSync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated });
-    for (const key of Object.keys(sync)) sync[key] += postSync?.[key] || 0;
+    // Anything the announcement channel shows must stay in sync, so the same edit is
+    // applied to the posted message instead of leaving it stale — through the lane,
+    // because a batch would otherwise fire one edit per post per channel at once and
+    // Telegram answers that with a flood limit. A single post still waits for its own
+    // result, so its reply stays exact.
+    const job = queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, adminId: updated.adminId, notifyChatId: chatId(ctx) });
+    if (target.adminIds.length === 1) {
+      for (const key of Object.keys(sync)) sync[key] += (await job)?.[key] || 0;
+    } else {
+      job.catch(() => {});
+      queued += 1;
+    }
   }
   if (!contents.length) {
     if (missing.length) {
@@ -622,7 +632,10 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
   if (missing.length) {
     lines.push(`Not found and skipped: ${missing.join(', ')}.`);
   }
-  lines.push(announcementSyncNote(sync));
+  if (queued) {
+    lines.push(`Telegram announcements: ${queued} channel post${queued === 1 ? '' : 's'} queued on the lane — one edit at a time, a Telegram limit waited out and retried rather than dropped. /sync shows what is still waiting.`);
+  }
+  if (sync.channels) lines.push(announcementSyncNote(sync));
   await ctx.reply(lines.join('\n'));
   return { handled: true, content: contents[0], contents, announcementSync: sync };
 }
@@ -743,7 +756,7 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
   // The artwork is the announcement, so replace the photo in every channel this
   // post was announced to. A poster nobody chose manually is still a real change.
   const announcementSync = updated
-    ? await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content: updated, config })
+    ? await queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, config, adminId: updated.adminId, notifyChatId: chatId(ctx) })
     : null;
   return { existing, posterResult, updated, announcementSync };
 }
@@ -1592,7 +1605,9 @@ async function showDraftStatus(ctx, repository) {
   return session;
 }
 
-function announcementCaption(content) {
+// Exported because a caller outside this file needs to know what the channel *should* say:
+// /sync compares it with what a reference remembers being sent, and a test asserts the same.
+export function announcementCaption(content) {
   const episodeSummary = content.episodeCount ? `${content.episodeCount} episode${content.episodeCount === 1 ? '' : 's'}` : null;
   const facts = [
     content.year ? `📅 <b>Year:</b> ${content.year}` : null,
@@ -1621,69 +1636,316 @@ function announcementKeyboard(config, content, websiteUrl = null) {
   return link ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', link)]]) : undefined;
 }
 
+let ANNOUNCEMENT_SYNC_SPACING_MS = configuredMilliseconds(process.env.ANNOUNCEMENT_SYNC_SPACING_MS, 1_100);
+
+/**
+ * Test seam (and an operator knob): the gap the lane leaves between two calls. Zero means
+ * "as fast as the API allows", which is what an automated check wants; production never
+ * uses it, because the gap is the thing that keeps a bulk refresh inside Telegram's limit.
+ */
+export function configureAnnouncementSyncSpacing(milliseconds) {
+  ANNOUNCEMENT_SYNC_SPACING_MS = configuredMilliseconds(milliseconds, ANNOUNCEMENT_SYNC_SPACING_MS);
+  return ANNOUNCEMENT_SYNC_SPACING_MS;
+}
+
+/** Resolves once everything queued on the lane so far has finished — for a caller that
+ *  wants to report or assert on a batch that was deliberately not awaited. */
+export function announcementLaneDrained() {
+  return announcementLane.tail.then(() => undefined, () => undefined);
+}
+const ANNOUNCEMENT_SYNC_REF_ATTEMPTS = 3;
+const ANNOUNCEMENT_SYNC_RETRY_CEILING_MS = 5 * 60_000;
+const ANNOUNCEMENT_SYNC_ROUNDS = 3;
+
+function configuredMilliseconds(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Whether a channel post already shows exactly what this card would produce today.
+ *
+ * `announcementRefs` remember the caption and artwork they were last sent with, so a
+ * repeat edit costs nothing — and a post published before that memory existed carries
+ * none, which is what makes /sync able to find the old announcements that still show an
+ * `@channel` tag without asking Telegram about a single one of them first.
+ */
+export function announcementReferenceIsCurrent(reference, { caption = null, link = null, posterUrl = null } = {}) {
+  if (!reference || typeof reference.caption !== 'string' || !reference.caption) return false;
+  if (reference.caption !== caption) return false;
+  if ((reference.websiteUrl || null) !== (link || null)) return false;
+  if (reference.kind !== 'text' && (reference.posterUrl || null) !== (posterUrl || null)) return false;
+  return true;
+}
+
+function announcementReferenceMemory(reference, { caption, link, posterUrl }) {
+  return {
+    ...reference,
+    caption,
+    posterUrl: reference.kind === 'text' ? null : (posterUrl || null),
+    ...(link ? { websiteUrl: link } : {})
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * The announcement lane
+ *
+ * A 40-ID /batch used to fire forty channel edits back to back and Telegram answered
+ * with a flood limit, so some announcements stayed stale and the only evidence was a
+ * line in the log. Every refresh and every merge deletion now runs through one lane:
+ * at most one call in flight, a gap between them, a bounded flood-wait retry per edit,
+ * and a job that still ends failing goes back for another round after the wait
+ * Telegram actually asked for. When the rounds run out, the publisher chat is told
+ * which Post IDs are left — a wait that outlives the command's own reply must not
+ * become silence.
+ * ------------------------------------------------------------------------- */
+const announcementLane = {
+  tail: Promise.resolve(),
+  pending: 0,
+  stale: new Map(),
+  totals: { jobs: 0, retried: 0, refreshed: 0, unchanged: 0, failed: 0, dropped: 0, deleted: 0 }
+};
+
+function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const totalRounds = Math.max(1, Number(options.rounds || rounds) || 1);
+
+  const task = async () => {
+    let result = null;
+    let retried = 0;
+    for (let round = 1; round <= totalRounds; round += 1) {
+      result = await run({ ...options, spacingMs, wait, round });
+      const stuck = Number(result?.failed) || 0;
+      announcementLane.totals.jobs += 1;
+      if (!stuck) break;
+      if (round === totalRounds) break;
+      retried += stuck;
+      announcementLane.totals.retried += stuck;
+      // Back of the lane, and no sooner than Telegram asked for: the restriction is
+      // measured in seconds, not in retries. The gap scales with the lane's own pacing, so
+      // a test that asked for zero spacing is not left waiting on a wall clock.
+      await wait(Math.max(Number(result.retryAfterMs) || 0, spacingMs * 4));
+    }
+    if (result?.failed) announcementLane.stale.set(key || `job-${Date.now()}`, { key: key || null, label: label || null, failed: Number(result.failed) || 0, retried });
+    else if (key) announcementLane.stale.delete(key);
+    if (retried && notifyChatId && typeof telegram?.sendMessage === 'function') {
+      const still = Number(result?.failed) || 0;
+      const lines = still
+        ? [
+          `⚠ ${label || key || 'An announcement'}: ${still} channel post${still === 1 ? '' : 's'} still refused after ${totalRounds} rounds.`,
+          'The catalog card is already correct — only the channel copy is behind. /sync lists what is left and /sync go sends it again.'
+        ]
+        : [
+          `✓ ${label || key || 'A queued announcement'} went through once Telegram’s limit lifted (${result.updated} edited${result.unchanged ? `, ${result.unchanged} already correct` : ''}).`,
+          'Nothing needed doing — the retry finished it.'
+        ];
+      await Promise.resolve(telegram.sendMessage(String(notifyChatId), lines.join('\n'))).catch(() => {});
+    }
+    return result;
+  };
+
+  announcementLane.pending += 1;
+  const tracked = announcementLane.tail.then(task, task);
+  announcementLane.tail = tracked.then(() => undefined, () => undefined);
+  const settled = tracked.then(
+    (value) => { announcementLane.pending -= 1; return value; },
+    (error) => { announcementLane.pending -= 1; throw error; }
+  );
+  if (options.detached) {
+    settled.catch(() => {});
+    return null;
+  }
+  return settled;
+}
+
+export function queueAnnouncementSync({ telegram, repository, content, config = null, adminId = null, notifyChatId = null, label = null }, options = {}) {
+  const key = adminId || content?.adminId || null;
+  return enqueueAnnouncementJob({
+    key,
+    // The Post ID leads: a publisher reading a “still refused” message has to know which
+    // card to name, and the title alone does not identify it.
+    label: label || (key ? `${key} · ${cleanText(content?.title, 48)}` : cleanText(content?.title, 48) || null),
+    notifyChatId,
+    telegram,
+    options,
+    run: (inner) => syncPublishedAnnouncements({ telegram, repository, content, config, options: inner })
+  });
+}
+
+export function queueAnnouncementDeletion({ telegram, repository, content, references, channelId = null }, options = {}) {
+  return enqueueAnnouncementJob({
+    key: content?.adminId || null,
+    label: content?.adminId ? `${content.adminId} · ${cleanText(content.title, 48)}` : null,
+    telegram,
+    options,
+    run: (inner) => deleteAnnouncementMessages({ telegram, references, ...inner })
+      .then(async (result) => {
+        if (result.deleted && repository?.updateContentByAdminId && content?.adminId) {
+          const left = (Array.isArray(content.announcementRefs) ? content.announcementRefs : [])
+            .filter((reference) => !references.some((entry) => entry.channelId === reference.channelId && entry.messageId === reference.messageId));
+          await Promise.resolve(repository.updateContentByAdminId(content.adminId, { announcementRefs: left })).catch(() => {});
+        }
+        return result;
+      })
+  });
+}
+
+export function announcementSyncStatus() {
+  return {
+    pending: announcementLane.pending,
+    stale: [...announcementLane.stale.entries()].map(([key, entry]) => ({ key, ...entry })),
+    totals: { ...announcementLane.totals }
+  };
+}
+
+/** Test seam: forget the queue's bookkeeping between cases. */
+export function resetAnnouncementLane() {
+  announcementLane.pending = 0;
+  announcementLane.stale.clear();
+  announcementLane.totals = { jobs: 0, retried: 0, refreshed: 0, unchanged: 0, failed: 0, dropped: 0, deleted: 0 };
+  announcementLane.tail = Promise.resolve();
+}
+
 /**
  * Keep the Telegram announcement of a published post visually identical to the
  * catalog card. Every edit path (title, languages, genres, synopsis, status,
  * release label, category, and poster) funnels through here, so an announcement
  * never keeps showing an old image or old information after /poster or /title.
  *
- * Only the messages this bot sent are touched, and only when the post recorded
- * where they landed; an announcement the publisher deleted manually is simply
- * forgotten instead of retried forever.
+ * Only the messages this bot sent are touched, and only when they are actually
+ * behind: a ref that already carries this caption, link, and artwork is not sent at
+ * all, which is what keeps a large batch inside the flood limit instead of testing it.
+ * An announcement the publisher deleted manually is forgotten rather than retried, and
+ * a refused edit keeps its ref so the lane can try again later.
  */
-export async function syncPublishedAnnouncements({ telegram, repository, content, config = null }) {
+export async function syncPublishedAnnouncements({ telegram, repository, content, config = null, options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
+  const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
   const refs = Array.isArray(content?.announcementRefs) ? content.announcementRefs : [];
-  const result = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: refs.length };
+  const result = { updated: 0, unchanged: 0, failed: 0, dropped: 0, skipped: 0, channels: refs.length, retryAfterMs: 0 };
   if (!refs.length || !telegram || isAdultCategory(content?.category)) return result;
   const caption = announcementCaption(content);
+  const posterUrl = content.posterUrl || null;
   const kept = [];
+  let dirty = false;
 
   for (const reference of refs) {
     // Only rewrite the button row when the destination link is actually known;
     // omitting reply_markup leaves the publisher's existing buttons untouched.
     const link = (config ? getContentPageUrl(config, content) : null) || reference.websiteUrl || null;
+    if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) {
+      kept.push(reference);
+      result.unchanged += 1;
+      continue;
+    }
     const keyboard = link ? announcementKeyboard(config, content, link) : undefined;
     const replyMarkup = keyboard ? keyboard.reply_markup : undefined;
-    try {
-      if (reference.kind !== 'text' && content.posterUrl) {
-        await telegram.editMessageMedia(
-          reference.channelId,
-          reference.messageId,
-          null,
-          { type: 'photo', media: content.posterUrl, caption, parse_mode: 'HTML' },
-          replyMarkup ? { reply_markup: replyMarkup } : {}
-        );
-        // Some Bot API versions ignore reply_markup on editMessageMedia; a
-        // second call is idempotent and keeps the website button present.
-        if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
-      } else {
-        await telegram.editMessageText(reference.channelId, reference.messageId, null, caption, {
-          parse_mode: 'HTML',
-          ...(replyMarkup ? { reply_markup: replyMarkup } : {})
-        });
+    const extra = replyMarkup ? { reply_markup: replyMarkup } : {};
+    let applied = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        if (reference.kind !== 'text' && posterUrl) {
+          await telegram.editMessageMedia(
+            reference.channelId,
+            reference.messageId,
+            null,
+            { type: 'photo', media: posterUrl, caption, parse_mode: 'HTML' },
+            replyMarkup ? { reply_markup: replyMarkup } : {}
+          );
+          // Some Bot API versions ignore reply_markup on editMessageMedia; a
+          // second call is idempotent and keeps the website button present.
+          if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
+        } else {
+          await telegram.editMessageText(reference.channelId, reference.messageId, null, caption, {
+            parse_mode: 'HTML',
+            ...extra
+          });
+        }
+        applied = 'updated';
+        break;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 200);
+        // Telegram says this when the post already reads exactly as we would write
+        // it, which is a success for a card that has not really changed.
+        if (/message is not modified/i.test(description)) { applied = 'unchanged'; break; }
+        if (/not found|can't be edited|chat not found|deleted|message to edit/i.test(description)) { applied = 'dropped'; break; }
+        const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
+        if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
+        const backoff = Math.min(retryAfterMs, ceilingMs);
+        result.retryAfterMs = Math.max(result.retryAfterMs, backoff);
+        if (spacingMs) await wait(backoff);
       }
-      kept.push(reference);
-      result.updated += 1;
-    } catch (error) {
-      const description = cleanText(error?.description || error?.message, 200);
-      if (/message is not modified/i.test(description)) {
-        kept.push(reference);
-        result.unchanged += 1;
-        continue;
-      }
-      if (/not found|can't be edited|chat not found|deleted|message to edit/i.test(description)) {
-        result.dropped += 1;
-        continue;
-      }
+    }
+
+    if (applied === 'updated' || applied === 'unchanged') {
+      const memory = announcementReferenceMemory(reference, { caption, link, posterUrl });
+      if (memory !== reference) dirty = true;
+      kept.push(memory);
+      result[applied === 'updated' ? 'updated' : 'unchanged'] += 1;
+    } else if (applied === 'dropped') {
+      result.dropped += 1;
+      dirty = true;
+    } else {
       kept.push(reference);
       result.failed += 1;
-      console.warn('[telegram] announcement sync failed:', reference.channelId, description || 'Unknown error');
+      // Not dropped: the ref stays in the list so the lane's next round can finish it.
     }
+    if (spacingMs) await wait(spacingMs);
   }
 
-  if (kept.length !== refs.length && content?.adminId && typeof repository?.updateContentByAdminId === 'function') {
+  // The reference list is written back when it shrank or a ref learned what the channel
+  // now shows, so the next edit of this card can answer "already correct" without calling.
+  if ((kept.length !== refs.length || dirty) && content?.adminId && typeof repository?.updateContentByAdminId === 'function') {
     await Promise.resolve(repository.updateContentByAdminId(content.adminId, { announcementRefs: kept })).catch(() => {});
   }
+  announcementLane.totals.refreshed += result.updated;
+  announcementLane.totals.unchanged += result.unchanged;
+  announcementLane.totals.failed += result.failed;
+  announcementLane.totals.dropped += result.dropped;
+  return result;
+}
+
+/**
+ * Remove the announcement copies of a card that no longer deserves them (a merged-away
+ * post). Deletions flood-limit exactly like edits, so this shares the retry policy and
+ * keeps an undeleted reference rather than losing the trail of where the post still is.
+ */
+export async function deleteAnnouncementMessages({ telegram, references, options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
+  const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
+  const list = Array.isArray(references) ? references : [];
+  const result = { deleted: 0, failed: 0, gone: 0, channels: list.length, retryAfterMs: 0 };
+  if (!list.length || !telegram || typeof telegram.deleteMessage !== 'function') return result;
+
+  for (const reference of list) {
+    let applied = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await telegram.deleteMessage(reference.channelId, reference.messageId);
+        applied = 'deleted';
+        break;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 200);
+        if (/message to delete not found|message can't be deleted|not found|already deleted/i.test(description)) { applied = 'gone'; break; }
+        const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
+        if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
+        const backoff = Math.min(retryAfterMs, ceilingMs);
+        result.retryAfterMs = Math.max(result.retryAfterMs, backoff);
+        await wait(backoff);
+      }
+    }
+    if (applied === 'deleted') { result.deleted += 1; announcementLane.totals.deleted += 1; }
+    else if (applied === 'gone') result.gone += 1;
+    else result.failed += 1;
+    if (spacingMs) await wait(spacingMs);
+  }
+  announcementLane.totals.failed += result.failed;
   return result;
 }
 
@@ -1692,9 +1954,10 @@ export function announcementSyncNote(sync) {
   const parts = [];
   if (sync.updated) parts.push(`${sync.updated} announcement${sync.updated === 1 ? '' : 's'} updated`);
   if (sync.unchanged) parts.push(`${sync.unchanged} already showing this information`);
-  if (sync.failed) parts.push(`${sync.failed} could not be edited (is the bot still an admin?)`);
+  if (sync.failed) parts.push(`${sync.failed} waiting on Telegram’s limit and queued for a later round`);
   if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
-  return parts.length ? `Telegram announcements: ${parts.join(', ')}.` : 'The Telegram announcement could not be edited.';
+  if (parts.length) return `Telegram announcements: ${parts.join(', ')}.`;
+  return 'The Telegram announcement could not be edited; it stays on the list, so /sync will send it again.';
 }
 
 export async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
@@ -1731,7 +1994,10 @@ export async function announcePublishedContent({ bot, repository, content, websi
         parse_mode: 'HTML',
         ...keyboard
       });
-      posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'photo', websiteUrl, postedAt: new Date().toISOString() });
+      // The caption and artwork are remembered on the reference so a later edit can answer
+      // "already correct" without calling Telegram at all — the difference between a big
+      // batch clearing the flood limit and one edit per post per channel hitting it.
+      posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'photo', websiteUrl, postedAt: new Date().toISOString(), caption, posterUrl: content.posterUrl || null });
       sent += 1;
     } catch (photoError) {
       try {
@@ -1739,7 +2005,7 @@ export async function announcePublishedContent({ bot, repository, content, websi
           parse_mode: 'HTML',
           ...keyboard
         });
-        posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'text', websiteUrl, postedAt: new Date().toISOString() });
+        posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'text', websiteUrl, postedAt: new Date().toISOString(), caption, posterUrl: null });
         sent += 1;
       } catch (messageError) {
         failed += 1;
@@ -2066,7 +2332,7 @@ async function publishDraftSession({
         const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
         // The channel post lists how many episodes/files a release carries, so
         // an append has to refresh it as well.
-        const sync = await syncPublishedAnnouncements({ telegram: ctx.telegram, repository, content, config });
+        const sync = await queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: content.adminId, notifyChatId: chatId(ctx) });
         await ctx.reply(
           [
             `Added ${session.files.length} new file${session.files.length === 1 ? '' : 's'} to the existing catalog post “${content.title}”. It now has ${content.filesCount} file${content.filesCount === 1 ? '' : 's'} and keeps Post ID ${content.adminId}.`,
@@ -4020,6 +4286,9 @@ export function mergeResultText(outcome, config = {}) {
       ? `▪ ${unnumbered.length} moved file${unnumbered.length === 1 ? '' : 's'} ${unnumbered.length === 1 ? 'has' : 'have'} no episode number and ${unnumbered.length === 1 ? 'stays' : 'stay'} outside the episode index (${unnumbered.slice(0, 3).map((file) => shortFileName(file)).join(', ')}${unnumbered.length > 3 ? `, +${unnumbered.length - 3} more` : ''}). ${unnumbered.length === 1 ? 'It' : 'They'} ${unnumbered.length === 1 ? 'is' : 'are'} still on the card and delivered as ${unnumbered.length === 1 ? 'a file' : 'files'} — re-send ${unnumbered.length === 1 ? 'it' : 'them'} with a caption like “Ep 12” to place ${unnumbered.length === 1 ? 'it' : 'them'} in the index.`
       : null,
     moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
+    outcome.announcementMessages?.queued
+      ? `▪ Announcement messages: ${outcome.announcementMessages.queued} copy${outcome.announcementMessages.queued === 1 ? '' : 's'} of the absorbed posts queued for deletion on the channel lane, so a Telegram limit cannot fail the merge. /sync lists what is still there.`
+      : null,
     outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
       ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
       : null,
@@ -4055,7 +4324,7 @@ export async function applyMergePlan({ bot, repository, config = {}, plan = {} }
   const moved = [];
   const missing = [];
   const blocked = [];
-  const announcementMessages = { deleted: 0, failed: 0 };
+  const announcementMessages = { deleted: 0, failed: 0, queued: 0 };
   const telegram = bot?.telegram;
 
   for (const entry of plan.sources || []) {
@@ -4071,14 +4340,13 @@ export async function applyMergePlan({ bot, repository, config = {}, plan = {} }
     movedFiles.push(...(Array.isArray(source.files) ? source.files : []));
     movedPlayers.push(...(Array.isArray(source.stream?.entries) ? source.stream.entries : []));
     aliases.push(...[source.titleKey, source.automationKey, ...(Array.isArray(source.automationKeys) ? source.automationKeys : [])].filter(Boolean));
-    for (const reference of Array.isArray(source.announcementRefs) ? source.announcementRefs : []) {
-      try {
-        await telegram.deleteMessage(reference.channelId, reference.messageId);
-        announcementMessages.deleted += 1;
-      } catch (error) {
-        announcementMessages.failed += 1;
-        console.warn('[telegram] merged-post announcement delete failed:', reference.channelId, error?.description || error?.message || 'Unknown error');
-      }
+    // Telegram refuses a burst of deletions the same way it refuses a burst of edits, so
+    // removing the absorbed posts' announcements runs on the lane: the merge completes
+    // whether or not the channel is willing, and /sync reports anything left behind.
+    const staleReferences = Array.isArray(source.announcementRefs) ? source.announcementRefs : [];
+    if (staleReferences.length) {
+      queueAnnouncementDeletion({ telegram, repository, content: source, references: staleReferences }, { detached: true });
+      announcementMessages.queued += staleReferences.length;
     }
     moved.push({
       adminId: source.adminId,
@@ -4113,7 +4381,7 @@ export async function applyMergePlan({ bot, repository, config = {}, plan = {} }
   const content = await repository.findContentByAdminId(target.adminId);
   // The merged card shows a new episode summary, so its own announcement must
   // say the same thing.
-  const sync = await syncPublishedAnnouncements({ telegram, repository, content, config });
+  const sync = await queueAnnouncementSync({ telegram, repository, content, config, adminId: content?.adminId });
   return {
     plan,
     content,
@@ -4171,7 +4439,7 @@ export async function applyMergeDrop({ repository, bot, config = {}, adminId, dr
     const entryStart = Number(entry.episode?.start);
     return Number.isInteger(entryStart) && droppedEpisodes.includes(entryStart);
   }).length;
-  const sync = await syncPublishedAnnouncements({ telegram: bot?.telegram, repository, content, config });
+  const sync = await queueAnnouncementSync({ telegram: bot?.telegram, repository, content, config, adminId: content?.adminId });
   return {
     content,
     removed,
@@ -4474,6 +4742,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
           'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
+          'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time; a Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
@@ -5107,7 +5376,7 @@ export async function launchTelegramBot({ config, repository }) {
   // A card is parsed once, when it is written, so a rule shipped later never reaches
   // the cards published before it. This is the one command that catches the whole
   // site up after a deploy, without re-uploading a single file.
-  const repairReportText = async ({ dryRun, adminId = null }) => {
+  const repairReportText = async ({ dryRun, adminId = null, ctx = null }) => {
     const report = await repository.reindexContent({ dryRun, adminId });
     if (adminId && !report.checked) {
       return `No published catalog post was found for ${adminId}. Use /posts or /postid to find its current ID.`;
@@ -5128,8 +5397,25 @@ export async function launchTelegramBot({ config, repository }) {
     lines.push(report.updated
       ? `▪ Nothing was dropped${seasonWord} ${report.unindexed} file${report.unindexed === 1 ? ' has' : 's have'} no episode number at all.${dryRun ? ' Re-send those with a caption like “Ep 12” only if a number was really missed.' : ' They stay in the card’s file list and are delivered as files.'}`
       : `▪ Every card already matches the indexing rules in this build${report.seasonPacks ? `, including ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} filed by season` : ''}. Nothing was written.`);
-    lines.push('Titles, Post IDs, slugs, posters, players, delivery links, and announcement messages were not touched, and no file was re-uploaded.');
-    if (dryRun && report.updated) lines.push('To apply it: /repair go');
+    // The channel post lists how many files and episodes a release carries, so a card
+    // whose index changed has an announcement that no longer matches it. Same lane as
+    // every other edit, so a site-wide repair cannot burst its way into a flood limit.
+    if (!dryRun && report.updated && ctx && typeof repository.listAnnouncedContent === 'function') {
+      const announced = new Set((await repository.listAnnouncedContent({ adminId })).map((entry) => entry.adminId));
+      let queuedAnnouncements = 0;
+      for (const card of report.cards) {
+        if (!announced.has(card.adminId)) continue;
+        const content = await repository.findContentByAdminId?.(card.adminId);
+        if (!content) continue;
+        queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: card.adminId, notifyChatId: chatId(ctx) }, { detached: true });
+        queuedAnnouncements += 1;
+      }
+      if (queuedAnnouncements) {
+        lines.push(`▪ ${queuedAnnouncements} channel announcement${queuedAnnouncements === 1 ? '' : 's'} queued so the posted copy matches the corrected card — one edit at a time on the lane, retried when Telegram lifts its limit, and /sync lists anything still waiting.`);
+      }
+    }
+    lines.push('Titles, Post IDs, slugs, posters, players, and delivery links were not touched, and no file was re-uploaded.');
+    if (dryRun && report.updated) lines.push('Applying also queues a channel-announcement refresh for the cards that change, because the posted copy lists file and episode counts. To apply it: /repair go');
     if (dryRun && !report.updated) lines.push('To apply it anyway: /repair go');
     return lines.join('\n').slice(0, 3_800);
   };
@@ -5154,7 +5440,91 @@ export async function launchTelegramBot({ config, repository }) {
     }
     await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
     const dryRun = !targetAdminId && (!argument || /^(?:preview|check)$/i.test(argument));
-    await ctx.reply(await repairReportText({ dryRun, adminId: targetAdminId }));
+    await ctx.reply(await repairReportText({ dryRun, adminId: targetAdminId, ctx }));
+  });
+
+  // ── /sync: the announcement channels on their own. Re-indexing fixes a card; this fixes
+  //    the copy a channel shows, which is where a post published before the channel-tag
+  //    cleaner still reads "@somechannel". Nothing here uploads a file or edits a card, and
+  //    every send rides the paced lane, so a site-wide refresh cannot fire hundreds of
+  //    simultaneous edits and get refused the way a big /batch used to.
+  bot.command('sync', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.listAnnouncedContent !== 'function') {
+      await ctx.reply('Channel refresh is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 60).trim();
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status)$/i.test(argument)) {
+      await ctx.reply([
+        'Usage:',
+        '/sync — shows which channel posts no longer match their card, sends nothing',
+        '/sync go — refreshes every one of them, one edit at a time',
+        '/sync SB-0123ABCDEF — refreshes that post’s announcement now and reports the result',
+        'A refused edit is not lost: it stays queued and is retried after Telegram’s own wait.'
+      ].join('\n'));
+      return;
+    }
+    const apply = Boolean(targetAdminId) || /^(?:go|run|apply|all)$/i.test(argument);
+    await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
+    const contents = await repository.listAnnouncedContent({ adminId: targetAdminId });
+    const status = announcementSyncStatus();
+    if (targetAdminId && !contents.length) {
+      await ctx.reply(`No published post with a Telegram announcement was found for ${targetAdminId}. /posts lists what has one, and 18+ releases are never announced.`);
+      return;
+    }
+
+    const stale = [];
+    let refs = 0;
+    for (const content of contents) {
+      const link = config ? getContentPageUrl(config, content) : null;
+      const caption = announcementCaption(content);
+      const behind = (Array.isArray(content.announcementRefs) ? content.announcementRefs : []).filter(
+        (reference) => !announcementReferenceIsCurrent(reference, { caption, link, posterUrl: content.posterUrl || null })
+      );
+      if (!behind.length) continue;
+      stale.push({ content, refs: behind.length });
+      refs += behind.length;
+    }
+
+    const lines = [];
+    lines.push(`▸ ${apply ? '' : 'Preview · '}${contents.length} announced card${contents.length === 1 ? '' : 's'} checked — ${stale.length} ${apply ? 'refreshing' : 'need'} a channel refresh (${refs} posted message${refs === 1 ? '' : 's'}).`);
+    for (const entry of stale.slice(0, 8)) {
+      lines.push(`▪ ${entry.content.adminId} · ${cleanText(entry.content.title, 44)} — ${entry.refs} message${entry.refs === 1 ? '' : 's'}`);
+    }
+    if (stale.length > 8) lines.push(`▪ +${stale.length - 8} more not listed here.`);
+    lines.push(status.pending
+      ? `▪ Lane: ${status.pending} job${status.pending === 1 ? '' : 's'} queued${status.totals.retried ? `, ${status.totals.retried} send${status.totals.retried === 1 ? '' : 's'} already waited out a Telegram limit` : ''}.`
+      : '▪ Lane is idle.');
+    if (status.stale.length) {
+      lines.push(`▪ Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => entry.key || entry.label).filter(Boolean).join(', ')}. /sync go tries again — the cards themselves are already correct.`);
+    }
+    if (!stale.length) {
+      lines.push('Every announcement already shows what this build would publish, so there is nothing to send. A post whose copy predates the channel-tag cleaner is refreshed here once and never again.');
+    } else if (apply) {
+      let queued = 0;
+      for (const entry of stale) {
+        const job = queueAnnouncementSync({
+          telegram: ctx.telegram,
+          repository,
+          content: entry.content,
+          config,
+          adminId: entry.content.adminId,
+          notifyChatId: chatId(ctx)
+        });
+        if (stale.length === 1 && job) lines.push(announcementSyncNote(await job));
+        else if (job) job.catch(() => {});
+        queued += 1;
+      }
+      if (stale.length > 1) {
+        const minutes = Math.max(1, Math.ceil((refs * ANNOUNCEMENT_SYNC_SPACING_MS) / 60_000));
+        lines.push(`▪ ${queued} card${queued === 1 ? '' : 's'} queued on the lane, one edit per ${(ANNOUNCEMENT_SYNC_SPACING_MS / 1000).toFixed(1)}s — roughly ${minutes} minute${minutes === 1 ? '' : 's'} of sending. This reply is not waiting for it; /sync shows progress, and you get a message only if something never gets through.`);
+      }
+    } else {
+      lines.push(`To send them: /sync go${targetAdminId ? '' : ', or /sync SB-… for a single card'}.`);
+    }
+    await ctx.reply(lines.filter(Boolean).join('\n').slice(0, 3_900));
   });
 
   // ── /players: the list view of attached players, with Remove buttons. The

@@ -46,6 +46,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Season markers (`S02`, `Season 2`, `2x05`) are read per file. When one upload batch contains more than one season, `/done` publishes **one catalog post per season** (`Title Season 1`, `Title Season 2`, …) and each season's merge keys are season-scoped, so a later Episode-of-Season-2 upload appends to the Season 2 post instead of colliding with Season 1. Files without a season marker join the season block they were sent inside. Category and type are decided from the name plus the files themselves: a release whose title and files carry no season marker stays a single post and is **never** given a generated `Season 1` label, while one stray `S01` file inside an otherwise unmarked group cannot relabel the whole upload either
 - Upload captions/file names resolve explicit audio and subtitle labels. For example, `Multi (Hindi + Malayalam)` is published as **Hindi** and **Malayalam**, never the unhelpful generic `Multi language` label. Dual/Multi or unlabeled media is inspected with MediaInfo only after the entire manual, batch, or auto release has collected; candidates are downloaded and parsed one at a time with byte, timeout, and file-count caps, so a failed/unavailable scan safely retains caption/filename fallback labels
 - Post pages show a safe, public episode index; each episode card opens a dedicated page containing exactly the delivery files for that episode (all qualities, ordered low to high) plus the players attached to it, while combined episode ranges open their own pack page. Storage message IDs remain private
+- Announcement-channel edits and deletions run on **one paced lane**, so a large `/batch` cannot trip Telegram's flood limit: a refused edit is retried after the wait Telegram asks for, a job that never gets through is reported to the publisher with its Post ID, and `/sync` (with `/sync go`) refreshes channel copy that no longer matches a card — which is how an old announcement still showing `@channel` gets corrected without re-uploading anything
 - **`/repair`** re-runs today's indexing rules over every published card. A card is indexed once, when it is published, so a rule added later never reaches the cards that came before it: `/repair` previews what would change, `/repair go` applies it site-wide, and `/repair SB-…` fixes one card now. Only derived fields move (file records, episode blocks, counts, release label) — titles, Post IDs, slugs, posters, players, delivery links, and announcement messages are untouched, and nothing is re-uploaded. Running it twice is a no-op
 - A file that names a **season** and no episode number is that season complete — how a whole-season upload arrives (`The.Simpsons.S01.1080p.DSNP.WEBRip`, `Show S03 Complete`, `Show.Season.5.Box.Set`). It is filed as a **complete season** instead of being reported as a file that lost its number: the card's delivery list gets one labelled block per season (`Season 1 · complete season`), each row keeps the uploader's own wording with an `S01` chip, the upload reply says `Season 1 complete season in one file (no episode number needed)`, and no `Ep 12` caption is ever asked for. Nothing is invented: a season must be readable in that file's own name or caption, so an extra (`Trailer 2`), a film, `S01E05`, or a season the card merely attributes to an unnamed file never becomes a pack
 - Files are copied to the Telegram database channel at upload time and delivered with `copyMessage` only after a valid deep link starts the bot. Fresh copied/resend captions and saved file labels automatically remove Telegram `@channel`, `t.me`, and promotional attribution while preserving title, quality, language, season, and episode information
@@ -325,7 +326,8 @@ Useful commands:
 | `/stats` | Show anonymous site-visitor/visit activity, private bot-user activity, catalog totals, and request status totals |
 | `/cmd SB-0123ABCDEF ep 2 <player URL>` | Immediately attach one approved player to Episode 2 (or `ep 2-7` for a range, or several links in one message); no new post or announcement is created |
 | `/cmd SB-0123ABCDEF del 3` / `del ep 2-7` / `del all` | Remove specific numbered players, every player of an episode range, or all players of that post |
-| `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no manual metadata, player, or announcement is touched |
+| `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no title, player, or delivery link is touched; the channel copy of a card that changed is refreshed on the announcement lane |
+| `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, and what Telegram refused stays listed instead of lost |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
 | `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
@@ -454,6 +456,26 @@ Metadata edits take one Post ID or as many as needed, separated by commas, space
 Only the Post IDs at the very front of the message are read as targets, so a value that contains commas (`Hindi, English`) or a file name that merely starts with `SB-` is never mistaken for another ID. The reply names each post it changed, lists any ID it could not find, and reports how many announcement messages were edited. A category change into or out of 18+ is refused for that one post (its storage channel and age gate must stay separate) while the rest of the list is still corrected.
 
 `/title`, `/description`, and `/poster` intentionally do **not** accept a list: a title, synopsis, and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
+
+### Announcement edits, flood limits, and `/sync`
+
+Every change to a published card is mirrored onto the announcement message the bot posted in the channel, and Telegram refuses a burst of edits or deletions in the same chat. The old behaviour was that a 40-ID `/batch` fired 40 simultaneous edits, some failed with *Too Many Requests*, and the only trace was a line in the log.
+
+So all channel work now runs on **one lane** inside the process:
+
+- at most one call in flight, with a gap between them (`ANNOUNCEMENT_SYNC_SPACING_MS`, default 1.1s — the limit is measured in seconds, so a gap is the fix rather than more retries);
+- a `Too Many Requests` reply is honoured inside the call: it waits exactly as long as Telegram asked and tries that edit again, up to three times;
+- a job still refused after its rounds goes to the back of the lane for another round, and if it never gets through the **publisher chat is told which Post IDs are left**, because a wait that outlives the command's own reply must not become silence;
+- `Bad Request: message is not modified` counts as success, and a post the publisher deleted by hand is forgotten — its reference is pruned rather than retried forever;
+- every reference remembers the caption and artwork it was last sent with, so a repeat edit costs **no API call at all**. That is also what makes `/sync` cheap: it compares each card with what its channel post was last given, which finds the announcements published before the channel-tag cleaner existed and refreshes them once.
+
+```text
+/sync        — preview: which posts differ, how many are queued, what is still refused
+/sync go     — refresh every one of them, one edit at a time
+/sync SB-…   — refresh that card's announcement now and report the result
+```
+
+`/batch`, `/lang`, `/category`, `/poster`, `/merge`, and `/repair go` all queue through the same lane, so a bulk command answers its own reply instead of spending a minute editing a channel; the deletion of absorbed posts' announcements does the same, which is why a merge can no longer be spoiled by a channel that will not answer.
 
 ### Merge split cards into one post
 

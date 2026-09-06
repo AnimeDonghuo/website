@@ -228,7 +228,15 @@ export function normalizeAnnouncementRefs(value) {
       // link is dropped, because this value is written back onto a Telegram
       // button.
       websiteUrl: /^https?:\/\//i.test(String(entry?.websiteUrl || '')) ? cleanText(entry.websiteUrl, 300) : null,
-      postedAt: cleanText(entry?.postedAt, 40) || null
+      postedAt: cleanText(entry?.postedAt, 40) || null,
+      // What the channel post was last sent with. Remembering it lets a repeat edit answer
+      // "already correct" without calling Telegram at all — which is the difference between
+      // a bulk refresh staying inside the flood limit and tripping it — and lets /sync list
+      // stale posts by looking at the card alone. Stored verbatim on purpose: normalizing
+      // here (cleanText collapses whitespace) would put a stored caption out of reach of
+      // the freshly rendered one, and then nothing would ever look up to date again.
+      caption: typeof entry?.caption === 'string' && entry.caption && entry.caption.length <= 1_000 ? entry.caption : null,
+      posterUrl: /^https?:\/\//i.test(String(entry?.posterUrl || '')) ? cleanText(entry.posterUrl, 2_000) : null
     }))
     .filter((entry) => entry.channelId && Number.isInteger(entry.messageId) && entry.messageId > 0)
     .slice(0, 100);
@@ -817,6 +825,26 @@ export class MemoryCatalogRepository {
       report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
     }
     return report;
+  }
+
+  /**
+   * Published cards that remember where their announcement landed, for /sync. The
+   * reference list is the whole point of the query — a card nobody announced to a
+   * channel has no copy to refresh — so it is filtered here rather than in the bot, and
+   * the records come back complete because the caption is rendered from the card.
+   */
+  async listAnnouncedContent({ adminId = null, limit = 2_000 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Number(limit) || 2_000);
+    const items = [];
+    for (const saved of this.contents.values()) {
+      if (saved.published === false) continue;
+      if (wanted && saved.adminId !== wanted) continue;
+      if (!saved.announcementRefs?.length) continue;
+      items.push(clone(saved));
+      if (items.length >= ceiling) break;
+    }
+    return items;
   }
 
   async createContent(input) {
@@ -1823,6 +1851,13 @@ export class MongoCatalogRepository {
       report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
     }
     return report;
+  }
+
+  async listAnnouncedContent({ adminId = null, limit = 2_000 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const filter = { published: { $ne: false }, 'announcementRefs.0': { $exists: true } };
+    if (wanted) filter.adminId = wanted;
+    return this.contents.find(filter, { limit: Math.max(1, Number(limit) || 2_000) }).toArray();
   }
 
   async createContent(input) {
