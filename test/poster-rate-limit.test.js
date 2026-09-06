@@ -14,7 +14,12 @@ import {
   resetPosterUploadPace,
   uploadImageToImgBB
 } from '../src/server/services/poster-service.js';
-import { attachPosterRetryQueue, createPosterRetryQueue } from '../src/server/services/telegram-bot.js';
+import {
+  attachPosterRetryQueue,
+  createPosterRetryQueue,
+  posterDeferralNote,
+  shortDuration
+} from '../src/server/services/telegram-bot.js';
 
 const reply = (body, { ok = true, status = 200, headers = {} } = {}) => ({
   ok,
@@ -211,7 +216,7 @@ key-c ; key-a   key-b,key-4,key-5,key-6,key-7,key-8,key-9,key-10,key-11,key-12,k
   assert.equal(posterKeyPoolStatus().configured, 20);
 });
 
-test('uploads rotate across the pool so one key never sees a burst', async () => {
+test('one key carries the burst until it refuses, and only then does the pool move', async () => {
   configurePosterKeys(['key-a', 'key-b', 'key-c']);
   const used = [];
   globalThis.fetch = async (url, options) => {
@@ -222,8 +227,23 @@ test('uploads rotate across the pool so one key never sees a burst', async () =>
     // No apiKey is passed: with a pool configured, that is the point of the pool.
     await uploadImageToImgBB({ buffer: Buffer.from(name), title: 'Minions' });
   }
-  assert.deepEqual(used, ['key-a', 'key-b', 'key-c', 'key-a', 'key-b'], 'each quota carries one upload per window instead of five');
+  assert.deepEqual(used, Array(5).fill('key-a'), 'a healthy key is not abandoned mid-batch: switching every upload is the slow version of this');
   assert.equal(posterKeyPoolStatus().cooling, 0, 'a pool that is merely busy is not a pool in trouble');
+  assert.equal(posterKeyPoolStatus().sticky, 'key-a');
+
+  let refused = 0;
+  globalThis.fetch = async (url, options) => {
+    const key = options.body.get('key');
+    used.push(key);
+    if (key === 'key-a' && refused++ === 0) {
+      return reply({ error: { message: 'Rate limit reached.' } }, { ok: false, status: 429, headers: { 'retry-after': '30' } });
+    }
+    return accepted('later');
+  };
+  used.length = 0;
+  for (const name of ['sixth', 'seventh']) await uploadImageToImgBB({ buffer: Buffer.from(name), title: 'Minions' });
+  assert.deepEqual(used, ['key-a', 'key-b', 'key-b'], 'the switch happens once, on the refusal, and the new key is then kept');
+  assert.equal(posterKeyPoolStatus().sticky, 'key-b');
 });
 
 test('a key that refuses is rested while the rest of the pool keeps hosting', async () => {
@@ -264,4 +284,35 @@ test('when every key is busy the poster is deferred, not waited out for an hour'
   );
   assert.equal(calls, 2, 'both keys were tried once each, and then the publish was let go instead of parked');
   assert.equal(posterKeyPoolStatus().cooling, 2);
+});
+
+test('an hour when every key is full is reported as a wait with a number, not as a failure', async () => {
+  assert.equal(shortDuration(42_000), '42 s');
+  assert.equal(shortDuration(4 * 60_000), '4 min');
+  assert.equal(shortDuration(75 * 60_000), '1 h 15 min');
+  const note = posterDeferralNote({ deferred: true, allKeysCooling: true, poolSize: 10, retryAfterMs: 40_000 });
+  assert.match(note, /all 10 configured ImgBB keys are rate limited right now/);
+  assert.match(note, /The next one is free in about 40 s/);
+  assert.match(note, /Nothing needs resending/);
+  assert.match(posterDeferralNote({ deferred: true }), /uses the poster from its source for now/);
+  assert.equal(posterDeferralNote({ deferred: false }), null, 'a card whose poster went through is not told about it again');
+
+  // And the queue obeys the host instead of its own default, because a 45-second wait should not
+  // become a five-minute one.
+  const clock = { at: 0 };
+  const queue = createPosterRetryQueue({
+    repository: { updateContentByAdminId: async () => null },
+    host: async () => {
+      const error = new PosterRateLimitError('Every configured ImgBB key is rate limited.');
+      error.retryAfterMs = 45_000;
+      throw error;
+    },
+    now: () => clock.at,
+    intervalMs: 300_000,
+    rounds: 4
+  });
+  queue.enqueue({ adminId: 'SB-1111AAAA1111', title: 'Gold', image: { buffer: Buffer.from('poster bytes') } });
+  await queue.runDue(300_000);
+  assert.equal(queue.size, 1, 'the card stays queued while the pool is busy');
+  assert.equal(queue.list()[0].nextAt, 345_000, 'the next attempt is when ImgBB said it would be ready');
 });

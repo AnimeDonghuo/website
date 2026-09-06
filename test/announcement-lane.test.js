@@ -7,12 +7,17 @@ import {
   announcementReferenceIsCurrent,
   announcementSyncNote,
   announcementSyncStatus,
+  classifyAnnouncementEditFailure,
   deleteAnnouncementMessages,
+  queuePosterRematchForTitle,
   queueAnnouncementSync,
+  clearAnnouncementUnsyncable,
+  listAnnouncementUnsyncable,
   queueAnnouncementDeletion,
   resetAnnouncementLane,
   syncPublishedAnnouncements
 } from '../src/server/services/telegram-bot.js';
+import { PosterRateLimitError } from '../src/server/services/poster-service.js';
 
 const card = (overrides = {}) => ({
   adminId: 'SB-AAA111',
@@ -168,9 +173,52 @@ test('a deleted announcement post is forgotten, a refused one is kept for the ne
     content: card(),
     options: { spacingMs: 0, wait: refused.wait }
   });
-  assert.equal(failed.failed, 1, 'a refusal that is not Telegram’s limit is still one attempt, not a loop');
-  assert.deepEqual(keptPatches, [], 'a refused edit does not rewrite the reference list');
-  assert.match(announcementSyncNote(failed), /waiting on Telegram’s limit and queued for a later round/);
+  assert.equal(failed.failed, 0);
+  assert.equal(failed.blocked, 1, 'a bot that is not in the channel is refused for a reason that will not change, so the lane stops after one attempt');
+  assert.equal(keptPatches.length, 1, 'the ref is kept — the card still wants that channel copy');
+  assert.equal(keptPatches[0].announcementRefs[0].syncError.blocked, true, 'and it remembers why, so /sync can say it');
+  assert.match(keptPatches[0].announcementRefs[0].syncError.reason, /bot is not a member/);
+  assert.match(announcementSyncNote(failed), /refused because this bot is not an administrator of that channel, or was removed from it/);
+
+  // A flood-limit refusal is the opposite case: one attempt per round, retried later, and still counted as failed.
+  const limited = recorder([editError('Too Many Requests: retry after 8 seconds')]);
+  const throttled = await syncPublishedAnnouncements({
+    telegram: limited.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: card(),
+    options: { spacingMs: 0, wait: limited.wait, attempts: 1 }
+  });
+  assert.equal(throttled.failed, 1, 'a wait is not a permanent refusal');
+  assert.match(announcementSyncNote(throttled), /waiting on Telegram\u2019s limit and queued for a later round/);
+});
+
+test('a copy another account posted is remembered as unfixable instead of refused forever', async () => {
+  const other = recorder([editError('Bad Request: MESSAGE_AUTHOR_INVALID: bots can\u2019t edit messages sent by other bots')]);
+  const patches = [];
+  const first = await syncPublishedAnnouncements({
+    telegram: other.telegram,
+    repository: { updateContentByAdminId: async (adminId, patch) => { patches.push(patch); return null; } },
+    content: card(),
+    options: { spacingMs: 0, wait: other.wait }
+  });
+  assert.equal(first.unsyncable, 1, 'the reference is dropped, because keeping it means refusing it again on every future edit');
+  assert.equal(first.dropped, 0, 'and it is not called a deleted post: the copy is still in the channel, it is just not this bot\u2019s to edit');
+  assert.equal(first.skipped, 0);
+  assert.match(announcementSyncNote(first), /copy this bot did not post/);
+  assert.equal(listAnnouncementUnsyncable()[0].key, '-100chan:11', 'the message is remembered by channel and id, not by card');
+
+  // The next edit of the same card never reaches Telegram at all, and /sync can still name it.
+  const second = recorder([editError('nope')]);
+  const again = await syncPublishedAnnouncements({
+    telegram: second.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: card(),
+    options: { spacingMs: 0, wait: second.wait }
+  });
+  assert.equal(second.calls.length, 0, 'one refused call per message is enough for anyone');
+  assert.equal(again.skipped, 1);
+  assert.match(again.reason, /posted by another account/);
+  assert.equal(clearAnnouncementUnsyncable(), 1, '/sync retry forgets it, so the next edit tries again');
 });
 
 test('the lane serializes every job, retries a stuck one, and reports what is left', async () => {
@@ -279,4 +327,60 @@ test('a queued deletion keeps the merge result honest without waiting on the cha
   assert.equal(job, null, 'a detached job returns nothing so the caller can answer at once');
   await announcementLaneDrained();
   assert.deepEqual(patches[0].patch.announcementRefs, [], 'the absorbed card forgets a message that no longer exists');
+});
+
+test('a refused edit says which kind of refusal it was', () => {
+  assert.deepEqual(classifyAnnouncementEditFailure('Bad Request: MESSAGE_AUTHOR_INVALID: bots can\u2019t edit messages sent by other bots'), {
+    kind: 'unsyncable', reason: 'the copy was posted by another account, so no bot can rewrite it'
+  });
+  assert.equal(classifyAnnouncementEditFailure('Forbidden: bot is not a member of the channel').kind, 'rights');
+  assert.equal(classifyAnnouncementEditFailure('Too Many Requests: retry after 6 seconds').kind, 'retry', 'a flood wait is not a permanent answer');
+  assert.equal(classifyAnnouncementEditFailure('Bad Request: message is not modified').kind, 'retry');
+});
+
+test('a corrected title re-matches the artwork and updates the card, its backdrop, and the channel copy', async () => {
+  const patches = [];
+  const announced = [];
+  const repository = {
+    async updateContentByAdminId(adminId, patch) {
+      patches.push({ adminId, patch });
+      return { adminId, ...patch, announcementRefs: [{ channelId: '-100chan', messageId: 11, kind: 'photo' }] };
+    }
+  };
+  const job = queuePosterRematchForTitle({
+    repository,
+    config: { imgbbApiKey: 'k' },
+    content: { adminId: 'SB-AAA111', title: 'Vampires Of The Velvet Lounge', category: 'anime', posterUrl: null, poster: { source: 'generated-fallback', title: 'untitled 001' } },
+    telegram: { editMessageMedia: async () => { announced.push('media'); return {}; } },
+    find: async () => ({ matched: true, posterOriginalUrl: 'https://image.test/poster.jpg' }),
+    prepare: async () => ({ buffer: Buffer.from('png'), contentType: 'image/png', sourceUrl: 'https://image.test/poster.jpg' }),
+    host: async () => ({ url: 'https://i.ibb.co/new.png', providerId: 'new', originalUrl: 'https://image.test/poster.jpg', source: 'remote-mirror' })
+  });
+  assert.ok(job, 'a card with no matched artwork is exactly what this is for');
+  const outcome = await job;
+  assert.equal(outcome.updated, 1);
+  assert.equal(patches[0].patch.posterUrl, 'https://i.ibb.co/new.png');
+  assert.equal(patches[0].patch.backdropUrl, 'https://i.ibb.co/new.png', 'the card and its page art move together');
+  assert.equal(patches[0].patch.poster.title, 'Vampires Of The Velvet Lounge', 'the artwork remembers the title it was matched under');
+  await announcementLaneDrained();
+  assert.deepEqual(announced, ['media'], 'the channel post is edited with the same fix, through the lane');
+});
+
+test('a poster chosen by hand is never re-matched away, and a busy ImgBB defers instead of failing', async () => {
+  const untouched = queuePosterRematchForTitle({
+    repository: { updateContentByAdminId: async () => ({}) },
+    content: { adminId: 'SB-BBB222', title: 'Gold', category: 'movie', posterUrl: 'https://i.ibb.co/chosen.png', poster: { source: 'remote-mirror', title: 'Gold' } },
+    find: async () => ({ matched: true, posterOriginalUrl: 'https://image.test/other.jpg' })
+  });
+  assert.equal(untouched, null, 'the title still matches the title the artwork was found under, so nothing is re-searched');
+
+  const deferred = await queuePosterRematchForTitle({
+    repository: { updateContentByAdminId: async () => { throw new Error('must not be called'); } },
+    content: { adminId: 'SB-CCC333', title: 'Oculus', category: 'movie', posterUrl: null, poster: { source: 'generated-fallback' } },
+    find: async () => ({ matched: true, posterOriginalUrl: 'https://image.test/poster.jpg' }),
+    prepare: async () => ({ buffer: Buffer.from('png'), contentType: 'image/png', sourceUrl: 'https://image.test/poster.jpg' }),
+    host: async () => { throw new PosterRateLimitError('Rate limit reached.'); }
+  });
+  assert.equal(deferred.skipped, 1);
+  assert.match(deferred.reason, /rate limiting/, 'the publisher is told the artwork is on the poster queue rather than that it failed');
 });

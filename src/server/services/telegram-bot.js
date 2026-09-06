@@ -638,10 +638,10 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
  * Returns false when the message is not a bulk rename — a single line or a draft title belongs to
  * the ordinary one-post flow, whose reply is more exact than a batch report would be.
  */
-export async function applyBulkTitleEdits({ ctx, repository, text, commands = ['title', 't', 'rename'] }) {
+export async function applyBulkTitleEdits({ ctx, repository, text, config = null, commands = ['title', 't', 'rename'] }) {
   const bulk = parseBulkPostEdits(text, { commands });
   if (!(bulk.entries.length > 1 || (bulk.entries.length === 1 && bulk.invalid.length))) return false;
-  const result = await updatePublishedPost({ ctx, repository, field: 'title', fieldLabel: 'Title', edits: bulk.entries });
+  const result = await updatePublishedPost({ ctx, repository, config, field: 'title', fieldLabel: 'Title', edits: bulk.entries, rematchPoster: true });
   if (result?.handled && bulk.invalid.length) {
     await ctx.reply([
       `${bulk.invalid.length} line${bulk.invalid.length === 1 ? ' was' : 's were'} left out because ${bulk.invalid.length === 1 ? 'it makes' : 'they make'} no sense as a rename:`,
@@ -674,7 +674,7 @@ const MULTI_POST_EDITABLE_FIELDS = new Set([
  * `guard(content)` may refuse one targeted post (the 18+ storage boundary)
  * without blocking the rest of the batch.
  */
-export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null }) {
+export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null, config = null, rematchPoster = false }) {
   // `edits` is the batch shape: one value per post ID, so a page of titles is one command.
   const paired = Array.isArray(edits) && edits.length
     ? edits
@@ -709,6 +709,7 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
   const missing = [];
   const blocked = [];
   const tidied = [];
+  let rechecks = 0;
   const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
   let queued = 0;
   for (const [index, adminId] of target.adminIds.entries()) {
@@ -734,6 +735,15 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
     }
     if (paired && paired[index].changed) tidied.push(adminId);
     contents.push(previous ? { ...updated, previousValue: cleanText(previous[field], 1_600) } : updated);
+    // A corrected title is the one edit that can also fix the artwork: the card may have been given
+    // a generated placeholder only because the name it was matched under was wrong.
+    if (rematchPoster && field === 'title') {
+      const job = queuePosterRematchForTitle({ ctx, repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram });
+      if (job) {
+        job.catch(() => {});
+        rechecks += 1;
+      }
+    }
     // Anything the announcement channel shows must stay in sync, so the same edit is
     // applied to the posted message instead of leaving it stale — through the lane,
     // because a batch would otherwise fire one edit per post per channel at once and
@@ -774,6 +784,9 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
     ];
   if (tidied.length) {
     lines.push(`${tidied.length} of those ${tidied.length === 1 ? 'title was' : 'titles were'} tidied from the pasted text (a file extension, brackets, underscores, dots, or a quality label). Send the line again exactly as you want it if that was the title itself.`);
+  }
+  if (rechecks) {
+    lines.push(`${rechecks} ${rechecks === 1 ? 'card had' : 'cards had'} no matched artwork, so its poster is being re-checked against the corrected title on the lane and will replace the card, its backdrop, and its channel copy wherever it is found.`);
   }
   if (blocked.length) {
     lines.push(`${blocked.length} post${blocked.length === 1 ? ' was' : 's were'} left alone: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}`);
@@ -907,11 +920,14 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
   const updated = await repository.updateContentByAdminId(adminId, {
     posterUrl: posterResult.url,
     backdropUrl: posterResult.url,
+    // `title` is what the artwork was matched against. A later /title correction is the signal that
+    // the match is worth repeating, and a poster chosen by hand is never overwritten by one.
     poster: {
       provider: 'imgbb',
       providerId: posterResult.providerId,
       originalUrl: posterResult.originalUrl,
       source: posterResult.source,
+      title: cleanText(existing.title, 180) || null,
       mirroredAt: new Date().toISOString()
     }
   });
@@ -2144,7 +2160,7 @@ export function settleQueuedJob(job, { graceMs = 10_000 } = {}) {
   });
 }
 
-function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, stuckNote = null, options = {} }) {
+export function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, stuckNote = null, options = {} }) {
   const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
   const wait = typeof options.wait === 'function' ? options.wait : pause;
   const totalRounds = Math.max(1, Number(options.rounds || rounds) || 1);
@@ -2165,20 +2181,30 @@ function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = 
       // a test that asked for zero spacing is not left waiting on a wall clock.
       await wait(Math.max(Number(result.retryAfterMs) || 0, spacingMs * 4));
     }
-    if (result?.failed) announcementLane.stale.set(key || `job-${Date.now()}`, { key: key || null, label: label || null, failed: Number(result.failed) || 0, retried });
+    if (result?.failed || result?.blocked) announcementLane.stale.set(key || `job-${Date.now()}`, { key: key || null, label: label || null, failed: Number(result.failed) || 0, blocked: Number(result.blocked) || 0, reason: result.reason || null, retried });
     else if (key) announcementLane.stale.delete(key);
     // A job that started from a command answers in its own message when it settles, which is how
     // the command gets to reply at once instead of holding a Telegram request open for minutes.
     if (typeof options.onSettled === 'function') {
       await Promise.resolve(options.onSettled(result, { retried, rounds: totalRounds })).catch(() => {});
     }
-    if (retried && notifyChatId && typeof telegram?.sendMessage === 'function') {
+    // A blocked edit is not something a later round fixes, so the publisher hears about it once,
+    // in the same message that says what to change in Telegram. A copy this bot never posted is
+    // remembered instead, and only listed by /sync — no repeat notice on every edit.
+    if ((retried || Number(result?.blocked)) && notifyChatId && typeof telegram?.sendMessage === 'function') {
       const still = Number(result?.failed) || 0;
+      const blocked = Number(result?.blocked) || 0;
+      const why = result?.reason ? ` Telegram said: ${result.reason}.` : '';
       const lines = still
         ? [
-          `⚠ ${label || key || 'An announcement'}: ${still} channel post${still === 1 ? '' : 's'} still refused after ${totalRounds} rounds.`,
+          `⚠ ${label || key || 'An announcement'}: ${still} channel post${still === 1 ? '' : 's'} still refused after ${totalRounds} rounds.${why}`,
           stuckNote || 'The catalog card is already correct — only the channel copy is behind. /sync lists what is left and /sync go sends it again.'
         ]
+        : blocked
+          ? [
+            `⚠ ${label || key || 'An announcement'}: ${blocked} channel post${blocked === 1 ? '' : 's'} cannot be edited by this bot.${why}`,
+            'The catalog card and its website page are correct, so nothing on the site is behind — only that channel copy is. Add this bot as an administrator of the channel (it needs “Manage messages”) and /sync go fixes it, or edit the copy in the channel yourself. /sync retry makes the bot look at those messages again.'
+          ]
         : [
           `✓ ${label || key || 'A queued announcement'} went through once Telegram’s limit lifted (${result.updated} edited${result.unchanged ? `, ${result.unchanged} already correct` : ''}).`,
           'Nothing needed doing — the retry finished it.'
@@ -2242,10 +2268,41 @@ export function announcementSyncStatus() {
   };
 }
 
+/**
+ * Channel messages this bot never sent, so no bot can rewrite them. Remembered by message, because
+ * re-asking Telegram about the same human-posted copy on every batch is how a refresh turned into a
+ * hundred guaranteed refusals. /sync names them, and /sync retry forgets the list.
+ */
+const announcementUnsyncable = new Map();
+const announcementRefKey = (reference) => `${reference?.channelId ?? '?'}:${reference?.messageId ?? '?'}`;
+
+export function listAnnouncementUnsyncable() {
+  return [...announcementUnsyncable.entries()].map(([key, entry]) => ({ key, ...entry }));
+}
+
+export function clearAnnouncementUnsyncable() {
+  const size = announcementUnsyncable.size;
+  announcementUnsyncable.clear();
+  return size;
+}
+
+/** Telegram refuses some edits for a reason that will never change; those say what to do instead. */
+export function classifyAnnouncementEditFailure(description) {
+  const reason = cleanText(description, 160);
+  if (/message[ _]author[ _]invalid|sent by (?:another|other) bots?|other bot[\u2019']?s message|can[\u2019']?t (?:be )?edit|not allowed to edit/i.test(reason)) {
+    return { kind: 'unsyncable', reason: 'the copy was posted by another account, so no bot can rewrite it' };
+  }
+  if (/not enough rights|administrator|kicked|removed from the chat|bot was blocked|unauthorized|forbidden|chat_id can access this bot/i.test(reason)) {
+    return { kind: 'rights', reason: 'this bot is not an administrator of that channel, or was removed from it' };
+  }
+  return { kind: 'retry', reason: null };
+}
+
 /** Test seam: forget the queue's bookkeeping between cases. */
 export function resetAnnouncementLane() {
   announcementLane.pending = 0;
   announcementLane.stale.clear();
+  announcementUnsyncable.clear();
   announcementLane.totals = { jobs: 0, retried: 0, refreshed: 0, unchanged: 0, failed: 0, dropped: 0, deleted: 0, captions: 0 };
   announcementLane.tail = Promise.resolve();
   // A test that resets the lane also forgets which captions were refused, so each case starts
@@ -2261,6 +2318,82 @@ export function resetAnnouncementLane() {
   storageSweepState.blocked = 0;
   storageSweepState.failed = 0;
   storageSweepState.stoppedFor = null;
+}
+
+/**
+ * Re-check the artwork after a title correction, and put whatever is found everywhere the card is
+ * shown: the catalog card, its backdrop, and the posted channel copy.
+ *
+ * A wrong title used to leave a card with a generated placeholder forever, because the poster was
+ * matched once, before the correction. This runs on the announcement lane — paced, retried against
+ * Telegram's own waits, and never awaited by the command that queued it — and a poster ImgBB will
+ * not take right now goes to the poster retry queue rather than being lost.
+ */
+export function queuePosterRematchForTitle({ ctx = null, repository, config = null, content, adminId = null, telegram = null, notify = null, find = findMetadata, prepare = preparePosterImage, host = hostPosterImage } = {}) {
+  const target = adminId || content?.adminId || null;
+  if (!target || !content || typeof repository?.updateContentByAdminId !== 'function') return null;
+  const poster = content.poster || {};
+  const wantsMatch = !content.posterUrl
+    || poster.source === 'generated-fallback'
+    || (poster.title && poster.title !== content.title);
+  if (!wantsMatch) return null;
+  const title = cleanText(content.title, 180);
+  const tell = notify || (ctx ? (chat, text) => ctx.reply(text).catch(() => {}) : null);
+  return enqueueAnnouncementJob({
+    key: `poster:${target}`,
+    label: `${target} · poster re-check`,
+    notifyChatId: null,
+    telegram: telegram || ctx?.telegram || null,
+    run: async () => {
+      const outcome = { updated: 0, unchanged: 0, failed: 0, skipped: 0, channels: 0, reason: null };
+      let metadata = null;
+      try {
+        metadata = await find(title, content.category, config);
+      } catch (error) {
+        outcome.reason = automationDiagnostic(error);
+        return outcome;
+      }
+      const sourceUrl = metadata?.posterOriginalUrl || null;
+      if (!sourceUrl || metadata?.matched === false) {
+        outcome.skipped = 1;
+        outcome.reason = 'no provider artwork was found for the corrected title';
+        return outcome;
+      }
+      const image = await prepare({ sourceUrl, title, category: content.category });
+      let hosted = null;
+      try {
+        hosted = await host({ image, title, config });
+      } catch (error) {
+        if (!isPosterRateLimit(error)) throw error;
+        queuePosterRetry({ adminId: target, title, image, notifyChatId: ctx ? chatId(ctx) : null });
+        outcome.skipped = 1;
+        outcome.reason = 'ImgBB is rate limiting; the artwork is hosted on the poster queue';
+        return outcome;
+      }
+      const saved = await repository.updateContentByAdminId(target, {
+        posterUrl: hosted.url,
+        backdropUrl: hosted.url,
+        poster: {
+          provider: 'imgbb',
+          providerId: hosted.providerId || null,
+          originalUrl: hosted.originalUrl || sourceUrl,
+          source: hosted.source || 'remote-mirror',
+          title,
+          mirroredAt: new Date().toISOString()
+        }
+      });
+      outcome.updated = saved ? 1 : 0;
+      if (!saved) outcome.reason = 'that card is no longer in the catalog';
+      // The channel copy shows the artwork too, so the same refresh that any edit uses updates it.
+      if (saved && Array.isArray(saved.announcementRefs) && saved.announcementRefs.length && telegram) {
+        queueAnnouncementSync({ telegram, repository, content: saved, config, adminId: target });
+      }
+      if (saved && typeof tell === 'function') {
+        Promise.resolve(tell(target, `✓ Poster for ${target} · ${title} was matched and hosted from the corrected title, and its channel copy was updated with it.`)).catch(() => {});
+      }
+      return outcome;
+    }
+  });
 }
 
 /**
@@ -2281,7 +2414,7 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
   const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
   const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
   const refs = Array.isArray(content?.announcementRefs) ? content.announcementRefs : [];
-  const result = { updated: 0, unchanged: 0, failed: 0, dropped: 0, skipped: 0, channels: refs.length, retryAfterMs: 0 };
+  const result = { updated: 0, unchanged: 0, failed: 0, blocked: 0, dropped: 0, unsyncable: 0, skipped: 0, reason: null, channels: refs.length, retryAfterMs: 0 };
   if (!refs.length || !telegram || isAdultCategory(content?.category)) return result;
   const caption = announcementCaption(content);
   const posterUrl = content.posterUrl || null;
@@ -2292,8 +2425,23 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
     // Only rewrite the button row when the destination link is actually known;
     // omitting reply_markup leaves the publisher's existing buttons untouched.
     const link = (config ? getContentPageUrl(config, content) : null) || reference.websiteUrl || null;
-    if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) {
+    if (announcementUnsyncable.has(announcementRefKey(reference))) {
+      // Known to be unfixable by this bot: the card is right, the copy is not, and that is said in
+      // /sync rather than re-attempted every time anything on the card changes.
       kept.push(reference);
+      result.skipped += 1;
+      result.reason = result.reason || announcementUnsyncable.get(announcementRefKey(reference))?.reason || null;
+      continue;
+    }
+    if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) {
+      if (reference.syncError) {
+        // A ref that once failed and now matches has its stale complaint cleared, or /sync keeps
+        // listing a card that is actually fine.
+        kept.push({ ...reference, syncError: null });
+        dirty = true;
+      } else {
+        kept.push(reference);
+      }
       result.unchanged += 1;
       continue;
     }
@@ -2301,6 +2449,9 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
     const replyMarkup = keyboard ? keyboard.reply_markup : undefined;
     const extra = replyMarkup ? { reply_markup: replyMarkup } : {};
     let applied = null;
+    // The last thing Telegram said about this message, kept for the report: "still refused" means
+    // nothing to a publisher, "the copy was posted by another account" tells them what to do.
+    let lastRefusal = null;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
@@ -2325,10 +2476,25 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
         break;
       } catch (error) {
         const description = cleanText(error?.description || error?.message, 200);
+        lastRefusal = description;
         // Telegram says this when the post already reads exactly as we would write
         // it, which is a success for a card that has not really changed.
         if (/message is not modified/i.test(description)) { applied = 'unchanged'; break; }
-        if (/not found|can't be edited|chat not found|deleted|message to edit/i.test(description)) { applied = 'dropped'; break; }
+        if (/not found|chat not found|deleted|message to edit/i.test(description)) { applied = 'dropped'; break; }
+        const refusal = classifyAnnouncementEditFailure(description);
+        if (refusal.kind === 'unsyncable') {
+          announcementUnsyncable.set(announcementRefKey(reference), { reason: refusal.reason, at: new Date().toISOString(), adminId: content?.adminId || null });
+          result.reason = result.reason || refusal.reason;
+          applied = 'unsyncable';
+          break;
+        }
+        if (refusal.kind === 'rights') {
+          // The ref is kept and the round stops: nothing about this card needs re-editing, and the
+          // publisher has one thing to fix in Telegram rather than a command to repeat.
+          result.reason = result.reason || refusal.reason;
+          applied = 'blocked';
+          break;
+        }
         const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
         if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
         const backoff = Math.min(retryAfterMs, ceilingMs);
@@ -2339,16 +2505,24 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
 
     if (applied === 'updated' || applied === 'unchanged') {
       const memory = announcementReferenceMemory(reference, { caption, link, posterUrl });
+      if (memory.syncError) { delete memory.syncError; dirty = true; }
       if (memory !== reference) dirty = true;
       kept.push(memory);
+      announcementUnsyncable.delete(announcementRefKey(reference));
       result[applied === 'updated' ? 'updated' : 'unchanged'] += 1;
-    } else if (applied === 'dropped') {
-      result.dropped += 1;
+    } else if (applied === 'unsyncable' || applied === 'dropped') {
+      // Both shrink the reference list: one because the copy belongs to another account, the other
+      // because it no longer exists. Keeping either would refuse the same message on every future edit.
+      result[applied === 'unsyncable' ? 'unsyncable' : 'dropped'] += 1;
       dirty = true;
     } else {
-      kept.push(reference);
-      result.failed += 1;
-      // Not dropped: the ref stays in the list so the lane's next round can finish it.
+      // Not dropped: the ref stays in the list so the lane's next round can finish it — and it now
+      // carries why Telegram refused, which is what makes a report actionable instead of alarming.
+      const detail = cleanText(lastRefusal, 160);
+      kept.push({ ...reference, syncError: { reason: detail, at: new Date().toISOString(), blocked: applied === 'blocked' } });
+      dirty = true;
+      result[applied === 'blocked' ? 'blocked' : 'failed'] += 1;
+      result.reason = result.reason || (applied === 'blocked' ? classifyAnnouncementEditFailure(detail).reason : null);
     }
     if (spacingMs) await wait(spacingMs);
   }
@@ -2896,7 +3070,10 @@ export function announcementSyncNote(sync) {
   if (sync.updated) parts.push(`${sync.updated} announcement${sync.updated === 1 ? '' : 's'} updated`);
   if (sync.unchanged) parts.push(`${sync.unchanged} already showing this information`);
   if (sync.failed) parts.push(`${sync.failed} waiting on Telegram’s limit and queued for a later round`);
+  if (sync.blocked) parts.push(`${sync.blocked} refused because ${sync.reason || 'this bot cannot edit that channel'}`);
   if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
+  if (sync.unsyncable) parts.push(`${sync.unsyncable} announcement${sync.unsyncable === 1 ? '' : 's'} ${sync.unsyncable === 1 ? 'is' : 'are'} a copy this bot did not post, so no bot can edit ${sync.unsyncable === 1 ? 'it' : 'them'} \u2014 remembered, so nothing is ever re-sent for ${sync.unsyncable === 1 ? 'it' : 'them'}`);
+  if (sync.skipped) parts.push(`${sync.skipped} copy this bot did not post, left for you to edit in the channel (remembered, so nothing is re-sent for it)`);
   if (parts.length) return `Telegram announcements: ${parts.join(', ')}.`;
   return 'The Telegram announcement could not be edited; it stays on the list, so /sync will send it again.';
 }
@@ -3232,6 +3409,11 @@ export async function publishDraft(ctx, bot, repository, config) {
     }
     const last = succeeded.at(-1).content;
     const deferredPosters = published.filter((entry) => entry.content && entry.posterResult?.deferred).length;
+    const cooling = published.filter((entry) => entry.posterResult?.allKeysCooling);
+    const freeInMs = cooling.length ? Math.max(...cooling.map((entry) => Number(entry.posterResult.retryAfterMs) || 0)) : 0;
+    const posterTimerNote = cooling.length
+      ? ` Every configured key is cooling; the next one frees in about ${freeInMs > 0 ? shortDuration(freeInMs) : 'a few minutes'} and the queue runs on that timer.`
+      : '';
     await ctx.reply([
       `Published ${succeeded.length} catalog post${succeeded.length === 1 ? '' : 's'} from this upload.`,
       '',
@@ -3239,7 +3421,7 @@ export async function publishDraft(ctx, bot, repository, config) {
         ? `\u2713 ${entry.content.title} \u00b7 ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} \u00b7 Post ID ${entry.content.adminId}`
         : `\u2717 ${entry.title} \u2014 ${entry.error || 'not published'}`)),
       deferredPosters
-        ? `\u25aa ${deferredPosters} poster${deferredPosters === 1 ? '' : 's'} could not be hosted because ImgBB is rate limiting. Those cards are live with their source artwork and the mirror is retried in the background — nothing needs re-sending.`
+        ? `\u25aa ${deferredPosters} poster${deferredPosters === 1 ? '' : 's'} could not be hosted because ImgBB is rate limiting. Those cards are live with their source artwork and the mirror is retried in the background — nothing needs re-sending.${posterTimerNote}`
         : null,
       cancelledAt
         ? `\u25aa Stopped at ${cancelledGroup}: the draft was cancelled, so ${notPublished} of ${plan.length} releases were not published. Nothing else was touched, and the ${notPublished === 1 ? 'card' : 'cards'} above stand${notPublished === 1 ? 's' : ''} as they are.`
@@ -3281,6 +3463,36 @@ const POSTER_RETRY_ROUNDS = (() => {
 const POSTER_RETRY_TICK_MS = 30_000;
 
 let activePosterRetryQueue = null;
+
+/** `42_000` reads as "about 40 s" to a publisher, which is what a wait has to be to be useful. */
+export function shortDuration(value) {
+  const ms = Math.max(0, Number(value) || 0);
+  if (ms < 1_000) return 'a moment';
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+/**
+ * What the poster host said, in the one sentence the publisher can act on (or ignore).
+ *
+ * "Every key in the pool is full" is a different report from "this one upload was refused": the
+ * first is a wait with a number attached, and saying so is what stops a bulk publish from reading
+ * like a failure while the mirror is quietly being retried on that timer.
+ */
+export function posterDeferralNote(deferred) {
+  if (!deferred?.deferred) return null;
+  if (deferred.allKeysCooling) {
+    const pool = Number(deferred.poolSize) > 1 ? `all ${deferred.poolSize} configured ImgBB keys are` : 'the ImgBB key is';
+    const when = deferred.retryAfterMs ? ` The next one is free in about ${shortDuration(deferred.retryAfterMs)},` : '';
+    return `\u25aa Rate limit note: ${pool} rate limited right now, so no key would take another upload.${when} the mirror runs on that timer instead of the usual wait. Nothing needs resending, and /poster can force one card whenever you like.`;
+  }
+  return '\u25aa ImgBB is rate limiting, so this card uses the poster from its source for now. The mirror is retried on its own queue and updates the card and its channel post when it goes through \u2014 nothing was created, and you do not need to publish this again.';
+}
 
 /**
  * Posters ImgBB would not take because it was busy — not because anything is wrong with them.
@@ -3380,6 +3592,7 @@ export function createPosterRetryQueue({
                 providerId: result.providerId || null,
                 originalUrl: result.originalUrl || entry.image.sourceUrl || null,
                 source: result.source || 'remote-mirror',
+                title: cleanText(entry.title, 180) || null,
                 mirroredAt: new Date(at).toISOString()
               }
             })
@@ -3401,7 +3614,12 @@ export function createPosterRetryQueue({
             continue;
           }
           entry.attempts += 1;
-          entry.nextAt = at + intervalMs * Math.min(rounds, entry.attempts + 1);
+          // The host's own number wins: a quota that says "30 seconds" is retried in 30 seconds,
+          // not five minutes later, and one that says "an hour" is never sat through.
+          const askedMs = Number(error.retryAfterMs) || 0;
+          entry.nextAt = at + (askedMs > 0
+            ? Math.min(intervalMs * rounds, Math.max(30_000, askedMs))
+            : intervalMs * Math.min(rounds, entry.attempts + 1));
           if (entry.attempts >= rounds) {
             pending.delete(adminId);
             counters.givenUp += 1;
@@ -3505,9 +3723,12 @@ async function publishDraftSession({
         originalUrl: posterImage.sourceUrl || null,
         source: 'pending-host-rate-limit',
         contentType: posterImage.contentType,
-        deferred: true
+        deferred: true,
+        allKeysCooling: Boolean(error.allKeysCooling),
+        poolSize: Number(error.poolSize) || null,
+        retryAfterMs: Number(error.nextFreeMs) || Number(error.retryAfterMs) || null
       };
-      console.warn(`[telegram] ImgBB is rate limiting; the poster for ${posterTitle} is served from its source and re-hosted on the retry queue.`);
+      console.warn(`[telegram] ImgBB is rate limiting; the poster for ${posterTitle} is served from its source and re-hosted on the retry queue${posterResult.allKeysCooling ? ` (every key in the pool is cooling; next free in ~${posterResult.retryAfterMs || 0} ms)` : ''}.`);
     }
 
     // The provider's canonical name wins, but a season boundary is never lost:
@@ -3535,6 +3756,9 @@ async function publishDraftSession({
         providerId: posterResult.providerId,
         originalUrl: posterResult.originalUrl,
         source: posterResult.source,
+        // The title this artwork was matched against, so a later rename can tell whether the match
+        // is still the right one. A manual pick is never re-matched away.
+        title: cleanText(title, 180) || null,
         mirroredAt: new Date().toISOString()
       },
       metadataProvider: metadata.provider,
@@ -3592,7 +3816,7 @@ async function publishDraftSession({
       }
     }
     const posterNote = posterResult.deferred
-      ? '▪ ImgBB is rate limiting, so this card uses the poster from its source for now. The mirror is retried on its own queue and updates the card and its channel post when it goes through — nothing was created, and you do not need to publish this again.'
+      ? posterDeferralNote(posterResult)
       : posterResult.source === 'generated-fallback'
         ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
         : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
@@ -5974,7 +6198,7 @@ export async function launchTelegramBot({ config, repository }) {
     if (!(await requirePublisher(ctx, repository, config))) return;
     // A block of one-line renames is the shape this command takes most, so it is read as a batch
     // first: pasted straight out of a notes app, with `/title` on every line or only on the first.
-    if (await applyBulkTitleEdits({ ctx, repository, text: ctx.message.text })) return;
+    if (await applyBulkTitleEdits({ ctx, repository, config, text: ctx.message.text })) return;
     const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     if (postTarget) {
@@ -5982,7 +6206,7 @@ export async function launchTelegramBot({ config, repository }) {
         await ctx.reply(`Usage: /title ${postTarget.adminId} Your corrected title`);
         return;
       }
-      await updatePublishedPost({ ctx, repository, argument, field: 'title', fieldLabel: 'Title' });
+      await updatePublishedPost({ ctx, repository, argument, config, field: 'title', fieldLabel: 'Title', rematchPoster: true });
       return;
     }
     if (!argument) {
@@ -6737,12 +6961,31 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
     const targetAdminId = postIdsFromCommand(argument)[0] || null;
-    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status)$/i.test(argument)) {
+    if (/^(?:retry|reset|forget|clear)$/i.test(argument)) {
+      const forgotten = clearAnnouncementUnsyncable();
+      // A message this bot failed to edit is kept on the card with the reason, so the publisher can
+      // act on it; after the bot's rights change, that memory has to go or the copy stays stale
+      // forever while every later edit answers "already remembered".
+      for (const content of await repository.listAnnouncedContent({}).catch(() => [])) {
+        const refs = Array.isArray(content.announcementRefs) ? content.announcementRefs : [];
+        const marked = refs.filter((reference) => reference?.syncError);
+        if (!marked.length || typeof repository.updateContentByAdminId !== 'function') continue;
+        await Promise.resolve(repository.updateContentByAdminId(content.adminId, {
+          announcementRefs: refs.map((reference) => (reference?.syncError ? { ...reference, syncError: null } : reference))
+        })).catch(() => {});
+      }
+      await ctx.reply(forgotten
+        ? `Forgot ${forgotten} channel message${forgotten === 1 ? '' : 's'} this bot could not edit, and cleared the refusals on the cards. /sync go tries them all again — if the bot was not an administrator of that channel, add it there first, or the same answer comes back.`
+        : 'Nothing was remembered as uneditable, so there is nothing to forget. /sync lists what is behind, and /sync go sends it.');
+      return;
+    }
+    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status|retry|reset|forget|clear)$/i.test(argument)) {
       await ctx.reply([
         'Usage:',
         '/sync — shows which channel posts no longer match their card, sends nothing',
         '/sync go — refreshes every one of them, one edit at a time',
         '/sync SB-0123ABCDEF — refreshes that post’s announcement now and reports the result',
+        '/sync retry — forgets which channel copies this bot could not edit, so they are attempted again',
         '/sync db — and /sync db go — the same for the captions on messages in the database channel',
         'A refused edit is not lost: it stays queued and is retried after Telegram’s own wait.'
       ].join('\n'));
@@ -6766,21 +7009,25 @@ export async function launchTelegramBot({ config, repository }) {
         (reference) => !announcementReferenceIsCurrent(reference, { caption, link, posterUrl: content.posterUrl || null })
       );
       if (!behind.length) continue;
-      stale.push({ content, refs: behind.length });
+      // The reason rides along, because "1 message" tells a publisher nothing they can act on while
+      // "this bot is not an administrator of that channel" is the whole instruction.
+      const why = behind.map((reference) => reference?.syncError?.reason).filter(Boolean)[0] || null;
+      const remembered = behind.filter((reference) => announcementUnsyncable.has(`${reference?.channelId}:${reference?.messageId}`)).length;
+      stale.push({ content, refs: behind.length, reason: why, remembered });
       refs += behind.length;
     }
 
     const lines = [];
     lines.push(`▸ ${apply ? '' : 'Preview · '}${contents.length} announced card${contents.length === 1 ? '' : 's'} checked — ${stale.length} ${apply ? 'refreshing' : 'need'} a channel refresh (${refs} posted message${refs === 1 ? '' : 's'}).`);
     for (const entry of stale.slice(0, 8)) {
-      lines.push(`▪ ${entry.content.adminId} · ${cleanText(entry.content.title, 44)} — ${entry.refs} message${entry.refs === 1 ? '' : 's'}`);
+      lines.push(`▪ ${entry.content.adminId} · ${cleanText(entry.content.title, 44)} — ${entry.refs} message${entry.refs === 1 ? '' : 's'}${entry.remembered ? ` (${entry.remembered} ${entry.remembered === 1 ? 'copy' : 'copies'} this bot did not post)` : ''}${entry.reason ? ` \u00b7 Telegram said: ${cleanText(entry.reason, 90)}` : ''}`);
     }
     if (stale.length > 8) lines.push(`▪ +${stale.length - 8} more not listed here.`);
     lines.push(status.pending
       ? `▪ Lane: ${status.pending} job${status.pending === 1 ? '' : 's'} queued${status.totals.retried ? `, ${status.totals.retried} send${status.totals.retried === 1 ? '' : 's'} already waited out a Telegram limit` : ''}.`
       : '▪ Lane is idle.');
     if (status.stale.length) {
-      lines.push(`▪ Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => entry.key || entry.label).filter(Boolean).join(', ')}. /sync go tries again — the cards themselves are already correct.`);
+      lines.push(`▪ Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => `${entry.key || entry.label}${entry.blocked ? ' (this bot cannot edit that channel — add it as an administrator with “Manage messages”)' : entry.reason ? ` (${cleanText(entry.reason, 60)})` : ''}`).filter(Boolean).join('; ')}. /sync go tries again, and /sync retry forgets what was remembered — the cards themselves are already correct.`);
     }
     lines.push('▪ The database channel’s own captions are a separate sweep: /sync db reads each file post’s caption from Telegram and cleans it, on this same lane.');
     if (!stale.length) {

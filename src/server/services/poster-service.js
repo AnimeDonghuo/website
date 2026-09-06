@@ -19,6 +19,14 @@ function boundedIntegerEnv(name, fallback, minimum, maximum) {
 const IMGBB_UPLOAD_SPACING_MS = boundedIntegerEnv('IMGBB_UPLOAD_SPACING_MS', 1_600, 0, 60_000);
 const IMGBB_RATE_LIMIT_ATTEMPTS = boundedIntegerEnv('IMGBB_RATE_LIMIT_ATTEMPTS', 3, 1, 8);
 const IMGBB_RATE_LIMIT_BACKOFF_MS = boundedIntegerEnv('IMGBB_RATE_LIMIT_BACKOFF_MS', 20_000, 1_000, 15 * 60_000);
+// One key is paced at the full interval, because a burst is what gets a key throttled. With a pool
+// the same risk is spread over several quotas, so the pace relaxes — that is the point of
+// configuring more than one key: a 117-card publish should take a couple of minutes, not five.
+const IMGBB_POOL_SPACING_MS = boundedIntegerEnv('IMGBB_POOL_SPACING_MS', 900, 150, 60_000);
+// A short wait is cheaper to sit out here than to hand to the retry queue. Anything longer belongs
+// to the queue's timer, because a publisher should never wait on an image host for minutes.
+const IMGBB_KEY_PATIENCE_MS = boundedIntegerEnv('IMGBB_KEY_PATIENCE_MS', 15_000, 0, 5 * 60_000);
+const IMGBB_POOL_SIZE = 4;
 const POSTER_UPLOAD_CACHE_LIMIT = 400;
 
 export class PosterHostingError extends Error {
@@ -82,7 +90,9 @@ export function parseImgBBKeys(value) {
   return [...new Set(list)].slice(0, IMGBB_KEY_POOL_LIMIT);
 }
 
-const posterKeyPool = { list: null, cursor: 0, state: new Map() };
+// `sticky` is the key currently in favour. Uploads stay on one key until it says it is full, which
+// is what an operator wants: one connection, one pace, and a switch only when it is forced.
+const posterKeyPool = { list: null, sticky: -1, state: new Map() };
 
 function resolvePosterKeys() {
   if (Array.isArray(posterKeyPool.list)) return posterKeyPool.list;
@@ -109,7 +119,7 @@ function posterKeyState(key) {
 /** Replace the pool: null re-reads the environment, an array pins it (a test seam, or a caller with its own list). */
 export function configurePosterKeys(keys) {
   posterKeyPool.list = keys === null || keys === undefined ? null : parseImgBBKeys(keys);
-  posterKeyPool.cursor = 0;
+  posterKeyPool.sticky = -1;
   posterKeyPool.state.clear();
   return posterKeyPool.list ? posterKeyPool.list.length : resolvePosterKeys().length;
 }
@@ -124,6 +134,7 @@ export function posterKeyPoolStatus() {
     limit: IMGBB_KEY_POOL_LIMIT,
     cooling: cooling.length,
     free: list.length - cooling.length,
+    sticky: posterKeyPool.sticky >= 0 ? list[posterKeyPool.sticky] || null : null,
     waitingMs: cooling.length ? Math.max(0, soonest - at) : 0,
     cooldownMs: IMGBB_KEY_COOLDOWN_MS,
     spacingMs: posterUploadOptions.spacingMs
@@ -132,10 +143,19 @@ export function posterKeyPoolStatus() {
 
 function pickPosterKey(keys, at) {
   if (!keys.length) return null;
-  const rotation = ((posterKeyPool.cursor % keys.length) + keys.length) % keys.length;
+  const sticky = posterKeyPool.sticky;
+  // Stay on the key in favour while it will still take an upload. Switching keys per upload buys
+  // nothing and costs a fresh quota's worth of waiting for no reason.
+  if (sticky >= 0 && sticky < keys.length && posterKeyState(keys[sticky]).cooldownUntil <= at) return { key: keys[sticky], index: sticky };
+  // With no key in favour the first one is offered; after a refusal the search starts just past the
+  // key that refused, so a burst walks the pool once and then settles on whatever works.
+  const start = sticky >= 0 ? (sticky + 1) % keys.length : 0;
   for (let offset = 0; offset < keys.length; offset += 1) {
-    const index = (rotation + offset) % keys.length;
-    if (posterKeyState(keys[index]).cooldownUntil <= at) return { key: keys[index], index };
+    const index = (start + offset) % keys.length;
+    if (posterKeyState(keys[index]).cooldownUntil <= at) {
+      posterKeyPool.sticky = index;
+      return { key: keys[index], index };
+    }
   }
   return null;
 }
@@ -147,8 +167,8 @@ function coolPosterKey(key, ms) {
   // than hammered at the same speed by the next card.
   const coolFor = Math.max(1_000, Number(ms) || 0) * Math.min(6, state.refusals);
   state.cooldownUntil = Math.max(state.cooldownUntil, posterUploadOptions.now() + coolFor);
-  // The rotation is advanced by the caller, which knows whether this upload succeeded: a key is
-  // never stepped past twice for one refusal.
+  // The refused key stops being the favoured one, so the next upload in this call picks another.
+  posterKeyPool.sticky = -1;
   return coolFor;
 }
 
@@ -168,10 +188,10 @@ export function clearPosterUploadCache() {
   return size;
 }
 
-/** Forget every key's pacing and cooldown, and start the rotation from the first key again. */
+/** Forget every key's pacing and cooldown, and let the next upload start on the first key. */
 export function resetPosterUploadPace() {
   posterKeyPool.state.clear();
-  posterKeyPool.cursor = 0;
+  posterKeyPool.sticky = -1;
 }
 
 function isPrivateIpv4(address) {
@@ -643,22 +663,23 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
   }
 
   const { spacingMs, attempts, backoffMs, wait, now } = posterUploadOptions;
+  const paceMs = keys.length >= IMGBB_POOL_SIZE ? Math.min(spacingMs, IMGBB_POOL_SPACING_MS) : spacingMs;
   let lastRateLimit = null;
   let restsTaken = 0;
   for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
     const picked = pickPosterKey(keys, now());
     if (!picked) {
-      // Resting is not one of the uploads the publisher is waiting on, so it does not consume an
-      // attempt — it is capped on its own, and only ever for the rest the host actually asked for.
+      // Every key in the pool has said it is full. The wait is reported, not sat through: the retry
+      // queue's timer is what an "all keys are down" hour needs, not a stalled publish.
       const soonest = Math.min(...keys.map((entry) => posterKeyState(entry).cooldownUntil));
       const restMs = Math.max(0, soonest - now());
-      // Every key is busy. Waiting out a short Retry-After is cheap; parking a publish for the rest
-      // of the hour is not what the retry queue is for.
       const pooled = new PosterRateLimitError('Every configured ImgBB key is rate limited.', { retryAfterMs: restMs });
+      pooled.allKeysCooling = true;
+      pooled.poolSize = keys.length;
+      pooled.nextFreeInMs = restMs;
       lastRateLimit = lastRateLimit || pooled;
-      if (restMs > IMGBB_KEY_COOLDOWN_MS || restsTaken >= 2) break;
-      // Waiting the seconds the host asked for is what makes a cooled key usable again, so the rest
-      // of this call may use it: the pool is not punished for a wait that already happened.
+      // A short Retry-After on the only key is cheaper to wait out here than to queue around.
+      if (restMs > IMGBB_KEY_PATIENCE_MS || keys.length > 1 || restsTaken >= 2) break;
       const resting = keys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
       restsTaken += 1;
       await wait(restMs);
@@ -667,9 +688,9 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
       continue;
     }
     const state = posterKeyState(picked.key);
-    if (spacingMs > 0 && state.lastUsedAt) {
+    if (paceMs > 0 && state.lastUsedAt) {
       const since = now() - state.lastUsedAt;
-      if (since < spacingMs) await wait(spacingMs - since);
+      if (since < paceMs) await wait(paceMs - since);
     }
     // The gap is measured per key, so ten keys carry ten uploads per window without any single
     // quota seeing more than one image per spacing interval.
@@ -679,15 +700,15 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
     try {
       outcome = await postPosterToImgBB({ buffer, title, key: picked.key });
     } catch (error) {
-      posterKeyPool.cursor = picked.index + 1;
       if (!isPosterRateLimit(error)) throw error;
       coolPosterKey(picked.key, backoffMs * attempt);
       lastRateLimit = new PosterRateLimitError(error.message, { retryAfterMs: backoffMs * attempt });
       continue;
     }
 
-    posterKeyPool.cursor = picked.index + 1;
     if (outcome.ok) {
+      // Success keeps this key in favour: the next poster goes to the same quota, one pace later.
+      posterKeyPool.sticky = picked.index;
       const hosted = { url: outcome.url, providerId: outcome.providerId };
       cachePosterUpload(cacheKey, hosted);
       return hosted;
