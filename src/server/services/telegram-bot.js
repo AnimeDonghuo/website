@@ -189,7 +189,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
-  { command: 'sync', description: 'Refresh what the announcement channels show: /sync, /sync go, or /sync db for the database channel' },
+  { command: 'sync', description: 'Refresh what the announcement channels show: /sync, /sync go, /sync retry, /sync db' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
   { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
@@ -1945,6 +1945,20 @@ export function announcementLaneDrained() {
   return announcementLane.tail.then(() => undefined, () => undefined);
 }
 const ANNOUNCEMENT_SYNC_REF_ATTEMPTS = 3;
+// How long a /sync preview stays valid, and how long /sync go may be answered from it. Sweeping the
+// announced archive is a read of every card, and the two commands are normally run back to back, so
+// the second one used to check everything the first had just checked. Anything that edits a card
+// drops the memo, and /sync force never uses it.
+const ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS = configuredMilliseconds(process.env.SYNC_PREVIEW_TTL_MS, 120_000);
+const ANNOUNCEMENT_SYNC_APPLY_TTL_MS = Math.min(ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS || 0, 60_000);
+let announcementSweepMemo = null;
+
+/** Test seam (and /sync force's escape hatch): forget the last sweep. */
+export function resetAnnouncementSweepMemo() {
+  const had = announcementSweepMemo;
+  announcementSweepMemo = null;
+  return Boolean(had);
+}
 const ANNOUNCEMENT_SYNC_RETRY_CEILING_MS = 5 * 60_000;
 const ANNOUNCEMENT_SYNC_ROUNDS = 3;
 
@@ -2078,6 +2092,25 @@ export function announcementReferenceIsCurrent(reference, { caption = null, link
   return true;
 }
 
+/** A fingerprint of what the channel copy would have to say, so "unchanged" survives a restart. */
+export function announcementSignature({ caption = null, link = null, posterUrl = null } = {}) {
+  return crypto.createHash('sha1').update(`${caption || ''}|${link || ''}|${posterUrl || ''}`).digest('base64url').slice(0, 16);
+}
+
+/**
+ * Whether this message was already refused for the copy it is being asked to carry now.
+ *
+ * A refusal by permission does not get milder with retries, so the reference remembers the exact
+ * caption/link/artwork it failed on and the next sweep skips it without a call. The moment the card
+ * changes, the signature changes with it and the edit is attempted again - nothing is skipped that
+ * could now succeed.
+ */
+export function announcementRefIsDeferred(reference, { caption = null, link = null, posterUrl = null } = {}) {
+  const error = reference?.syncError;
+  if (!error?.blocked || !error.signature) return false;
+  return error.signature === announcementSignature({ caption, link, posterUrl });
+}
+
 function announcementReferenceMemory(reference, { caption, link, posterUrl }) {
   return {
     ...reference,
@@ -2161,6 +2194,9 @@ export function settleQueuedJob(job, { graceMs = 10_000 } = {}) {
 }
 
 export function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, stuckNote = null, options = {} }) {
+  // Anything queued here changes what a channel post should say, so a preview of the archive is no
+  // longer trustworthy until the next command sweeps it again.
+  announcementSweepMemo = null;
   const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
   const wait = typeof options.wait === 'function' ? options.wait : pause;
   const totalRounds = Math.max(1, Number(options.rounds || rounds) || 1);
@@ -2300,6 +2336,7 @@ export function classifyAnnouncementEditFailure(description) {
 
 /** Test seam: forget the queue's bookkeeping between cases. */
 export function resetAnnouncementLane() {
+  announcementSweepMemo = null;
   announcementLane.pending = 0;
   announcementLane.stale.clear();
   announcementUnsyncable.clear();
@@ -2318,6 +2355,57 @@ export function resetAnnouncementLane() {
   storageSweepState.blocked = 0;
   storageSweepState.failed = 0;
   storageSweepState.stoppedFor = null;
+}
+
+/**
+ * Read every announced card once and split them into what needs a channel edit and what does not.
+ *
+ * This is the whole cost of /sync, so it is one function that can be counted and reused rather than
+ * inlined in the command: a card whose stored reference already carries this caption, link, and
+ * artwork is a string compare, and a copy this bot provably cannot rewrite is counted as left alone
+ * instead of being asked about again. Nothing here calls Telegram.
+ */
+export async function sweepAnnouncedCards({ repository, config = null, adminId = null, list = null } = {}) {
+  const startedAt = Date.now();
+  const contents = Array.isArray(list) ? list : await Promise.resolve(repository.listAnnouncedContent({ adminId })).catch(() => []);
+  const cards = Array.isArray(contents) ? contents : [];
+  const stale = [];
+  let refs = 0;
+  let matching = 0;
+  let leftAlone = 0;
+  let deferred = 0;
+  for (const content of cards) {
+    const link = config ? getContentPageUrl(config, content) : null;
+    const caption = announcementCaption(content);
+    const posterUrl = content.posterUrl || null;
+    const references = Array.isArray(content.announcementRefs) ? content.announcementRefs : [];
+    const behind = [];
+    let remembered = 0;
+    let reason = null;
+    for (const reference of references) {
+      if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) continue;
+      const key = announcementRefKey(reference);
+      if (announcementUnsyncable.has(key)) {
+        remembered += 1;
+        reason = reason || announcementUnsyncable.get(key)?.reason || null;
+        continue;
+      }
+      if (announcementRefIsDeferred(reference, { caption, link, posterUrl })) {
+        remembered += 1;
+        reason = reason || reference?.syncError?.reason || null;
+        continue;
+      }
+      behind.push(reference);
+    }
+    if (!behind.length) {
+      if (remembered) { leftAlone += 1; deferred += remembered; }
+      else matching += 1;
+      continue;
+    }
+    stale.push({ content, refs: behind.length, reason, remembered });
+    refs += behind.length;
+  }
+  return { checked: cards.length, matching, leftAlone, deferred, stale, refs, elapsedMs: Math.max(0, Date.now() - startedAt) };
 }
 
 /**
@@ -2433,6 +2521,14 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
       result.reason = result.reason || announcementUnsyncable.get(announcementRefKey(reference))?.reason || null;
       continue;
     }
+    if (announcementRefIsDeferred(reference, { caption, link, posterUrl })) {
+      // Already refused for exactly this copy. Counted, reported by /sync, and never re-attempted
+      // until the card says something different - that is what keeps a repeat /sync go cheap.
+      kept.push(reference);
+      result.skipped += 1;
+      result.reason = result.reason || reference.syncError.reason || null;
+      continue;
+    }
     if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) {
       if (reference.syncError) {
         // A ref that once failed and now matches has its stale complaint cleared, or /sync keeps
@@ -2519,7 +2615,17 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
       // Not dropped: the ref stays in the list so the lane's next round can finish it — and it now
       // carries why Telegram refused, which is what makes a report actionable instead of alarming.
       const detail = cleanText(lastRefusal, 160);
-      kept.push({ ...reference, syncError: { reason: detail, at: new Date().toISOString(), blocked: applied === 'blocked' } });
+      kept.push({
+        ...reference,
+        syncError: {
+          reason: detail,
+          at: new Date().toISOString(),
+          blocked: applied === 'blocked',
+          // What the copy was supposed to say, so the next sweep recognises "the same request" and
+          // leaves it alone without spending a call on a refusal that will repeat itself.
+          signature: announcementSignature({ caption, link, posterUrl })
+        }
+      });
       dirty = true;
       result[applied === 'blocked' ? 'blocked' : 'failed'] += 1;
       result.reason = result.reason || (applied === 'blocked' ? classifyAnnouncementEditFailure(detail).reason : null);
@@ -3073,7 +3179,7 @@ export function announcementSyncNote(sync) {
   if (sync.blocked) parts.push(`${sync.blocked} refused because ${sync.reason || 'this bot cannot edit that channel'}`);
   if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
   if (sync.unsyncable) parts.push(`${sync.unsyncable} announcement${sync.unsyncable === 1 ? '' : 's'} ${sync.unsyncable === 1 ? 'is' : 'are'} a copy this bot did not post, so no bot can edit ${sync.unsyncable === 1 ? 'it' : 'them'} \u2014 remembered, so nothing is ever re-sent for ${sync.unsyncable === 1 ? 'it' : 'them'}`);
-  if (sync.skipped) parts.push(`${sync.skipped} copy this bot did not post, left for you to edit in the channel (remembered, so nothing is re-sent for it)`);
+  if (sync.skipped) parts.push(`${sync.skipped} ${sync.skipped === 1 ? 'copy is' : 'copies are'} left for you to edit in the channel${sync.reason ? ` because ${sync.reason}` : ''} - remembered, so nothing is re-sent for ${sync.skipped === 1 ? 'it' : 'them'}, and re-checked the moment the card changes`);
   if (parts.length) return `Telegram announcements: ${parts.join(', ')}.`;
   return 'The Telegram announcement could not be edited; it stays on the list, so /sync will send it again.';
 }
@@ -6149,7 +6255,7 @@ export async function launchTelegramBot({ config, repository }) {
           'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
           'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
           'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
-          'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time; a Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
+          'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time — it reports how many cards were checked and only touches the ones that differ, so a second /sync costs no re-reading, and /sync force checks the archive again. A Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
           'If the file posts in your database channel still open with an @channel handle, /sync db shows them and /sync db go rewrites each caption to the clean label the catalog stored for it. Only posts this bot sent can be edited by a bot — the rest are listed instead of retried, and the website label is clean either way.',
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it. /title renames a whole list in one message: one line per post ID, with or without /title at the start of each line, and titles pasted from a filename are tidied as they are saved.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
@@ -6979,68 +7085,95 @@ export async function launchTelegramBot({ config, repository }) {
         : 'Nothing was remembered as uneditable, so there is nothing to forget. /sync lists what is behind, and /sync go sends it.');
       return;
     }
-    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status|retry|reset|forget|clear)$/i.test(argument)) {
+    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status|retry|reset|forget|clear|now|force|fresh|re-?check|rescan)$/i.test(argument)) {
       await ctx.reply([
         'Usage:',
         '/sync — shows which channel posts no longer match their card, sends nothing',
         '/sync go — refreshes every one of them, one edit at a time',
         '/sync SB-0123ABCDEF — refreshes that post’s announcement now and reports the result',
         '/sync retry — forgets which channel copies this bot could not edit, so they are attempted again',
+        '/sync force — re-reads the whole archive now instead of answering from the sweep it just did',
         '/sync db — and /sync db go — the same for the captions on messages in the database channel',
         'A refused edit is not lost: it stays queued and is retried after Telegram’s own wait.'
       ].join('\n'));
       return;
     }
     const apply = Boolean(targetAdminId) || /^(?:go|run|apply|all)$/i.test(argument);
+    const force = /^(?:now|force|fresh|re-?check|rescan)$/i.test(argument);
     await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
-    const contents = await repository.listAnnouncedContent({ adminId: targetAdminId });
+    // One sweep, not one per command. /sync and /sync go read every announced card, which on a
+    // catalog of hundreds is the slow part, and running them back to back checked the same cards
+    // twice. A fresh preview is therefore reused by /sync go, which then re-reads only the few cards
+    // it is about to touch; /sync force always checks the whole archive again.
+    const memoKey = targetAdminId || '*';
+    const memoIsFresh = (maxAgeMs) => !force && announcementSweepMemo
+      && announcementSweepMemo.key === memoKey
+      && Date.now() - announcementSweepMemo.at <= maxAgeMs;
+    const reuseAge = !apply
+      ? (memoIsFresh(ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS) ? Date.now() - announcementSweepMemo.at : null)
+      : (memoIsFresh(ANNOUNCEMENT_SYNC_APPLY_TTL_MS) ? Date.now() - announcementSweepMemo.at : null);
+    const sweep = reuseAge === null
+      ? await sweepAnnouncedCards({ repository, config, adminId: targetAdminId })
+      : announcementSweepMemo.sweep;
+    if (!apply || reuseAge === null) announcementSweepMemo = { key: memoKey, at: Date.now(), sweep };
     const status = announcementSyncStatus();
-    if (targetAdminId && !contents.length) {
+    const { stale, refs, checked, matching, leftAlone, deferred } = sweep;
+    if (targetAdminId && !checked) {
       await ctx.reply(`No published post with a Telegram announcement was found for ${targetAdminId}. /posts lists what has one, and 18+ releases are never announced.`);
       return;
     }
 
-    const stale = [];
-    let refs = 0;
-    for (const content of contents) {
-      const link = config ? getContentPageUrl(config, content) : null;
-      const caption = announcementCaption(content);
-      const behind = (Array.isArray(content.announcementRefs) ? content.announcementRefs : []).filter(
-        (reference) => !announcementReferenceIsCurrent(reference, { caption, link, posterUrl: content.posterUrl || null })
-      );
-      if (!behind.length) continue;
-      // The reason rides along, because "1 message" tells a publisher nothing they can act on while
-      // "this bot is not an administrator of that channel" is the whole instruction.
-      const why = behind.map((reference) => reference?.syncError?.reason).filter(Boolean)[0] || null;
-      const remembered = behind.filter((reference) => announcementUnsyncable.has(`${reference?.channelId}:${reference?.messageId}`)).length;
-      stale.push({ content, refs: behind.length, reason: why, remembered });
-      refs += behind.length;
-    }
-
+    const took = sweep.elapsedMs >= 1000 ? `${(sweep.elapsedMs / 1000).toFixed(1)} s` : `${sweep.elapsedMs} ms`;
     const lines = [];
-    lines.push(`▸ ${apply ? '' : 'Preview · '}${contents.length} announced card${contents.length === 1 ? '' : 's'} checked — ${stale.length} ${apply ? 'refreshing' : 'need'} a channel refresh (${refs} posted message${refs === 1 ? '' : 's'}).`);
+    lines.push([
+      `\u25b8 ${apply ? 'Applying \u00b7 ' : 'Preview \u00b7 '}${checked} announced card${checked === 1 ? '' : 's'} checked in ${took}`,
+      `${stale.length} ${apply ? 'refreshing' : 'need'} a channel refresh (${refs} posted message${refs === 1 ? '' : 's'})`,
+      `${matching} ${matching === 1 ? 'already matches' : 'already match'} and cost no call at all`,
+      leftAlone ? `${leftAlone} ${leftAlone === 1 ? 'card has' : 'cards have'} ${deferred} copy${deferred === 1 ? '' : 'ies'} this bot cannot edit${stale.length ? ', not counted above' : ''}` : null
+    ].filter(Boolean).join(' \u2014 ') + '.');
+    lines.push(reuseAge === null
+      ? `\u25aa ${matching} of those ${checked === 1 ? 'card was' : 'cards were'} skipped without asking Telegram: each one already carries the caption, link, and artwork its posted copy remembers.${leftAlone ? ` ${leftAlone} ${leftAlone === 1 ? 'is' : 'are'} left alone for a reason that will not change on its own.` : ''}`
+      : `\u25aa Answered from the sweep ${shortDuration(reuseAge)} ago, so nothing was re-checked${apply ? ' - only the cards about to be edited were read again' : ''}. ${force ? '' : 'Send /sync force to check the whole archive again.'}`);
     for (const entry of stale.slice(0, 8)) {
-      lines.push(`▪ ${entry.content.adminId} · ${cleanText(entry.content.title, 44)} — ${entry.refs} message${entry.refs === 1 ? '' : 's'}${entry.remembered ? ` (${entry.remembered} ${entry.remembered === 1 ? 'copy' : 'copies'} this bot did not post)` : ''}${entry.reason ? ` \u00b7 Telegram said: ${cleanText(entry.reason, 90)}` : ''}`);
+      lines.push(`\u25aa ${entry.content.adminId} \u00b7 ${cleanText(entry.content.title, 44)} \u2014 ${entry.refs} message${entry.refs === 1 ? '' : 's'}${entry.remembered ? ` (${entry.remembered} ${entry.remembered === 1 ? 'copy' : 'copies'} this bot did not post)` : ''}${entry.reason ? ` \u00b7 Telegram said: ${cleanText(entry.reason, 90)}` : ''}`);
     }
-    if (stale.length > 8) lines.push(`▪ +${stale.length - 8} more not listed here.`);
+    if (stale.length > 8) lines.push(`\u25aa +${stale.length - 8} more not listed here.`);
     lines.push(status.pending
-      ? `▪ Lane: ${status.pending} job${status.pending === 1 ? '' : 's'} queued${status.totals.retried ? `, ${status.totals.retried} send${status.totals.retried === 1 ? '' : 's'} already waited out a Telegram limit` : ''}.`
-      : '▪ Lane is idle.');
+      ? `\u25aa Lane: ${status.pending} job${status.pending === 1 ? '' : 's'} queued${status.totals.retried ? `, ${status.totals.retried} send${status.totals.retried === 1 ? '' : 's'} already waited out a Telegram limit` : ''}.`
+      : '\u25aa Lane is idle.');
     if (status.stale.length) {
-      lines.push(`▪ Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => `${entry.key || entry.label}${entry.blocked ? ' (this bot cannot edit that channel — add it as an administrator with “Manage messages”)' : entry.reason ? ` (${cleanText(entry.reason, 60)})` : ''}`).filter(Boolean).join('; ')}. /sync go tries again, and /sync retry forgets what was remembered — the cards themselves are already correct.`);
+      lines.push(`\u25aa Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => `${entry.key || entry.label}${entry.blocked ? ' (this bot cannot edit that channel \u2014 add it as an administrator with \u201cManage messages\u201d)' : entry.reason ? ` (${cleanText(entry.reason, 60)})` : ''}`).filter(Boolean).join('; ')}. /sync go tries again, and /sync retry forgets what was remembered \u2014 the cards themselves are already correct.`);
     }
-    lines.push('▪ The database channel’s own captions are a separate sweep: /sync db reads each file post’s caption from Telegram and cleans it, on this same lane.');
+    lines.push('\u25aa The database channel\u2019s own captions are a separate sweep: /sync db reads each file post\u2019s caption from Telegram and cleans it, on this same lane.');
     if (!stale.length) {
       lines.push('Every announcement already shows what this build would publish, so there is nothing to send. A post whose copy predates the channel-tag cleaner is refreshed here once and never again.');
     } else if (apply) {
       let queued = 0;
+      let caughtUp = 0;
       for (const entry of stale) {
+        // A reused preview is a snapshot, so the handful of cards about to be touched are read again
+        // rather than sent from what the archive said a minute ago.
+        let content = entry.content;
+        if (reuseAge !== null && typeof repository.findContentByAdminId === 'function') {
+          content = await Promise.resolve(repository.findContentByAdminId(entry.content.adminId)).catch(() => null) || entry.content;
+          const link = config ? getContentPageUrl(config, content) : null;
+          const caption = announcementCaption(content);
+          const behind = (Array.isArray(content.announcementRefs) ? content.announcementRefs : []).filter(
+            (reference) => !announcementReferenceIsCurrent(reference, { caption, link, posterUrl: content.posterUrl || null })
+              && !announcementRefIsDeferred(reference, { caption, link, posterUrl: content.posterUrl || null })
+              && !announcementUnsyncable.has(announcementRefKey(reference))
+          );
+          if (!behind.length) {
+            caughtUp += 1;
+            continue;
+          }
+        }
         const job = queueAnnouncementSync({
           telegram: ctx.telegram,
           repository,
-          content: entry.content,
+          content,
           config,
-          adminId: entry.content.adminId,
+          adminId: content.adminId,
           notifyChatId: chatId(ctx)
         });
         if (stale.length === 1 && job) {
@@ -7048,18 +7181,23 @@ export async function launchTelegramBot({ config, repository }) {
           if (settled) lines.push(announcementSyncNote(result));
           else {
             job.catch(() => {});
-            lines.push('▪ Queued behind the work already on the lane, so this reply is not waiting for it; the lane reports the edit when it goes through.');
+            lines.push('\u25aa Queued behind the work already on the lane, so this reply is not waiting for it; the lane reports the edit when it goes through.');
           }
         }
         else if (job) job.catch(() => {});
         queued += 1;
       }
-      if (stale.length > 1) {
+      if (caughtUp) {
+        lines.push(`\u25aa ${caughtUp} ${caughtUp === 1 ? 'card had' : 'cards had'} already caught up since that preview, so nothing was sent for ${caughtUp === 1 ? 'it' : 'them'}.`);
+      }
+      if (!queued) {
+        lines.push('Nothing needed sending after all \u2014 every copy on that list was already correct.');
+      } else if (stale.length > 1) {
         const minutes = Math.max(1, Math.ceil((refs * ANNOUNCEMENT_SYNC_SPACING_MS) / 60_000));
-        lines.push(`▪ ${queued} card${queued === 1 ? '' : 's'} queued on the lane, one edit per ${(ANNOUNCEMENT_SYNC_SPACING_MS / 1000).toFixed(1)}s — roughly ${minutes} minute${minutes === 1 ? '' : 's'} of sending. This reply is not waiting for it; /sync shows progress, and you get a message only if something never gets through.`);
+        lines.push(`\u25aa ${queued} card${queued === 1 ? '' : 's'} queued on the lane, one edit per ${(ANNOUNCEMENT_SYNC_SPACING_MS / 1000).toFixed(1)}s \u2014 roughly ${minutes} minute${minutes === 1 ? '' : 's'} of sending. This reply is not waiting for it; /sync shows progress, and you get a message only if something never gets through.`);
       }
     } else {
-      lines.push(`To send them: /sync go${targetAdminId ? '' : ', or /sync SB-… for a single card'}.`);
+      lines.push(`To send them: /sync go${targetAdminId ? '' : ', or /sync SB-\u2026 for a single card'}. A refresh only ever touches the ${stale.length} ${stale.length === 1 ? 'card' : 'cards'} above, never the ${matching} that already match.`);
     }
     await ctx.reply(lines.filter(Boolean).join('\n'));
   });

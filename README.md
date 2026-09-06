@@ -349,7 +349,7 @@ Useful commands:
 | `/cmd SB-0123ABCDEF ep 2 <player URL>` | Immediately attach one approved player to Episode 2 (or `ep 2-7` for a range, or several links in one message); no new post or announcement is created |
 | `/cmd SB-0123ABCDEF del 3` / `del ep 2-7` / `del all` | Remove specific numbered players, every player of an episode range, or all players of that post |
 | `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no title, player, or delivery link is touched; the channel copy of a card that changed is refreshed on the announcement lane |
-| `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, and what Telegram refused stays listed instead of lost |
+| `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, `/sync force` re-reads every card instead of answering from the sweep just done, and what Telegram refused stays listed instead of lost |
 | `/sync db` — then `/sync db go` | The database channel on its own: read the caption of every copied file post and rewrite the ones still carrying a `@channel` prefix, a page at a time until the archive is done. `/sync db status` asks how far it got |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
@@ -499,6 +499,8 @@ SB-B65405F26C Oculus
 
 ### Announcement edits, flood limits, and `/sync`
 
+A sweep says what it looked at, not only what it changed: `/sync` opens with `▸ 412 announced cards checked in 84 ms — 3 need a channel refresh (5 posted messages), 409 already match and cost no call at all`, and `/sync go` right after it is answered from that same sweep (up to `SYNC_PREVIEW_TTL_MS`, default two minutes) instead of reading the whole announced archive twice — only the few cards about to be edited are re-read, and a card that caught up in between is dropped from the queue and said so. `/sync force` always checks everything again. A refused copy is remembered per message with the caption it failed on, so repeating `/sync go` costs nothing until the card actually changes.
+
 A channel copy this bot cannot rewrite is said as a reason, not as a count: `⚠ SB-702C01A205 · Some Title: 1 channel post still refused after 3 rounds. Telegram said: Forbidden: bot is not a member of the channel.`, or the one-round version that names the fix instead of repeating itself. `/sync` lists the same reasons per card, and `/sync retry` forgets which copies were written off as uneditable so they are attempted again.
 
 Every change to a published card is mirrored onto the announcement message the bot posted in the channel, and Telegram refuses a burst of edits or deletions in the same chat. The old behaviour was that a 40-ID `/batch` fired 40 simultaneous edits, some failed with *Too Many Requests*, and the only trace was a line in the log.
@@ -640,6 +642,7 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `IMGBB_API_KEYS` | Secret | No | Up to 20 ImgBB keys to rotate uploads across (`IMGBB_API_KEY_2` … `_20` also work). Only needed when a bulk publish trips one key's quota |
 | `IMGBB_POOL_SPACING_MS` | Plaintext | No | Per-key gap used once the pool has at least four keys; default `900` |
 | `IMGBB_KEY_PATIENCE_MS` | Plaintext | No | How long a single-key deployment will sit out a short `Retry-After` inside one upload before deferring it to the poster queue; default `15000` |
+| `SYNC_PREVIEW_TTL_MS` | Plaintext | No | How long a `/sync` sweep may be reused by `/sync go` instead of reading every announced card again; default `120000` (the refresh itself never waits longer than 60 s for it) |
 | `IMGBB_KEY_COOLDOWN_MS` | Plaintext | No | How long a refusing key is rested while the rest of the pool keeps working; default `60000` |
 | `IMGBB_UPLOAD_SPACING_MS` | Plaintext | No | Minimum gap between two ImgBB uploads; default `1600`. Raise it if a bulk publish still trips the host |
 | `IMGBB_RATE_LIMIT_ATTEMPTS` | Plaintext | No | Upload attempts inside one publish before the poster moves to the retry queue; default `3`, up to `8` |

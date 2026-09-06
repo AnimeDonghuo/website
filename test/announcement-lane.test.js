@@ -7,7 +7,10 @@ import {
   announcementReferenceIsCurrent,
   announcementSyncNote,
   announcementSyncStatus,
+  announcementRefIsDeferred,
+  announcementSignature,
   classifyAnnouncementEditFailure,
+  sweepAnnouncedCards,
   deleteAnnouncementMessages,
   queuePosterRematchForTitle,
   queueAnnouncementSync,
@@ -383,4 +386,78 @@ test('a poster chosen by hand is never re-matched away, and a busy ImgBB defers 
   });
   assert.equal(deferred.skipped, 1);
   assert.match(deferred.reason, /rate limiting/, 'the publisher is told the artwork is on the poster queue rather than that it failed');
+});
+
+test('a refused copy is left alone on the next sweep until the card changes', async () => {
+  const refused = recorder([editError('Forbidden: bot is not a member of the channel')]);
+  const patches = [];
+  const repository = {
+    async updateContentByAdminId(adminId, patch) {
+      patches.push(patch);
+      return { ...card(), ...patch };
+    }
+  };
+  const first = await syncPublishedAnnouncements({
+    telegram: refused.telegram,
+    repository,
+    content: card(),
+    options: { spacingMs: 0, wait: refused.wait }
+  });
+  assert.equal(first.blocked, 1);
+  const remembered = patches[0].announcementRefs[0];
+  assert.ok(remembered.syncError.signature, 'the refusal remembers exactly what it was asked to say');
+
+  // The next sweep of the same card therefore costs no Telegram call at all. That is the difference
+  // between /sync go being one pass over the archive and a publisher repeating it until the bot is
+  // rate limited.
+  const second = recorder([editError('this must never be reached')]);
+  const again = await syncPublishedAnnouncements({
+    telegram: second.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: { ...card(), announcementRefs: [remembered] },
+    options: { spacingMs: 0, wait: second.wait }
+  });
+  assert.deepEqual(second.calls, [], 'a refusal that cannot change is not re-attempted');
+  assert.equal(again.skipped, 1);
+  assert.equal(again.blocked, 0, 'and it is not counted as a fresh failure, so no warning is repeated');
+  assert.equal(again.failed, 0);
+
+  // The moment the card says something different, the same message is worth trying again.
+  const third = recorder([{}]);
+  const changed = await syncPublishedAnnouncements({
+    telegram: third.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: { ...card(), title: 'A Different Release', announcementRefs: [remembered] },
+    options: { spacingMs: 0, wait: third.wait }
+  });
+  assert.equal(third.calls.length, 1, 'a new caption is a new request, so it is made once');
+  assert.equal(changed.updated, 1);
+  const websiteUrl = card().announcementRefs[0].websiteUrl;
+  assert.ok(announcementRefIsDeferred(remembered, { caption: announcementCaption(card()), link: websiteUrl, posterUrl: card().posterUrl }), 'the same card, the same copy - deferred');
+  assert.equal(announcementRefIsDeferred(remembered, { caption: 'other', link: null, posterUrl: null }), false);
+});
+
+test('the sweep says what it checked and never asks Telegram about a card that already matches', async () => {
+  const reference = (over) => ({ channelId: '-100chan', messageId: 11, kind: 'text', ...over });
+  const upToDate = { ...card(), announcementRefs: [reference({ caption: announcementCaption(card()), posterUrl: null })] };
+  const behind = { ...card(), adminId: 'SB-BBB222', title: 'Old Name', announcementRefs: [reference({ messageId: 12, caption: 'something else entirely' })] };
+
+  const sweep = await sweepAnnouncedCards({ repository: {}, list: [upToDate, behind] });
+  assert.equal(sweep.checked, 2, 'the report has to say how much was looked at, not only what changed');
+  assert.equal(sweep.matching, 1);
+  assert.equal(sweep.stale.length, 1);
+  assert.equal(sweep.stale[0].content.adminId, 'SB-BBB222');
+  assert.equal(sweep.refs, 1);
+  assert.ok(Number.isFinite(sweep.elapsedMs));
+
+  const deferredReference = reference({
+    messageId: 12,
+    caption: 'something else entirely',
+    syncError: { blocked: true, reason: 'no rights', signature: announcementSignature({ caption: announcementCaption(behind), link: null, posterUrl: card().posterUrl }) }
+  });
+  const leftAlone = await sweepAnnouncedCards({ repository: {}, list: [{ ...behind, announcementRefs: [deferredReference] }] });
+  assert.equal(leftAlone.stale.length, 0, 'a card this bot cannot refresh is not offered as work to do');
+  assert.equal(leftAlone.leftAlone, 1);
+  assert.equal(leftAlone.deferred, 1);
+  assert.equal(leftAlone.matching, 0, 'it is not "already correct" either: the copy is behind, and only the reason is settled');
 });
