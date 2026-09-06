@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
-import { confirmAdultAccess, getConfig, getContent, getContentBySlug } from './api.js';
+import { confirmAdultAccess, getCategories, getCollection, getCollections, getConfig, getContent, getContentBySlug, getGenres } from './api.js';
 import AdultGate from './components/AdultGate.jsx';
 import DeliveryDialog from './components/DeliveryDialog.jsx';
 import Footer from './components/Footer.jsx';
@@ -25,6 +25,8 @@ const categoryCopy = {
   all: { eyebrow: 'EVERYTHING TO EXPLORE', title: 'A world of stories, neatly cataloged.', description: 'Browse every release across the SoraBox catalog.' }
 };
 
+const categoryLabels = Object.fromEntries(categoryOrder.map((id) => [id, id === 'adult' ? '18+' : id === 'web-series' ? 'Web Series' : id === 'kdrama' ? 'K-Drama' : id[0].toUpperCase() + id.slice(1)]));
+
 function useRemote(loader, dependencies = []) {
   const [state, setState] = useState({ loading: true, data: null, error: null });
 
@@ -46,6 +48,107 @@ function useRemote(loader, dependencies = []) {
   }, dependencies);
 
   return state;
+}
+
+/**
+ * A listing that keeps the pages it already has.
+ *
+ * `useRemote` re-fetches and drops what came before, which is the opposite of what a reader who
+ * just pressed "Load more" wants: the sixty cards they scrolled past would vanish as the next
+ * sixty arrive. This appends instead, and keeps `total` — the count the store made, not the number
+ * of cards on hand — so the line under the grid can say how much of the shelf is left. A page
+ * still in flight when the reader switches category is discarded rather than appended to the new
+ * listing, so a slow response can never mix two categories into one grid.
+ */
+function useCatalog(fetchPage, dependencies = []) {
+  const [state, setState] = useState({ loading: true, error: null, items: [], total: 0, page: 0, pages: 0, hasMore: false, loadingMore: false, collection: null });
+  const latest = useRef(state);
+  const listingId = useRef(0);
+  useEffect(() => {
+    latest.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    listingId.current += 1;
+    const listing = listingId.current;
+    let active = true;
+    setState((previous) => ({ ...previous, loading: true, error: null, loadingMore: false }));
+    fetchPage(1)
+      .then((data) => {
+        if (!active || !data || listing !== listingId.current) return;
+        setState({
+          loading: false,
+          error: null,
+          items: Array.isArray(data.items) ? data.items : [],
+          total: Number(data.total) || 0,
+          page: Number(data.page) || 1,
+          pages: Number(data.pages) || 0,
+          hasMore: Boolean(data.hasMore),
+          loadingMore: false,
+          collection: data.collection || null
+        });
+      })
+      .catch((error) => {
+        if (active && listing === listingId.current) setState((previous) => ({ ...previous, loading: false, error }));
+      });
+    // fetchPage is supplied at the callsite with the values it depends on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, dependencies);
+
+  async function loadMore() {
+    const current = latest.current;
+    if (current.loading || current.loadingMore || !current.hasMore) return;
+    const listing = listingId.current;
+    setState((previous) => ({ ...previous, loadingMore: true }));
+    try {
+      const data = await fetchPage(current.page + 1);
+      if (!data || listing !== listingId.current) return;
+      setState((previous) => ({
+        ...previous,
+        error: null,
+        loadingMore: false,
+        items: [...previous.items, ...(Array.isArray(data.items) ? data.items : [])],
+        total: Number(data.total) || previous.total,
+        page: Number(data.page) || previous.page + 1,
+        pages: Number(data.pages) || previous.pages,
+        hasMore: Boolean(data.hasMore)
+      }));
+    } catch (error) {
+      // A failed page must not eat the shelf: what is already on screen stays, and the button
+      // comes back so the reader can ask again.
+      if (listing === listingId.current) setState((previous) => ({ ...previous, loadingMore: false, error }));
+    }
+  }
+
+  return { ...state, loadMore };
+}
+
+/**
+ * The line under a grid: how far along the shelf the reader is, and the way to the rest of it.
+ * A listing used to say "100 releases" because it asked for a hundred and stopped; this states what
+ * the store holds and keeps fetching until the reader has had all of it.
+ */
+function CatalogPager({ catalog, unit = 'release' }) {
+  if (!catalog.items.length) return null;
+  const remaining = Math.max(0, catalog.total - catalog.items.length);
+  const plural = catalog.total === 1 ? '' : 's';
+  return (
+    <div className="catalog-pager">
+      <p className="catalog-pager__count">
+        Showing <strong>{catalog.items.length}</strong> of <strong>{catalog.total}</strong> {unit}{plural}
+        {catalog.pages > 1 ? <span> · page {catalog.page} of {catalog.pages}</span> : null}
+      </p>
+      {remaining > 0 ? (
+        <button type="button" className="button button--secondary catalog-pager__more" onClick={catalog.loadMore} disabled={catalog.loadingMore}>
+          {catalog.loadingMore ? 'Fetching the next ones…' : `Load ${Math.min(remaining, 60)} more`}
+          <Icon name="chevron" size={17} className="catalog-pager__icon" />
+        </button>
+      ) : <p className="catalog-pager__end">That is the whole shelf — nothing is waiting past this page.</p>}
+      {catalog.error && catalog.items.length ? (
+        <p className="catalog-pager__error">{catalog.error.message} The cards above are still here — press the button to try again.</p>
+      ) : null}
+    </div>
+  );
 }
 
 function PageShell({ children }) {
@@ -204,15 +307,24 @@ function CategoryNav({ activeCategory }) {
 
 function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category: requestedCategory } = useParams();
+  const [params] = useSearchParams();
   const category = categoryOrder.includes(requestedCategory) ? requestedCategory : undefined;
-  const copy = categoryCopy[category || 'all'];
+  // A genre arrives as a query rather than a path, because it is a shelf cut across categories:
+  // `/browse?genre=Action` holds everything tagged action, in any format. It is never combined with
+  // 18+ — the server leaves adult cards out of a genre listing whatever the URL claims.
+  const genre = params.get('genre')?.trim() || '';
+  const copy = genre
+    ? { eyebrow: 'BROWSE BY GENRE', title: `Everything tagged ${genre}.`, description: `Every release carrying the ${genre} tag across the catalog, newest first.` }
+    : categoryCopy[category || 'all'];
   const requestedAdultCategory = category === 'adult';
   // The adult endpoint is never requested before the visitor confirms. This
   // avoids rendering, preloading, or even receiving adult cards behind a UI
   // overlay; the server independently enforces the same cookie gate.
-  const catalog = useRemote(
-    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [], total: 0 }) : getContent({ category }),
-    [category, requestedAdultCategory, adultAccess, adultAccessVersion]
+  const catalog = useCatalog(
+    (page) => requestedAdultCategory && !adultAccess
+      ? Promise.resolve({ items: [], total: 0, page: 1, pages: 1, hasMore: false })
+      : getContent({ category, genre, page, limit: 60 }),
+    [category, genre, requestedAdultCategory, adultAccess, adultAccessVersion]
   );
   // A sessionStorage marker can outlive the HTTP-only server cookie. A denied
   // request returns to the same confirmation safely rather than presenting an
@@ -227,17 +339,25 @@ function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAcce
           <Eyebrow>{copy.eyebrow}</Eyebrow>
           <h1>{copy.title}</h1>
           <p>{copy.description}</p>
+          {genre ? <Link className="browse-hero__clear" to="/browse">Show every genre <Icon name="close" size={15} /></Link> : null}
           <CategoryNav activeCategory={category} />
         </div>
       </section>
       <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`}>
         {adultLocked ? <AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /> : <>
           <div className="browse-results__top">
-            <p><strong>{catalog.loading ? '…' : catalog.data?.total || 0}</strong> release{catalog.data?.total === 1 ? '' : 's'} {category ? `in ${categoryCopy[category].title.split('.')[0]}` : 'to explore'}</p>
-            <button type="button" className="filter-button" onClick={() => setFilterOpen((current) => !current)}><Icon name="filter" size={17} /> Collections <Icon name="chevron" size={15} /></button>
-            <div className={`browse-filter-popover ${filterOpen ? 'browse-filter-popover--open' : ''}`}><CategoryNav activeCategory={category} /></div>
+            <p><strong>{catalog.loading ? '…' : catalog.total || 0}</strong> release{catalog.total === 1 ? '' : 's'} {genre ? `tagged ${genre}` : category ? `in ${categoryCopy[category].title.split('.')[0]}` : 'to explore'}</p>
+            <div className="browse-results__actions">
+              <Link className="filter-button collections-button" to="/collections"><Icon name="layers" size={17} /> Collections</Link>
+              <Link className="filter-button genres-button" to="/genres"><Icon name="grid" size={17} /> Genres</Link>
+              <button type="button" className="filter-button" onClick={() => setFilterOpen((current) => !current)} aria-expanded={filterOpen}><Icon name="filter" size={17} /> Categories <Icon name="chevron" size={15} className={filterOpen ? 'is-open' : ''} /></button>
+              <div className={`browse-filter-popover ${filterOpen ? 'browse-filter-popover--open' : ''}`}><CategoryNav activeCategory={category} /></div>
+            </div>
           </div>
-          {catalog.loading || (requestedAdultCategory && adultAccess && !catalog.data && !catalog.error) ? <LoadingGrid count={8} /> : catalog.error ? <ErrorBlock error={catalog.error} /> : catalog.data?.items?.length ? <div className="release-grid">{catalog.data.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div> : <EmptyState category={category} />}
+          {catalog.loading || (requestedAdultCategory && adultAccess && !catalog.items.length && !catalog.error) ? <LoadingGrid count={8} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
+            <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
+            <CatalogPager catalog={catalog} />
+          </> : <EmptyState category={category} />}
         </>}
       </section>
     </PageShell>
@@ -247,7 +367,9 @@ function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAcce
 function SearchPage() {
   const [params] = useSearchParams();
   const query = params.get('q')?.trim() || '';
-  const catalog = useRemote(() => getContent({ query }), [query]);
+  // A search for "love" or "dragon" matches far more than one screen of cards, so the results page
+  // pages like the catalog does instead of stopping at the first sixty.
+  const catalog = useCatalog((page) => getContent({ query, page, limit: 60 }), [query]);
 
   if (!query) return <Navigate to="/browse" replace />;
 
@@ -259,8 +381,11 @@ function SearchPage() {
         <p>Searches titles, episode numbers, genres and available languages across the catalog.</p>
       </section>
       <section className="browse-results page-width search-results">
-        <div className="browse-results__top"><p>{catalog.loading ? 'Searching…' : <><strong>{catalog.data?.total || 0}</strong> matching release{catalog.data?.total === 1 ? '' : 's'}</>}</p><Link className="text-link" to="/browse">Clear search <Icon name="close" size={15} /></Link></div>
-        {catalog.loading ? <LoadingGrid count={6} /> : catalog.error ? <ErrorBlock error={catalog.error} /> : catalog.data?.items?.length ? <div className="release-grid">{catalog.data.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div> : <EmptyState query={query} />}
+        <div className="browse-results__top"><p>{catalog.loading ? 'Searching…' : <><strong>{catalog.total || 0}</strong> matching release{catalog.total === 1 ? '' : 's'}</>}</p><Link className="text-link" to="/browse">Clear search <Icon name="close" size={15} /></Link></div>
+        {catalog.loading ? <LoadingGrid count={6} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
+          <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
+          <CatalogPager catalog={catalog} unit="match" />
+        </> : <EmptyState query={query} />}
       </section>
     </PageShell>
   );
@@ -332,6 +457,161 @@ function EpisodeWatchPanel({ item, episode, entries }) {
   </div>;
 }
 
+/**
+ * Every shelf a visitor can land on, counted in the store rather than off one page of results.
+ *
+ * 18+ is not here by construction: an age-restricted shelf is reached through its own confirmed
+ * route, so a genre and category list offered to everyone simply never contains it. Genres are
+ * whatever the publishers tagged, sorted by how much of the catalog wears the tag.
+ */
+function GenresPage() {
+  const categories = useRemote(() => getCategories(), []);
+  const genres = useRemote(() => getGenres(), []);
+  const shelves = (categories.data?.categories || []).filter((category) => category.id !== 'adult');
+  const tagged = genres.data?.genres || [];
+  return (
+    <PageShell>
+      <section className="browse-hero browse-hero--genres">
+        <div className="page-width">
+          <Eyebrow>FIND SOMETHING TO WATCH</Eyebrow>
+          <h1>Pick a shelf, not a guess.</h1>
+          <p>Categories and genres across the whole catalog — tap one and every release carrying it opens, oldest included.</p>
+        </div>
+      </section>
+      <section className="page-width browse-results">
+        <div className="shelf-block">
+          <div className="shelf-block__head">
+            <h2>Categories</h2>
+            <Link className="text-link" to="/browse">Everything at once <Icon name="arrow" size={16} /></Link>
+          </div>
+          {categories.loading ? <LoadingGrid count={2} /> : categories.error ? <ErrorBlock error={categories.error} compact /> : (
+            <div className="shelf-grid">
+              {shelves.map((category) => (
+                <Link className="shelf-tile" key={category.id} to={`/browse/${category.id}`}>
+                  <span className={`shelf-tile__dot shelf-tile__dot--${category.tone || 'violet'}`} aria-hidden="true" />
+                  <span className="shelf-tile__label"><strong>{category.label}</strong><small>{category.count} {category.count === 1 ? 'release' : 'releases'}</small></span>
+                  <Icon name="arrow" size={18} />
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="shelf-block">
+          <div className="shelf-block__head">
+            <h2>Genres</h2>
+            <span className="shelf-block__note">{genres.loading ? 'Counting…' : tagged.length ? `${tagged.length} in the catalog` : null}</span>
+          </div>
+          {genres.loading ? <p className="shelf-note">Counting what every shelf holds…</p> : genres.error ? <ErrorBlock error={genres.error} compact /> : tagged.length ? (
+            <div className="genre-grid">
+              {tagged.map((genre) => (
+                <Link className="genre-tile" key={genre.name} to={`/browse?genre=${encodeURIComponent(genre.name)}`}>
+                  {genre.name}<span>{genre.count}</span>
+                </Link>
+              ))}
+            </div>
+          ) : <p className="shelf-note">Nothing is tagged with a genre yet, so the categories above hold the whole catalog.</p>}
+        </div>
+      </section>
+    </PageShell>
+  );
+}
+
+/**
+ * The franchise groups the catalog contains, built from the titles themselves. A group of one is
+ * not a collection, so this page only ever lists something a reader can watch in order.
+ */
+function CollectionsPage() {
+  const collections = useRemote(() => getCollections(), []);
+  const entries = collections.data?.collections || [];
+  return (
+    <PageShell>
+      <section className="browse-hero browse-hero--collections">
+        <div className="page-width">
+          <Eyebrow>WATCH IT IN ORDER</Eyebrow>
+          <h1>Collections.</h1>
+          <p>Every part of a franchise on one page — a numbered title, or one with a subtitle, joins the rest of its series on its own.</p>
+        </div>
+      </section>
+      <section className="page-width browse-results">
+        <div className="browse-results__top"><p><strong>{collections.loading ? '…' : entries.length}</strong> collection{entries.length === 1 ? '' : 's'} in the catalog</p></div>
+        {collections.loading ? <LoadingGrid count={4} /> : collections.error ? <ErrorBlock error={collections.error} /> : entries.length ? (
+          <div className="collection-grid">
+            {entries.map((entry, index) => (
+              <Link className="collection-card" key={entry.key} to={`/collection/${entry.key}`} style={{ '--stagger': `${Math.min(index, 9) * 45}ms` }}>
+                <div className="collection-card__art">
+                  <Artwork item={{ posterUrl: entry.posterUrls?.[0] || '', title: entry.name, tone: 'violet', categoryLabel: `${entry.count} titles` }} size="card" />
+                  {entry.posterUrls?.length > 1 ? <span className="collection-card__stack" aria-hidden="true" /> : null}
+                </div>
+                <div className="collection-card__copy">
+                  <strong>{entry.name}</strong>
+                  <span>{entry.count} {entry.count === 1 ? 'title' : 'titles'} · {(entry.categories || []).map((slug) => categoryLabels[slug] || slug).join(', ')}</span>
+                  <small>{(entry.titles || []).slice(0, 3).join(' · ')}{(entry.titles || []).length > 3 ? ` +${entry.titles.length - 3} more` : ''}</small>
+                </div>
+              </Link>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">
+            <span className="empty-state__icon"><Icon name="layers" size={27} /></span>
+            <h2>No collections yet</h2>
+            <p>A collection appears as soon as two related titles are in the catalog — a second part, or a film with its series.</p>
+            <Link className="button button--secondary" to="/browse">Browse everything <Icon name="arrow" size={17} /></Link>
+          </div>
+        )}
+      </section>
+    </PageShell>
+  );
+}
+
+/**
+ * One franchise, in one list. The page is paged like every other shelf, and the titles the group is
+ * made of are offered as a quick jump, because that is what someone opening a collection wants:
+ * part one, then part two.
+ */
+function CollectionPage() {
+  const { key } = useParams();
+  const catalog = useCatalog((page) => getCollection(key, { page, limit: 60 }), [key]);
+  const collection = catalog.collection;
+
+  if (catalog.error && !catalog.items.length) {
+    return (
+      <PageShell>
+        <section className="page-width not-found">
+          <span><Icon name="info" size={28} /></span>
+          <Eyebrow>NOT FOUND</Eyebrow>
+          <h1>That collection is not open right now.</h1>
+          <p>{catalog.error.message}</p>
+          <Link className="button button--primary" to="/collections">See every collection <Icon name="arrow" size={18} /></Link>
+        </section>
+      </PageShell>
+    );
+  }
+
+  return (
+    <PageShell>
+      <section className="browse-hero browse-hero--collections">
+        <div className="page-width">
+          <Eyebrow>THE COLLECTION</Eyebrow>
+          <h1>{collection?.name || 'The collection'}</h1>
+          <p>{catalog.loading ? 'Gathering the parts…' : `${catalog.total} ${catalog.total === 1 ? 'title is' : 'titles are'} here, oldest first in the order they were released.`}</p>
+          {collection?.titles?.length > 1 ? (
+            <div className="collection-titles">
+              {collection.titles.map((title) => <span key={title}>{title}</span>)}
+            </div>
+          ) : null}
+          <Link className="text-link collection-page__all" to="/collections">All collections <Icon name="arrow" size={16} /></Link>
+        </div>
+      </section>
+      <section className="page-width browse-results">
+        {catalog.loading ? <LoadingGrid count={6} /> : catalog.items.length ? <>
+          <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
+          <CatalogPager catalog={catalog} />
+        </> : <EmptyState />}
+      </section>
+    </PageShell>
+  );
+}
+
 function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
   const { category, slug } = useParams();
   const requestedAdultCategory = category === 'adult';
@@ -389,6 +669,15 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
             <div className="detail-layout__copy">
               <div className="detail-layout__pills"><span className={`category-pill category-pill--${item.tone}`}>{item.categoryLabel}</span><span className="status-pill"><span /> {item.status}</span></div>
               <h1>{item.title}</h1>
+              {/* A numbered or subtitled title knows the series it belongs to, so the page says so
+                  and hands over the rest of it in one tap. */}
+              {item.collection ? (
+                <Link className="collection-chip" to={`/collection/${item.collection.key}`}>
+                  <Icon name="layers" size={16} />
+                  <span>Part of the <strong>{item.collection.name}</strong> collection</span>
+                  <Icon name="arrow" size={16} />
+                </Link>
+              ) : null}
               <div className="detail-facts">
                 {item.year ? <span><Icon name="calendar" size={15} /> {item.year}</span> : null}
                 {item.releaseLabel ? <span><Icon name="clock" size={15} /> {item.releaseLabel}</span> : null}
@@ -807,6 +1096,10 @@ export default function App() {
         <Route path="/browse" element={<BrowsePage {...adultGateProps} />} />
         <Route path="/browse/:category" element={<BrowsePage {...adultGateProps} />} />
         <Route path="/search" element={<SearchPage />} />
+        {/* These three pages render their own PageShell, as every other page here does. */}
+        <Route path="/genres" element={<GenresPage />} />
+        <Route path="/collections" element={<CollectionsPage />} />
+        <Route path="/collection/:key" element={<CollectionPage />} />
         <Route path="/:category/:slug/watch/episode/:episodeRange" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
         <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
         <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={openDelivery} {...adultGateProps} />} />

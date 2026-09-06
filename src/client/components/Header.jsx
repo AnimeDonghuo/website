@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { getCategories, getGenres } from '../api.js';
 import { Icon } from './Icons.jsx';
 import { applyTheme, currentTheme, readStoredTheme, THEME_EVENT } from '../theme.js';
 
@@ -37,11 +38,41 @@ export default function Header() {
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInput = useRef(null);
   const panelInput = useRef(null);
+  // The drawer's shelf list — every category and genre — is fetched the first time it is opened,
+  // never on page load. A visitor who taps Genres on a phone should not have paid for it in the
+  // first paint, and the counts come from the store so they cannot be the size of one page.
+  const [shelvesOpen, setShelvesOpen] = useState(false);
+  const [shelves, setShelves] = useState({ loading: false, error: '', categories: [], genres: [] });
+  const shelvesFetched = useRef(false);
 
   useEffect(() => {
     setOpen(false);
     setSearchOpen(false);
+    setShelvesOpen(false);
   }, [location.pathname]);
+
+  async function toggleShelves() {
+    const next = !shelvesOpen;
+    setShelvesOpen(next);
+    if (!next || shelvesFetched.current) return;
+    shelvesFetched.current = true;
+    setShelves((previous) => ({ ...previous, loading: true }));
+    try {
+      const [categoryData, genreData] = await Promise.all([getCategories(), getGenres()]);
+      // 18+ is never listed here: this panel is open to every visitor, and an adult shelf is only
+      // reachable from its own age-confirmed route.
+      setShelves({
+        loading: false,
+        error: '',
+        categories: (categoryData.categories || []).filter((category) => category.id !== 'adult'),
+        genres: genreData.genres || []
+      });
+    } catch (error) {
+      // A failed fetch must leave the button able to try again rather than an empty panel forever.
+      shelvesFetched.current = false;
+      setShelves({ loading: false, error: error.message || 'The shelf list is unavailable right now.', categories: [], genres: [] });
+    }
+  }
 
   useEffect(() => {
     if (!searchOpen) return undefined;
@@ -194,6 +225,57 @@ export default function Header() {
             </NavLink>
           ))}
         </nav>
+        <div className="mobile-menu__shelves">
+          <button
+            type="button"
+            className="mobile-menu__shelf-toggle"
+            onClick={toggleShelves}
+            aria-expanded={shelvesOpen}
+          >
+            <Icon name="grid" size={18} />
+            <span>Genres &amp; categories</span>
+            <Icon name="chevron" size={17} className={shelvesOpen ? 'is-open' : ''} />
+          </button>
+          <Link className="mobile-menu__shelf-toggle" to="/collections">
+            <Icon name="layers" size={18} />
+            <span>Collections</span>
+            <Icon name="arrow" size={17} />
+          </Link>
+          <div className={`mobile-menu__shelf-panel ${shelvesOpen ? 'is-open' : ''}`} aria-hidden={!shelvesOpen}>
+            {shelves.loading ? <p className="mobile-menu__shelf-note">Counting the catalog…</p> : null}
+            {shelves.error ? (
+              <p className="mobile-menu__shelf-note">{shelves.error} Close the menu and tap Genres again to retry.</p>
+            ) : null}
+            {shelves.categories.length ? (
+              <div className="mobile-menu__shelf-group">
+                <h3>Categories</h3>
+                <div className="mobile-menu__shelf-list">
+                  {shelves.categories.map((category) => (
+                    <Link key={category.id} to={`/browse/${category.id}`} onClick={() => setOpen(false)}>
+                      <span>{category.label}</span><small>{category.count}</small>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {shelves.genres.length ? (
+              <div className="mobile-menu__shelf-group">
+                <h3>Genres</h3>
+                <div className="mobile-menu__genre-chips">
+                  {shelves.genres.map((genre) => (
+                    <Link key={genre.name} to={`/browse?genre=${encodeURIComponent(genre.name)}`} onClick={() => setOpen(false)}>
+                      {genre.name}<span>{genre.count}</span>
+                    </Link>
+                  ))}
+                </div>
+                <Link className="mobile-menu__shelf-all" to="/genres" onClick={() => setOpen(false)}>Every shelf, with counts <Icon name="arrow" size={15} /></Link>
+              </div>
+            ) : null}
+            {!shelves.loading && !shelves.error && !shelves.categories.length && !shelves.genres.length ? (
+              <p className="mobile-menu__shelf-note">The catalog has no shelves to list yet.</p>
+            ) : null}
+          </div>
+        </div>
       </div>
     </header>
   );

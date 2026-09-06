@@ -10,6 +10,7 @@ import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliver
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
+import { normalizeCollection } from './services/collection-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -248,6 +249,11 @@ function publicFileChoices(files, config, shareCode, content) {
   });
 }
 
+export function publicCollection(content) {
+  const collection = normalizeCollection(content?.collection);
+  return collection ? { name: collection.name, key: collection.key } : null;
+}
+
 export function toPublicContent(content, config, { includeFileChoices = true } = {}) {
   if (!content) return null;
   const category = categoryDetails(content.category);
@@ -281,6 +287,9 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
     episodeGroups: publicEpisodeGroups(content.episodeGroups),
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
+    // The franchise group this card belongs to, so its page can point at the rest of the
+    // collection. Derived from the title, and never shown for 18+ cards.
+    collection: isAdultContent(content) ? null : publicCollection(content),
     publishedAt: serializeDate(content.publishedAt),
     telegramUrl,
     deliveryUrl,
@@ -370,12 +379,15 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
 
   app.get('/api/categories', async (request, response, next) => {
     try {
-      const items = await repository.listContent({ limit: 100 });
-      const counts = items.reduce((result, item) => {
-        result[item.category] = (result[item.category] || 0) + 1;
-        return result;
-      }, {});
       const adultAccess = hasAdultAccess(request);
+      // Counted in the store rather than counted off a page of results: a category with 400 cards
+      // used to report 100 and the rest looked like they had fallen off the catalog.
+      const counted = await Promise.all(CATEGORIES.map((category) => (
+        category.id === 'adult' && !adultAccess
+          ? Promise.resolve(0)
+          : repository.countContent({ category: category.id })
+      )));
+      const counts = Object.fromEntries(CATEGORIES.map((category, index) => [category.id, counted[index]]));
       // Cookie-aware category data must not be shared by a CDN/cache. The
       // category itself remains visible, but its catalog count stays private
       // until the visitor has confirmed their age.
@@ -396,18 +408,88 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       const rawCategory = cleanText(request.query.category, 40);
       const category = CATEGORY_IDS.has(rawCategory) ? rawCategory : undefined;
       const query = cleanText(request.query.q, 100);
+      const collectionKey = cleanText(request.query.collection, 90).toLowerCase() || null;
+      // A genre comes from the menu in the drawer, which lists every shelf a reader can land on.
+      const genre = cleanText(request.query.genre, 40) || undefined;
       if (category === 'adult' && !hasAdultAccess(request)) {
         return apiError(response, 403, 'Confirm that you are 18 or older to open this category.');
       }
-      const listed = await repository.listContent({ category, query, limit: 100 });
+      // A listing is a page, not the whole catalog. The old behaviour — ask for 100 and show those —
+      // meant everything past the hundredth card was unreachable, and every new release quietly
+      // pushed an old one off the site.
+      const limit = Math.max(1, Math.min(Number.parseInt(request.query.limit, 10) || 60, 100));
+      const page = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
+      const scope = { category, query, collectionKey, genre };
+      const listed = await repository.listContent({
+        ...scope,
+        limit,
+        offset: (page - 1) * limit,
+        hideAdult: category !== 'adult'
+      });
+      const total = await repository.countContent({ ...scope, hideAdult: category !== 'adult' });
       // Adult cards never appear in home, all-catalog, or search responses.
       // They are available only from the explicit age-confirmed 18+ category.
       const items = category === 'adult' ? listed : listed.filter((item) => !isAdultContent(item));
       response.set('Cache-Control', category === 'adult' ? 'private, no-store' : 'public, max-age=45, s-maxage=90');
       return response.json({
         items: items.map((item) => toPublicContent(item, config, { includeFileChoices: false })),
-        total: items.length
+        total,
+        page,
+        limit,
+        pages: Math.max(1, Math.ceil(total / limit)),
+        hasMore: page * limit < total
       });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // ── Collections: the parts of a franchise, grouped from the titles themselves. There is nothing
+  //    for a publisher to maintain, so there is nothing to go stale — a card joins "Iron Man" the
+  //    day it is published, and moves out of it the day /title gives it a different name. A group of
+  //    one is not a collection, and 18+ never appears in one.
+  app.get('/api/collections', async (_request, response, next) => {
+    try {
+      const collections = typeof repository.listCollections === 'function' ? await repository.listCollections() : [];
+      response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
+      return response.json({ collections });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/collections/:key', async (request, response, next) => {
+    try {
+      const key = cleanText(request.params.key, 90).toLowerCase();
+      if (typeof repository.findCollection !== 'function') return apiError(response, 404, 'Collections are not available in this catalog store.');
+      const collection = await repository.findCollection(key);
+      if (!collection) return apiError(response, 404, 'That collection is not available.');
+      const limit = Math.max(1, Math.min(Number.parseInt(request.query.limit, 10) || 60, 100));
+      const page = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
+      const listed = await repository.listContent({ collectionKey: key, limit, offset: (page - 1) * limit, hideAdult: true });
+      const total = await repository.countContent({ collectionKey: key, hideAdult: true });
+      const items = (await Promise.all(listed.map(async (item) => (isAdultContent(item) ? null : toPublicContent(item, config, { includeFileChoices: false }))))).filter(Boolean);
+      response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
+      return response.json({
+        collection,
+        items,
+        total,
+        page,
+        limit,
+        pages: Math.max(1, Math.ceil(total / limit)),
+        hasMore: page * limit < total
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // The genre list the menu offers, counted over the whole catalog rather than over one page of it.
+  app.get('/api/genres', async (_request, response, next) => {
+    try {
+      const genres = typeof repository.listGenres === 'function' ? await repository.listGenres({ limit: 60 }) : [];
+      response.set('Cache-Control', 'public, max-age=300, s-maxage=600');
+      return response.json({ genres });
     } catch (error) {
       return next(error);
     }

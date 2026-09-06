@@ -440,3 +440,120 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
   .header-search-panel input::placeholder { color: var(--muted); }
   .header-search-panel__clear { display: grid; place-items: center; flex: none; width: 26px; height: 26px; border: 0; border-radius: 6px; color: var(--muted); background: var(--surface); }
 }
+
+/* ── Paged catalog listings ───────────────────────────────────────────────────────────────
+   A shelf used to stop at the first hundred cards, so everything past them looked deleted.
+   The grid now says how far along it is and keeps fetching, and the line is deliberately
+   quiet about it: a count plus one button, never a page-number bar nobody asked for. */
+.catalog-pager { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 22px; margin-top: 34px; padding-top: 22px; border-top: 1px solid rgba(255,255,255,.08); }
+.catalog-pager__count { margin: 0; color: #939cab; font-size: 11px; font-weight: 600; }
+.catalog-pager__count strong { color: var(--ink); font-family: 'DM Mono', monospace; font-size: 12px; font-weight: 500; }
+.catalog-pager__more { min-height: 34px; padding: 0 13px; font-size: 10px; }
+.catalog-pager__more:disabled { cursor: wait; opacity: .66; transform: none; }
+.catalog-pager__icon { transform: rotate(90deg); transition: transform 180ms ease; }
+.catalog-pager__more:hover .catalog-pager__icon { transform: rotate(90deg) translateY(2px); }
+.catalog-pager__end { margin: 0; color: #747e8d; font-size: 10px; font-weight: 700; }
+.catalog-pager__error { flex: 1 0 100%; margin: 0; color: #f0b998; font-size: 10px; font-weight: 700; }
+
+/* ── Shelves: categories and genres ───────────────────────────────────────────────────────
+   Reached from the drawer's Genres button and from /genres. Category counts are the store's,
+   and 18+ is absent from the markup entirely rather than hidden by CSS. */
+.browse-hero__clear { display: inline-flex; margin: -4px 0 18px; }
+.shelf-block { margin-top: 46px; }
+.shelf-block:first-child { margin-top: 0; }
+.shelf-block__head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; margin-bottom: 15px; padding-bottom: 11px; border-bottom: 1px solid rgba(255,255,255,.08); }
+.shelf-block__head h2 { margin: 0; font-size: 16px; letter-spacing: -.035em; }
+.shelf-block__note { color: #77808f; font-family: 'DM Mono', monospace; font-size: 9px; }
+.shelf-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; }
+.shelf-tile { display: flex; align-items: center; gap: 11px; min-width: 0; padding: 14px 15px; border: 1px solid rgba(255,255,255,.1); border-radius: 11px; background: rgba(255,255,255,.025); color: var(--ink); transition: border-color 170ms ease, background 170ms ease, transform 170ms ease; }
+.shelf-tile:hover { border-color: rgba(197,248,106,.42); background: rgba(197,248,106,.06); transform: translateY(-2px); }
+.shelf-tile__label { display: grid; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.shelf-tile__label strong { overflow: hidden; font-size: 13px; font-weight: 800; letter-spacing: -.03em; text-overflow: ellipsis; white-space: nowrap; }
+.shelf-tile__label small { color: #8b94a3; font-family: 'DM Mono', monospace; font-size: 9px; }
+.shelf-tile > svg { flex: 0 0 auto; color: #6f7887; transition: color 170ms ease, transform 170ms ease; }
+.shelf-tile:hover > svg { color: var(--lime); transform: translateX(3px); }
+.shelf-tile__dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--violet); }
+.shelf-tile__dot--orange { background: var(--orange); }
+.shelf-tile__dot--cyan { background: var(--cyan); }
+.shelf-tile__dot--rose { background: var(--rose); }
+.shelf-tile__dot--lime { background: var(--lime); }
+.shelf-tile__dot--blue { background: var(--blue); }
+.genre-grid { display: flex; flex-wrap: wrap; gap: 9px; }
+.genre-tile { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; border: 1px solid rgba(255,255,255,.1); border-radius: 999px; background: rgba(255,255,255,.025); color: #b6bdca; font-size: 11px; font-weight: 800; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
+.genre-tile span { color: #727b8a; font-family: 'DM Mono', monospace; font-size: 9px; font-weight: 500; }
+.genre-tile:hover { color: #172109; border-color: var(--lime); background: var(--lime); }
+.genre-tile:hover span { color: rgba(23,33,9,.68); }
+.shelf-note { margin: 0; color: #8b94a3; font-size: 11px; line-height: 1.7; }
+
+/* ── Collections ──────────────────────────────────────────────────────────────────────────
+   A franchise group, so "Iron Man 2" leads somewhere with the rest of Iron Man on it. The
+   tile carries the strip of posters it grouped, which is the quickest way to recognise a
+   series, and the detail page wears the group as a chip under its title. */
+.browse-results__actions { display: flex; align-items: center; gap: 7px; }
+.browse-results__actions .collections-button, .browse-results__actions .genres-button { display: inline-flex; }
+.collection-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 28px 16px; }
+.collection-card { display: block; min-width: 0; color: var(--ink); animation: rise-in 450ms both ease-out; animation-delay: var(--stagger, 0ms); }
+.collection-card__art { position: relative; display: block; overflow: hidden; border: 1px solid rgba(255,255,255,.11); border-radius: 10px; background: #171e2b; box-shadow: 0 10px 20px rgba(0,0,0,.11); transition: border-color 210ms ease, box-shadow 210ms ease, transform 210ms ease; }
+.collection-card:hover .collection-card__art { border-color: rgba(197,248,106,.45); box-shadow: 0 18px 31px rgba(0,0,0,.26); transform: translateY(-4px); }
+.collection-card__art .artwork { transition: transform 400ms ease; }
+.collection-card:hover .collection-card__art .artwork { transform: scale(1.022); }
+.collection-card__stack { position: absolute; right: 9px; bottom: 9px; width: 20px; height: 27px; border: 1px solid rgba(255,255,255,.2); border-radius: 4px; background: rgba(6,8,13,.62); backdrop-filter: blur(6px); }
+.collection-card__copy { display: grid; gap: 4px; padding: 11px 2px 0; }
+.collection-card__copy strong { overflow: hidden; font-size: 14px; font-weight: 800; letter-spacing: -.045em; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; transition: color 160ms ease; }
+.collection-card:hover .collection-card__copy strong { color: var(--lime); }
+.collection-card__copy span { color: #939cab; font-size: 9px; font-weight: 700; }
+.collection-card__copy small { display: -webkit-box; overflow: hidden; color: #6f7887; font-size: 9px; font-weight: 600; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+.collection-titles { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 18px; }
+.collection-titles span { padding: 6px 9px; border: 1px solid rgba(255,255,255,.12); border-radius: 6px; background: rgba(255,255,255,.03); color: #b6bdca; font-size: 10px; font-weight: 700; }
+.collection-page__all { margin-top: 17px; }
+.collection-chip { display: inline-flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; margin-top: 14px; padding: 9px 12px; border: 1px solid rgba(197,248,106,.3); border-radius: 9px; background: rgba(197,248,106,.07); color: var(--lime-ink); font-size: 11px; font-weight: 700; transition: background 170ms ease, transform 170ms ease; }
+.collection-chip strong { color: var(--ink); font-weight: 800; letter-spacing: -.025em; }
+.collection-chip > svg:last-child { transition: transform 170ms ease; }
+.collection-chip:hover { background: rgba(197,248,106,.15); transform: translateY(-1px); }
+.collection-chip:hover > svg:last-child { transform: translateX(3px); }
+
+/* ── Drawer shelves (the three-line menu) ─────────────────────────────────────────────────
+   One button opens the whole catalog's shelves inside the drawer itself — every category and
+   genre a visitor can tap, with the number of releases behind each. It never lists 18+. */
+.mobile-menu__shelves { display: grid; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,.08); }
+.mobile-menu__shelf-toggle { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 13px; border: 1px solid rgba(255,255,255,.1); border-radius: 10px; background: rgba(255,255,255,.03); color: #cfd5de; font-size: 12px; font-weight: 800; text-align: left; transition: border-color 160ms ease, color 160ms ease; }
+.mobile-menu__shelf-toggle > span { flex: 1 1 auto; }
+.mobile-menu__shelf-toggle:hover { border-color: rgba(197,248,106,.42); color: var(--lime); }
+.mobile-menu__shelf-toggle svg { transition: transform 200ms ease; }
+.mobile-menu__shelf-toggle svg.is-open { transform: rotate(90deg); }
+/* A closed panel is taken out of the tab order the same way the search strip is — a collapsed
+   panel a keyboard can still walk into is a menu that lies about what is on screen. */
+.mobile-menu__shelf-panel { display: grid; gap: 14px; max-height: 0; overflow: hidden; visibility: hidden; opacity: 0; transition: max-height 250ms ease, opacity 180ms ease, visibility 0s linear 250ms; }
+.mobile-menu__shelf-panel.is-open { max-height: 430px; overflow-y: auto; visibility: visible; opacity: 1; transition: max-height 250ms ease, opacity 180ms ease, visibility 0s; }
+.mobile-menu__shelf-group h3 { margin: 0 0 8px; color: #78818f; font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
+.mobile-menu__shelf-list a { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 2px; border-bottom: 1px solid rgba(255,255,255,.06); color: #b7bfca; font-size: 11px; font-weight: 700; transition: color 150ms ease; }
+.mobile-menu__shelf-list a small { color: #737c8b; font-family: 'DM Mono', monospace; font-size: 9px; }
+.mobile-menu__shelf-list a:hover { color: var(--lime); }
+.mobile-menu__genre-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.mobile-menu__genre-chips a { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid rgba(255,255,255,.1); border-radius: 999px; background: rgba(255,255,255,.025); color: #aeb6c2; font-size: 10px; font-weight: 800; }
+.mobile-menu__genre-chips a span { color: #6f7887; font-family: 'DM Mono', monospace; font-size: 8px; }
+.mobile-menu__genre-chips a:hover { color: #172109; border-color: var(--lime); background: var(--lime); }
+.mobile-menu__genre-chips a:hover span { color: rgba(23,33,9,.68); }
+.mobile-menu__shelf-all { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; color: var(--lime-ink); font-size: 10px; font-weight: 800; }
+.mobile-menu__shelf-note { margin: 0; color: #8b94a3; font-size: 10px; line-height: 1.6; }
+
+@media (max-width: 1000px) {
+  .shelf-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .collection-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
+}
+
+@media (max-width: 760px) {
+  .catalog-pager { flex-direction: column; align-items: stretch; gap: 12px; margin-top: 24px; padding-top: 18px; }
+  .catalog-pager__more { justify-content: center; width: 100%; min-height: 40px; }
+  .catalog-pager__count { text-align: center; }
+  .catalog-pager__end { text-align: center; }
+  .shelf-grid { grid-template-columns: minmax(0,1fr); }
+  .collection-grid { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 22px 12px; }
+  .browse-results__actions { flex-wrap: wrap; }
+  .shelf-block { margin-top: 34px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .catalog-pager__icon, .collection-chip, .collection-chip > svg, .shelf-tile, .shelf-tile > svg, .collection-card__art, .collection-card:hover .collection-card__art .artwork, .collection-card:hover .collection-card__art { transition: none; }
+  .collection-card { animation: none; }
+}

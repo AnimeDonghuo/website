@@ -2,6 +2,7 @@ import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
 import { cleanMediaName, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { deriveCollection, normalizeCollection, resolveCollection } from './services/collection-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -40,6 +41,8 @@ const LIST_CONTENT_PROJECTION = {
   subtitleLanguageSource: 1,
   languageSource: 1,
   genres: 1,
+  collection: 1,
+  collectionManual: 1,
   description: 1,
   status: 1,
   releaseLabel: 1,
@@ -234,6 +237,79 @@ function searchPredicate(item, query) {
   return query.toLowerCase().split(/\s+/).filter(Boolean).every((term) => haystack.includes(term));
 }
 
+/**
+ * Whether a card belongs in a listing. One predicate for the memory store and one filter for Mongo,
+ * with the same rules: a category, a search phrase, and now a collection. A card with no collection
+ * never matches a collection listing, so /repair backfilling cannot half-populate a page.
+ */
+function contentMatchesList(item, { category = null, query = '', collectionKey = null, hideAdult = false, genre = null } = {}) {
+  if (category && item.category !== category) return false;
+  // A genre is a free-text label rather than a fixed list, so the match is on trimmed letters and
+  // case: "Action", "action " and "ACTION" are one shelf, not three pages of nothing.
+  const wantedGenre = cleanText(genre, 40)?.toLowerCase();
+  if (wantedGenre && !(Array.isArray(item.genres) ? item.genres : []).some((tag) => cleanText(tag, 40)?.toLowerCase() === wantedGenre)) return false;
+  // 18+ is never part of a public listing, a search, or a collection: filtering it here rather than
+  // after the page is cut means a page still holds the number of cards it promised.
+  if (hideAdult && item.category === 'adult') return false;
+  if (collectionKey && normalizeCollection(item.collection)?.key !== collectionKey) return false;
+  return searchPredicate(item, query);
+}
+
+/** A collection is only a collection when two different titles are in it. */
+/**
+ * The spelling a group of tags is most often written with.
+ *
+ * A tie goes to the sentence-case form, because that is what a shelf looks like on a page —
+ * "Action" rather than "action" — and a tag nobody has capitalised yet is still shown, just lower.
+ */
+export function preferredSpelling(spellings) {
+  const entries = [...(spellings instanceof Map ? spellings : spellings || [])];
+  if (!entries.length) return null;
+  const startsUpper = (value) => (/[A-Z]/.test(String(value).charAt(0)) ? 1 : 0);
+  return entries.sort((first, second) => (
+    second[1] - first[1]
+    || startsUpper(second[0]) - startsUpper(first[0])
+    || String(first[0]).localeCompare(String(second[0]))
+  ))[0][0];
+}
+
+function collectionEntries(records) {
+  const groups = new Map();
+  for (const item of records) {
+    if (item.category === 'adult') continue;
+    const collection = normalizeCollection(item.collection);
+    if (!collection) continue;
+    const entry = groups.get(collection.key) || {
+      key: collection.key,
+      name: collection.name,
+      titles: new Set(),
+      count: 0,
+      posterUrls: [],
+      categories: new Set(),
+      latestAt: null
+    };
+    entry.titles.add(item.title);
+    entry.count += 1;
+    entry.categories.add(item.category);
+    if (item.posterUrl && entry.posterUrls.length < 4 && !entry.posterUrls.includes(item.posterUrl)) entry.posterUrls.push(item.posterUrl);
+    const at = new Date(item.publishedAt || 0).getTime();
+    if (!entry.latestAt || at > entry.latestAt) entry.latestAt = item.publishedAt || null;
+    groups.set(collection.key, entry);
+  }
+  return [...groups.values()]
+    .filter((entry) => entry.titles.size >= 2)
+    .map((entry) => ({
+      key: entry.key,
+      name: entry.name,
+      count: entry.count,
+      titles: [...entry.titles].sort(),
+      categories: [...entry.categories],
+      posterUrls: entry.posterUrls,
+      latestAt: entry.latestAt
+    }))
+    .sort((first, second) => second.count - first.count || first.name.localeCompare(second.name));
+}
+
 function sortByPublishedAt(items) {
   return [...items].sort(
     (first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime()
@@ -332,7 +408,38 @@ function storageReferenceChannel(value) {
  * update the very same channel posts instead of leaving stale artwork or
  * metadata in public Telegram channels.
  */
-export function normalizeAnnouncementRefs(value) {
+export /** The Mongo half of the listing rules the memory store applies in `contentMatchesList`. */
+/** @param {{ hideAdult?: boolean }} [options] 18+ is excluded in the query, not after the page cut. */
+function contentListFilter({ category, query, collectionKey = null, hideAdult = false, genre = null } = {}) {
+  const filter = { published: true };
+  const wantedGenre = cleanText(genre, 40);
+  if (wantedGenre) filter.genres = new RegExp(`^${escapeRegex(wantedGenre)}$`, 'i');
+  if (hideAdult && !category) filter.category = { $ne: 'adult' };
+  if (CATEGORY_IDS.has(category)) filter.category = category;
+  const key = cleanText(collectionKey, 90).toLowerCase();
+  if (key) {
+    filter.$and = [...(filter.$and || []), { 'collection.key': key }];
+  }
+  const normalizedQuery = cleanText(query, 100);
+  if (normalizedQuery) {
+    const terms = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
+    filter.$and = [...(filter.$and || []), ...terms.map((term) => {
+      const expression = new RegExp(escapeRegex(term), 'i');
+      return {
+        $or: [
+          { searchText: expression },
+          { title: expression },
+          { description: expression },
+          { genres: expression },
+          { languages: expression }
+        ]
+      };
+    })];
+  }
+  return filter;
+}
+
+function normalizeAnnouncementRefs(value) {
   if (!Array.isArray(value)) return [];
   return value
     .map((entry) => ({
@@ -608,6 +715,7 @@ function contentMetadataPatch(content, requested = {}) {
     ...(requested.category === undefined ? {} : { art: { ...(content.art || {}), tone: categoryDetails(category).tone } }),
     ...(requested.poster === undefined ? {} : { poster: requested.poster || null }),
     ...(requested.announcementRefs === undefined ? {} : { announcementRefs: normalizeAnnouncementRefs(requested.announcementRefs) }),
+    ...resolveCollection({ title, stored: content.collection, requested: requested.collection, locked: Boolean(content.collectionManual) }),
     titleKey,
     automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey, looseTitleKey]),
     // a metadata edit leaves the episode index alone, so it carries the existing one over
@@ -692,6 +800,10 @@ function normalizeContent(input) {
     // service before persistence. No media bytes are held by this field.
     stream: input.stream && typeof input.stream === 'object' ? clone(input.stream) : null,
     announcementRefs: normalizeAnnouncementRefs(input.announcementRefs),
+    // A franchise group is derived from the title at write time, so a card joins "Iron Man" the
+    // moment it is published and leaves it again the day /title corrects the name. A hand-set
+    // collection (or a hand-cleared one) is never overwritten by the derivation.
+    ...resolveCollection({ title, stored: input.collection, locked: Boolean(input.collectionManual) }),
     // titleKey makes same-title merging work for manual, batch, and older
     // records. Automation keeps raw and internet-verified aliases so slightly
     // different upload labels still converge on one catalog record.
@@ -726,7 +838,10 @@ function normalizeContent(input) {
  * (title, languages, poster, players, announcement references, delivery identity) is
  * touched. This is what `/repair` writes.
  */
-const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery', 'searchText'];
+// `collection` is in the list because a franchise group is derived from the title: a catalog
+// published before collections existed gets them from the names it already carries, and a card whose
+// title was corrected moves to the group that name describes.
+const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery', 'searchText', 'collection', 'collectionManual'];
 
 /**
  * Re-derive a stored card's episode index with today's parsing rules.
@@ -751,6 +866,9 @@ export function reindexContentRecord(content) {
     else if (field === 'episodeGroups') notes.push(`${(Array.isArray(content.episodeGroups) || []).length} → ${(rebuilt.episodeGroups || []).length} index blocks`);
     else if (field === 'files') notes.push(`${(content.files || []).length} file records re-parsed`);
     else if (field === 'releaseLabel') notes.push(`label “${content.releaseLabel || '—'}” → “${rebuilt.releaseLabel || '—'}”`);
+    else if (field === 'collection' && rebuilt.collection?.name) {
+      notes.push(content.collection?.name ? `collection “${content.collection.name}” → “${rebuilt.collection.name}”` : `joins the “${rebuilt.collection.name}” collection`);
+    }
   }
   const files = Array.isArray(patchFields.files) ? patchFields.files : (Array.isArray(content.files) ? content.files : []);
   const unindexed = files.filter((file) => !hasEpisodeRange(file) && !seasonPackOf(file)).map((file) => file?.name || file?.displayName || 'unnamed file');
@@ -800,14 +918,58 @@ export class MemoryCatalogRepository {
 
   async init() {}
 
-  async listContent({ category, query, limit = 60 } = {}) {
+  async listContent({ category, query, limit = 60, offset = 0, collectionKey = null, hideAdult = false, genre = null } = {}) {
     const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
     const normalizedQuery = cleanText(query, 100);
+    const key = cleanText(collectionKey, 90).toLowerCase() || null;
+    const wantedGenre = cleanText(genre, 40) || null;
     return sortByPublishedAt([...this.contents.values()])
-      .filter((item) => !normalizedCategory || item.category === normalizedCategory)
-      .filter((item) => searchPredicate(item, normalizedQuery))
-      .slice(0, Math.max(1, Math.min(Number(limit) || 60, 100)))
+      .filter((item) => contentMatchesList(item, { category: normalizedCategory, query: normalizedQuery, collectionKey: key, hideAdult, genre: wantedGenre }))
+      .slice(Math.max(0, Number(offset) || 0), Math.max(0, Number(offset) || 0) + Math.max(1, Math.min(Number(limit) || 60, 100)))
       .map(clone);
+  }
+
+  // The count a page needs to know it has more: without it, a listing that stops at 100 looks like
+  // a catalog of 100, which is exactly how "my old posts disappeared" reads from the outside.
+  async countContent({ category, query, collectionKey = null, hideAdult = false, genre = null } = {}) {
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const normalizedQuery = cleanText(query, 100);
+    const key = cleanText(collectionKey, 90).toLowerCase() || null;
+    const wantedGenre = cleanText(genre, 40) || null;
+    return [...this.contents.values()].filter((item) => (
+      contentMatchesList(item, { category: normalizedCategory, query: normalizedQuery, collectionKey: key, hideAdult, genre: wantedGenre })
+    )).length;
+  }
+
+  async listCollections() {
+    return collectionEntries([...this.contents.values()]);
+  }
+
+  async findCollection(key) {
+    const wanted = cleanText(key, 90).toLowerCase();
+    return (await this.listCollections()).find((entry) => entry.key === wanted) || null;
+  }
+
+  async listGenres({ limit = 60 } = {}) {
+    const counts = new Map();
+    for (const item of this.contents.values()) {
+      if (item.category === 'adult') continue;
+      for (const genre of item.genres || []) {
+        const name = cleanText(genre, 40);
+        if (!name) continue;
+        // "Action" and "action" are one shelf: the entry is keyed by the letters alone and shows the
+        // spelling the catalog uses most, so a list never offers two tiles for the same tag.
+        const key = name.toLowerCase();
+        const entry = counts.get(key) || { name, count: 0, spellings: new Map() };
+        entry.count += 1;
+        entry.spellings.set(name, (entry.spellings.get(name) || 0) + 1);
+        counts.set(key, entry);
+      }
+    }
+    return [...counts.values()]
+      .map((entry) => ({ name: preferredSpelling(entry.spellings), count: entry.count }))
+      .sort((first, second) => second.count - first.count || first.name.localeCompare(second.name))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 60, 200)));
   }
 
   async findContentBySlug(slug) {
@@ -1778,34 +1940,81 @@ export class MongoCatalogRepository {
     ]);
   }
 
-  async listContent({ category, query, limit = 60 } = {}) {
-    const filter = { published: true };
-    if (CATEGORY_IDS.has(category)) filter.category = category;
-
-    const normalizedQuery = cleanText(query, 100);
-    if (normalizedQuery) {
-      const terms = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
-      filter.$and = terms.map((term) => {
-        const expression = new RegExp(escapeRegex(term), 'i');
-        return {
-          $or: [
-            { searchText: expression },
-            { title: expression },
-            { description: expression },
-            { genres: expression },
-            { languages: expression }
-          ]
-        };
-      });
-    }
+  async listContent({ category, query, limit = 60, offset = 0, collectionKey = null, hideAdult = false, genre = null } = {}) {
+    const filter = contentListFilter({ category, query, collectionKey, hideAdult, genre });
+    const start = Math.max(0, Number(offset) || 0);
 
     // The list serializer uses safe file labels to resolve legacy language tags
     // such as "Multi (Hindi + Malayalam)". It never returns `files` to clients.
     return this.contents
       .find(filter, { projection: LIST_CONTENT_PROJECTION })
       .sort({ featured: -1, publishedAt: -1 })
+      .skip(start)
       .limit(Math.max(1, Math.min(Number(limit) || 60, 100)))
       .toArray();
+  }
+
+  async countContent({ category, query, collectionKey = null, hideAdult = false, genre = null } = {}) {
+    return this.contents.countDocuments(contentListFilter({ category, query, collectionKey, hideAdult, genre }));
+  }
+
+  // Aggregated rather than assembled from a page of results: a collection with 40 entries is exactly
+  // the case a 100-card listing cannot describe.
+  async listCollections() {
+    const rows = await this.contents.aggregate([
+      { $match: { published: true, category: { $ne: 'adult' }, 'collection.key': { $type: 'string' } } },
+      {
+        $group: {
+          _id: '$collection.key',
+          name: { $first: '$collection.name' },
+          count: { $sum: 1 },
+          titles: { $addToSet: '$title' },
+          categories: { $addToSet: '$category' },
+          posters: { $addToSet: '$posterUrl' },
+          latestAt: { $max: '$publishedAt' }
+        }
+      }
+    ], { allowDiskUse: true }).toArray();
+    return rows
+      .filter((row) => (row.titles || []).length >= 2)
+      .map((row) => ({
+        key: row._id,
+        name: row.name || row._id,
+        count: row.count,
+        titles: [...(row.titles || [])].sort(),
+        categories: (row.categories || []).filter(Boolean),
+        posterUrls: (row.posters || []).filter(Boolean).slice(0, 4),
+        latestAt: row.latestAt ? new Date(row.latestAt).toISOString() : null
+      }))
+      .sort((first, second) => second.count - first.count || first.name.localeCompare(second.name));
+  }
+
+  async findCollection(key) {
+    const wanted = cleanText(key, 90).toLowerCase();
+    if (!wanted) return null;
+    return (await this.listCollections()).find((entry) => entry.key === wanted) || null;
+  }
+
+  async listGenres({ limit = 60 } = {}) {
+    const rows = await this.contents.aggregate([
+      { $match: { published: true, category: { $ne: 'adult' }, genres: { $exists: true, $ne: [] } } },
+      { $unwind: '$genres' },
+      // Grouped on the lower-cased tag so "Action" and "action" share one shelf; the spellings come
+      // along so the shelf can be named the way the catalog names it most.
+      { $group: { _id: { $toLower: '$genres' }, count: { $sum: 1 }, spellings: { $push: '$genres' } } },
+      { $sort: { count: -1, _id: 1 } },
+      { $limit: Math.max(1, Math.min(Number(limit) || 60, 200)) }
+    ], { allowDiskUse: true }).toArray();
+    return rows
+      .map((row) => {
+        const spellings = new Map();
+        for (const value of row.spellings || []) {
+          const name = cleanText(value, 40);
+          if (name) spellings.set(name, (spellings.get(name) || 0) + 1);
+        }
+        return { name: preferredSpelling(spellings) || cleanText(row._id, 40), count: row.count };
+      })
+      .filter((row) => row.name);
   }
 
   async findContentBySlug(slug) {
