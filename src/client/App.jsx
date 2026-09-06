@@ -345,14 +345,18 @@ function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAcce
       </section>
       <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`}>
         {adultLocked ? <AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /> : <>
-          <div className="browse-results__top">
-            <p><strong>{catalog.loading ? '…' : catalog.total || 0}</strong> release{catalog.total === 1 ? '' : 's'} {genre ? `tagged ${genre}` : category ? `in ${categoryCopy[category].title.split('.')[0]}` : 'to explore'}</p>
+          <div className="browse-results__top browse-results__top--shelves">
+            <p><strong>{catalog.loading ? '…' : catalog.total || 0}</strong> release{catalog.total === 1 ? '' : 's'} {genre ? `tagged ${genre}` : category ? `in ${categoryLabels[category]}` : 'in the catalog'}</p>
             <div className="browse-results__actions">
-              <Link className="filter-button collections-button" to="/collections"><Icon name="layers" size={17} /> Collections</Link>
-              <Link className="filter-button genres-button" to="/genres"><Icon name="grid" size={17} /> Genres</Link>
-              <button type="button" className="filter-button" onClick={() => setFilterOpen((current) => !current)} aria-expanded={filterOpen}><Icon name="filter" size={17} /> Categories <Icon name="chevron" size={15} className={filterOpen ? 'is-open' : ''} /></button>
-              <div className={`browse-filter-popover ${filterOpen ? 'browse-filter-popover--open' : ''}`}><CategoryNav activeCategory={category} /></div>
+              <Link className="shelf-button" to="/collections"><Icon name="layers" size={16} /> Collections</Link>
+              <Link className={`shelf-button ${genre ? 'is-active' : ''}`} to="/genres"><Icon name="grid" size={16} /> Genres</Link>
+              <button type="button" className={`shelf-button shelf-button--categories ${filterOpen ? 'is-active' : ''}`} onClick={() => setFilterOpen((current) => !current)} aria-expanded={filterOpen} aria-controls="browse-shelf-panel"><Icon name="filter" size={16} /> Categories <Icon name="chevron" size={14} className={filterOpen ? 'is-open' : ''} /></button>
             </div>
+          </div>
+          {/* A shelf switch that expands in place instead of floating a popover over the grid: on a
+              phone an overlay panel lands on top of the cards it is meant to replace. */}
+          <div className={`browse-shelf-panel ${filterOpen ? 'is-open' : ''}`} id="browse-shelf-panel" aria-hidden={!filterOpen}>
+            <div className="browse-shelf-panel__inner"><CategoryNav activeCategory={category} /></div>
           </div>
           {catalog.loading || (requestedAdultCategory && adultAccess && !catalog.items.length && !catalog.error) ? <LoadingGrid count={8} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
             <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
@@ -487,9 +491,9 @@ function GenresPage() {
           {categories.loading ? <LoadingGrid count={2} /> : categories.error ? <ErrorBlock error={categories.error} compact /> : (
             <div className="shelf-grid">
               {shelves.map((category) => (
-                <Link className="shelf-tile" key={category.id} to={`/browse/${category.id}`}>
+                <Link className={`shelf-tile ${category.count ? '' : 'shelf-tile--empty'}`} key={category.id} to={`/browse/${category.id}`}>
                   <span className={`shelf-tile__dot shelf-tile__dot--${category.tone || 'violet'}`} aria-hidden="true" />
-                  <span className="shelf-tile__label"><strong>{category.label}</strong><small>{category.count} {category.count === 1 ? 'release' : 'releases'}</small></span>
+                  <span className="shelf-tile__label"><strong>{category.label}</strong><small>{category.count ? `${category.count} ${category.count === 1 ? 'release' : 'releases'}` : 'Nothing added yet'}</small></span>
                   <Icon name="arrow" size={18} />
                 </Link>
               ))}

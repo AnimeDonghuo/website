@@ -266,6 +266,14 @@ function generate(css) {
     '  --line: rgba(18, 24, 36, 0.13);',
     '  --line-strong: rgba(18, 24, 36, 0.2);',
     '  --shadow: 0 20px 55px rgba(18, 24, 36, 0.1);',
+    // The three-line drawer paints itself from these, so it follows the theme even though every rule
+    // that lays it out lives in a narrow media block the colour map does not walk.
+    '  --menu-surface: #f1f2f4;',
+    '  --menu-ink: #3d4148;',
+    '  --menu-muted: #6a7382;',
+    '  --menu-line: rgba(18, 24, 36, 0.09);',
+    '  --menu-field: #ffffff;',
+    '  --menu-shadow: 0 17px 24px rgba(18, 24, 36, 0.1);',
     '  --lime-ink: #3c7a12;',
     '  --violet-ink: #5b3fb8;',
     '  --cyan-ink: #0d6f66;',

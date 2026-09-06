@@ -47,6 +47,10 @@ test('a failed page leaves the cards already shown where they are', () => {
 test('the hamburger menu opens the shelves a visitor can click, and never lists 18+', () => {
   assert.match(header, /import \{ getCategories, getGenres \} from '\.\.\/api\.js';/);
   assert.match(header, /onClick=\{toggleShelves\}/);
+  assert.match(header, /<p className="mobile-menu__label">Explore<\/p>/, 'the section is labelled, so it reads as part of the menu');
+  assert.match(header, /className=\{`mobile-menu__row \$\{shelvesOpen \? 'is-active' : ''\}`\}/);
+  assert.match(header, /aria-controls="mobile-shelf-panel"/);
+  assert.doesNotMatch(header, /mobile-menu__shelf-toggle/, 'no bordered boxes waiting at the foot of a plain list');
   assert.match(header, /Genres &amp; categories/);
   assert.match(header, /to="\/collections"/);
   // Fetched when the panel is opened, not on every page load.
@@ -86,13 +90,60 @@ test('collections are browsable, and a release points at the rest of its series'
 });
 
 test('the new surfaces are styled, and none of them is a rewrite', () => {
-  const selectors = ['.catalog-pager', '.catalog-pager__more', '.catalog-pager__end', '.genre-grid', '.genre-tile', '.shelf-grid', '.shelf-tile', '.collection-grid', '.collection-card', '.collection-chip', '.collection-titles', '.mobile-menu__shelf-panel', '.mobile-menu__genre-chips', '.browse-results__actions'];
+  const selectors = ['.catalog-pager', '.catalog-pager__more', '.catalog-pager__end', '.genre-grid', '.genre-tile', '.shelf-grid', '.shelf-tile', '.collection-grid', '.collection-card', '.collection-chip', '.collection-titles', '.mobile-menu__shelf-panel', '.mobile-menu__genre-chips', '.mobile-menu__row', '.mobile-menu__label', '.browse-results__actions', '.shelf-button', '.browse-shelf-panel'];
   for (const selector of selectors) {
     const pattern = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\{`);
     assert.match(styles, pattern, `${selector} needs its own rule`);
   }
-  // The Collections button stays on the page at every width, where the category filter is a
-  // narrow-screen control; the base rule is what it is added to.
-  assert.match(styles, /\.browse-results__actions \.collections-button, \.browse-results__actions \.genres-button \{ display: inline-flex; \}/);
-  assert.match(styles, /\.filter-button \{ display: none;/, 'the category popover keeps its old breakpoint');
+});
+
+test('the row under a listing heading is one control shape, in one line', () => {
+  // Three pills of the same height and weight. What it replaced was two links and a differently
+  // styled button wrapping into a ragged column on the right of the count.
+  assert.match(styles, /\.shelf-button \{[^}]*height: 31px[^}]*white-space: nowrap/);
+  assert.match(styles, /\.shelf-button\.is-active \{ color: #172109; border-color: var\(--lime\); background: var\(--lime\); \}/, 'an active shelf is lit, not underlined');
+  assert.match(app, /className=\{`shelf-button \$\{genre \? 'is-active' : ''\}\`\}/, 'a genre page lights the Genres button');
+  // A shelf with nothing on it is dimmed and dashed, so a dead end is visible before the tap.
+  assert.match(styles, /\.shelf-tile--empty \{[^}]*border-style: dashed/);
+  assert.match(app, /shelf-tile \$\{category\.count \? '' : 'shelf-tile--empty'\}/);
+  // On a phone the three share one row of equal widths instead of crowding the count line.
+  assert.match(styles, /\.browse-results__actions \{ display: grid; grid-template-columns: repeat\(3, minmax\(0,1fr\)\); gap: 7px; \}/);
+  assert.match(styles, /@media \(max-width: 410px\) \{\s*\/\* Three equal buttons[\s\S]*?\.browse-results__actions \.shelf-button > svg:first-child \{ display: none; \}/, 'the icons step aside before the labels get clipped');
+});
+
+test('the category control only exists where the hero rail is hidden, and expands in place', () => {
+  assert.match(styles, /\.browse-results__actions \.shelf-button--categories \{ display: none; \}/);
+  assert.match(styles, /\.browse-results__actions \.shelf-button--categories \{ display: inline-flex; \}/);
+  // A popover floating over the grid it is meant to change became the second ugly thing on the page.
+  assert.match(styles, /\.browse-shelf-panel\.is-open \{ max-height: 120px; visibility: visible; margin: 13px 0 20px/);
+  assert.match(app, /className=\{`browse-shelf-panel \$\{filterOpen \? 'is-open' : ''\}\`\} id="browse-shelf-panel" aria-hidden=\{!filterOpen\}/);
+  assert.doesNotMatch(styles, /\.filter-button|\.browse-filter-popover/, 'the popover it replaced is gone, not left behind as dead CSS');
+  assert.doesNotMatch(app, /filter-button|browse-filter-popover/);
+});
+
+test('the drawer is a solid surface that follows the theme, not a panel fading the page through it', () => {
+  // Two things made the open menu look unfinished in a screenshot: it faded in over 160ms, so the
+  // cards behind it showed through the rows, and it was painted with night colours hardcoded inside
+  // a narrow media block — which the theme generator cannot re-colour, so Day mode got a black slab
+  // with dark text. It is gated by visibility now, and painted from --menu-* tokens.
+  assert.match(styles, /--menu-surface: #0a0d15;/);
+  assert.match(styles, /--menu-ink: #b7bfca;/);
+  assert.match(styles, /\.mobile-menu \{ display: none; border-bottom: 1px solid transparent; background: var\(--menu-surface\); box-shadow: var\(--menu-shadow\); visibility: hidden; pointer-events: none/);
+  assert.match(styles, /\.mobile-menu--open \{ visibility: visible; pointer-events: auto; border-color: var\(--menu-line\); \}/);
+  assert.doesNotMatch(styles, /\.mobile-menu \{[^}]*opacity: 0/);
+  const layout = styles.match(/\.mobile-menu \{ position: absolute;[^}]*\}/)[0];
+  assert.doesNotMatch(layout, /#[0-9a-f]{3,8}|rgba?\(/i, 'no hardcoded colour inside the drawer layout rule, because nothing out there gets re-mapped');
+  assert.match(read('scripts/build-light-theme.mjs'), /--menu-surface: #f1f2f4;/, 'and Day mode has a light drawer, so the light ink has something under it');
+  // The two new rows keep the nav list's rhythm instead of wearing their own box.
+  assert.match(styles, /\.mobile-menu__row \{[^}]*border-bottom: 1px solid var\(--menu-line\)/);
+  assert.match(styles, /\.mobile-menu__label \{[^}]*border-top: 1px solid var\(--menu-line\)/, 'and the section is labelled, so they read as part of the menu');
+  assert.match(styles, /\.mobile-menu__shelf-panel \{[^}]*border-left: 1px solid var\(--menu-line\)/, 'an opened panel nests under its row instead of being pasted after it');
+});
+
+test('a shelf line never pastes half of the hero headline into a count', () => {
+  // `188 releases in Anime worth crossing worlds for` was the old sentence: it took the first
+  // clause of the hero title as the category name.
+  assert.match(app, /category \? `in \$\{categoryLabels\[category\]\}` : 'in the catalog'/);
+  assert.doesNotMatch(app, /categoryCopy\[category\]\.title\.split/);
+  assert.match(styles, /\.browse-results__top p strong \{[^}]*font-variant-numeric: tabular-nums/, 'and the number does not jitter as pages arrive');
 });

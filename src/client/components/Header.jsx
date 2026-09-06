@@ -226,22 +226,26 @@ export default function Header() {
           ))}
         </nav>
         <div className="mobile-menu__shelves">
+          <p className="mobile-menu__label">Explore</p>
+          {/* Same rhythm as the rows above — a hairline, an icon, a label, a chevron — because two
+              bordered boxes at the foot of a plain list is what made this block look unfinished. */}
           <button
             type="button"
-            className="mobile-menu__shelf-toggle"
+            className={`mobile-menu__row ${shelvesOpen ? 'is-active' : ''}`}
             onClick={toggleShelves}
             aria-expanded={shelvesOpen}
+            aria-controls="mobile-shelf-panel"
           >
-            <Icon name="grid" size={18} />
+            <Icon name="grid" size={17} />
             <span>Genres &amp; categories</span>
             <Icon name="chevron" size={17} className={shelvesOpen ? 'is-open' : ''} />
           </button>
-          <Link className="mobile-menu__shelf-toggle" to="/collections">
-            <Icon name="layers" size={18} />
+          <Link className="mobile-menu__row" to="/collections">
+            <Icon name="layers" size={17} />
             <span>Collections</span>
-            <Icon name="arrow" size={17} />
+            <Icon name="chevron" size={17} />
           </Link>
-          <div className={`mobile-menu__shelf-panel ${shelvesOpen ? 'is-open' : ''}`} aria-hidden={!shelvesOpen}>
+          <div className={`mobile-menu__shelf-panel ${shelvesOpen ? 'is-open' : ''}`} id="mobile-shelf-panel" aria-hidden={!shelvesOpen}>
             {shelves.loading ? <p className="mobile-menu__shelf-note">Counting the catalog…</p> : null}
             {shelves.error ? (
               <p className="mobile-menu__shelf-note">{shelves.error} Close the menu and tap Genres again to retry.</p>
@@ -251,8 +255,8 @@ export default function Header() {
                 <h3>Categories</h3>
                 <div className="mobile-menu__shelf-list">
                   {shelves.categories.map((category) => (
-                    <Link key={category.id} to={`/browse/${category.id}`} onClick={() => setOpen(false)}>
-                      <span>{category.label}</span><small>{category.count}</small>
+                    <Link key={category.id} to={`/browse/${category.id}`} onClick={() => setOpen(false)} className={category.count ? '' : 'is-empty'}>
+                      <span>{category.label}</span><small>{category.count || '—'}</small>
                     </Link>
                   ))}
                 </div>
@@ -262,13 +266,17 @@ export default function Header() {
               <div className="mobile-menu__shelf-group">
                 <h3>Genres</h3>
                 <div className="mobile-menu__genre-chips">
-                  {shelves.genres.map((genre) => (
+                  {/* A drawer is a thumb's reach tall, so it shows the shelves the catalog actually
+                      leans on and hands the rest to the full page. */}
+                  {shelves.genres.slice(0, 14).map((genre) => (
                     <Link key={genre.name} to={`/browse?genre=${encodeURIComponent(genre.name)}`} onClick={() => setOpen(false)}>
                       {genre.name}<span>{genre.count}</span>
                     </Link>
                   ))}
                 </div>
-                <Link className="mobile-menu__shelf-all" to="/genres" onClick={() => setOpen(false)}>Every shelf, with counts <Icon name="arrow" size={15} /></Link>
+                <Link className="mobile-menu__shelf-all" to="/genres" onClick={() => setOpen(false)}>
+                  {shelves.genres.length > 14 ? `All ${shelves.genres.length} shelves, with counts` : 'Every shelf, with counts'} <Icon name="arrow" size={15} />
+                </Link>
               </div>
             ) : null}
             {!shelves.loading && !shelves.error && !shelves.categories.length && !shelves.genres.length ? (
