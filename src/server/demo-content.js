@@ -97,29 +97,6 @@ export const demoContent = [
     publishedAt: daysAgo(4)
   },
   {
-    id: 'demo-jade-circuit-shadow',
-    shareCode: 'demoJade10',
-    slug: 'jade-circuit-shadow-protocol',
-    // A subtitled second entry, so the demo shows why a collection needs no maintenance: this card
-    // joins "Jade Circuit" because its own title says so.
-    title: 'Jade Circuit: Shadow Protocol',
-    category: 'donghua',
-    year: 2027,
-    languages: ['Chinese', 'Hindi'],
-    genres: ['Fantasy', 'Martial Arts'],
-    description: 'The living map leads somewhere it was never meant to go, and the forge that can repair a sky has a price written in the same jade.',
-    status: 'New season',
-    releaseLabel: 'Season 2',
-    filesCount: 20,
-    episodeCount: 20,
-    episodeGroups: [
-      { start: 1, end: 10, label: 'Episodes 01–10', fileCount: 1 },
-      { start: 11, end: 20, label: 'Episodes 11–20', fileCount: 1 }
-    ],
-    art: { tone: 'cyan', mark: 'JC', motif: 'jade' },
-    publishedAt: daysAgo(1)
-  },
-  {
     id: 'demo-ghost-protocol',
     shareCode: 'demoGhost06',
     slug: 'ghost-protocol',

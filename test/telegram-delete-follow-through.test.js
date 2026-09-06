@@ -5,12 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { beforeEach, test } from 'node:test';
 
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
-import {
-  announcementLaneDrained,
-  queueAnnouncementDeletion,
-  resetAnnouncementLane,
-  updatePublishedPost
-} from '../src/server/services/telegram-bot.js';
+import { announcementLaneDrained, queueAnnouncementDeletion, resetAnnouncementLane } from '../src/server/services/telegram-bot.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const botSource = readFileSync(join(root, 'src/server/services/telegram-bot.js'), 'utf8');
@@ -114,75 +109,4 @@ test('/delete asks for the announcements of every card it removed, and says so',
   assert.match(block, /channel announcement/, 'and the reply tells the publisher the copies went too');
   // Cards that were never announced must not be reported as channel deletions.
   assert.match(block, /never announced/);
-});
-
-test('a collection set by hand is stored, shown on the announcement, and survives a rename', async () => {
-  const repository = await repositoryWith([
-    { slug: 'iron-man-2', title: 'Iron Man 2' },
-    { slug: 'iron-man-3', title: 'Iron Man 3' }
-  ]);
-  await repository.init();
-  const [second, third] = await repository.listContent({ limit: 2 });
-  const replies = [];
-  const ctx = makeContext({}, replies);
-
-  const set = await updatePublishedPost({
-    ctx,
-    repository,
-    argument: `${second.adminId}, ${third.adminId} Marvel Saga`,
-    field: 'collection',
-    fieldLabel: 'Collection'
-  });
-  assert.equal(set.handled, true);
-  const storedSecond = await repository.findContentByAdminId(second.adminId);
-  const storedThird = await repository.findContentByAdminId(third.adminId);
-  assert.equal(storedSecond.collection.name, 'Marvel Saga', 'one command names the group for both posts');
-  assert.equal(storedThird.collection.name, 'Marvel Saga');
-  assert.equal(storedSecond.collectionManual, true);
-  assert.notEqual(storedSecond.collection.key, 'iron-man', 'and the derived group is not used');
-
-  const renamed = await updatePublishedPost({
-    ctx,
-    repository,
-    argument: `${second.adminId} Iron Man: Revived`,
-    field: 'title',
-    fieldLabel: 'Title'
-  });
-  assert.equal(renamed.handled, true);
-  const afterRename = await repository.findContentByAdminId(second.adminId);
-  assert.equal(afterRename.title, 'Iron Man: Revived');
-  assert.equal(afterRename.collection.name, 'Marvel Saga', '/title never undoes a collection someone set');
-
-  const cleared = await updatePublishedPost({
-    ctx,
-    repository,
-    argument: `${second.adminId} none`,
-    field: 'collection',
-    fieldLabel: 'Collection'
-  });
-  assert.equal(cleared.handled, true);
-  assert.equal((await repository.findContentByAdminId(second.adminId)).collection, null);
-  const afterClear = await updatePublishedPost({
-    ctx,
-    repository,
-    argument: `${second.adminId} Iron Man 4`,
-    field: 'title',
-    fieldLabel: 'Title'
-  });
-  assert.equal(afterClear.handled, true);
-  assert.equal(
-    (await repository.findContentByAdminId(second.adminId)).collection,
-    null,
-    'a card taken out of its group by hand stays out, even though its new title looks like a sequel'
-  );
-});
-
-test('/collection explains the automatic case instead of demanding a name', () => {
-  const start = botSource.indexOf("bot.command('collection'");
-  assert.notEqual(start, -1, 'publishers need a way to name a group, and to refuse one');
-  const block = botSource.slice(start, botSource.indexOf("\n  bot.", start + 10));
-  assert.match(block, /field: 'collection'/);
-  assert.match(block, /\/repair go/, 'the help has to mention the backfill, or every card published before this waits for a rename');
-  assert.match(block, /two different titles/, 'and that a group of one is not shown as a collection');
-  assert.match(block, /18\+/, 'and that adult cards are never grouped');
 });

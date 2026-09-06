@@ -32,12 +32,11 @@ export async function getConfig() {
  * the whole shelf and `items` is the part of it this visitor has reached, so a category is never
  * silently truncated at some fixed number of cards.
  */
-export async function getContent({ category, query, genre, collection, page = 1, limit = 60 } = {}) {
+export async function getContent({ category, query, genre, page = 1, limit = 60 } = {}) {
   const params = new URLSearchParams();
   if (category) params.set('category', category);
   if (query) params.set('q', query);
   if (genre) params.set('genre', genre);
-  if (collection) params.set('collection', collection);
   if (page > 1) params.set('page', page);
   if (limit) params.set('limit', limit);
   const suffix = params.size ? `?${params}` : '';
@@ -52,20 +51,6 @@ export async function getCategories() {
 /** The genre shelves the menu offers, 18+ never among them. */
 export async function getGenres() {
   return request('/genres');
-}
-
-/** Franchise groups derived from the titles themselves — only groups of two or more appear. */
-export async function getCollections() {
-  return request('/collections');
-}
-
-/** One franchise group, paged like any other listing, plus the group's own details. */
-export async function getCollection(key, { page = 1, limit = 60 } = {}) {
-  const params = new URLSearchParams();
-  if (page > 1) params.set('page', page);
-  if (limit) params.set('limit', limit);
-  const suffix = params.size ? `?${params}` : '';
-  return request(`/collections/${encodeURIComponent(key)}${suffix}`);
 }
 
 export async function getFeatured() {

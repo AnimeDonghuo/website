@@ -226,9 +226,8 @@ export default function Header() {
           ))}
         </nav>
         <div className="mobile-menu__shelves">
-          <p className="mobile-menu__label">Explore</p>
-          {/* Same rhythm as the rows above — a hairline, an icon, a label, a chevron — because two
-              bordered boxes at the foot of a plain list is what made this block look unfinished. */}
+          {/* Same rhythm as the rows above — a hairline, an icon, a label, a chevron — because a
+              bordered box at the foot of a plain list is what made this block look unfinished. */}
           <button
             type="button"
             className={`mobile-menu__row ${shelvesOpen ? 'is-active' : ''}`}
@@ -240,11 +239,6 @@ export default function Header() {
             <span>Genres &amp; categories</span>
             <Icon name="chevron" size={17} className={shelvesOpen ? 'is-open' : ''} />
           </button>
-          <Link className="mobile-menu__row" to="/collections">
-            <Icon name="layers" size={17} />
-            <span>Collections</span>
-            <Icon name="chevron" size={17} />
-          </Link>
           <div className={`mobile-menu__shelf-panel ${shelvesOpen ? 'is-open' : ''}`} id="mobile-shelf-panel" aria-hidden={!shelvesOpen}>
             {shelves.loading ? <p className="mobile-menu__shelf-note">Counting the catalog…</p> : null}
             {shelves.error ? (

@@ -257,11 +257,6 @@
 [data-theme='light'] .genre-tile span { color: #62656a; }
 [data-theme='light'] .shelf-note { color: #61656b; }
 [data-theme='light'] .shelf-button { color: #3e4147; background: rgba(18, 24, 36, 0.056); }
-[data-theme='light'] .collection-card__stack { border: 1px solid rgba(18, 24, 36, 0.084); background: rgba(250, 251, 252, 0.94); }
-[data-theme='light'] .collection-card:hover .collection-card__copy strong { color: var(--lime-ink); }
-[data-theme='light'] .collection-card__copy span { color: #3e4146; }
-[data-theme='light'] .collection-card__copy small { color: #62656a; }
-[data-theme='light'] .collection-titles span { border: 1px solid rgba(18, 24, 36, 0.05); background: rgba(18, 24, 36, 0.056); color: #3d4148; }
 [data-theme='light'] .mobile-menu__row:hover { color: var(--lime-ink); }
 [data-theme='light'] .mobile-menu__row.is-active { color: var(--lime-ink); }
 [data-theme='light'] .mobile-menu__row:hover > svg { color: var(--lime-ink); }

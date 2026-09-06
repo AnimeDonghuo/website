@@ -518,31 +518,10 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
    two ways to do the same thing. */
 .browse-results__actions .shelf-button--categories { display: none; }
 .browse-shelf-panel { display: none; }
-.collection-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 28px 16px; }
-.collection-card { display: block; min-width: 0; color: var(--ink); animation: rise-in 450ms both ease-out; animation-delay: var(--stagger, 0ms); }
-.collection-card__art { position: relative; display: block; overflow: hidden; border: 1px solid rgba(255,255,255,.11); border-radius: 10px; background: #171e2b; box-shadow: 0 10px 20px rgba(0,0,0,.11); transition: border-color 210ms ease, box-shadow 210ms ease, transform 210ms ease; }
-.collection-card:hover .collection-card__art { border-color: rgba(197,248,106,.45); box-shadow: 0 18px 31px rgba(0,0,0,.26); transform: translateY(-4px); }
-.collection-card__art .artwork { transition: transform 400ms ease; }
-.collection-card:hover .collection-card__art .artwork { transform: scale(1.022); }
-.collection-card__stack { position: absolute; right: 9px; bottom: 9px; width: 20px; height: 27px; border: 1px solid rgba(255,255,255,.2); border-radius: 4px; background: rgba(6,8,13,.62); backdrop-filter: blur(6px); }
-.collection-card__copy { display: grid; gap: 4px; padding: 11px 2px 0; }
-.collection-card__copy strong { overflow: hidden; font-size: 14px; font-weight: 800; letter-spacing: -.045em; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; transition: color 160ms ease; }
-.collection-card:hover .collection-card__copy strong { color: var(--lime); }
-.collection-card__copy span { color: #939cab; font-size: 9px; font-weight: 700; }
-.collection-card__copy small { display: -webkit-box; overflow: hidden; color: #6f7887; font-size: 9px; font-weight: 600; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
-.collection-titles { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 18px; }
-.collection-titles span { padding: 6px 9px; border: 1px solid rgba(255,255,255,.12); border-radius: 6px; background: rgba(255,255,255,.03); color: #b6bdca; font-size: 10px; font-weight: 700; }
-.collection-page__all { margin-top: 17px; }
-.collection-chip { display: inline-flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; margin-top: 14px; padding: 9px 12px; border: 1px solid rgba(197,248,106,.3); border-radius: 9px; background: rgba(197,248,106,.07); color: var(--lime-ink); font-size: 11px; font-weight: 700; transition: background 170ms ease, transform 170ms ease; }
-.collection-chip strong { color: var(--ink); font-weight: 800; letter-spacing: -.025em; }
-.collection-chip > svg:last-child { transition: transform 170ms ease; }
-.collection-chip:hover { background: rgba(197,248,106,.15); transform: translateY(-1px); }
-.collection-chip:hover > svg:last-child { transform: translateX(3px); }
 
 
 @media (max-width: 1000px) {
   .shelf-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  .collection-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
 }
 
 @media (max-width: 760px) {
@@ -551,9 +530,8 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
   .catalog-pager__count { text-align: center; }
   .catalog-pager__end { text-align: center; }
   .shelf-grid { grid-template-columns: minmax(0,1fr); }
-  .collection-grid { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 22px 12px; }
   .browse-results__top--shelves { flex-direction: column; align-items: stretch; gap: 13px; }
-  .browse-results__actions { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
+  .browse-results__actions { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; }
   .browse-results__actions .shelf-button, .browse-results__actions .shelf-button--categories { width: 100%; height: 36px; }
   .browse-results__actions .shelf-button--categories { display: inline-flex; }
   .browse-shelf-panel { display: block; max-height: 0; overflow: hidden; visibility: hidden; transition: max-height 220ms ease, margin 220ms ease, visibility 0s linear 220ms; }
@@ -563,13 +541,12 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .catalog-pager__icon, .collection-chip, .collection-chip > svg, .shelf-tile, .shelf-tile > svg, .collection-card__art, .collection-card:hover .collection-card__art .artwork, .collection-card:hover .collection-card__art { transition: none; }
-  .collection-card { animation: none; }
+  .catalog-pager__icon, .shelf-tile, .shelf-tile > svg { transition: none; }
 }
 
 @media (max-width: 410px) {
-  /* Three equal buttons still fit at 320px once the icons step aside — a clipped
-     "Collectio…" is what the row looked like before. */
+  /* Equal-width buttons still fit at 320px once the icons step aside — a clipped label
+     inside a shrunk pill is what the row looked like before. */
   .browse-results__actions { gap: 6px; }
   .browse-results__actions .shelf-button { padding: 0 6px; gap: 4px; font-size: 9.5px; }
   .browse-results__actions .shelf-button > svg:first-child { display: none; }
@@ -579,9 +556,8 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
    One button opens the whole catalog's shelves inside the drawer itself — every category and
    genre a visitor can tap, with the number of releases behind each. It never lists 18+. */
 .mobile-menu__shelves { display: grid; }
-/* The list above ends on a hairline, so these two rows wear the same hairline, the same height and
-   the same type size, and only add a muted icon. A labelled section, not two boxes glued to a menu. */
-.mobile-menu__label { margin: 8px 0 0; padding: 12px 3px 9px; border-top: 1px solid var(--menu-line); color: var(--menu-muted); font-family: 'DM Mono', monospace; font-size: 9px; font-weight: 500; letter-spacing: .14em; text-transform: uppercase; }
+/* The list above ends on a hairline, so this row wears the same hairline, the same height and the
+   same type size, and only adds a muted icon — a shelf switch, not a box glued to the foot of a menu. */
 .mobile-menu__row { display: flex; align-items: center; gap: 9px; width: 100%; padding: 12px 3px; border: 0; border-bottom: 1px solid var(--menu-line); background: none; color: var(--menu-ink); font-size: 12px; font-weight: 800; text-align: left; transition: color 160ms ease; }
 .mobile-menu__row > span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-menu__row > svg { flex: 0 0 auto; color: var(--menu-muted); transition: color 160ms ease, transform 200ms ease; }

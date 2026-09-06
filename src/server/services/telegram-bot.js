@@ -205,7 +205,6 @@ export const PUBLISHER_COMMANDS = [
   { command: 'imgdd', description: 'Add artwork with the same old/new poster flow' },
   { command: 'category', description: 'Set the category of one or many posts' },
   { command: 'release', description: 'Set a release label on one or many posts' },
-  { command: 'collection', description: 'Put a card in (or out of) a franchise collection' },
   { command: 'done', description: 'Publish current draft' },
   { command: 'status', description: 'Show current draft, or set post status' },
   { command: 'teststorage', description: 'Check the storage channel connection' },
@@ -665,7 +664,7 @@ export async function applyBulkTitleEdits({ ctx, repository, text, config = null
  * once; a title or synopsis is unique to one release, so those stay singular.
  */
 const MULTI_POST_EDITABLE_FIELDS = new Set([
-  'category', 'languages', 'subtitleLanguages', 'genres', 'status', 'releaseLabel', 'year', 'collection'
+  'category', 'languages', 'subtitleLanguages', 'genres', 'status', 'releaseLabel', 'year'
 ]);
 
 /**
@@ -6343,7 +6342,6 @@ export async function launchTelegramBot({ config, repository }) {
           'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
           'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time — it reports how many cards were checked and only touches the ones that differ, so a second /sync costs no re-reading, and /sync force checks the archive again. A Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
           'If the file posts in your database channel still open with an @channel handle, /sync db shows them and /sync db go rewrites each caption to the clean label the catalog stored for it. Only posts this bot sent can be edited by a bot — the rest are listed instead of retried, and the website label is clean either way.',
-          'Collections: a numbered or subtitled title is grouped with the rest of its franchise on its own, so Iron Man, Iron Man 2 and Iron Man 3 share one collection page. /collection SB-0123ABCDEF Name sets it by hand, /collection SB-0123ABCDEF none takes a card out, and /repair go builds the groups for every card published before this existed.',
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it. /title renames a whole list in one message: one line per post ID, with or without /title at the start of each line, and titles pasted from a filename are tidied as they are saved.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
@@ -6688,27 +6686,6 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
     await updatePublishedPost({ ctx, repository, argument, field: 'releaseLabel', fieldLabel: 'Release label' });
-  });
-
-  // ── /collection: name the franchise group a card belongs to. The group is normally derived from
-  //    the title on its own — "Iron Man 3" joins Iron Man without anyone saying so — so this command
-  //    exists for the two cases the derivation cannot see: a card that belongs in a group under a
-  //    different name, and a card that should not be in one at all.
-  bot.command('collection', async (ctx) => {
-    if (!(await requirePublisher(ctx, repository, config))) return;
-    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
-    const target = parsePublishedPostEdit(argument);
-    if (!target?.value) {
-      await ctx.reply([
-        'Usage: /collection SB-0123ABCDEF Iron Man',
-        'Several posts into one group: /collection SB-0123ABCDEF, SB-1122334455 Iron Man',
-        'Take a card out of its group: /collection SB-0123ABCDEF none',
-        '',
-        'Nothing needs setting for the usual case: a card whose title is a numbered or subtitled entry of another title is grouped with it automatically, on /done, on /title, and on /repair go for everything already published. A group only appears on the site once two different titles are in it, and 18+ cards are never grouped.'
-      ].join('\n'));
-      return;
-    }
-    await updatePublishedPost({ ctx, repository, argument, field: 'collection', fieldLabel: 'Collection' });
   });
 
   bot.command('status', async (ctx) => {
