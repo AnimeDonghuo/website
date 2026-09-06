@@ -501,6 +501,14 @@ A file copied into the database channel keeps the caption it arrived with, and a
 
 `/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone.
 
+### Long reports and the time a command is given
+
+Telegram answers `Bad Request: message is too long` above 4096 characters, and Telegraf gives every update handler a fixed budget — 90 seconds by default — before it stops waiting on it. Both limits used to bite together on a 300-file `/batch`: the import finished, its report was refused, and the publisher was told *"Something went wrong while handling that request"* about work that had gone through.
+
+- **every text reply is paginated instead of truncated** (`splitTelegramText`, `TELEGRAM_REPLY_CHUNK_LIMIT`, 3800 by default). A 261-line skip report or a whole page of caption targets arrives as `(1/n)`, `(2/n)` … messages with every line intact, and the inline keyboard stays on the first message so the buttons still point at something. An `editMessageText` has one message to work with, so it is clamped and the remainder is sent underneath it rather than dropped;
+- **a large job is given room to finish** (`TELEGRAM_HANDLER_TIMEOUT_MS`, 20 minutes by default), and running out of that room is no longer reported as a failure — it means the work is still going, so the bot says so instead of asking for the command to be repeated;
+- the sweep's preview names a whole page (25 cards by default) rather than the first three lines, because listing them is now safe.
+
 `/batch` and the auto-publisher do their share as they go, and never inline: when an inspected file post still carries a prefix, the import hands the same edit to this lane and keeps importing, so a channel that is rate limiting delays a caption and never the release. Nothing is created for the fix — the message is only edited — and the import's reply says how many it handed over, with `/sync db` as the way to read back what is left.
 
 `/batch`, `/lang`, `/category`, `/poster`, `/merge`, and `/repair go` all queue through the same lane, so a bulk command answers its own reply instead of spending a minute editing a channel; the deletion of absorbed posts' announcements does the same, which is why a merge can no longer be spoiled by a channel that will not answer.
@@ -590,6 +598,8 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 | `TELEGRAM_BOT_USERNAME` | Plaintext | Yes | No leading `@` |
 | `TELEGRAM_STORAGE_CHANNEL_ID` | Secret or plaintext | Yes | Normal private channel numeric ID |
 | `TELEGRAM_ADULT_STORAGE_CHANNEL_ID` | Secret or plaintext | Required for 18+ publishing | A different private channel numeric ID for `/adultdb`, `/18db`, and `/batch adult \| …`; no public announcements are sent for these posts |
+| `TELEGRAM_HANDLER_TIMEOUT_MS` | Plaintext | No | How long an update handler may run before Telegraf stops waiting on it; default `1200000` (20 min). A large `/batch` needs the room |
+| `TELEGRAM_REPLY_CHUNK_LIMIT` | Plaintext | No | Characters per outgoing message before a long reply is split; default `3800`, never above Telegram's 4096 |
 | `TELEGRAM_REQUEST_CHANNEL_ID` | Secret or plaintext | No | Separate private request channel; defaults to storage channel |
 | `ADMIN_LOGIN_CODE` | Secret | Yes | Publisher passcode; use your chosen value, not a client variable |
 | `ADMIN_SESSION_HOURS` | Plaintext | No | Defaults to `24` |

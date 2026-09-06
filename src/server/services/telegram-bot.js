@@ -1688,6 +1688,115 @@ const ANNOUNCEMENT_SYNC_REF_ATTEMPTS = 3;
 const ANNOUNCEMENT_SYNC_RETRY_CEILING_MS = 5 * 60_000;
 const ANNOUNCEMENT_SYNC_ROUNDS = 3;
 
+// Telegram's hard text limit for a message. Anything longer is refused outright — the update then
+// fails with "Bad Request: message is too long", which is exactly what a 261-file release's skip
+// report or a whole-archive caption list used to do.
+const TELEGRAM_TEXT_LIMIT = 4_096;
+const TELEGRAM_REPLY_CHUNK_LIMIT = (() => {
+  const parsed = Number(process.env.TELEGRAM_REPLY_CHUNK_LIMIT);
+  return Number.isInteger(parsed) && parsed >= 500 && parsed <= TELEGRAM_TEXT_LIMIT ? parsed : 3_800;
+})();
+// Telegraf gives every update handler this many seconds and rejects the handler after it, while the
+// work carries on inside the process. A big /batch (one message forwarded, inspected and deleted
+// per file, then the catalog publish) needs minutes, so the budget is generous by default.
+const TELEGRAM_HANDLER_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.TELEGRAM_HANDLER_TIMEOUT_MS);
+  return Number.isInteger(parsed) && parsed >= 30_000 ? parsed : 20 * 60_000;
+})();
+
+/**
+ * Split a long reply into messages Telegram will accept.
+ *
+ * The reply is broken on line boundaries rather than truncated: the part a publisher needs — which
+ * ids were skipped, and why — is normally at the end, and silently cutting it off turns an honest
+ * report into "something went wrong, try again". Numbering only appears once there is more than
+ * one part, so a normal reply is untouched.
+ */
+export function splitTelegramText(text, maxLength = TELEGRAM_REPLY_CHUNK_LIMIT) {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  if (!source) return [''];
+  const budget = Math.max(200, Math.min(Number(maxLength) || TELEGRAM_REPLY_CHUNK_LIMIT, TELEGRAM_TEXT_LIMIT)) - 12;
+  const parts = [];
+  let chunk = '';
+  const push = (value) => { if (value) parts.push(value); };
+  for (const line of source.split('\n')) {
+    let rest = line;
+    while (rest.length > budget) {
+      push(chunk);
+      chunk = '';
+      parts.push(rest.slice(0, budget));
+      rest = rest.slice(budget);
+    }
+    const joined = chunk ? `${chunk}\n${rest}` : rest;
+    if (joined.length > budget) {
+      push(chunk);
+      chunk = rest;
+      continue;
+    }
+    chunk = joined;
+  }
+  push(chunk);
+  if (parts.length < 2) return parts.length ? parts : [''];
+  return parts.map((part, index) => `(${index + 1}/${parts.length}) ${part}`);
+}
+
+function withoutKeyboard(args) {
+  return args.map((arg) => (arg && typeof arg === 'object' && !Array.isArray(arg) && 'reply_markup' in arg
+    ? Object.fromEntries(Object.entries(arg).filter(([key]) => key !== 'reply_markup'))
+    : arg));
+}
+
+/**
+ * Every text reply the bot sends goes through this, so no command has to remember the limit.
+ * Inline keyboards stay attached to the first part — the buttons belong to the message the user is
+ * looking at — and a later part keeps the rest of the options (parse mode, notifications).
+ */
+export function installLongReplyPagination(bot) {
+  const replyMethods = ['reply', 'replyWithMarkdown', 'replyWithMarkdownV2', 'replyWithHTML'];
+  bot.use(async (ctx, next) => {
+    for (const method of replyMethods) {
+      const original = typeof ctx[method] === 'function' ? ctx[method].bind(ctx) : null;
+      if (!original) continue;
+      ctx[method] = async (text, ...rest) => {
+        if (typeof text !== 'string') return original(text, ...rest);
+        const parts = splitTelegramText(text);
+        let first = null;
+        for (let index = 0; index < parts.length; index += 1) {
+          const sent = await original(parts[index], ...(index === 0 ? rest : withoutKeyboard(rest)));
+          if (index === 0) first = sent;
+        }
+        return first;
+      };
+    }
+    if (typeof ctx.editMessageText === 'function') {
+      const originalEdit = ctx.editMessageText.bind(ctx);
+      // An edit has one message to work with, so it is clamped instead of split — with the overflow
+      // sent as a follow-up, because the point of an edit is to keep the panel usable, not to lose
+      // what it had to say.
+      ctx.editMessageText = async (text, ...rest) => {
+        if (typeof text !== 'string' || text.length <= TELEGRAM_REPLY_CHUNK_LIMIT) return originalEdit(text, ...rest);
+        // Reserve room for the note, so the clamped edit is still inside the limit.
+        const parts = splitTelegramText(text, TELEGRAM_REPLY_CHUNK_LIMIT - 60);
+        const edited = await originalEdit(`${parts[0]}\n▪ Continued in the message below.`, ...rest);
+        await Promise.resolve(ctx.reply(parts.slice(1).join('\n'))).catch(() => {});
+        return edited;
+      };
+    }
+    return next();
+  });
+}
+
+/**
+ * A handler that ran out of its time budget is not a failed job. Telegraf rejects the update while
+ * the import or sweep keeps going and reports in its own message, so the only honest answer is that
+ * the work is still running — "something went wrong, please try again" made a finished 261-file
+ * import look like a crash and pushed publishers to run the same range twice.
+ */
+export function isTelegramHandlerTimeout(error) {
+  const description = String(error?.description || error?.message || '');
+  return error?.name === 'TimeoutError' || /Promise timed out after/i.test(description);
+}
+
 function configuredMilliseconds(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
@@ -2410,7 +2519,7 @@ export function storageSweepReport(result, { adminId = null } = {}) {
   if (result.blockedCards?.length) {
     lines.push(`Not editable: ${result.blockedCards.slice(0, 8).map((entry) => `${entry.adminId || entry.title || 'card'} → message ${entry.messageId}`).join(', ')}${result.blockedCards.length > 8 ? ` · +${result.blockedCards.length - 8} more` : ''}. A bot can only edit the messages it sent.`);
   }
-  return lines.join('\n').slice(0, 3_900);
+  return lines.join('\n');
 }
 
 /**
@@ -2483,6 +2592,7 @@ export function storageScrubPreviewText({
   stats = null,
   apply = false,
   single = false,
+  listed = 25,
   spacingMs = ANNOUNCEMENT_SYNC_SPACING_MS
 } = {}) {
   const count = targets.length;
@@ -2490,10 +2600,13 @@ export function storageScrubPreviewText({
   const lines = [
     `▸ ${apply ? '' : 'Preview · '}${plural(count, 'database-channel message')} on ${plural(cards || new Set(targets.map((entry) => entry.adminId).filter(Boolean)).size, 'card')} ${apply ? 'queued for rewriting' : 'listed for a caption check'}.`
   ];
-  for (const target of targets.slice(0, 8)) {
+  // A page is 80 messages, and the publisher has to be able to check which ones — a long list is
+  // paginated now instead of being cut at three lines, so the whole page is named.
+  const listedCount = Math.max(8, Number(listed) || 25);
+  for (const target of targets.slice(0, listedCount)) {
     lines.push(`▪ ${target.adminId || 'unlisted card'} · ${cleanText(target.title, 40) || 'untitled'} — message ${Number(target.messageId)}`);
   }
-  if (count > 8) lines.push(`▪ +${count - 8} more not listed here.`);
+  if (count > listedCount) lines.push(`▪ +${count - listedCount} more not listed here.`);
   if (blocked) {
     lines.push(`▪ ${plural(blocked, 'message')} ${blocked === 1 ? 'was' : 'were'} refused before because this bot did not send ${blocked === 1 ? 'it' : 'them'}. Telegram only lets a bot edit its own messages, so those captions stay as their sender wrote them — the website label is already clean either way.`);
   }
@@ -2528,7 +2641,9 @@ export function storageScrubPreviewText({
     }
     lines.push(`To apply it: /sync db go${single ? '' : `, or /sync db SB-0123ABCDEF for one card`}.`);
   }
-  return lines.join('\n').slice(0, 3_900);
+  // Not sliced: a caption sweep's list is exactly what a publisher wants whole, and a long reply
+  // is paginated now instead of being cut off.
+  return lines.join('\n');
 }
 
 export function announcementSyncNote(sync) {
@@ -5216,7 +5331,10 @@ export async function launchTelegramBot({ config, repository }) {
     return null;
   }
 
-  const bot = new Telegraf(config.telegram.botToken);
+  const bot = new Telegraf(config.telegram.botToken, { handlerTimeout: TELEGRAM_HANDLER_TIMEOUT_MS });
+  // Long publisher reports are split rather than truncated, and every reply goes through that
+  // wrapper, so no command has to remember Telegram's 4096-character ceiling.
+  installLongReplyPagination(bot);
   // Private Telegram activity is tracked only in the publisher-side repository
   // for aggregate analytics; it is never exposed from the public site API.
   bot.use(async (ctx, next) => {
@@ -6212,7 +6330,7 @@ export async function launchTelegramBot({ config, repository }) {
     } else {
       lines.push(`To send them: /sync go${targetAdminId ? '' : ', or /sync SB-… for a single card'}.`);
     }
-    await ctx.reply(lines.filter(Boolean).join('\n').slice(0, 3_900));
+    await ctx.reply(lines.filter(Boolean).join('\n'));
   });
 
   // ── /players: the list view of attached players, with Remove buttons. The
@@ -6691,6 +6809,15 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
 
+    if (isTelegramHandlerTimeout(error)) {
+      console.warn('[telegram] an update handler outlived its time budget; the job keeps running and reports in its own message.');
+      try {
+        await ctx.reply('▪ Still working — this is a large job, and it answers in its own message when it finishes. Nothing was lost, and you do not need to send it again.');
+      } catch {
+        // The work continues regardless of whether this note could be delivered.
+      }
+      return;
+    }
     console.error('[telegram] unhandled update error:', diagnostic);
     try {
       await ctx.reply('Something went wrong while handling that request. Please try again.');
