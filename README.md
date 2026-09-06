@@ -328,6 +328,7 @@ Useful commands:
 | `/cmd SB-0123ABCDEF del 3` / `del ep 2-7` / `del all` | Remove specific numbered players, every player of an episode range, or all players of that post |
 | `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no title, player, or delivery link is touched; the channel copy of a card that changed is refreshed on the announcement lane |
 | `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, and what Telegram refused stays listed instead of lost |
+| `/sync db` — then `/sync db go` | The database channel on its own: rewrite the caption of each copied file post to the clean label the catalog stored for it, which is what removes a leftover `@channel` prefix from the channel itself |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
 | `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
@@ -473,7 +474,21 @@ So all channel work now runs on **one lane** inside the process:
 /sync        — preview: which posts differ, how many are queued, what is still refused
 /sync go     — refresh every one of them, one edit at a time
 /sync SB-…   — refresh that card's announcement now and report the result
+/sync db     — preview the database channel's own captions; /sync db go rewrites them
 ```
+
+### The database channel's captions (`/sync db`)
+
+A file copied into the database channel keeps the caption it arrived with, and a publisher's channel usually opens every one of them with its own `@handle`. The website was never the problem: the catalog stores the *sanitized* label, so file rows and delivery names already read cleanly — but the message sitting in the channel still shows the prefix.
+
+`/sync db` closes that gap, on the same lane and with the same rule as an announcement edit:
+
+- nothing is invented: each message is set to the exact label this catalog already stored for it, so running the sweep twice is safe (Telegram answers `message is not modified`, which counts as already clean);
+- a message whose record carries no caption is skipped rather than given one, and a label that still looks promotional is sanitized on the way out instead of being written raw;
+- **a bot can only edit its own messages.** A post written by a human account or another bot is reported as uneditable and then remembered as such, so the next sweep spends no call on it — edit those in the channel yourself, or upload through this bot so the copy is clean from the start;
+- one edit per `ANNOUNCEMENT_SYNC_SPACING_MS`, a `429` waited out and retried, and a caption that never gets through reported to the publisher chat rather than dropped.
+
+`/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone.
 
 `/batch`, `/lang`, `/category`, `/poster`, `/merge`, and `/repair go` all queue through the same lane, so a bulk command answers its own reply instead of spending a minute editing a channel; the deletion of absorbed posts' announcements does the same, which is why a merge can no longer be spoiled by a channel that will not answer.
 

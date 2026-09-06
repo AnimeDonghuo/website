@@ -153,6 +153,49 @@ function episodeSearchText(episodeGroups = [], episodeCount = 0) {
   return ['ep', 'episode', 'episodes', ...labels, ...compact, ...ordered].join(' ');
 }
 
+/**
+ * Which database-channel captions this site is able to rewrite, and with what.
+ *
+ * A caption that arrives from a publisher's channel usually opens with that channel's own
+ * @handle. Every file record stores the *sanitized* form of the caption, which is why the
+ * website already reads clean while the message sitting in the database channel keeps the
+ * promotion prefix it came with. A sweep can therefore write back exactly what was stored,
+ * inventing nothing — and a message whose record carries no caption at all is skipped,
+ * because a file that never had a caption must not gain one.
+ */
+function storageCaptionTargets(records = [], { limit = 80 } = {}) {
+  const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+  const seen = new Set();
+  const targets = [];
+  for (const record of records) {
+    if (!record || record.published === false) continue;
+    for (const file of Array.isArray(record.files) ? record.files : []) {
+      const messageId = Number(file?.storageMessageId);
+      const channel = cleanText(file?.storageChannelId, 80);
+      if (!channel || !Number.isSafeInteger(messageId) || messageId < 1) continue;
+      const label = cleanText(file?.sourceLabel, 1_024);
+      const name = cleanText(file?.name, 1_024);
+      // An identical or filename-prefixed label means the record kept the file name, not a
+      // caption — Telegram truncates neither, so this is the only marker there is.
+      if (!label || label === name || label.startsWith(name)) continue;
+      // Never push an unsanitized string back into a channel, whatever the record claims.
+      if (/@[A-Za-z][A-Za-z0-9_]{2,}|https?:\/\/|\bt\.me\//i.test(label)) continue;
+      const key = `${channel}:${messageId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({
+        adminId: record.adminId || null,
+        title: cleanText(record.title, 70),
+        channel,
+        messageId,
+        label
+      });
+      if (targets.length >= ceiling) return targets;
+    }
+  }
+  return targets;
+}
+
 function searchPredicate(item, query) {
   if (!query) return true;
   const haystack = item.searchText || [
@@ -907,6 +950,21 @@ export class MemoryCatalogRepository {
       if (items.length >= ceiling) break;
     }
     return items;
+  }
+
+  /**
+   * The database channel's own captions, as this catalog remembers them. Ordered newest
+   * first and capped, because a sweep is paced against Telegram's flood limit and a
+   * publisher is better off seeing the newest posts than waiting on an entire archive.
+   */
+  async listStorageCaptionTargets({ adminId = null, limit = 80 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+    const records = [...this.contents.values()]
+      .filter((entry) => entry.published !== false && (!wanted || entry.adminId === wanted))
+      .sort((first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime())
+      .slice(0, Math.max(20, ceiling * 6));
+    return storageCaptionTargets(records, { limit: ceiling });
   }
 
   async createContent(input) {
@@ -1920,6 +1978,24 @@ export class MongoCatalogRepository {
     const filter = { published: { $ne: false }, 'announcementRefs.0': { $exists: true } };
     if (wanted) filter.adminId = wanted;
     return this.contents.find(filter, { limit: Math.max(1, Number(limit) || 2_000) }).toArray();
+  }
+
+  /**
+   * The database channel's own captions, as this catalog remembers them. Only the fields a
+   * caption sweep needs are read: an archive of thousands of file records must not be
+   * pulled into memory to fix a few dozen captions.
+   */
+  async listStorageCaptionTargets({ adminId = null, limit = 80 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+    const filter = { published: { $ne: false } };
+    if (wanted) filter.adminId = wanted;
+    const records = await this.contents
+      .find(filter, { projection: { adminId: 1, title: 1, publishedAt: 1, 'files.storageMessageId': 1, 'files.storageChannelId': 1, 'files.sourceLabel': 1, 'files.name': 1 } })
+      .sort({ publishedAt: -1 })
+      .limit(Math.max(20, ceiling * 6))
+      .toArray();
+    return storageCaptionTargets(records, { limit: ceiling });
   }
 
   async createContent(input) {
