@@ -102,6 +102,57 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Visitors of a long-running show rarely remember the arc name; they remember "episode
+// 176". Storing the numbers, the words people type for them, and the season labels is what
+// makes an episode query reach the card that owns it — and from there the Watch page can be
+// opened straight at that episode. A card indexed before this existed is healed by /repair,
+// which re-runs the same normalization and now diffs searchText like any other index field.
+const EPISODE_SEARCH_TOKEN_LIMIT = 1_500;
+const EPISODE_SEARCH_SPAN_LIMIT = 1_000;
+
+function episodeSearchText(episodeGroups = [], episodeCount = 0) {
+  const groups = Array.isArray(episodeGroups) ? episodeGroups.slice(0, 600) : [];
+  const numbers = new Set();
+  const compact = new Set();
+  const labels = new Set();
+  for (const group of groups) {
+    const start = Number(group?.start);
+    const end = Number(group?.end ?? group?.start);
+    if (Number.isInteger(start) && start >= 1) {
+      numbers.add(start);
+      // typed without a space as often as with one
+      compact.add(`ep${start}`);
+      compact.add(`e${start}`);
+    }
+    if (Number.isInteger(end) && end >= 1) {
+      numbers.add(end);
+      compact.add(`ep${end}`);
+    }
+    // A combined upload names the whole span it covers, so every episode inside it
+    // is searchable. A thousand-hour release does not get a token per episode.
+    if (Number.isInteger(start) && Number.isInteger(end) && end > start && end - start <= EPISODE_SEARCH_SPAN_LIMIT) {
+      for (let episode = start + 1; episode < end; episode += 1) numbers.add(episode);
+    }
+    const label = cleanText(group?.label, 50);
+    if (label) labels.add(label.toLowerCase());
+    const season = Number(group?.season);
+    if (Number.isInteger(season) && season >= 1) {
+      labels.add(`season ${season}`);
+      labels.add(`s${String(season).padStart(2, '0')}`);
+      labels.add(`e${String(start).padStart(2, '0')}`);
+    }
+    const seasonLabel = cleanText(group?.seasonLabel, 30);
+    if (seasonLabel) labels.add(seasonLabel.toLowerCase());
+    if (numbers.size >= EPISODE_SEARCH_TOKEN_LIMIT) break;
+  }
+  const count = Number(episodeCount) || 0;
+  if (!numbers.size && !labels.size && !count) return '';
+  const ordered = [...numbers].sort((first, second) => first - second).slice(0, EPISODE_SEARCH_TOKEN_LIMIT);
+  // "file 07" is deliberately not indexed: it is a position in one card's list, not a
+  // name anyone searches for, and the word alone would match every series in the catalog.
+  return ['ep', 'episode', 'episodes', ...labels, ...compact, ...ordered].join(' ');
+}
+
 function searchPredicate(item, query) {
   if (!query) return true;
   const haystack = item.searchText || [
@@ -109,7 +160,8 @@ function searchPredicate(item, query) {
     item.description,
     ...(item.genres || []),
     ...(item.languages || []),
-    item.category
+    item.category,
+    episodeSearchText(item.episodeGroups, item.episodeCount)
   ]
     .join(' ')
     .toLowerCase();
@@ -407,9 +459,13 @@ function contentFileAppendPatch(content, additionalFiles, { supersedeExisting = 
       : uploadLanguages.length
         ? 'upload'
         : content?.languageSource || null,
-    searchText: [content?.title, content?.description, content?.category, ...languages, ...subtitleLanguages, ...(content?.genres || [])]
+    // the episode index is rebuilt with the files, so its search text has to be too
+    searchText: [content?.title, content?.description, content?.category, ...languages, ...subtitleLanguages, ...(content?.genres || []),
+      episodeSearchText(episodeSummary.groups, episodeSummary.count)]
       .filter(Boolean)
       .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
       .toLowerCase(),
     updatedAt: now
   };
@@ -470,9 +526,14 @@ function contentMetadataPatch(content, requested = {}) {
     ...(requested.announcementRefs === undefined ? {} : { announcementRefs: normalizeAnnouncementRefs(requested.announcementRefs) }),
     titleKey,
     automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey, looseTitleKey]),
-    searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres]
+    // a metadata edit leaves the episode index alone, so it carries the existing one over
+    // verbatim rather than dropping the numbers out of the search text
+    searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres,
+      episodeSearchText(content?.episodeGroups, content?.episodeCount)]
       .filter(Boolean)
       .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
       .toLowerCase(),
     updatedAt: new Date().toISOString()
   };
@@ -564,7 +625,8 @@ function normalizeContent(input) {
     hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
     episodeGroups,
     episodeCount,
-    searchText: [title, description, category, ...languages, ...subtitleLanguages, ...genres].join(' ').toLowerCase(),
+    searchText: [title, description, category, ...languages, ...subtitleLanguages, ...genres,
+      episodeSearchText(episodeGroups, episodeCount)].join(' ').replace(/\s+/g, ' ').trim().toLowerCase(),
     featured: Boolean(input.featured),
     published: true,
     publishedAt: input.publishedAt || now,
@@ -580,7 +642,7 @@ function normalizeContent(input) {
  * (title, languages, poster, players, announcement references, delivery identity) is
  * touched. This is what `/repair` writes.
  */
-const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery'];
+const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery', 'searchText'];
 
 /**
  * Re-derive a stored card's episode index with today's parsing rules.

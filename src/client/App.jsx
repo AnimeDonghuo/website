@@ -256,7 +256,7 @@ function SearchPage() {
       <section className="search-hero page-width">
         <Eyebrow>CATALOG SEARCH</Eyebrow>
         <h1>Results for <em>“{query}”</em></h1>
-        <p>Searches title, genre and available language labels across the catalog.</p>
+        <p>Searches titles, episode numbers, genres and available languages across the catalog.</p>
       </section>
       <section className="browse-results page-width search-results">
         <div className="browse-results__top"><p>{catalog.loading ? 'Searching…' : <><strong>{catalog.data?.total || 0}</strong> matching release{catalog.data?.total === 1 ? '' : 's'}</>}</p><Link className="text-link" to="/browse">Clear search <Icon name="close" size={15} /></Link></div>

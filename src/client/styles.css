@@ -97,6 +97,14 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .theme-toggle:hover { color: var(--lime); border-color: rgba(197,248,106,0.42); background: rgba(197,248,106,0.08); }
 .theme-toggle svg { transition: transform 320ms ease; }
 .theme-toggle:hover svg { transform: rotate(24deg); }
+/* The search field in the header is the desktop control; on a narrow screen the same
+   search has to survive as an icon, because "find episode 176" is the one thing a visitor
+   reaches for without opening a menu. It copies .menu-toggle's metrics for the same reason
+   the theme button does: the header must not grow a third control width. */
+.header-search-toggle { display: none; border: 0; border-radius: 7px; width: 38px; height: 38px; color: var(--ink); background: transparent; }
+/* Inside the narrow block this becomes a visible button, and it stays token-painted so Day
+   mode does not hand it white ink on a white header. */
+.header-search-panel { display: none; }
 .menu-toggle { display: none; border: 0; border-radius: 7px; width: 38px; height: 38px; color: var(--ink); background: transparent; }
 .mobile-menu { display: none; }
 
@@ -412,4 +420,23 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
   .episode-grid--packs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .episode-watch-panel { align-items: flex-start; flex-direction: column; gap: 12px; padding: 13px; }
   .episode-watch-panel .button { width: 100%; justify-content: center; }
+}
+
+/* Header search on a narrow screen: the pill cannot fit beside the brand, so the icon owns
+   the row and the field slides down into a strip under the header. It is closed by Escape,
+   by a search, and by opening the menu — the two never overlap, which is why the strip can
+   share the drawer's position instead of stacking under it. */
+@media (max-width: 760px) {
+  .header-search-toggle { display: grid; place-items: center; }
+  .header-search-toggle:active { background: var(--surface); }
+  /* The strip borrows the drawer's motion and shadow but paints itself from the theme
+     tokens, because a search field has to stay readable in Day mode: styles-light.css only
+     mirrors top-level rules, so a hardcoded night colour inside a media query would stay
+     black under a white page. */
+  .header-search-panel { position: absolute; left: 0; right: 0; top: 63px; display: flex; align-items: center; gap: 9px; max-height: 0; padding: 0 16px; overflow: hidden; visibility: hidden; opacity: 0; pointer-events: none; border-bottom: 1px solid var(--line); background: var(--background); box-shadow: 0 17px 24px rgba(0,0,0,.18); transition: max-height 240ms ease, padding 240ms ease, opacity 160ms ease, visibility 0s linear 240ms; }
+  .header-search-panel--open { max-height: 76px; padding: 13px 16px 15px; visibility: visible; opacity: 1; pointer-events: auto; transition: max-height 240ms ease, padding 240ms ease, opacity 160ms ease, visibility 0s; }
+  .header-search-panel svg { flex: none; color: var(--muted); }
+  .header-search-panel input { flex: 1; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 13px; font-weight: 600; }
+  .header-search-panel input::placeholder { color: var(--muted); }
+  .header-search-panel__clear { display: grid; place-items: center; flex: none; width: 26px; height: 26px; border: 0; border-radius: 6px; color: var(--muted); background: var(--surface); }
 }

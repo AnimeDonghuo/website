@@ -32,11 +32,28 @@ export default function Header() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [theme, setTheme] = useState(() => currentTheme());
+  // The narrow-screen search lives in its own strip, so it needs the same open/close
+  // bookkeeping the menu has: one of the two, never both, and never across a navigation.
+  const [searchOpen, setSearchOpen] = useState(false);
   const searchInput = useRef(null);
+  const panelInput = useRef(null);
 
   useEffect(() => {
     setOpen(false);
+    setSearchOpen(false);
   }, [location.pathname]);
+
+  useEffect(() => {
+    if (!searchOpen) return undefined;
+    // A person tapping a search icon has already decided what to type; the field has to be
+    // ready for it, and Escape has to be a way out that does not need a second tap.
+    panelInput.current?.focus();
+    function onKeyDown(event) {
+      if (event.key === 'Escape') setSearchOpen(false);
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [searchOpen]);
 
   useEffect(() => {
     function focusSearch(event) {
@@ -76,6 +93,7 @@ export default function Header() {
     const value = query.trim();
     navigate(value ? `/search?q=${encodeURIComponent(value)}` : '/browse');
     setOpen(false);
+    setSearchOpen(false);
   }
 
   return (
@@ -106,6 +124,20 @@ export default function Header() {
             />
             <kbd>⌘ K</kbd>
           </form>
+          {/* Same search, different shape: below the pill's breakpoint the catalog stays one
+              tap away instead of hiding inside the menu. */}
+          <button
+            className="header-search-toggle"
+            type="button"
+            onClick={() => {
+              setSearchOpen((value) => !value);
+              setOpen(false);
+            }}
+            aria-label={searchOpen ? 'Close search' : 'Search titles and episodes'}
+            aria-expanded={searchOpen}
+          >
+            <Icon name={searchOpen ? 'close' : 'search'} size={20} />
+          </button>
           <Link className="header-telegram" to="/browse" aria-label="Browse Telegram-delivered releases">
             <Icon name="telegram" size={18} />
             <span>Delivery</span>
@@ -120,11 +152,35 @@ export default function Header() {
             <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
             <span>{theme === 'light' ? 'Night' : 'Day'}</span>
           </button>
-          <button className="menu-toggle" type="button" aria-label={open ? 'Close menu' : 'Open menu'} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+          <button className="menu-toggle" type="button" aria-label={open ? 'Close menu' : 'Open menu'} aria-expanded={open} onClick={() => { setOpen((value) => !value); setSearchOpen(false); }}>
             <Icon name={open ? 'close' : 'menu'} size={22} />
           </button>
         </div>
       </div>
+
+      <form
+        className={`header-search-panel ${searchOpen ? 'header-search-panel--open' : ''}`}
+        onSubmit={submitSearch}
+        role="search"
+        aria-hidden={!searchOpen}
+      >
+        <Icon name="search" size={19} />
+        <input
+          ref={panelInput}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Title, episode number, language"
+          aria-label="Search titles and episodes"
+          inputMode="search"
+          enterKeyHint="search"
+          tabIndex={searchOpen ? 0 : -1}
+        />
+        {query ? (
+          <button type="button" className="header-search-panel__clear" aria-label="Clear search" onClick={() => setQuery('')}>
+            <Icon name="close" size={14} />
+          </button>
+        ) : null}
+      </form>
 
       <div className={`mobile-menu ${open ? 'mobile-menu--open' : ''}`} aria-hidden={!open}>
         <form className="mobile-menu__search" onSubmit={submitSearch} role="search">

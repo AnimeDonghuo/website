@@ -234,6 +234,7 @@
 [data-theme='light'] .episode-watch-panel { background: linear-gradient(140deg, rgba(197,248,106,.11), rgba(18, 24, 36, 0.05)); }
 [data-theme='light'] .episode-watch-panel__copy strong { color: #4a6426; }
 [data-theme='light'] .episode-watch-panel__copy p { color: #42473e; }
+[data-theme='light'] @media (max-width: 760px) { box-shadow: 0 17px 24px rgba(18, 24, 36, 0.09); }
 
 /* Hand-tuned on top of the mapped layer. */
 [data-theme='light'] .delivery-dialog { background: rgba(18, 24, 36, 0.44); }
