@@ -12,34 +12,62 @@ const header = read('src/client/components/Header.jsx');
 const styles = read('src/client/styles.css');
 
 // ── paging ──────────────────────────────────────────────────────────────────────────────────
-test('a browse request asks for a page instead of the whole catalog', () => {
+test('a browse listing names its page in the URL and asks for one screen of cards', () => {
   assert.match(api, /export async function getContent\(\{ category, query, genre, page = 1, limit = 60 \}/);
   assert.match(api, /params\.set\('page', page\)/);
   assert.match(api, /params\.set\('limit', limit\)/);
   assert.match(api, /params\.set\('genre', genre\)/);
-  // Nothing in the client asks for a fixed hundred any more — that was the cap that hid older posts.
+  // Nothing asks for a fixed hundred any more: the cap is what hid older posts, and a grid that
+  // grows to hundreds of posters is what made an appended shelf crawl on a phone.
   assert.doesNotMatch(app, /getContent\(\{[^}]*limit: 100/);
-  assert.match(app, /getContent\(\{ category, genre, page, limit: 60 \}\)/);
+  assert.match(app, /getContent\(\{ category, genre, page: requested, limit: 30 \}\)/);
+  assert.match(app, /getContent\(\{ query, page: requested, limit: 30 \}\)/);
+  assert.match(app, /const page = Math\.max\(1, Number\.parseInt\(params\.get\('page'\), 10\) \|\| 1\);/, 'the page lives in the URL, so a listing can be shared and Back works');
+  assert.match(app, /if \(next <= 1\) params\.delete\('page'\);/, 'and page one is the plain listing URL rather than ?page=1');
 });
 
-test('the results grid keeps its pages and offers the next one', () => {
-  assert.match(app, /function useCatalog\(fetchPage, dependencies = \[\]\)/);
-  // The pager speaks in counts the store produced, not in the length of the array on screen.
-  assert.match(app, /Showing <strong>\{catalog\.items\.length\}<\/strong> of <strong>\{catalog\.total\}<\/strong>/);
-  assert.match(app, /Load \$\{Math\.min\(remaining, 60\)\} more/);
-  assert.match(app, /That is the whole shelf — nothing is waiting past this page\./);
-  // An append, never a replace: what the reader scrolled past stays on screen.
-  assert.match(app, /items: \[\.\.\.previous\.items, \.\.\.\(Array\.isArray\(data\.items\) \? data\.items : \[\]\)\]/);
-  // And a page that arrives after the reader moved on is dropped, not appended to the new listing.
-  assert.match(app, /if \(!data \|\| listing !== listingId\.current\) return;/);
-  assert.match(app, /const catalog = useCatalog\(/, 'the browse page pages through the category');
+test('a page number replaces the grid instead of stacking another page under it', () => {
+  assert.match(app, /function useCatalog\(fetchPage, dependencies = \[\], page = 1\)/);
+  assert.match(app, /fetchPage\(page\)/);
+  // No append, so the page holds one screen of cards however deep into the shelf the reader is.
+  assert.doesNotMatch(app, /items: \[\.\.\.previous\.items/);
+  assert.doesNotMatch(app, /loadMore|loadingMore|catalog-pager__more|catalog-pager__end/, 'there is no "load more" left to grow the grid');
+  // The count line states which slice is on screen, using the numbers the store produced.
+  assert.match(app, /Showing <strong>\{from\}&ndash;\{to\}<\/strong> of <strong>\{catalog\.total\}<\/strong>/);
+  assert.match(app, /const size = catalog\.limit \|\| catalog\.items\.length;/);
+  // Navigating to a page lands the reader at the top of the grid they asked for, clear of the header,
+  // and it happens on the way out so the new page arrives there rather than swapping under their feet.
+  assert.match(app, /if \(rendered\.current !== 0 && rendered\.current !== page\) scrollToListingTop\(\);/);
+  assert.match(app, /const near = Math\.abs\(target - window\.scrollY\) < window\.innerHeight \* 1\.5;/);
+  assert.match(app, /behavior: !reduced && near \? 'smooth' : 'auto'/, 'a long jump is a jump, not a glide');
+  assert.match(app, /data-listing-top>/, 'a listing marks its own top so the scroll has somewhere to land');
+  // Page numbers are links, so a middle click, a back press and a copied URL behave like pages.
+  assert.match(app, /function pageNumbers\(current, pages\)/);
+  assert.match(app, /aria-label=\{`Page \$\{step\}`\}>\{step\}<\/Link>/);
+  assert.match(app, /aria-current="page"/);
+  // A page still in flight when the reader moves on is dropped rather than painted over the new one.
+  assert.match(app, /if \(!active \|\| !data \|\| listing !== listingId\.current\) return;/);
   assert.equal(app.match(/<CatalogPager /g).length, 2, 'browse and search each end in a pager');
 });
 
-test('a failed page leaves the cards already shown where they are', () => {
-  assert.match(app, /loadingMore: false, error \}\)/);
-  assert.match(app, /The cards above are still here — press the button to try again\./);
+test('a page that fails to load leaves the page that did load on screen', () => {
+  assert.match(app, /setState\(\(previous\) => \(\{ \.\.\.previous, loading: false, error, errorPage: page \}\)\)/);
+  assert.match(app, /Page \{catalog\.errorPage \|\| current\} did not load — the cards above are the page that did\./);
+  assert.match(app, /className="catalog-pager__retry" onClick=\{catalog\.retry\}>Try again</);
   assert.match(app, /catalog\.error && !catalog\.items\.length \? <ErrorBlock/, 'only an empty grid turns into an error block');
+});
+
+test('the listing surfaces all have their own rule, and none of them is a rewrite', () => {
+  const selectors = ['.catalog-pager', '.catalog-pager__count', '.catalog-pager__pages', '.catalog-pager__step', '.catalog-pager__num', '.catalog-pager__gap', '.catalog-pager__retry', '.catalog-pager__error', '.genre-grid', '.genre-tile', '.shelf-grid', '.shelf-tile', '.shelf-tile--empty', '.mobile-menu__shelf-panel', '.mobile-menu__genre-chips', '.mobile-menu__row', '.browse-results__actions', '.shelf-button', '.browse-shelf-panel'];
+  for (const selector of selectors) {
+    // Some rules are shared by two selectors, so a comma is allowed before the brace.
+    const pattern = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:,\\s*[^{]+)?\\s*\\{`);
+    assert.match(styles, pattern, `${selector} needs its own rule`);
+  }
+  // A thumb has to be able to hit a page number, and the page you are on has to be obvious.
+  assert.match(styles, /\.catalog-pager__step, \.catalog-pager__num \{ min-width: 38px; height: 38px; \}/);
+  assert.match(styles, /\.catalog-pager__num\.is-current \{ color: #172109; border-color: var\(--lime\); background: var\(--lime\); \}/);
+  assert.match(styles, /\.catalog-pager__step\.is-off \{ pointer-events: none; opacity: \.38; \}/, 'a step that leads nowhere does not react to a tap');
 });
 
 // ── categories and genres, from the menu ─────────────────────────────────────────────────────

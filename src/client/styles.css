@@ -461,11 +461,19 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 .catalog-pager { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 22px; margin-top: 34px; padding-top: 22px; border-top: 1px solid rgba(255,255,255,.08); }
 .catalog-pager__count { margin: 0; color: #939cab; font-size: 11px; font-weight: 600; }
 .catalog-pager__count strong { color: var(--ink); font-family: 'DM Mono', monospace; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
-.catalog-pager__more { min-height: 34px; padding: 0 13px; font-size: 10px; }
-.catalog-pager__more:disabled { cursor: wait; opacity: .66; transform: none; }
-.catalog-pager__icon { transform: rotate(90deg); transition: transform 180ms ease; }
-.catalog-pager__more:hover .catalog-pager__icon { transform: rotate(90deg) translateY(2px); }
-.catalog-pager__end { margin: 0; color: #747e8d; font-size: 10px; font-weight: 700; }
+.catalog-pager__pages { display: flex; align-items: center; flex-wrap: wrap; justify-content: center; gap: 5px; }
+.catalog-pager__step, .catalog-pager__num { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 31px; height: 31px; padding: 0 10px; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; background: rgba(255,255,255,.04); color: #aeb6c2; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; transition: color 150ms ease, border-color 150ms ease, background 150ms ease, transform 150ms ease; }
+.catalog-pager__step { padding: 0 11px; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.catalog-pager__step:hover, .catalog-pager__num:hover { color: var(--lime-ink); border-color: rgba(197,248,106,.4); background: rgba(197,248,106,.08); transform: translateY(-1px); }
+.catalog-pager__num.is-current { color: #172109; border-color: var(--lime); background: var(--lime); }
+.catalog-pager__step.is-off { pointer-events: none; opacity: .38; }
+.catalog-pager__gap { padding: 0 3px; color: #6f7887; font-size: 11px; }
+.catalog-pager__arrow { transition: transform 180ms ease; }
+.catalog-pager__arrow--prev { transform: rotate(180deg); }
+.catalog-pager__step:hover .catalog-pager__arrow--next { transform: translateX(2px); }
+.catalog-pager__step:hover .catalog-pager__arrow--prev { transform: rotate(180deg) translateX(2px); }
+.catalog-pager__retry { margin-left: 8px; padding: 0; border: 0; border-bottom: 1px solid rgba(240,185,152,.45); background: none; color: #f0b998; font-size: 10px; font-weight: 700; cursor: pointer; }
+.catalog-pager__retry:hover { color: var(--lime); border-bottom-color: rgba(197,248,106,.45); }
 .catalog-pager__error { flex: 1 0 100%; margin: 0; color: #f0b998; font-size: 10px; font-weight: 700; }
 
 /* ── Shelves: categories and genres ───────────────────────────────────────────────────────
@@ -526,9 +534,9 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 
 @media (max-width: 760px) {
   .catalog-pager { flex-direction: column; align-items: stretch; gap: 12px; margin-top: 24px; padding-top: 18px; }
-  .catalog-pager__more { justify-content: center; width: 100%; min-height: 40px; }
   .catalog-pager__count { text-align: center; }
-  .catalog-pager__end { text-align: center; }
+  /* 38px squares: a page number you have to aim at is not a page number. */
+  .catalog-pager__step, .catalog-pager__num { min-width: 38px; height: 38px; }
   .shelf-grid { grid-template-columns: minmax(0,1fr); }
   .browse-results__top--shelves { flex-direction: column; align-items: stretch; gap: 13px; }
   .browse-results__actions { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; }
@@ -541,7 +549,7 @@ h1 em, h2 em { color: var(--lime); font-family: 'Playfair Display', serif; font-
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .catalog-pager__icon, .shelf-tile, .shelf-tile > svg { transition: none; }
+  .catalog-pager__arrow, .catalog-pager__step, .catalog-pager__num, .shelf-tile, .shelf-tile > svg { transition: none; }
 }
 
 @media (max-width: 410px) {

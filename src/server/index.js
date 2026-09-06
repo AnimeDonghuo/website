@@ -408,15 +408,17 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       // meant everything past the hundredth card was unreachable, and every new release quietly
       // pushed an old one off the site.
       const limit = Math.max(1, Math.min(Number.parseInt(request.query.limit, 10) || 60, 100));
-      const page = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
+      const asked = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
       const scope = { category, query, genre };
-      const listed = await repository.listContent({
-        ...scope,
-        limit,
-        offset: (page - 1) * limit,
-        hideAdult: category !== 'adult'
-      });
-      const total = await repository.countContent({ ...scope, hideAdult: category !== 'adult' });
+      const hideAdult = category !== 'adult';
+      // Counting first is what lets a page number be clamped instead of obeyed: `?page=99` on a shelf
+      // with two pages is a mistyped address, not an empty catalog, so it answers with the last page
+      // that does hold cards. The listing itself is cut in the store, so a page always holds `limit`
+      // cards (or the remainder) rather than a hundred minus whatever the filters later dropped.
+      const total = await repository.countContent({ ...scope, hideAdult });
+      const pages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(asked, pages);
+      const listed = await repository.listContent({ ...scope, limit, offset: (page - 1) * limit, hideAdult });
       // Adult cards never appear in home, all-catalog, or search responses.
       // They are available only from the explicit age-confirmed 18+ category.
       const items = category === 'adult' ? listed : listed.filter((item) => !isAdultContent(item));
@@ -426,7 +428,7 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
         total,
         page,
         limit,
-        pages: Math.max(1, Math.ceil(total / limit)),
+        pages,
         hasMore: page * limit < total
       });
     } catch (error) {

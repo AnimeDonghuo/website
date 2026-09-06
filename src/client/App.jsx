@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation, useParams, useSearchParams } from 'react-router-dom';
 import { confirmAdultAccess, getCategories, getConfig, getContent, getContentBySlug, getGenres } from './api.js';
 import AdultGate from './components/AdultGate.jsx';
 import DeliveryDialog from './components/DeliveryDialog.jsx';
@@ -51,102 +51,145 @@ function useRemote(loader, dependencies = []) {
 }
 
 /**
- * A listing that keeps the pages it already has.
- *
- * `useRemote` re-fetches and drops what came before, which is the opposite of what a reader who
- * just pressed "Load more" wants: the sixty cards they scrolled past would vanish as the next
- * sixty arrive. This appends instead, and keeps `total` — the count the store made, not the number
- * of cards on hand — so the line under the grid can say how much of the shelf is left. A page
- * still in flight when the reader switches category is discarded rather than appended to the new
- * listing, so a slow response can never mix two categories into one grid.
+ * Put the top of a listing under the sticky header, which is where a reader expects to be after
+ * asking for another page. A short hop animates so the grid is seen to change; the distance a page
+ * number covers does not, because gliding past two hundred cards is the lag this replaced.
  */
-function useCatalog(fetchPage, dependencies = []) {
-  const [state, setState] = useState({ loading: true, error: null, items: [], total: 0, page: 0, pages: 0, hasMore: false, loadingMore: false });
-  const latest = useRef(state);
+function scrollToListingTop() {
+  const listing = document.querySelector('[data-listing-top]');
+  if (!listing) return;
+  const header = document.querySelector('.site-header');
+  const offset = (header?.offsetHeight || 0) + 12;
+  const target = Math.max(0, listing.getBoundingClientRect().top + window.scrollY - offset);
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  const near = Math.abs(target - window.scrollY) < window.innerHeight * 1.5;
+  window.scrollTo({ top: target, behavior: !reduced && near ? 'smooth' : 'auto' });
+}
+
+/**
+ * A listing, one page at a time.
+ *
+ * Pressing a page number replaces the grid rather than stacking another thirty cards under it: the
+ * appended shelf grew to hundreds of posters on a phone, which is slow to paint and never told the
+ * reader where they were. The page comes from the URL, so a listing is shareable, the back button
+ * returns to the page you were reading, and `total` stays the count the store made rather than the
+ * number of cards on hand. A response that arrives after the reader moved on is dropped, so a slow
+ * page can never mix two listings into one grid.
+ */
+function useCatalog(fetchPage, dependencies = [], page = 1) {
+  const [state, setState] = useState({ loading: true, error: null, errorPage: 0, items: [], total: 0, page: 1, pages: 0, limit: 0 });
   const listingId = useRef(0);
-  useEffect(() => {
-    latest.current = state;
-  }, [state]);
+  const rendered = useRef(0);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     listingId.current += 1;
     const listing = listingId.current;
+    // Scrolling happens on the way out rather than when the cards land, so the new page arrives at
+    // the top of the grid instead of swapping underneath a reader still standing at the old foot.
+    if (rendered.current !== 0 && rendered.current !== page) scrollToListingTop();
     let active = true;
-    setState((previous) => ({ ...previous, loading: true, error: null, loadingMore: false }));
-    fetchPage(1)
+    setState((previous) => ({ ...previous, loading: true, error: null }));
+    fetchPage(page)
       .then((data) => {
         if (!active || !data || listing !== listingId.current) return;
+        rendered.current = Number(data.page) || page;
         setState({
           loading: false,
           error: null,
+          errorPage: 0,
           items: Array.isArray(data.items) ? data.items : [],
           total: Number(data.total) || 0,
-          page: Number(data.page) || 1,
+          page: Number(data.page) || page,
           pages: Number(data.pages) || 0,
-          hasMore: Boolean(data.hasMore),
-          loadingMore: false
+          limit: Number(data.limit) || 0
         });
       })
       .catch((error) => {
-        if (active && listing === listingId.current) setState((previous) => ({ ...previous, loading: false, error }));
+        // A failed page must not eat the shelf: the cards already on screen stay, and the pager
+        // says which page could not be loaded instead of pretending the grid is empty.
+        if (active && listing === listingId.current) setState((previous) => ({ ...previous, loading: false, error, errorPage: page }));
       });
     // fetchPage is supplied at the callsite with the values it depends on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, dependencies);
+  }, [...dependencies, page, attempt]);
 
-  async function loadMore() {
-    const current = latest.current;
-    if (current.loading || current.loadingMore || !current.hasMore) return;
-    const listing = listingId.current;
-    setState((previous) => ({ ...previous, loadingMore: true }));
-    try {
-      const data = await fetchPage(current.page + 1);
-      if (!data || listing !== listingId.current) return;
-      setState((previous) => ({
-        ...previous,
-        error: null,
-        loadingMore: false,
-        items: [...previous.items, ...(Array.isArray(data.items) ? data.items : [])],
-        total: Number(data.total) || previous.total,
-        page: Number(data.page) || previous.page + 1,
-        pages: Number(data.pages) || previous.pages,
-        hasMore: Boolean(data.hasMore)
-      }));
-    } catch (error) {
-      // A failed page must not eat the shelf: what is already on screen stays, and the button
-      // comes back so the reader can ask again.
-      if (listing === listingId.current) setState((previous) => ({ ...previous, loadingMore: false, error }));
-    }
+  return { ...state, retry: () => setAttempt((current) => current + 1) };
+}
+
+/** Page numbers with the gaps a real pager shows — `1 … 4 5 6 … 20`, never twenty pills. */
+function pageNumbers(current, pages) {
+  const wanted = new Set([1, pages, current]);
+  for (let offset = 1; offset <= 1; offset += 1) {
+    wanted.add(current - offset);
+    wanted.add(current + offset);
   }
+  if (current <= 3) [2, 3, 4].forEach((number) => wanted.add(number));
+  if (current >= pages - 2) [pages - 1, pages - 2, pages - 3].forEach((number) => wanted.add(number));
+  const numbers = [...wanted].filter((number) => number >= 1 && number <= pages).sort((first, second) => first - second);
+  const steps = [];
+  let previous = 0;
+  for (const number of numbers) {
+    if (previous && number - previous > 1) steps.push('gap');
+    steps.push(number);
+    previous = number;
+  }
+  return steps;
+}
 
-  return { ...state, loadMore };
+function PagerStep({ to, off, direction, children }) {
+  const arrow = <Icon name="chevron" size={15} className={`catalog-pager__arrow catalog-pager__arrow--${direction}`} />;
+  const inner = direction === 'prev' ? <>{arrow}{children}</> : <>{children}{arrow}</>;
+  if (off) return <span className="catalog-pager__step is-off" aria-hidden="true">{inner}</span>;
+  return <Link className="catalog-pager__step" to={to} aria-label={`${children} page`}>{inner}</Link>;
 }
 
 /**
- * The line under a grid: how far along the shelf the reader is, and the way to the rest of it.
- * A listing used to say "100 releases" because it asked for a hundred and stopped; this states what
- * the store holds and keeps fetching until the reader has had all of it.
+ * The line under a grid: which slice of the shelf is on screen, and the pages holding the rest of it.
+ * Every number is a link rather than a button that mutates state, so this is ordinary navigation — a
+ * middle click, a back press, and a copied URL all behave like the page they look like.
  */
 function CatalogPager({ catalog, unit = 'release' }) {
+  const { pathname, search } = useLocation();
   if (!catalog.items.length) return null;
-  const remaining = Math.max(0, catalog.total - catalog.items.length);
+  const current = catalog.page || 1;
+  const pages = catalog.pages || 0;
+  const size = catalog.limit || catalog.items.length;
+  const from = (current - 1) * size + 1;
+  const to = Math.min(current * size, catalog.total || from + catalog.items.length - 1);
   const plural = catalog.total === 1 ? '' : 's';
+  const hrefFor = (next) => {
+    const params = new URLSearchParams(search);
+    if (next <= 1) params.delete('page');
+    else params.set('page', String(next));
+    const suffix = params.size ? `?${params}` : '';
+    return `${pathname}${suffix}`;
+  };
   return (
-    <div className="catalog-pager">
+    <nav className="catalog-pager" aria-label="Catalog pages">
       <p className="catalog-pager__count">
-        Showing <strong>{catalog.items.length}</strong> of <strong>{catalog.total}</strong> {unit}{plural}
-        {catalog.pages > 1 ? <span> · page {catalog.page} of {catalog.pages}</span> : null}
+        {pages > 1
+          ? <>Showing <strong>{from}&ndash;{to}</strong> of <strong>{catalog.total}</strong> {unit}{plural}</>
+          : <><strong>{catalog.total}</strong> {unit}{plural} on this shelf</>}
       </p>
-      {remaining > 0 ? (
-        <button type="button" className="button button--secondary catalog-pager__more" onClick={catalog.loadMore} disabled={catalog.loadingMore}>
-          {catalog.loadingMore ? 'Fetching the next ones…' : `Load ${Math.min(remaining, 60)} more`}
-          <Icon name="chevron" size={17} className="catalog-pager__icon" />
-        </button>
-      ) : <p className="catalog-pager__end">That is the whole shelf — nothing is waiting past this page.</p>}
-      {catalog.error && catalog.items.length ? (
-        <p className="catalog-pager__error">{catalog.error.message} The cards above are still here — press the button to try again.</p>
+      {pages > 1 ? (
+        <div className="catalog-pager__pages">
+          <PagerStep to={hrefFor(current - 1)} off={current <= 1} direction="prev">Prev</PagerStep>
+          {pageNumbers(current, pages).map((step, index) => (step === 'gap'
+            ? <span className="catalog-pager__gap" key={`gap-${index}`} aria-hidden="true">&hellip;</span>
+            : step === current
+              ? <span className="catalog-pager__num is-current" key={step} aria-current="page">{step}</span>
+              : <Link className="catalog-pager__num" key={step} to={hrefFor(step)} aria-label={`Page ${step}`}>{step}</Link>))}
+          <PagerStep to={hrefFor(current + 1)} off={current >= pages} direction="next">Next</PagerStep>
+        </div>
       ) : null}
-    </div>
+      {catalog.error ? (
+        <p className="catalog-pager__error">
+          {catalog.error.message} Page {catalog.errorPage || current} did not load — the cards above are the page that did.
+          <button type="button" className="catalog-pager__retry" onClick={catalog.retry}>Try again</button>
+        </p>
+      ) : null}
+    </nav>
   );
 }
 
@@ -319,11 +362,15 @@ function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAcce
   // The adult endpoint is never requested before the visitor confirms. This
   // avoids rendering, preloading, or even receiving adult cards behind a UI
   // overlay; the server independently enforces the same cookie gate.
+  // A page number belongs in the URL, not in a stack of cards: `/browse/anime?page=3` is the same
+  // listing someone else can open, and the back button returns to the page they came from.
+  const page = Math.max(1, Number.parseInt(params.get('page'), 10) || 1);
   const catalog = useCatalog(
-    (page) => requestedAdultCategory && !adultAccess
-      ? Promise.resolve({ items: [], total: 0, page: 1, pages: 1, hasMore: false })
-      : getContent({ category, genre, page, limit: 60 }),
-    [category, genre, requestedAdultCategory, adultAccess, adultAccessVersion]
+    (requested) => requestedAdultCategory && !adultAccess
+      ? Promise.resolve({ items: [], total: 0, page: 1, pages: 1, limit: 0 })
+      : getContent({ category, genre, page: requested, limit: 30 }),
+    [category, genre, requestedAdultCategory, adultAccess, adultAccessVersion],
+    page
   );
   // A sessionStorage marker can outlive the HTTP-only server cookie. A denied
   // request returns to the same confirmation safely rather than presenting an
@@ -342,7 +389,7 @@ function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAcce
           <CategoryNav activeCategory={category} />
         </div>
       </section>
-      <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`}>
+      <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`} data-listing-top>
         {adultLocked ? <AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /> : <>
           <div className="browse-results__top browse-results__top--shelves">
             <p><strong>{catalog.loading ? '…' : catalog.total || 0}</strong> release{catalog.total === 1 ? '' : 's'} {genre ? `tagged ${genre}` : category ? `in ${categoryLabels[category]}` : 'in the catalog'}</p>
@@ -370,8 +417,9 @@ function SearchPage() {
   const [params] = useSearchParams();
   const query = params.get('q')?.trim() || '';
   // A search for "love" or "dragon" matches far more than one screen of cards, so the results page
-  // pages like the catalog does instead of stopping at the first sixty.
-  const catalog = useCatalog((page) => getContent({ query, page, limit: 60 }), [query]);
+  // pages like the catalog does, one page at a time.
+  const page = Math.max(1, Number.parseInt(params.get('page'), 10) || 1);
+  const catalog = useCatalog((requested) => getContent({ query, page: requested, limit: 30 }), [query], page);
 
   if (!query) return <Navigate to="/browse" replace />;
 
@@ -382,7 +430,7 @@ function SearchPage() {
         <h1>Results for <em>“{query}”</em></h1>
         <p>Searches titles, episode numbers, genres and available languages across the catalog.</p>
       </section>
-      <section className="browse-results page-width search-results">
+      <section className="browse-results page-width search-results" data-listing-top>
         <div className="browse-results__top"><p>{catalog.loading ? 'Searching…' : <><strong>{catalog.total || 0}</strong> matching release{catalog.total === 1 ? '' : 's'}</>}</p><Link className="text-link" to="/browse">Clear search <Icon name="close" size={15} /></Link></div>
         {catalog.loading ? <LoadingGrid count={6} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
           <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
