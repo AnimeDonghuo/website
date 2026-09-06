@@ -574,7 +574,10 @@ export function tidyTypedTitle(value) {
     .replace(/[ \t]{2,}/g, ' ')
     .trim();
   if (title.length < 2) title = raw;
-  return { title, changed: title !== raw };
+  // A line pasted out of a list ends in a comma, and that is not worth telling the publisher about:
+  // `changed` means the words themselves were reshaped, so a trailing separator does not count.
+  const changed = title !== raw && raw.replace(/[\s.,;:]+$/, '') !== title;
+  return { title, changed };
 }
 
 /**
@@ -2088,8 +2091,12 @@ export function announcementReferenceIsCurrent(reference, { caption = null, link
   if (!reference || typeof reference.caption !== 'string' || !reference.caption) return false;
   if (reference.caption !== caption) return false;
   if ((reference.websiteUrl || null) !== (link || null)) return false;
-  if (reference.kind !== 'text' && (reference.posterUrl || null) !== (posterUrl || null)) return false;
-  return true;
+  if (reference.kind !== 'text') return (reference.posterUrl || null) === (posterUrl || null);
+  // A copy posted as plain text because the card had no artwork at the time is still behind once
+  // artwork exists: that message can carry a photo now. `posterUpgrade` is the note saying the
+  // attachment was tried and Telegram refused it, so the same refusal is not paid for twice.
+  if (!posterUrl) return true;
+  return reference.posterUpgrade?.signature === announcementSignature({ caption, link, posterUrl });
 }
 
 /** A fingerprint of what the channel copy would have to say, so "unchanged" survives a restart. */
@@ -2472,12 +2479,29 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
       });
       outcome.updated = saved ? 1 : 0;
       if (!saved) outcome.reason = 'that card is no longer in the catalog';
-      // The channel copy shows the artwork too, so the same refresh that any edit uses updates it.
-      if (saved && Array.isArray(saved.announcementRefs) && saved.announcementRefs.length && telegram) {
-        queueAnnouncementSync({ telegram, repository, content: saved, config, adminId: target });
+      // The channel copy is refreshed here rather than queued, because this job is already on the
+      // lane: a queued follow-up goes to the back and arrives after the very edit this card's title
+      // change is making from an older snapshot, which is how a new poster could be overwritten by
+      // the old one. Doing it inline also lets the reply say what actually happened to the post.
+      const references = Array.isArray(saved?.announcementRefs) ? saved.announcementRefs : [];
+      let sync = null;
+      if (saved && references.length && telegram) {
+        sync = await syncPublishedAnnouncements({ telegram, repository, content: saved, config, options: {} });
+        outcome.channels = references.length;
+        outcome.promoted = Number(sync?.promoted) || 0;
+        outcome.announcementSync = sync;
       }
       if (saved && typeof tell === 'function') {
-        Promise.resolve(tell(target, `✓ Poster for ${target} · ${title} was matched and hosted from the corrected title, and its channel copy was updated with it.`)).catch(() => {});
+        const channel = !references.length
+          ? 'No channel copy is attached to that card, so the website page is what changed.'
+          : !telegram
+            ? 'Its channel copy was not touched because this job has no bot attached; /sync sends it.'
+            : sync && (sync.promoted || sync.updated)
+              ? `Its channel copy was updated with it. ${announcementSyncNote(sync)}`
+              : sync && sync.unchanged && !sync.failed && !sync.blocked && !sync.skipped && !sync.upgradeFailed
+                ? 'Its channel copy was already showing that artwork.'
+                : `Its channel copy could not be finished by this run. ${announcementSyncNote(sync)} /sync lists it.`;
+        Promise.resolve(tell(target, `✓ Poster for ${target} · ${title} was matched and hosted from the corrected title. ${channel}`)).catch(() => {});
       }
       return outcome;
     }
@@ -2501,18 +2525,27 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
   const wait = typeof options.wait === 'function' ? options.wait : pause;
   const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
   const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
-  const refs = Array.isArray(content?.announcementRefs) ? content.announcementRefs : [];
-  const result = { updated: 0, unchanged: 0, failed: 0, blocked: 0, dropped: 0, unsyncable: 0, skipped: 0, reason: null, channels: refs.length, retryAfterMs: 0 };
-  if (!refs.length || !telegram || isAdultCategory(content?.category)) return result;
-  const caption = announcementCaption(content);
-  const posterUrl = content.posterUrl || null;
+  // The card is read again as this job runs. A queued refresh carries the content it was asked
+  // about, which on a 48-card batch is a minute old by the time the lane reaches it — long enough
+  // for a poster re-match to have landed in between, and an edit built from that snapshot would
+  // quietly put the previous artwork back in the channel.
+  let source = content;
+  if (content?.adminId && typeof repository?.findContentByAdminId === 'function') {
+    const fresh = await Promise.resolve(repository.findContentByAdminId(content.adminId)).catch(() => null);
+    if (fresh) source = { ...content, ...fresh };
+  }
+  const refs = Array.isArray(source?.announcementRefs) ? source.announcementRefs : [];
+  const result = { updated: 0, unchanged: 0, failed: 0, blocked: 0, dropped: 0, unsyncable: 0, skipped: 0, promoted: 0, upgradeFailed: 0, reason: null, channels: refs.length, retryAfterMs: 0 };
+  if (!refs.length || !telegram || isAdultCategory(source?.category)) return result;
+  const caption = announcementCaption(source);
+  const posterUrl = source.posterUrl || null;
   const kept = [];
   let dirty = false;
 
   for (const reference of refs) {
     // Only rewrite the button row when the destination link is actually known;
     // omitting reply_markup leaves the publisher's existing buttons untouched.
-    const link = (config ? getContentPageUrl(config, content) : null) || reference.websiteUrl || null;
+    const link = (config ? getContentPageUrl(config, source) : null) || reference.websiteUrl || null;
     if (announcementUnsyncable.has(announcementRefKey(reference))) {
       // Known to be unfixable by this bot: the card is right, the copy is not, and that is said in
       // /sync rather than re-attempted every time anything on the card changes.
@@ -2541,13 +2574,55 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
       result.unchanged += 1;
       continue;
     }
-    const keyboard = link ? announcementKeyboard(config, content, link) : undefined;
+    const wantsArt = reference.kind === 'text' && Boolean(posterUrl)
+      && reference.posterUpgrade?.signature !== announcementSignature({ caption, link, posterUrl });
+    const keyboard = link ? announcementKeyboard(config, source, link) : undefined;
     const replyMarkup = keyboard ? keyboard.reply_markup : undefined;
     const extra = replyMarkup ? { reply_markup: replyMarkup } : {};
     let applied = null;
     // The last thing Telegram said about this message, kept for the report: "still refused" means
     // nothing to a publisher, "the copy was posted by another account" tells them what to do.
     let lastRefusal = null;
+    let upgradeFailure = null;
+
+    if (wantsArt) {
+      // Telegram lets a text message be replaced with a photo, and that is the only way an
+      // announcement posted while the card had no artwork ever gets one. A refusal here does not
+      // end the edit: the caption is still worth fixing, and the artwork failure is remembered on
+      // the reference so the next sweep does not spend a call learning it again.
+      let attached = false;
+      try {
+        await telegram.editMessageMedia(
+          reference.channelId,
+          reference.messageId,
+          null,
+          { type: 'photo', media: posterUrl, caption, parse_mode: 'HTML' },
+          replyMarkup ? { reply_markup: replyMarkup } : {}
+        );
+        if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
+        attached = true;
+      } catch (error) {
+        upgradeFailure = cleanText(error?.description || error?.message, 160);
+        if (/message is not modified/i.test(upgradeFailure)) attached = true;
+      }
+      if (attached) {
+        // The reference becomes a photo one, remembering the artwork it now carries: that is what
+        // makes the next edit of this card see it as a poster post instead of a text post again.
+        kept.push({
+          ...announcementReferenceMemory(reference, { caption, link, posterUrl }),
+          kind: 'photo',
+          posterUrl,
+          posterUpgrade: null,
+          syncError: null
+        });
+        dirty = true;
+        result.promoted += 1;
+        result.updated += 1;
+        announcementUnsyncable.delete(announcementRefKey(reference));
+        if (spacingMs) await wait(spacingMs);
+        continue;
+      }
+    }
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
@@ -2602,6 +2677,14 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
     if (applied === 'updated' || applied === 'unchanged') {
       const memory = announcementReferenceMemory(reference, { caption, link, posterUrl });
       if (memory.syncError) { delete memory.syncError; dirty = true; }
+      if (upgradeFailure && !/too many requests|flood|retry after|not found|deleted|message to edit/i.test(upgradeFailure)) {
+        memory.posterUpgrade = { reason: upgradeFailure, at: new Date().toISOString(), signature: announcementSignature({ caption, link, posterUrl }) };
+        result.upgradeFailed += 1;
+        dirty = true;
+      } else if (memory.posterUpgrade) {
+        delete memory.posterUpgrade;
+        dirty = true;
+      }
       if (memory !== reference) dirty = true;
       kept.push(memory);
       announcementUnsyncable.delete(announcementRefKey(reference));
@@ -2628,15 +2711,15 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
       });
       dirty = true;
       result[applied === 'blocked' ? 'blocked' : 'failed'] += 1;
-      result.reason = result.reason || (applied === 'blocked' ? classifyAnnouncementEditFailure(detail).reason : null);
+      result.reason = result.reason || (applied === 'blocked' ? classifyAnnouncementEditFailure(detail).reason : detail) || null;
     }
     if (spacingMs) await wait(spacingMs);
   }
 
   // The reference list is written back when it shrank or a ref learned what the channel
   // now shows, so the next edit of this card can answer "already correct" without calling.
-  if ((kept.length !== refs.length || dirty) && content?.adminId && typeof repository?.updateContentByAdminId === 'function') {
-    await Promise.resolve(repository.updateContentByAdminId(content.adminId, { announcementRefs: kept })).catch(() => {});
+  if ((kept.length !== refs.length || dirty) && source?.adminId && typeof repository?.updateContentByAdminId === 'function') {
+    await Promise.resolve(repository.updateContentByAdminId(source.adminId, { announcementRefs: kept })).catch(() => {});
   }
   announcementLane.totals.refreshed += result.updated;
   announcementLane.totals.unchanged += result.unchanged;
@@ -3177,6 +3260,8 @@ export function announcementSyncNote(sync) {
   if (sync.unchanged) parts.push(`${sync.unchanged} already showing this information`);
   if (sync.failed) parts.push(`${sync.failed} waiting on Telegram’s limit and queued for a later round`);
   if (sync.blocked) parts.push(`${sync.blocked} refused because ${sync.reason || 'this bot cannot edit that channel'}`);
+  if (sync.promoted) parts.push(`${sync.promoted} text-only ${sync.promoted === 1 ? 'copy was' : 'copies were'} given their artwork for the first time`);
+  if (sync.upgradeFailed) parts.push(`${sync.upgradeFailed} ${sync.upgradeFailed === 1 ? 'post would not' : 'posts would not'} take the photo, so its caption was corrected without it (remembered, not re-attempted)`);
   if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
   if (sync.unsyncable) parts.push(`${sync.unsyncable} announcement${sync.unsyncable === 1 ? '' : 's'} ${sync.unsyncable === 1 ? 'is' : 'are'} a copy this bot did not post, so no bot can edit ${sync.unsyncable === 1 ? 'it' : 'them'} \u2014 remembered, so nothing is ever re-sent for ${sync.unsyncable === 1 ? 'it' : 'them'}`);
   if (sync.skipped) parts.push(`${sync.skipped} ${sync.skipped === 1 ? 'copy is' : 'copies are'} left for you to edit in the channel${sync.reason ? ` because ${sync.reason}` : ''} - remembered, so nothing is re-sent for ${sync.skipped === 1 ? 'it' : 'them'}, and re-checked the moment the card changes`);

@@ -30,7 +30,9 @@ const card = (overrides = {}) => ({
   slug: 'long-march',
   filesCount: 3,
   episodeCount: 3,
-  posterUrl: 'https://img.test/poster.jpg',
+  // No artwork on the fixture card, so a text reference stays on the text path: the tests that
+  // watch caption edits are not also paying for the photo promotion that a card with art gets.
+  posterUrl: null,
   description: 'A crew crosses a desert.',
   languages: ['Hindi'],
   announcementRefs: [{ channelId: '-100chan', messageId: 11, kind: 'text', websiteUrl: 'https://site.test/anime/long-march' }],
@@ -78,7 +80,10 @@ test('a reference counts as current only when caption, link, and artwork all agr
   assert.equal(announcementReferenceIsCurrent({ ...current, caption: 'older' }, { caption: 'same', link: 'https://site.test/a', posterUrl: 'https://img.test/p.jpg' }), false);
   assert.equal(announcementReferenceIsCurrent(current, { caption: 'same', link: 'https://site.test/b', posterUrl: 'https://img.test/p.jpg' }), false, 'a moved detail-page link is a real change');
   assert.equal(announcementReferenceIsCurrent(current, { caption: 'same', link: 'https://site.test/a', posterUrl: 'https://img.test/other.jpg' }), false, 'new artwork has to reach the channel');
-  assert.equal(announcementReferenceIsCurrent({ kind: 'text', caption: 'same' }, { caption: 'same', link: null, posterUrl: 'https://img.test/p.jpg' }), true, 'a text announcement has no artwork to disagree about');
+  assert.equal(announcementReferenceIsCurrent({ kind: 'text', caption: 'same' }, { caption: 'same', link: null, posterUrl: null }), true, 'a text copy of a card with no artwork has nothing to disagree about');
+  const art = { caption: 'same', link: null, posterUrl: 'https://img.test/p.jpg' };
+  assert.equal(announcementReferenceIsCurrent({ kind: 'text', caption: 'same' }, art), false, 'a text copy of a card that now has artwork is behind, because the photo can be attached');
+  assert.equal(announcementReferenceIsCurrent({ kind: 'text', caption: 'same', posterUpgrade: { signature: announcementSignature(art) } }, art), true, 'unless Telegram already refused that very attachment, which is remembered instead of re-attempted');
   // A post announced before this memory existed has nothing to compare against, and that is
   // exactly the point: it is treated as stale, which is how /sync finds the announcements
   // whose copy still carries an @channel handle from before the cleaner.
@@ -112,6 +117,7 @@ test('an announcement that already reads correctly costs no call at all', async 
   // A photo announcement, because that is the shape that carries artwork: the memory has to
   // cover both the text and the image, or a poster change would be skipped as "unchanged".
   const content = card({
+    posterUrl: 'https://img.test/poster.jpg',
     announcementRefs: [{ channelId: '-100chan', messageId: 11, kind: 'photo', websiteUrl: 'https://site.test/anime/long-march' }]
   });
   const caption = announcementCaption(content);
@@ -193,6 +199,7 @@ test('a deleted announcement post is forgotten, a refused one is kept for the ne
   });
   assert.equal(throttled.failed, 1, 'a wait is not a permanent refusal');
   assert.match(announcementSyncNote(throttled), /waiting on Telegram\u2019s limit and queued for a later round/);
+  assert.match(throttled.reason, /Too Many Requests/, 'and the report quotes what Telegram actually said');
 });
 
 test('a copy another account posted is remembered as unfixable instead of refused forever', async () => {
@@ -433,6 +440,7 @@ test('a refused copy is left alone on the next sweep until the card changes', as
   assert.equal(third.calls.length, 1, 'a new caption is a new request, so it is made once');
   assert.equal(changed.updated, 1);
   const websiteUrl = card().announcementRefs[0].websiteUrl;
+  assert.equal(card().posterUrl, null, 'the fixture card carries no artwork');
   assert.ok(announcementRefIsDeferred(remembered, { caption: announcementCaption(card()), link: websiteUrl, posterUrl: card().posterUrl }), 'the same card, the same copy - deferred');
   assert.equal(announcementRefIsDeferred(remembered, { caption: 'other', link: null, posterUrl: null }), false);
 });
@@ -460,4 +468,74 @@ test('the sweep says what it checked and never asks Telegram about a card that a
   assert.equal(leftAlone.leftAlone, 1);
   assert.equal(leftAlone.deferred, 1);
   assert.equal(leftAlone.matching, 0, 'it is not "already correct" either: the copy is behind, and only the reason is settled');
+});
+
+test('a text-only channel copy gets its artwork attached, and a refusal is remembered not chased', async () => {
+  const fixture = recorder([
+    editError('Bad Request: wrong file identifier/HTTP URL specified'),
+    {}
+  ]);
+  const saved = [];
+  const withArt = card({ posterUrl: 'https://img.test/new.jpg' });
+  const first = await syncPublishedAnnouncements({
+    telegram: fixture.telegram,
+    repository: { updateContentByAdminId: async (adminId, patch) => { saved.push(patch); return null; } },
+    content: withArt,
+    options: { spacingMs: 0, wait: fixture.wait }
+  });
+  assert.equal(first.upgradeFailed, 1, 'the photo was refused');
+  assert.equal(first.updated, 1, 'and the caption was still corrected');
+  assert.equal(fixture.calls[0].method, 'editMessageMedia', 'a text copy of a card with artwork is asked for a photo first');
+  assert.match(saved[0].announcementRefs[0].posterUpgrade.reason, /wrong file identifier/);
+  assert.equal(saved[0].announcementRefs[0].kind, 'text', 'it stays a text post, because that is what Telegram has');
+
+  const quiet = recorder([{}]);
+  const second = await syncPublishedAnnouncements({
+    telegram: quiet.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: { ...withArt, announcementRefs: saved[0].announcementRefs },
+    options: { spacingMs: 0, wait: quiet.wait }
+  });
+  assert.deepEqual(quiet.calls, [], 'the same refusal is not bought twice');
+  assert.equal(second.unchanged, 1);
+
+  const tried = recorder([{}, {}]);
+  const third = await syncPublishedAnnouncements({
+    telegram: tried.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: { ...withArt, title: 'Renamed Again', announcementRefs: saved[0].announcementRefs },
+    options: { spacingMs: 0, wait: tried.wait }
+  });
+  assert.equal(third.promoted, 1, 'a new caption is a new request, and the photo is worth trying again');
+  assert.equal(tried.calls[0].method, 'editMessageMedia');
+
+  const promoted = recorder([{}, {}]);
+  const fourth = await syncPublishedAnnouncements({
+    telegram: promoted.telegram,
+    repository: { updateContentByAdminId: async () => null },
+    content: { ...withArt, announcementRefs: [{ channelId: '-100chan', messageId: 11, kind: 'text', websiteUrl: 'https://site.test/anime/long-march' }] },
+    options: { spacingMs: 0, wait: promoted.wait }
+  });
+  assert.equal(fourth.promoted, 1);
+  assert.equal(fourth.updated, 1);
+  assert.match(announcementSyncNote(fourth), /text-only copy was given their artwork for the first time/);
+});
+
+test('a refresh reads the card as it is now, not as it was when the job was queued', async () => {
+  const fresh = card({ title: 'Long March Final', posterUrl: 'https://img.test/better.jpg' });
+  const fixture = recorder([{}, {}]);
+  const stale = { ...card(), title: 'Long March Old Name', announcementRefs: [{ channelId: '-100chan', messageId: 11, kind: 'text', websiteUrl: 'https://site.test/anime/long-march' }] };
+  const sync = await syncPublishedAnnouncements({
+    telegram: fixture.telegram,
+    repository: {
+      findContentByAdminId: async () => fresh,
+      updateContentByAdminId: async () => null
+    },
+    content: stale,
+    options: { spacingMs: 0, wait: fixture.wait }
+  });
+  assert.equal(sync.updated, 1);
+  const caption = fixture.calls[0].args[3].caption;
+  assert.match(caption, /Long March Final/, 'the queued snapshot was a minute old; the channel must not be written from it');
+  assert.doesNotMatch(caption, /Long March Old Name/);
 });

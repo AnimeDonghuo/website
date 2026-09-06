@@ -618,6 +618,7 @@ test('a corrected published post edits the announcement in place instead of post
     announcementRefs: [
       { channelId: '-100public', messageId: 11, kind: 'photo', websiteUrl: 'https://site.test/web-series/the-gentlemen' },
       { channelId: '-100mirror', messageId: 12, kind: 'text', websiteUrl: null },
+      { channelId: '-100plain', messageId: 14, kind: 'text', websiteUrl: null },
       { channelId: '-100gone', messageId: 13, kind: 'photo', websiteUrl: null }
     ]
   });
@@ -626,6 +627,7 @@ test('a corrected published post edits the announcement in place instead of post
     async editMessageMedia(chatId, messageId, inlineMessageId, media, extra) {
       edits.push({ op: 'media', chatId, messageId, media, replyMarkup: extra?.reply_markup });
       if (chatId === '-100gone') throw { description: 'Bad Request: message to edit is not found' };
+      if (chatId === '-100plain') throw { description: 'Bad Request: wrong file identifier/HTTP URL specified' };
       return { message_id: messageId };
     },
     async editMessageText(chatId, messageId, inlineMessageId, text, extra) {
@@ -642,15 +644,21 @@ test('a corrected published post edits the announcement in place instead of post
   const renamed = await repository.updateContentByAdminId(created.adminId, { title: 'The Gentlemen S01' });
   const sync = await syncPublishedAnnouncements({ telegram, repository, content: renamed });
 
-  assert.equal(sync.updated, 2);
+  assert.equal(sync.updated, 3);
   assert.equal(sync.dropped, 1);
-  assert.deepEqual(edits.filter((entry) => entry.op === 'media').map((entry) => entry.chatId), ['-100public', '-100gone']);
+  assert.equal(sync.promoted, 1, 'a copy posted as plain text while the card had no artwork gets the photo now that it has one');
+  assert.equal(sync.upgradeFailed, 1, 'and the one Telegram would not give a photo to still has its caption fixed');
+  assert.deepEqual(edits.filter((entry) => entry.op === 'media').map((entry) => entry.chatId), ['-100public', '-100mirror', '-100plain', '-100gone']);
   const photo = edits.find((entry) => entry.chatId === '-100public');
   assert.equal(photo.media.type, 'photo');
   assert.equal(photo.media.media, 'https://imgbb.test/final-one.png');
   assert.match(photo.media.caption, /The Gentlemen S01/);
-  // the text-only mirror keeps the same corrected copy
+  // the text-only mirror keeps the same corrected copy, now as a photo
+  const promoted = edits.find((entry) => entry.op === 'media' && entry.chatId === '-100mirror');
+  assert.equal(promoted.media.media, 'https://imgbb.test/final-one.png');
+  assert.match(promoted.media.caption, /The Gentlemen S01/);
   const text = edits.find((entry) => entry.op === 'text');
+  assert.equal(text.chatId, '-100plain', 'the copy that would not take a photo is edited as text instead of being skipped');
   assert.match(text.text, /NEW WEB SERIES DROP/);
   assert.match(text.text, /The Gentlemen S01/);
   // the remembered detail-page link keeps the buttons pointing at the site
@@ -660,8 +668,29 @@ test('a corrected published post edits the announcement in place instead of post
   assert.equal(text.replyMarkup, undefined);
   // a dead reference is pruned, so later edits do not keep chasing it
   const stored = await repository.findContentByAdminId(created.adminId);
-  assert.deepEqual(stored.announcementRefs.map((ref) => ref.messageId), [11, 12]);
-  assert.equal(announcementSyncNote(sync), 'Telegram announcements: 2 announcements updated, 1 deleted announcement forgotten.');
+  assert.deepEqual(stored.announcementRefs.map((ref) => ref.messageId), [11, 12, 14], 'and the dead reference is pruned as before');
+  assert.equal(stored.announcementRefs.find((ref) => ref.messageId === 12).kind, 'photo', 'the mirror is remembered as a photo post from now on');
+  assert.match(stored.announcementRefs.find((ref) => ref.messageId === 14).posterUpgrade.reason, /wrong file identifier/);
+  const note = announcementSyncNote(sync);
+  assert.match(note, /3 announcements updated/);
+  assert.match(note, /text-only copy was given their artwork for the first time/);
+  assert.match(note, /would not take the photo/);
+  assert.match(note, /deleted announcement forgotten/);
+
+  // And the next sweep asks Telegram about none of it: the refusals and the successes are both
+  // remembered on the references, which is what lets /sync go be run twice without cost.
+  const later = [];
+  const again = await syncPublishedAnnouncements({
+    telegram: {
+      async editMessageMedia() { later.push('media'); return {}; },
+      async editMessageText() { later.push('text'); return {}; },
+      async editMessageReplyMarkup() { later.push('markup'); }
+    },
+    repository,
+    content: stored
+  });
+  assert.deepEqual(later, [], 'nothing to send, so nothing is asked');
+  assert.deepEqual({ updated: again.updated, unchanged: again.unchanged, upgradeFailed: again.upgradeFailed }, { updated: 0, unchanged: 3, upgradeFailed: 0 });
 });
 
 test('an unchanged announcement is not counted as a failure and 18+ posts are never touched', async () => {

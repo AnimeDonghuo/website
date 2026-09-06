@@ -96,6 +96,8 @@ test('the last line for a card wins, and a title a human typed is not rewritten'
   assert.deepEqual(tidyTypedTitle('Vampires.Of.The.Velvet.Lounge.1080p.x264'), { title: 'Vampires Of The Velvet Lounge', changed: true });
   assert.deepEqual(tidyTypedTitle('Balan_The_Boy_[Etah].mkv'), { title: 'Balan The Boy', changed: true });
   assert.deepEqual(tidyTypedTitle('- Gold |'), { title: 'Gold', changed: true });
+  assert.deepEqual(tidyTypedTitle('Extinction,'), { title: 'Extinction', changed: false }, 'a comma a paste left behind is not worth warning about');
+  assert.deepEqual(tidyTypedTitle('Minions, '), { title: 'Minions', changed: false });
   for (const typed of ['Dr. No', 'O.R.Y.X', 'Despicable Me (2010)', 'Reacher Season 4', 'D E B S AKA DEBS', 'Our Hero, Balthazar', 'Top Gunner America vs Russia', 'Don\u2019t Say Good Luck']) {
     assert.deepEqual(tidyTypedTitle(typed), { title: typed, changed: false }, `a title someone chose is stored as written: ${typed}`);
   }

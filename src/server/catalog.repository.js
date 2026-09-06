@@ -353,7 +353,26 @@ export function normalizeAnnouncementRefs(value) {
       // here (cleanText collapses whitespace) would put a stored caption out of reach of
       // the freshly rendered one, and then nothing would ever look up to date again.
       caption: typeof entry?.caption === 'string' && entry.caption && entry.caption.length <= 1_000 ? entry.caption : null,
-      posterUrl: /^https?:\/\//i.test(String(entry?.posterUrl || '')) ? cleanText(entry.posterUrl, 2_000) : null
+      posterUrl: /^https?:\/\//i.test(String(entry?.posterUrl || '')) ? cleanText(entry.posterUrl, 2_000) : null,
+      // Two small memories about *failures*, carried through the same normalizer so they survive a
+      // save: `syncError` is why Telegram refused an edit (and whether that reason can ever change),
+      // `posterUpgrade` that the photo itself would not attach. Without them a repeat /sync go re-asks
+      // about a hundred refused messages, which is the "checks everything again" cost they exist to end.
+      ...(entry?.syncError && typeof entry.syncError === 'object' ? {
+        syncError: {
+          reason: cleanText(entry.syncError.reason, 200) || null,
+          at: cleanText(entry.syncError.at, 40) || null,
+          blocked: entry.syncError.blocked === true,
+          signature: cleanText(entry.syncError.signature, 40) || null
+        }
+      } : {}),
+      ...(entry?.posterUpgrade && typeof entry.posterUpgrade === 'object' ? {
+        posterUpgrade: {
+          reason: cleanText(entry.posterUpgrade.reason, 200) || null,
+          at: cleanText(entry.posterUpgrade.at, 40) || null,
+          signature: cleanText(entry.posterUpgrade.signature, 40) || null
+        }
+      } : {})
     }))
     .filter((entry) => entry.channelId && Number.isInteger(entry.messageId) && entry.messageId > 0)
     .slice(0, 100);
