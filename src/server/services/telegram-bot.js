@@ -539,6 +539,124 @@ export function parsePublishedPostEdit(value) {
 }
 
 /**
+ * Tidy text a publisher typed by hand, without second-guessing it.
+ *
+ * Only the furniture a pasted filename carries is removed — a release extension, a bracketed group
+ * tag, underscores, dot-separated words, and a trailing quality or codec label. A year, a season
+ * number, an apostrophe-less word, or an "&" is left exactly as written: the publisher's own wording
+ * is the source of truth for a title, and `cleanMediaName` is far too aggressive for text someone
+ * chose deliberately.
+ */
+export function tidyTypedTitle(value) {
+  const raw = cleanText(value, 1_600).replace(/\s+/g, ' ').trim();
+  if (!raw) return { title: '', changed: false };
+  const extension = /\.(mkv|mp4|avi|webm|mov|m4v|ts|m4a)$/i;
+  const dottedParts = raw.replace(extension, '').split('.');
+  // "Vampires.Of.The.Velvet.Lounge" is one filename; "Dr. No" and "O.R.Y.X" are titles.
+  const dottedFile = !/\s/.test(raw) && dottedParts.length >= 3 && dottedParts.every((part) => part.trim().length >= 2);
+  const looksLikeFile = extension.test(raw) || raw.includes('_') || dottedFile;
+  let title = raw
+    .replace(extension, ' ')
+    // Square brackets are a release group or a codec note; parentheses can be part of the title.
+    .replace(/[[{][^\]}]{0,120}[\]}]/g, ' ')
+    .replace(/_/g, ' ');
+  if (dottedFile) title = title.replace(/\./g, ' ');
+  if (looksLikeFile) {
+    title = title
+      .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
+      .replace(/\b(?:4k|8k|uhd|fhd|hd|remux|web[- ]?dl|webrip|blu[- ]?ray|bdrip|brrip|dvdrip|x\s*26[45]|h\s*26[45]|hevc|av1|avc|10 ?bit|8 ?bit)\b/gi, ' ');
+  }
+  title = title
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/^[\s\-–—|:,*>]+/, '')
+    .replace(/[\s\-–—|:,<]+$/, '')
+    .replace(/\s+([,:;!?.'’"])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+  if (title.length < 2) title = raw;
+  return { title, changed: title !== raw };
+}
+
+/**
+ * Read a pasted block of `SB-… New title` lines as one rename request.
+ *
+ * Correcting the titles of a hundred-card `/done` used to mean a hundred messages, each with its own
+ * edit and its own announcement refresh. Every line is still an independent edit — a missing post ID
+ * or an empty title skips only that line — but the block is applied and reported in one go, with no
+ * limit on how many lines it names. A repeated `/title` prefix on each line, and a comma-separated
+ * ID list on one line, are both accepted because both are how the paste arrives.
+ */
+export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
+  const names = commands.filter(Boolean).map((name) => String(name).replace(/[^a-z]/gi, ''));
+  const commandPattern = names.length
+    ? new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\b[:\\s,-]*`, 'i')
+    : null;
+  const lines = String(value || '').split(/\r?\n/);
+  const entries = [];
+  const invalid = [];
+  const seen = new Map();
+  let replaced = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const body = commandPattern ? trimmed.replace(commandPattern, ' ') : trimmed;
+    const target = parsePublishedPostEdit(body);
+    if (!target) {
+      invalid.push({ line: trimmed, reason: 'no Post ID on that line' });
+      continue;
+    }
+    const title = cleanText(target.value, 1_600);
+    if (!title) {
+      invalid.push({ line: trimmed, reason: `no ${commands[0] || 'value'} after the post ID` });
+      continue;
+    }
+    if (target.adminIds.length > 1) {
+      invalid.push({
+        line: trimmed,
+        reason: `${target.adminIds.length} post IDs share one ${commands[0] || 'value'}; a title belongs to one release, so give each ID its own line`
+      });
+      continue;
+    }
+    const adminId = target.adminId;
+    const tidied = tidyTypedTitle(title);
+    if (seen.has(adminId)) {
+      // The last line for a card wins, because a paste with a note under it usually corrects it.
+      entries[seen.get(adminId)] = { adminId, value: tidied.title, raw: title, changed: tidied.changed };
+      replaced += 1;
+      continue;
+    }
+    seen.set(adminId, entries.length);
+    entries.push({ adminId, value: tidied.title, raw: title, changed: tidied.changed });
+    if (entries.length >= 1_000) break;
+  }
+  return { entries, invalid, replaced, hasEdits: entries.length > 0 };
+}
+
+/**
+ * Apply a pasted block of renames in one go, and report the lines that made no sense.
+ *
+ * Returns false when the message is not a bulk rename — a single line or a draft title belongs to
+ * the ordinary one-post flow, whose reply is more exact than a batch report would be.
+ */
+export async function applyBulkTitleEdits({ ctx, repository, text, commands = ['title', 't', 'rename'] }) {
+  const bulk = parseBulkPostEdits(text, { commands });
+  if (!(bulk.entries.length > 1 || (bulk.entries.length === 1 && bulk.invalid.length))) return false;
+  const result = await updatePublishedPost({ ctx, repository, field: 'title', fieldLabel: 'Title', edits: bulk.entries });
+  if (result?.handled && bulk.invalid.length) {
+    await ctx.reply([
+      `${bulk.invalid.length} line${bulk.invalid.length === 1 ? ' was' : 's were'} left out because ${bulk.invalid.length === 1 ? 'it makes' : 'they make'} no sense as a rename:`,
+      ...bulk.invalid.slice(0, 25).map((entry) => `▪ ${cleanText(entry.line, 90)} — ${entry.reason}`),
+      bulk.invalid.length > 25 ? `…and ${bulk.invalid.length - 25} more line${bulk.invalid.length - 25 === 1 ? '' : 's'}.` : null,
+      'Nothing else was changed. Send those lines again with their Post ID and the title.'
+    ].filter((line) => line !== null).join('\n'));
+  }
+  if (result?.handled && bulk.replaced) {
+    await ctx.reply(`${bulk.replaced} post ID appeared on more than one line, so the last title for it won.`);
+  }
+  return result || { handled: true, content: null, entries: bulk.entries, invalid: bulk.invalid };
+}
+
+/**
  * Fields that describe how a release is labelled can be set across posts at
  * once; a title or synopsis is unique to one release, so those stay singular.
  */
@@ -556,15 +674,27 @@ const MULTI_POST_EDITABLE_FIELDS = new Set([
  * `guard(content)` may refuse one targeted post (the 18+ storage boundary)
  * without blocking the rest of the batch.
  */
-export async function updatePublishedPost({ ctx, repository, argument, field, value, fieldLabel, guard = null }) {
-  const target = parsePublishedPostEdit(argument);
+export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null }) {
+  // `edits` is the batch shape: one value per post ID, so a page of titles is one command.
+  const paired = Array.isArray(edits) && edits.length
+    ? edits
+      .map((entry) => ({
+        adminId: cleanText(entry?.adminId, 40).toUpperCase(),
+        value: cleanText(entry?.value, 1_600),
+        changed: Boolean(entry?.changed)
+      }))
+      .filter((entry) => /^SB-[A-F0-9]{10}$/.test(entry.adminId) && entry.value)
+    : null;
+  const target = paired
+    ? { adminIds: paired.map((entry) => entry.adminId), adminId: paired[0].adminId, value: null }
+    : parsePublishedPostEdit(argument);
   if (!target) return null;
   const multi = MULTI_POST_EDITABLE_FIELDS.has(field);
-  if (target.adminIds.length > 1 && !multi) {
+  if (!paired && target.adminIds.length > 1 && !multi) {
     await ctx.reply(`${fieldLabel} is set one post at a time, because every release needs its own ${fieldLabel.toLowerCase()}. Send /${field} ${target.adminIds[0]} …`);
     return { handled: true, content: null };
   }
-  if (!target.value && value === undefined) {
+  if (!paired && !target.value && value === undefined) {
     await ctx.reply(multi
       ? `Add a ${fieldLabel} after the post ID${target.adminIds.length > 1 ? 's' : ''}. Example: /${field} ${target.adminIds[0]}${multi ? ', SB-SECONDID' : ''} value`
       : `Add a ${fieldLabel} after the post ID. Example: /${field} ${target.adminId} value`);
@@ -578,27 +708,32 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
   const contents = [];
   const missing = [];
   const blocked = [];
+  const tidied = [];
   const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
   let queued = 0;
-  for (const adminId of target.adminIds) {
-    if (guard) {
+  for (const [index, adminId] of target.adminIds.entries()) {
+    const entryValue = paired ? paired[index].value : patchValue;
+    let previous = null;
+    if (guard || paired) {
       const existing = await repository.findContentByAdminId?.(adminId);
       if (!existing) {
         missing.push(adminId);
         continue;
       }
-      const refusal = guard(existing);
+      previous = existing;
+      const refusal = guard ? guard(existing) : null;
       if (refusal) {
         blocked.push({ adminId, title: existing.title, reason: refusal });
         continue;
       }
     }
-    const updated = await repository.updateContentByAdminId(adminId, { [field]: patchValue });
+    const updated = await repository.updateContentByAdminId(adminId, { [field]: entryValue });
     if (!updated) {
       missing.push(adminId);
       continue;
     }
-    contents.push(updated);
+    if (paired && paired[index].changed) tidied.push(adminId);
+    contents.push(previous ? { ...updated, previousValue: cleanText(previous[field], 1_600) } : updated);
     // Anything the announcement channel shows must stay in sync, so the same edit is
     // applied to the posted message instead of leaving it stale — through the lane,
     // because a batch would otherwise fire one edit per post per channel at once and
@@ -631,8 +766,15 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
     ? [`${fieldLabel} updated for ${contents[0].adminId} · ${contents[0].title}.`]
     : [
       `${fieldLabel} updated for ${contents.length} posts:`,
-      ...contents.map((content) => `▪ ${content.adminId} · ${cleanText(content.title, 70)}`)
+      ...contents.map((content) => `▪ ${content.adminId} · ${cleanText(content.title, 70)}${paired
+        && content.previousValue
+        && content.previousValue !== content.title
+        ? ` \u2014 was ${cleanText(content.previousValue, 60)}`
+        : ''}`)
     ];
+  if (tidied.length) {
+    lines.push(`${tidied.length} of those ${tidied.length === 1 ? 'title was' : 'titles were'} tidied from the pasted text (a file extension, brackets, underscores, dots, or a quality label). Send the line again exactly as you want it if that was the title itself.`);
+  }
   if (blocked.length) {
     lines.push(`${blocked.length} post${blocked.length === 1 ? ' was' : 's were'} left alone: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}`);
   }
@@ -5691,7 +5833,7 @@ export async function launchTelegramBot({ config, repository }) {
           'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
           'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time; a Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
           'If the file posts in your database channel still open with an @channel handle, /sync db shows them and /sync db go rewrites each caption to the clean label the catalog stored for it. Only posts this bot sent can be edited by a bot — the rest are listed instead of retried, and the website label is clean either way.',
-          'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it.',
+          'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it. /title renames a whole list in one message: one line per post ID, with or without /title at the start of each line, and titles pasted from a filename are tidied as they are saved.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
           'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
@@ -5736,6 +5878,9 @@ export async function launchTelegramBot({ config, repository }) {
 
   bot.command('title', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
+    // A block of one-line renames is the shape this command takes most, so it is read as a batch
+    // first: pasted straight out of a notes app, with `/title` on every line or only on the first.
+    if (await applyBulkTitleEdits({ ctx, repository, text: ctx.message.text })) return;
     const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const postTarget = parsePublishedPostEdit(argument);
     if (postTarget) {
@@ -5747,7 +5892,14 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
     if (!argument) {
-      await ctx.reply('Usage: /title Your release title\nEdit an existing post: /title SB-0123ABCDEF Corrected title');
+      await ctx.reply([
+        'Usage: /title Your release title',
+        'Edit an existing post: /title SB-0123ABCDEF Corrected title',
+        'Rename a whole list at once \u2014 one line per post in a single message, with or without /title on each line:',
+        '/title SB-0123ABCDEF Vampires Of The Velvet Lounge',
+        'SB-E47CB05E36 Gold',
+        'SB-B65405F26C Oculus'
+      ].join('\n'));
       return;
     }
     const session = await repository.findSession(chatId(ctx), userId(ctx));

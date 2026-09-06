@@ -61,7 +61,7 @@ A production-minded, responsive catalog for **media you are authorized to distri
 - Every post receives a private `SB-…` Post ID; `/posts 50` lists recent IDs, `/postid` filters IDs and names by Today/Yesterday/Week/Month, and `/delete SB-…` can remove one or several unwanted catalog cards. Authorized publisher command scopes are registered on startup and when an allowed owner opens/logs into the bot, so `/posts`, `/postid`, and other publisher commands remain visible through Telegram menu caching
 - `/merge <title (optional)> <target Post ID> <Post ID to absorb> [more IDs]` collapses cards that a provider split apart: the target keeps its ID, slug, poster, and delivery links, every file and player of the other cards moves onto it, its season blocks are rebuilt (Season 1 with its episodes, then Season 2 with its own Episode 01 — same-numbered episodes of different seasons never overwrite each other), and the absorbed cards plus **their announcement-channel messages** are deleted while the private storage messages stay untouched. A title in front is a safety check that stops the merge when that Post ID carries another name, mistyped IDs are reported instead of read as titles, 18+ cards are never mixed with normal ones, and the plan is applied only after **Confirm merge** or `/merge confirm`. `/merge drop SB-… season 2`, `ep 5`, or `season 2 ep 5-7` trims files back off one card and reports the players left behind
 
-- `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …`, `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…` (or `/p`, `/imgdd`), `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
+- `/lang SB-ID Hindi, English`, `/year SB-ID 2026`, `/title SB-ID …` (or one `/title`-style line per post in a single message to rename a whole list at once), `/genres SB-ID …`, `/description SB-ID …`, `/poster SB-ID https://…` (or `/p`, `/imgdd`), `/subtitles SB-ID …`, `/category SB-ID …`, `/release SB-ID …`, and `/status SB-ID …` edit an already-published catalog card without changing its stable slug/share delivery identity; `/lan` and `/lam` are compatible `/lang` aliases
 - `/backup` creates a signed gzip application snapshot and sends it only to the configured private storage channel; `/recover` accepts one signed backup document in an authorized private publisher chat and restores it into the current database, including a new/empty MongoDB URI. A durable India-calendar-month scheduler sends one automatic backup each month
 - `/stats` reports private aggregate bot activity, anonymous site visitors/visits, catalog totals, and request status totals. Site tracking uses only a random first-party visitor cookie—never raw IPs or public Telegram data
 - Draft/login/request-selection sessions survive restarts when MongoDB is configured and expire automatically
@@ -322,7 +322,7 @@ Useful commands:
 | `/adultdb Title` / `/18db Title` | Start an isolated 18+ draft; requires a distinct `TELEGRAM_ADULT_STORAGE_CHANNEL_ID` and never announces publicly |
 | `/batch Optional title` | Import an inclusive first/last `t.me/c/...` range from the configured private storage channel; omit title to infer it, or use `category \| title` to override category (for example, `/batch adult \| Title` for the isolated adult store) |
 | `/auto` | Show persistent ON/OFF controls for direct database-channel auto-publishing |
-| `/title Title` | Replace a draft title and re-run provider lookup; `/title SB-… Corrected title` edits an existing card without changing its delivery identity |
+| `/title Title` | Replace a draft title and re-run provider lookup; `/title SB-… Corrected title` edits an existing card without changing its delivery identity. **A whole list at once:** paste one line per post in a single message — `/title SB-1 Gold`, `SB-2 Oculus`, … — and every title is applied and reported together |
 | `/lang Hindi, English` | Set draft audio labels; `/lang SB-… Hindi, English` edits an existing card, and `/lang SB-…, SB-… Hindi, English` corrects every named card at once (`/lan` and `/lam` are compatible aliases) |
 | `/subtitles English` | Set draft subtitle labels; `/subtitles SB-… English, Hindi` edits an existing card, or list several Post IDs to correct them all (`/subs` is an alias) |
 | `/year 2026` | Set draft year; `/year SB-… 2026` corrects an existing card, or `SB-…, SB-…` for many |
@@ -468,7 +468,23 @@ Metadata edits take one Post ID or as many as needed, separated by commas, space
 
 Only the Post IDs at the very front of the message are read as targets, so a value that contains commas (`Hindi, English`) or a file name that merely starts with `SB-` is never mistaken for another ID. The reply names each post it changed, lists any ID it could not find, and reports how many announcement messages were edited. A category change into or out of 18+ is refused for that one post (its storage channel and age gate must stay separate) while the rest of the list is still corrected.
 
-`/title`, `/description`, and `/poster` intentionally do **not** accept a list: a title, synopsis, and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
+`/description` and `/poster` intentionally do **not** accept a list: a synopsis and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
+
+**Renaming a page of cards at once — `/title` with one line per post.** After a bulk `/done`, correcting titles used to mean one message per card. A multi-line message is now read as one request:
+
+```text
+/title SB-85F36EE4CC Vampires Of The Velvet Lounge
+/title SB-E47CB05E36 Gold
+SB-B65405F26C Oculus
+/title SB-593FCD898E Stand Your Ground
+```
+
+- each line is an independent edit, so a hundred lines are applied by one message — and there is no cap on how many a paste may name;
+- the `/title` prefix is optional on every line after the first, since Telegram only treats the first one as a command, and IDs may be lowercase;
+- a line that cannot be a rename is **named in the reply** rather than guessed at: no Post ID, no title, or several post IDs sharing one title (a title belongs to exactly one card). Everything else still goes through;
+- if one card is listed twice, the last line wins and the reply says so;
+- **a title you typed is stored as you typed it.** Only the furniture a pasted filename carries is removed — a release extension, a bracketed group tag, underscores, dot-separated words, and a trailing quality or codec label — and the reply counts how many titles were tidied so you can send any of them back exactly as written. A year, a season number, or `Dr. No` is never touched;
+- each corrected card's announcement is edited through the shared lane, one at a time, so 36 renames never turn into 36 simultaneous channel edits — and the reply arrives whether or not the channels have caught up.
 
 ### Announcement edits, flood limits, and `/sync`
 
