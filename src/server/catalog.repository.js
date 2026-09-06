@@ -170,7 +170,10 @@ function storageCaptionTargets(records = [], { limit = 80, storageChannelId = nu
   const adultChannel = cleanText(adultStorageChannelId, 80);
   const seen = new Set();
   const targets = [];
-  const stats = { files: 0, noChannel: 0, legacyChannel: 0, cards: 0, capped: false };
+  // `scanned` counts the cards this call looked at, so a caller walking an archive knows how far
+  // to advance; `capped` says the message ceiling cut into the window, which is a page boundary
+  // and not the end of the work.
+  const stats = { files: 0, noChannel: 0, legacyChannel: 0, cards: 0, scanned: 0, capped: false };
   for (const record of records) {
     if (!record || record.published === false) continue;
     // A file posted before the catalog began persisting the source channel carries no channel
@@ -207,12 +210,12 @@ function storageCaptionTargets(records = [], { limit = 80, storageChannelId = nu
       if (targets.length >= ceiling) {
         stats.capped = true;
         stats.cards += 1;
-        return { targets, stats };
+        return { targets, stats: { ...stats, scanned: records.length } };
       }
     }
     if (fromThisCard) stats.cards += 1;
   }
-  return { targets, stats };
+  return { targets, stats: { ...stats, scanned: records.length } };
 }
 
 function searchPredicate(item, query) {
@@ -976,14 +979,18 @@ export class MemoryCatalogRepository {
    * first and capped, because a sweep is paced against Telegram's flood limit and a
    * publisher is better off seeing the newest posts than waiting on an entire archive.
    */
-  async listStorageCaptionTargets({ adminId = null, limit = 80, storageChannelId = null, adultStorageChannelId = null } = {}) {
+  async listStorageCaptionTargets({ adminId = null, limit = 80, skip = 0, cards = null, storageChannelId = null, adultStorageChannelId = null } = {}) {
     const wanted = adminId ? String(adminId).toUpperCase() : null;
     const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
-    const records = [...this.contents.values()]
+    const window = Math.max(1, Number(cards) || Math.max(20, ceiling * 6));
+    const offset = Math.max(0, Number(skip) || 0);
+    const candidates = [...this.contents.values()]
       .filter((entry) => entry.published !== false && (!wanted || entry.adminId === wanted))
-      .sort((first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime())
-      .slice(0, Math.max(20, ceiling * 6));
-    return storageCaptionTargets(records, { limit: ceiling, storageChannelId, adultStorageChannelId });
+      .sort((first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime());
+    const records = candidates.slice(offset, offset + window + 1);
+    const more = records.length > window;
+    const listed = storageCaptionTargets(records.slice(0, window), { limit: ceiling, storageChannelId, adultStorageChannelId });
+    return { ...listed, more, stats: { ...listed.stats, more } };
   }
 
   async createContent(input) {
@@ -2004,19 +2011,26 @@ export class MongoCatalogRepository {
    * caption sweep needs are read: an archive of thousands of file records must not be
    * pulled into memory to fix a few dozen captions.
    */
-  async listStorageCaptionTargets({ adminId = null, limit = 80, storageChannelId = null, adultStorageChannelId = null } = {}) {
+  async listStorageCaptionTargets({ adminId = null, limit = 80, skip = 0, cards = null, storageChannelId = null, adultStorageChannelId = null } = {}) {
     const wanted = adminId ? String(adminId).toUpperCase() : null;
     const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+    const window = Math.max(1, Number(cards) || Math.max(20, ceiling * 6));
+    const offset = Math.max(0, Number(skip) || 0);
     const filter = { published: { $ne: false } };
     if (wanted) filter.adminId = wanted;
-    const records = await this.contents
+    const fetched = await this.contents
       // Only the message reference is needed: what the caption says is read from Telegram, and
       // the title and category only exist so the reply can name the card in the publisher's words.
       .find(filter, { projection: { adminId: 1, title: 1, category: 1, publishedAt: 1, 'files.storageMessageId': 1, 'files.storageChannelId': 1 } })
       .sort({ publishedAt: -1 })
-      .limit(Math.max(20, ceiling * 6))
+      // One card past the window is fetched only to learn whether the archive continues, which is
+      // what lets a sweep walk a whole database in pages without a count query.
+      .skip(offset)
+      .limit(window + 1)
       .toArray();
-    return storageCaptionTargets(records, { limit: ceiling, storageChannelId, adultStorageChannelId });
+    const more = fetched.length > window;
+    const listed = storageCaptionTargets(fetched.slice(0, window), { limit: ceiling, storageChannelId, adultStorageChannelId });
+    return { ...listed, more, stats: { ...listed.stats, more } };
   }
 
   async createContent(input) {

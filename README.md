@@ -328,7 +328,7 @@ Useful commands:
 | `/cmd SB-0123ABCDEF del 3` / `del ep 2-7` / `del all` | Remove specific numbered players, every player of an episode range, or all players of that post |
 | `/repair` — then `/repair go` | Re-index every published card with the parsing rules in the current build; `/repair SB-0123ABCDEF` does one card now. Nothing is re-uploaded and no title, player, or delivery link is touched; the channel copy of a card that changed is refreshed on the announcement lane |
 | `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, and what Telegram refused stays listed instead of lost |
-| `/sync db` — then `/sync db go` | The database channel on its own: read the caption of every copied file post and rewrite the ones still carrying a `@channel` prefix, which is what clears the leftover from the channel itself |
+| `/sync db` — then `/sync db go` | The database channel on its own: read the caption of every copied file post and rewrite the ones still carrying a `@channel` prefix, a page at a time until the archive is done. `/sync db status` asks how far it got |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
 | `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
@@ -474,8 +474,13 @@ So all channel work now runs on **one lane** inside the process:
 /sync        — preview: which posts differ, how many are queued, what is still refused
 /sync go     — refresh every one of them, one edit at a time
 /sync SB-…   — refresh that card's announcement now and report the result
-/sync db     — preview the database channel's own captions; /sync db go rewrites them
+/sync db     — preview the database channel's own captions; /sync db go rewrites them all
+/sync db SB-… — that card's file posts only
+/sync db status — how far a running sweep has got
+/sync db retry — forget refused and already-read messages, so they are looked at again
 ```
+
+Nothing on the lane is awaited by a command handler. A bulk run is longer than a Telegram request timeout, and a handler that sits on it produces `Something went wrong while handling that request` on work that did go through; the queue therefore answers first and reports when it settles (`settleQueuedJob` bounds the one exception — a single-card edit — at 10 seconds).
 
 ### The database channel's captions (`/sync db`)
 
@@ -486,11 +491,13 @@ A file copied into the database channel keeps the caption it arrived with, and a
 - every database message the catalog knows about is a candidate. The work list is built from `files.storageMessageId` alone, so a record that stored only a filename, a caption someone edited by hand afterwards, and a file posted before channels were tracked are all still found;
 - each one is read through the same one-time preview `/batch` uses — forwarded into the publisher's chat, inspected, deleted again — and then edited to exactly the cleaned form of what Telegram reported. Nothing is composed from the catalog, so a caption that is already clean costs no edit and a file post that never had one is left without one instead of being handed a title;
 - a file post saved before the catalog tracked which channel it went to is addressed through `TELEGRAM_STORAGE_CHANNEL_ID` (and the 18+ channel for adult cards), exactly the way `/batch` reaches it. Without that, an old database looked empty to the sweep — which is what `/sync db` reported while `/batch` kept cleaning the same messages;
-- the reply names what it could not reach, so "nothing to clean" and "I could not look" are different answers: messages this bot cannot read at all (a protected channel refuses the preview), posts with no caption, files naming no channel, and the per-run cap;
+- the reply names what it could not reach, so "nothing to clean" and "I could not look" are different answers: messages this bot cannot read at all (a protected channel refuses the preview), posts with no caption, files naming no channel, and where a page stopped;
 - **a bot can only edit its own messages.** A post written by a human account or another bot is reported as uneditable and then remembered as such, so the next sweep spends no call on it — edit those in the channel yourself, or upload through this bot so the copy is clean from the start;
 - one read and, if needed, one edit per `ANNOUNCEMENT_SYNC_SPACING_MS`, a `429` waited out and retried, and a caption that never gets through reported to the publisher chat rather than dropped;
 - only a refusal that can never change is remembered. "That is not your message" is cached so the next sweep spends no call on it, while a flood wait or a missing admin right stays a real leftover that is retried and reported. **`/sync db retry`** forgets both caches — the refusals and the already-read-and-clean list — for after the bot's rights change or a file is re-uploaded through it;
-- one run touches `STORAGE_CAPTION_SWEEP_LIMIT` messages (80 by default), newest card first, so a large archive is walked a set at a time instead of being abandoned mid-way.
+- **one command walks the whole archive.** It pages instead of stopping: `STORAGE_CAPTION_SWEEP_CARDS` (25) cards and up to `STORAGE_CAPTION_SWEEP_LIMIT` (80) messages per read, then the next window, newest card first, until the catalog runs out or `STORAGE_CAPTION_SWEEP_TOTAL` (1500) messages have been read — and when it stops early for that reason it says so instead of looking finished. A card holding more files than a page allows (a season pack) is re-listed with a wider ceiling rather than having its files silently skipped;
+- a channel that will not let its posts be forwarded is stopped at after the first page, with the reason said out loud — there is no point spending the archive on captions it cannot read;
+- **the command never waits for the sweep.** Nothing on the lane is awaited from a handler any more: a whole-archive run outlives Telegram's own request timeout, which used to turn a command that had actually worked into `Something went wrong while handling that request`. The sweep answers in its own message when it settles, `/sync db status` reports progress while it runs, and a second `/sync db go` while one is running is refused rather than duplicated. A single-card edit may still wait — at most 10 seconds, after which the reply says it is queued and the lane reports later.
 
 `/repair` does not touch this: it re-indexes cards. `/sync` refreshes announcement channels. `/sync db` is for the database channel alone.
 

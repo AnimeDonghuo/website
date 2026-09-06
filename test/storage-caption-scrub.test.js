@@ -11,10 +11,15 @@ import {
   listStorageCaptionBlockers,
   listStorageCaptionTargets,
   queueStorageCaptionScrub,
+  queueStorageCaptionSweep,
   resetAnnouncementLane,
+  runStorageCaptionSweep,
   scrubStorageCaptions,
   storageScrubNote,
-  storageScrubPreviewText
+  settleQueuedJob,
+  storageScrubPreviewText,
+  storageSweepReport,
+  storageSweepStatusText
 } from '../src/server/services/telegram-bot.js';
 
 const error = (description, retryAfter = null) => Object.assign(new Error(description), {
@@ -394,4 +399,193 @@ test('only a refusal that can never change is remembered, and retry forgets all 
   await scrubStorageCaptions({ telegram, targets: [target({ messageId: 95 })], options });
   assert.deepEqual(telegram.calls.edits.map((entry) => entry.messageId), [95], 'after a retry the message is attempted again, because the bot may have been made an editor since');
   assert.deepEqual(listStorageCaptionBlockers().map((entry) => entry.key), ['-100db:95'], 'a refusal that happens again is remembered again, not forgiven forever');
+});
+
+test('a card window can be walked, and it says whether the archive continues', async () => {
+  const repository = new MemoryCatalogRepository(
+    Array.from({ length: 6 }, (_, index) => ({
+      slug: `show-${index}`,
+      title: `Show ${index}`,
+      category: 'anime',
+      publishedAt: new Date(Date.UTC(2026, 8, 20 - index)).toISOString(),
+      files: [{ name: `Show.${index}.mkv`, storageMessageId: 1_000 + index, storageChannelId: '-100db' }]
+    }))
+  );
+  await repository.init();
+
+  const seen = [];
+  const windows = [];
+  let skip = 0;
+  for (let page = 0; page < 10; page += 1) {
+    const listed = await repository.listStorageCaptionTargets({ limit: 80, skip, cards: 2, storageChannelId: '-100db' });
+    seen.push(...listed.targets.map((entry) => entry.messageId));
+    windows.push({ scanned: listed.stats.scanned, more: listed.more });
+    if (!listed.more) break;
+    skip += listed.stats.scanned;
+  }
+  assert.deepEqual(seen, [1_000, 1_001, 1_002, 1_003, 1_004, 1_005], 'every card is reached exactly once, newest first');
+  assert.deepEqual(windows, [
+    { scanned: 2, more: true },
+    { scanned: 2, more: true },
+    { scanned: 2, more: false }
+  ], 'the window is honest about how far it got, so no card is skipped and none is read twice');
+});
+
+test('one command walks the whole archive instead of stopping at the first page', async () => {
+  const pages = [
+    { targets: [target({ messageId: 91 }), target({ messageId: 92 })], more: true, stats: { scanned: 2, more: true, capped: false } },
+    { targets: [target({ messageId: 93 })], more: false, stats: { scanned: 1, more: false, capped: false } }
+  ];
+  const asked = [];
+  const repository = {
+    async listStorageCaptionTargets(options) {
+      asked.push({ skip: options.skip, cards: options.cards, channel: options.storageChannelId });
+      const page = pages[asked.length - 1] || { targets: [], more: false, stats: { scanned: 0, more: false, capped: false } };
+      return { ...page, targets: page.targets.map((entry) => ({ ...entry, caption: PROMOTIONAL })) };
+    }
+  };
+  const telegram = makeTelegram({ edits: () => ({}) });
+  const result = await runStorageCaptionSweep({
+    telegram,
+    repository,
+    config: { telegram: { storageChannelId: '-100db' } },
+    inspectChatId: '-100publisher',
+    options: { spacingMs: 0, wait: async () => {} }
+  });
+
+  assert.equal(result.pages, 2, 'it moves on to the next window instead of reporting a cap');
+  assert.equal(result.messages, 3);
+  assert.equal(result.updated, 3);
+  assert.equal(result.cards, 3);
+  assert.equal(result.stoppedFor, null);
+  assert.deepEqual(asked.map((entry) => entry.skip), [0, 2], 'the card window advances by what was scanned');
+  assert.deepEqual(asked.map((entry) => entry.channel), ['-100db', '-100db'], 'the configured database channel is passed down on every page');
+  assert.match(storageSweepReport(result), /Database channel sweep: 2 pages, 3 messages read from Telegram\./);
+  assert.match(storageSweepReport(result), /3 captions rewritten/);
+});
+
+test('a page cut off by its own ceiling is read wider rather than losing files', async () => {
+  const big = Array.from({ length: 6 }, (_, index) => target({ messageId: 200 + index, caption: PROMOTIONAL }));
+  const asked = [];
+  const repository = {
+    async listStorageCaptionTargets(options) {
+      asked.push(options.limit);
+      const capped = asked.length === 1;
+      return {
+        targets: capped ? big.slice(0, 2) : big,
+        more: false,
+        stats: { scanned: 1, more: false, capped }
+      };
+    }
+  };
+  const telegram = makeTelegram({ edits: () => ({}) });
+  const result = await runStorageCaptionSweep({
+    telegram,
+    repository,
+    options: { spacingMs: 0, wait: async () => {}, limit: 2 }
+  });
+  assert.deepEqual(asked, [2, 6], 'the same window is re-listed with room for the whole pack');
+  assert.equal(result.messages, 6, 'so a 100-episode season pack is not cleaned 80 files at a time forever');
+});
+
+test('a channel whose posts cannot be read is stopped at, and the reason is said out loud', async () => {
+  const repository = {
+    async listStorageCaptionTargets() {
+      return { targets: [target({ messageId: 91 })], more: true, stats: { scanned: 1, more: true, capped: false } };
+    }
+  };
+  const telegram = makeTelegram({ forwardError: () => error("Bad Request: message can't be forwarded") });
+  const result = await runStorageCaptionSweep({
+    telegram,
+    repository,
+    inspectChatId: '-100publisher',
+    options: { spacingMs: 0, wait: async () => {} }
+  });
+  assert.equal(result.pages, 1, 'no further page is spent on a channel that cannot be read at all');
+  assert.equal(result.stoppedFor, 'unreadable');
+  assert.match(storageSweepReport(result), /does not allow its posts to be forwarded/);
+  assert.match(storageSweepReport(result), /edit the posts there yourself/);
+});
+
+test('a run has a ceiling, and says so instead of looking finished', async () => {
+  const repository = {
+    async listStorageCaptionTargets(options) {
+      const first = 300 + (Number(options.skip) || 0) * 3;
+      return {
+        targets: [target({ messageId: first, caption: PROMOTIONAL }), target({ messageId: first + 1, caption: PROMOTIONAL })],
+        more: true,
+        stats: { scanned: 1, more: true, capped: false }
+      };
+    }
+  };
+  const telegram = makeTelegram({ edits: () => ({}) });
+  const result = await runStorageCaptionSweep({ telegram, repository, options: { spacingMs: 0, wait: async () => {}, limit: 2, totalCeiling: 4 } });
+  assert.equal(result.messages, 4);
+  assert.equal(result.pages, 2);
+  assert.equal(result.stoppedFor, 'total');
+  assert.match(storageSweepReport(result), /Stopped at the run ceiling/);
+  assert.match(storageSweepReport(result), /\/sync db go picks up with the next set/);
+});
+
+test('the command that starts a sweep never waits for it, and the sweep answers when it finishes', async () => {
+  const sent = [];
+  const telegram = {
+    async editMessageCaption(chatIdArg, messageId, inlineId, caption) { sent.push({ kind: 'edit', messageId, caption }); return {}; },
+    async sendMessage(chatIdArg, text) { sent.push({ kind: 'note', chat: chatIdArg, text }); return {}; }
+  };
+  const repository = {
+    async listStorageCaptionTargets() {
+      return { targets: [target({ messageId: 91, caption: PROMOTIONAL })], more: false, stats: { scanned: 1, more: false, capped: false } };
+    }
+  };
+  const job = queueStorageCaptionSweep({ telegram, repository, notifyChatId: '-100admin', inspectChatId: '-100publisher' }, { spacingMs: 0, wait: async () => {} });
+  assert.match(storageSweepStatusText(), /A database-channel sweep is (running|queued on the lane)/, 'while the lane is busy, /sync db status is the answer');
+  assert.equal(queueStorageCaptionSweep({ telegram, repository, notifyChatId: '-100admin' }, { spacingMs: 0 }), null, 'and the command knows not to start it twice');
+  await job;
+  assert.match(storageSweepStatusText(), /Last sweep finished/);
+
+  assert.deepEqual(sent.map((entry) => entry.kind), ['edit', 'note'], 'the edit happens on the lane and the summary arrives afterwards');
+  assert.match(sent[1].text, /Database channel sweep: 1 page, 1 message read from Telegram\./);
+  assert.match(sent[1].text, /Database channel: 1 caption rewritten/);
+  assert.equal(sent[1].chat, '-100admin');
+  assert.match(storageSweepStatusText(), /Last sweep finished/);
+  assert.match(storageSweepStatusText(), /1 caption rewritten/);
+});
+
+test('a sweep is not queued twice at once', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const telegram = {
+    async editMessageCaption() { await gate; return {}; },
+    async sendMessage() { return {}; }
+  };
+  const repository = {
+    async listStorageCaptionTargets() {
+      return { targets: [target({ messageId: 91, caption: PROMOTIONAL })], more: false, stats: { scanned: 1, more: false, capped: false } };
+    }
+  };
+  const options = { spacingMs: 0, wait: async () => {} };
+  const first = queueStorageCaptionSweep({ telegram, repository, notifyChatId: '-100admin' }, options);
+  assert.ok(first, 'the first command starts it');
+  assert.equal(queueStorageCaptionSweep({ telegram, repository, notifyChatId: '-100admin' }, options), null, 'a second one does not queue a duplicate sweep');
+  release();
+  await first;
+  assert.ok(queueStorageCaptionSweep({ telegram, repository, notifyChatId: '-100admin' }, options), 'and once it is finished, another run can be started');
+  await announcementLaneDrained();
+});
+
+test('a command never sits on the lane waiting for a channel', async () => {
+  // The job is deliberately slower than the grace period, which is the whole point: a command
+  // that outlives Telegram's own request timeout turns finished work into an error message.
+  let resolveSlow;
+  const slow = new Promise((resolve) => { resolveSlow = resolve; });
+  setTimeout(() => resolveSlow({ updated: 3 }), 25);
+  const bounded = await settleQueuedJob(slow, { graceMs: 1 });
+  assert.equal(bounded.settled, false, 'once the grace period passes, the command answers on its own');
+  assert.equal(bounded.result, null);
+  await slow;
+
+  assert.deepEqual(await settleQueuedJob(Promise.resolve({ updated: 2 }), { graceMs: 1_000 }), { settled: true, result: { updated: 2 } }, 'an idle lane is still reported exactly');
+  assert.deepEqual(await settleQueuedJob(Promise.reject(new Error('channel refused')), { graceMs: 1_000 }), { settled: true, result: null }, 'a rejected job is an answer, not a thrown error in the handler');
+  assert.deepEqual(await settleQueuedJob(null, { graceMs: 1_000 }), { settled: false, result: null }, 'a detached job was never something to await');
 });

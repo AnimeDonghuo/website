@@ -606,7 +606,14 @@ export async function updatePublishedPost({ ctx, repository, argument, field, va
     // result, so its reply stays exact.
     const job = queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, adminId: updated.adminId, notifyChatId: chatId(ctx) });
     if (target.adminIds.length === 1) {
-      for (const key of Object.keys(sync)) sync[key] += (await job)?.[key] || 0;
+      // A single post used to wait for its channel edit so the reply could be exact. That is only
+      // safe while the lane is idle, so the wait is now bounded and the answer says "queued".
+      const { settled, result } = await settleQueuedJob(job);
+      for (const key of Object.keys(sync)) sync[key] += (result?.[key]) || 0;
+      if (!settled) {
+        job.catch(() => {});
+        queued += 1;
+      }
     } else {
       job.catch(() => {});
       queued += 1;
@@ -1644,6 +1651,23 @@ const STORAGE_CAPTION_SWEEP_LIMIT = (() => {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 600 ? parsed : 80;
 })();
 const STORAGE_CAPTION_JOB_KEY = 'storage-captions';
+// A sweep is paged, not capped: 25 cards and up to 80 messages per read, then it moves to the
+// next window until the archive ends or the run ceiling is reached. Every one of these is a knob
+// because the honest number depends on how large a database the publisher keeps.
+const STORAGE_CAPTION_SWEEP_CARDS = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_CARDS);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 200 ? parsed : 25;
+})();
+const STORAGE_CAPTION_SWEEP_TOTAL = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_TOTAL);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 50_000 ? parsed : 1_500;
+})();
+const STORAGE_CAPTION_SWEEP_PAGES = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_PAGES);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 5_000 ? parsed : 400;
+})();
+// The counters a sweep reports, so an aggregate over pages adds exactly what one page produced.
+const STORAGE_CAPTION_OUTCOMES = ['updated', 'unchanged', 'alreadyClean', 'knownClean', 'noCaption', 'unreadable', 'gone', 'blocked', 'failed', 'inspected'];
 
 /**
  * Test seam (and an operator knob): the gap the lane leaves between two calls. Zero means
@@ -1725,9 +1749,46 @@ const storageCaptionBlockers = new Map();
 // not looked at again in this process, which is what makes running /sync db twice cheap. Forgetting
 // it is /sync db retry.
 const storageCaptionClean = new Set();
+// A sweep runs on the lane, after its command has already answered, so the publisher needs a way
+// to ask what it is doing. This is that answer: live counters, refreshed per page.
+const storageSweepState = {
+  running: false,
+  adminId: null,
+  startedAt: null,
+  at: null,
+  pages: 0,
+  messages: 0,
+  updated: 0,
+  blocked: 0,
+  failed: 0,
+  stoppedFor: null
+};
 
 export function listStorageCaptionBlockers() {
   return [...storageCaptionBlockers.entries()].map(([key, reason]) => ({ key, reason }));
+}
+
+/**
+ * A command may wait for a lane job only while the lane is quick. Waiting any longer risks
+ * outliving Telegram's own request timeout on the update, which turns work that did go through
+ * into "Something went wrong while handling that request" — so past the grace period the command
+ * answers on its own and the lane reports when it finishes.
+ */
+export function settleQueuedJob(job, { graceMs = 10_000 } = {}) {
+  if (!job || typeof job.then !== 'function') return Promise.resolve({ settled: false, result: null });
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve({ settled: false, result: null });
+    }, Math.max(1, Number(graceMs) || 10_000));
+    timer.unref?.();
+    Promise.resolve(job).then(
+      (result) => { if (done) return; done = true; clearTimeout(timer); resolve({ settled: true, result: result || null }); },
+      () => { if (done) return; done = true; clearTimeout(timer); resolve({ settled: true, result: null }); }
+    );
+  });
 }
 
 function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, stuckNote = null, options = {} }) {
@@ -1753,6 +1814,11 @@ function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = 
     }
     if (result?.failed) announcementLane.stale.set(key || `job-${Date.now()}`, { key: key || null, label: label || null, failed: Number(result.failed) || 0, retried });
     else if (key) announcementLane.stale.delete(key);
+    // A job that started from a command answers in its own message when it settles, which is how
+    // the command gets to reply at once instead of holding a Telegram request open for minutes.
+    if (typeof options.onSettled === 'function') {
+      await Promise.resolve(options.onSettled(result, { retried, rounds: totalRounds })).catch(() => {});
+    }
     if (retried && notifyChatId && typeof telegram?.sendMessage === 'function') {
       const still = Number(result?.failed) || 0;
       const lines = still
@@ -1833,6 +1899,15 @@ export function resetAnnouncementLane() {
   // from the same place a freshly deployed process would.
   storageCaptionBlockers.clear();
   storageCaptionClean.clear();
+  storageSweepState.running = false;
+  storageSweepState.adminId = null;
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
 }
 
 /**
@@ -2152,16 +2227,29 @@ export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId 
  * The sweep's inputs. A file post is a candidate because the catalog knows its message ID; what
  * its caption says is read from Telegram, so nothing depends on which label the record kept.
  */
-export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT, config = null } = {}) {
-  if (typeof repository?.listStorageCaptionTargets !== 'function') return { targets: [], available: false, stats: null, blocked: 0, clean: 0 };
+export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT, skip = 0, cards = null, config = null } = {}) {
+  if (typeof repository?.listStorageCaptionTargets !== 'function') {
+    return { targets: [], available: false, stats: null, blocked: 0, clean: 0, more: false };
+  }
   const listed = await repository.listStorageCaptionTargets({
     adminId,
     limit,
+    skip,
+    cards,
     storageChannelId: cleanText(config?.telegram?.storageChannelId, 80) || null,
     adultStorageChannelId: cleanText(config?.telegram?.adultStorageChannelId, 80) || null
   });
   const targets = Array.isArray(listed?.targets) ? listed.targets : (Array.isArray(listed) ? listed : []);
-  return { targets, available: true, stats: listed?.stats || null, blocked: storageCaptionBlockers.size, clean: storageCaptionClean.size };
+  return {
+    targets,
+    available: true,
+    stats: listed?.stats || null,
+    // `more` is what lets a sweep page through an archive without a count query: the store fetched
+    // one card past its window and is saying whether anything followed it.
+    more: Boolean(listed?.more ?? listed?.stats?.more),
+    blocked: storageCaptionBlockers.size,
+    clean: storageCaptionClean.size
+  };
 }
 
 /**
@@ -2217,6 +2305,174 @@ export function batchCaptionQueueNote(count) {
 }
 
 /**
+ * One sweep, walked a page at a time.
+ *
+ * A single command has to finish the job it was asked for, so this does not stop at the first
+ * page: it lists a window of cards, reads and cleans those messages, and moves to the next window
+ * until the archive runs out or the run ceiling is reached. `STORAGE_CAPTION_SWEEP_LIMIT` sizes a
+ * page, not the whole run — answering "capped at 80, run it again" turned cleaning a database into
+ * a chore instead of a command.
+ *
+ * Nothing here is awaited by the command that started it. A sweep that outlives Telegram's own
+ * request timeout used to surface as "Something went wrong while handling that request" while the
+ * work had in fact gone through, which is the worst possible answer for a bulk command.
+ */
+export async function runStorageCaptionSweep({ telegram, repository, config = null, adminId = null, inspectChatId = null, options = {} } = {}) {
+  const pageSize = Math.max(1, Math.min(Number(options.limit) || STORAGE_CAPTION_SWEEP_LIMIT, 600));
+  const totalCeiling = Math.max(pageSize, Number(options.totalCeiling) || STORAGE_CAPTION_SWEEP_TOTAL);
+  const cardWindow = Math.max(1, Number(options.cards) || STORAGE_CAPTION_SWEEP_CARDS);
+  const aggregate = {
+    updated: 0, unchanged: 0, alreadyClean: 0, knownClean: 0, noCaption: 0, unreadable: 0,
+    gone: 0, blocked: 0, failed: 0, inspected: 0, messages: 0, cards: 0, pages: 0,
+    retryAfterMs: 0, blockedCards: [], stoppedFor: null, available: true
+  };
+  if (typeof repository?.listStorageCaptionTargets !== 'function') {
+    aggregate.available = false;
+    aggregate.stoppedFor = 'unavailable';
+    return aggregate;
+  }
+  storageSweepState.running = true;
+  storageSweepState.adminId = adminId || null;
+  storageSweepState.startedAt = new Date().toISOString();
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
+  let skip = 0;
+  try {
+    // The page count is a hard stop of its own, so a store that keeps reporting "more" because of
+    // a bug cannot keep a lane busy forever.
+    for (let page = 0; page < STORAGE_CAPTION_SWEEP_PAGES; page += 1) {
+      let pageLimit = pageSize;
+      let listed = await listStorageCaptionTargets(repository, { adminId, limit: pageLimit, cards: cardWindow, skip, config });
+      // A card holding more files than a page allows (a season pack) would be cut off mid-list, so
+      // the same window is re-read with a wider ceiling rather than silently skipping its files.
+      while (listed.stats?.capped && pageLimit < 600) {
+        pageLimit = Math.min(600, pageLimit * 3);
+        listed = await listStorageCaptionTargets(repository, { adminId, limit: pageLimit, cards: cardWindow, skip, config });
+      }
+      aggregate.pages += 1;
+      aggregate.cards += Number(listed.stats?.scanned) || listed.targets.length;
+      storageSweepState.pages = aggregate.pages;
+      if (listed.targets.length) {
+        const result = await scrubStorageCaptions({ telegram, targets: listed.targets, options: { ...options, inspectChatId } });
+        for (const key of STORAGE_CAPTION_OUTCOMES) aggregate[key] += Number(result[key]) || 0;
+        aggregate.messages += listed.targets.length;
+        aggregate.retryAfterMs = Math.max(aggregate.retryAfterMs, Number(result.retryAfterMs) || 0);
+        if (Array.isArray(result.blockedCards)) aggregate.blockedCards.push(...result.blockedCards);
+        storageSweepState.messages = aggregate.messages;
+        storageSweepState.updated = aggregate.updated;
+        storageSweepState.blocked = aggregate.blocked;
+        storageSweepState.failed = aggregate.failed;
+        // A channel that refuses to let its posts be forwarded cannot be read at all, and no
+        // number of pages will change that. Stop and say so instead of spending the archive.
+        if (result.unreadable === listed.targets.length && !result.updated && !result.failed) {
+          aggregate.stoppedFor = 'unreadable';
+          break;
+        }
+      }
+      if (!listed.more) break;
+      if (aggregate.messages >= totalCeiling) {
+        aggregate.stoppedFor = 'total';
+        break;
+      }
+      skip += Math.max(1, Number(listed.stats?.scanned) || 1);
+    }
+  } finally {
+    storageSweepState.running = false;
+    storageSweepState.at = new Date().toISOString();
+    storageSweepState.stoppedFor = aggregate.stoppedFor;
+  }
+  return aggregate;
+}
+
+/**
+ * What a finished sweep says, in the publisher's chat. It repeats the numbers rather than
+ * promising that everything is clean, because a page that was unreadable and a message another
+ * sender owns are different follow-ups.
+ */
+export function storageSweepReport(result, { adminId = null } = {}) {
+  if (!result?.pages) return null;
+  const scope = adminId ? ` for ${adminId}` : '';
+  const lines = [
+    `Database channel sweep${scope}: ${result.pages} page${result.pages === 1 ? '' : 's'}, ${result.messages} message${result.messages === 1 ? '' : 's'} read from Telegram.`
+  ];
+  lines.push(storageScrubNote(result, { blocked: result.blocked }));
+  if (result.stoppedFor === 'unreadable') {
+    lines.push('Stopped early: the whole page refused the preview, which means this database channel does not allow its posts to be forwarded. A caption that cannot be read cannot be cleaned from the bot — either allow forwarding in the channel or edit the posts there yourself.');
+  }
+  if (result.stoppedFor === 'total') {
+    lines.push('Stopped at the run ceiling, with the archive still going: /sync db go picks up with the next set.');
+  }
+  if (result.blockedCards?.length) {
+    lines.push(`Not editable: ${result.blockedCards.slice(0, 8).map((entry) => `${entry.adminId || entry.title || 'card'} → message ${entry.messageId}`).join(', ')}${result.blockedCards.length > 8 ? ` · +${result.blockedCards.length - 8} more` : ''}. A bot can only edit the messages it sent.`);
+  }
+  return lines.join('\n').slice(0, 3_900);
+}
+
+/**
+ * How far the running (or last finished) sweep got, without touching Telegram. A publisher who
+ * sees "queued on the lane" needs a way to ask what the lane is doing.
+ */
+export function storageSweepStatusText() {
+  const plural = (value, word) => `${value} ${word}${value === 1 ? '' : 's'}`;
+  if (storageSweepState.running) {
+    const ahead = Math.max(0, (announcementSyncStatus().pending || 0) - 1);
+    const stage = storageSweepState.pages
+      ? 'running'
+      : `queued on the lane${ahead ? ` behind ${plural(ahead, 'job')}` : ''}`;
+    return `A database-channel sweep is ${stage}${storageSweepState.adminId ? ` for ${storageSweepState.adminId}` : ''}: ${plural(storageSweepState.pages, 'page')} read, ${plural(storageSweepState.messages, 'message')} looked at, ${plural(storageSweepState.updated, 'caption')} rewritten so far. It keeps going on its own; /sync db answers immediately and never waits for it.`;
+  }
+  if (!storageSweepState.at) return 'No database-channel sweep has run since this process started. /sync db shows what it would read, /sync db go runs it.';
+  const finishedAt = cleanText(storageSweepState.at, 20).slice(11, 16);
+  const tail = storageSweepState.stoppedFor === 'total'
+    ? 'It stopped at the run ceiling with the archive still going — /sync db go continues with the next set.'
+    : 'Run /sync db go again any time: a message already read and found clean is not touched twice, and a refusal is retried only after /sync db retry.';
+  return [
+    `Last sweep finished at ${finishedAt} UTC: ${plural(storageSweepState.pages, 'page')}, ${plural(storageSweepState.messages, 'message')} read, ${plural(storageSweepState.updated, 'caption')} rewritten, ${plural(storageSweepState.blocked, 'message')} a bot may not edit, ${plural(storageSweepState.failed, 'refusal')} still outstanding.`,
+    tail
+  ].join('\n');
+}
+
+/**
+ * Start a whole-archive sweep on the lane and answer at once. The completion note is sent when the
+ * job settles, and a refusal that outlives the retries is reported by the lane itself.
+ */
+export function queueStorageCaptionSweep({ telegram, repository, config = null, adminId = null, notifyChatId = null, inspectChatId = null }, options = {}) {
+  // Claimed here rather than inside the runner, so a second /sync db go while the lane is still
+  // working cannot queue a duplicate, and `/sync db status` can answer immediately.
+  if (storageSweepState.running) return null;
+  storageSweepState.running = true;
+  storageSweepState.adminId = adminId || null;
+  storageSweepState.startedAt = new Date().toISOString();
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
+  const releaseClaim = () => { storageSweepState.running = false; };
+  const report = (result) => {
+    const text = storageSweepReport(result, { adminId });
+    if (!text || !notifyChatId || typeof telegram?.sendMessage !== 'function') return null;
+    return Promise.resolve(telegram.sendMessage(String(notifyChatId), text)).catch(() => {});
+  };
+  return enqueueAnnouncementJob({
+    key: STORAGE_CAPTION_JOB_KEY,
+    label: adminId ? `Database channel captions (${adminId})` : 'Database channel captions',
+    notifyChatId,
+    telegram,
+    stuckNote: 'The website labels were already clean — only the messages in the database channel are behind. /sync db lists them again and /sync db go retries the edit.',
+    options: { ...options, onSettled: report },
+    run: (inner) => runStorageCaptionSweep({ telegram, repository, config, adminId, inspectChatId, options: inner })
+  }).finally(releaseClaim);
+}
+
+/**
  * What a database-caption sweep would do, in the publisher's own words. Kept apart from the
  * command so the preview and the applied run say the same thing about the same numbers.
  */
@@ -2260,15 +2516,15 @@ export function storageScrubPreviewText({
       : 'Every database-channel message this catalog knows about was checked and already reads cleanly, so there is nothing to send.');
   } else if (apply) {
     const minutes = Math.max(1, Math.ceil((count * spacingMs) / 60_000));
-    lines.push(`▪ One read and, if needed, one edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — roughly ${plural(minutes, 'minute')} of sending. No file is re-uploaded and no caption is invented: a message is set to the cleaned form of its own text, so a sweep is safe to run twice and the second run is cheap.`);
+    lines.push(`▪ One read and, if needed, one edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — about ${plural(minutes, 'minute')} for this page. No file is re-uploaded and no caption is invented: a message is set to the cleaned form of its own text, so a sweep is safe to run twice and the second run is cheap.`);
     if (stats?.capped) {
-      lines.push(`▪ This run is capped at ${plural(count, 'message')}; /sync db go again for the next set, or raise STORAGE_CAPTION_SWEEP_LIMIT for a longer sweep.`);
+      lines.push(`▪ That is one page. The run continues past it — a page at a time, up to ${plural(STORAGE_CAPTION_SWEEP_TOTAL, 'message')} in total (STORAGE_CAPTION_SWEEP_LIMIT, STORAGE_CAPTION_SWEEP_CARDS and STORAGE_CAPTION_SWEEP_TOTAL change the shape of a page). /sync db status asks how far it has got.`);
     }
   } else {
     if (stats?.capped) {
       // A preview that quietly stops at the cap would read like the whole archive, which is
       // how a sweep ends up looking like "it only did some of them".
-      lines.push(`▪ The list is capped at ${plural(count, 'message')} per run, so an archive is walked a set at a time (STORAGE_CAPTION_SWEEP_LIMIT).`);
+      lines.push(`▪ This preview shows one page of ${plural(count, 'message')}; /sync db go walks the whole archive a page at a time, so nothing needs running twice.`);
     }
     lines.push(`To apply it: /sync db go${single ? '' : `, or /sync db SB-0123ABCDEF for one card`}.`);
   }
@@ -5811,12 +6067,17 @@ export async function launchTelegramBot({ config, repository }) {
           : 'Nothing was remembered from an earlier run, so there is nothing to forget. /sync db lists what can be cleaned.');
         return;
       }
+      if (/^(?:status|progress|how)$/i.test(only)) {
+        await ctx.reply(storageSweepStatusText());
+        return;
+      }
       if (only && !/^(?:go|run|apply|all|preview|check)$/i.test(only)) {
         await ctx.reply([
           'Usage:',
           '/sync db — reads the caption on every database-channel file post and shows which carry an @channel prefix; it changes nothing',
-          '/sync db go — rewrites them, one edit at a time',
-          '/sync db SB-0123ABCDEF — that card’s captions now',
+          '/sync db go — cleans them all, a page at a time, and answers again when the sweep is done',
+          '/sync db SB-0123ABCDEF — that card’s posts only',
+          '/sync db status — how far the running sweep has got',
           '/sync db retry — forget which messages were refused or already clean, so they are read again',
           'Nothing is re-uploaded and no caption is invented: a message is only ever set to the cleaned form of the caption Telegram reports for it. A post this bot did not send cannot be edited by any bot, and is listed rather than retried.'
         ].join('\n'));
@@ -5847,28 +6108,30 @@ export async function launchTelegramBot({ config, repository }) {
       }
       // The publisher's own chat is the safe place to forward a message into for inspection,
       // exactly as /batch does, and the preview is deleted again per message.
-      const storageJob = queueStorageCaptionScrub({
+      const sweepQueued = queueStorageCaptionSweep({
         telegram: ctx.telegram,
-        targets: storageTargets,
+        repository,
+        config,
+        adminId: storageAdminId,
         notifyChatId: chatId(ctx),
+        // Never awaited. A sweep of a whole database outlives a Telegram request timeout, and
+        // holding the update open used to turn a command that worked into "Something went wrong
+        // while handling that request". The sweep reports here when it finishes instead.
         inspectChatId: chatId(ctx)
       });
-      if (storageTargets.length <= 3 && storageJob) {
-        const storageResult = await storageJob;
-        await ctx.reply([
-          `Database channel: ${storageAdminId ? `${storageAdminId} re-indexed captions` : `${storageCards} card${storageCards === 1 ? '' : 's'} refreshed`}.`,
-          storageScrubNote(storageResult, { blocked: listStorageCaptionBlockers().length }),
-          storageResult.blockedCards.length
-            ? `Not editable: ${storageResult.blockedCards.slice(0, 8).map((entry) => `${entry.adminId || entry.title || 'card'} → message ${entry.messageId}`).join(', ')}${storageResult.blockedCards.length > 8 ? ` · +${storageResult.blockedCards.length - 8} more` : ''}. Edit those in the channel yourself if you want the prefix gone; a bot cannot touch another sender’s post.`
-            : null
-        ].filter(Boolean).join('\n'));
-        return;
-      }
-      if (storageJob) storageJob.catch(() => {});
       await ctx.reply([
-        storageScrubPreviewText({ targets: storageTargets, cards: storageCards, blocked: listStorageCaptionBlockers().length, stats: storageStats, apply: true }),
-        '▪ Queued on the lane: this reply is not waiting for it, and a caption Telegram refuses is retried rather than dropped. You hear again only if something never gets through.'
-      ].join('\n'));
+        storageScrubPreviewText({
+          targets: storageTargets,
+          cards: storageCards,
+          blocked: listStorageCaptionBlockers().length,
+          stats: storageStats,
+          apply: true,
+          single: Boolean(storageAdminId)
+        }),
+        sweepQueued
+          ? '▪ Running on the lane: every database message this catalog knows, a page at a time — not only the first page. This reply is not waiting for it, it answers again when the sweep finishes, and /sync db status asks how far it has got. A caption Telegram refuses is retried rather than dropped.'
+          : '▪ A sweep is already running on the lane and will report here when it finishes. /sync db status shows how far it has got.'
+      ].filter(Boolean).join('\n'));
       return;
     }
     const targetAdminId = postIdsFromCommand(argument)[0] || null;
@@ -5917,7 +6180,7 @@ export async function launchTelegramBot({ config, repository }) {
     if (status.stale.length) {
       lines.push(`▪ Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => entry.key || entry.label).filter(Boolean).join(', ')}. /sync go tries again — the cards themselves are already correct.`);
     }
-    lines.push('▪ The database channel’s own captions are a separate sweep: /sync db writes the stored label back over each copied file post, on this same lane.');
+    lines.push('▪ The database channel’s own captions are a separate sweep: /sync db reads each file post’s caption from Telegram and cleans it, on this same lane.');
     if (!stale.length) {
       lines.push('Every announcement already shows what this build would publish, so there is nothing to send. A post whose copy predates the channel-tag cleaner is refreshed here once and never again.');
     } else if (apply) {
@@ -5931,7 +6194,14 @@ export async function launchTelegramBot({ config, repository }) {
           adminId: entry.content.adminId,
           notifyChatId: chatId(ctx)
         });
-        if (stale.length === 1 && job) lines.push(announcementSyncNote(await job));
+        if (stale.length === 1 && job) {
+          const { settled, result } = await settleQueuedJob(job);
+          if (settled) lines.push(announcementSyncNote(result));
+          else {
+            job.catch(() => {});
+            lines.push('▪ Queued behind the work already on the lane, so this reply is not waiting for it; the lane reports the edit when it goes through.');
+          }
+        }
         else if (job) job.catch(() => {});
         queued += 1;
       }
