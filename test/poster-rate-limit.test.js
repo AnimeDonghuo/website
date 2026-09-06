@@ -4,9 +4,12 @@ import { beforeEach, test } from 'node:test';
 import {
   PosterRateLimitError,
   clearPosterUploadCache,
+  configurePosterKeys,
   configurePosterUploadOptions,
   hostPosterImage,
   isPosterRateLimit,
+  parseImgBBKeys,
+  posterKeyPoolStatus,
   preparePosterImage,
   resetPosterUploadPace,
   uploadImageToImgBB
@@ -36,6 +39,7 @@ let waits = [];
 beforeEach(() => {
   clearPosterUploadCache();
   resetPosterUploadPace();
+  configurePosterKeys([]);
   waits = [];
   configurePosterUploadOptions({
     spacingMs: 0,
@@ -191,4 +195,73 @@ test('a poster problem that is not a rate limit is reported at once, and the bot
   assert.equal(queue.status().waiting, 0);
   assert.equal(queue.status().attached, true);
   attachPosterRetryQueue(null);
+});
+
+/* -- the key pool ------------------------------------------------------------
+ * A burst of a hundred poster uploads is one quota's worst day, so the uploads are spread across
+ * every configured ImgBB key instead of being fired at whichever key is first in the secret.
+ */
+test('the pool is read the way an operator writes it, up to twenty keys deep', () => {
+  const list = parseImgBBKeys(`key-a, key-b
+key-c ; key-a   key-b,key-4,key-5,key-6,key-7,key-8,key-9,key-10,key-11,key-12,key-13,key-14,key-15,key-16,key-17,key-18,key-19,key-20,key-21,key-22`);
+  assert.deepEqual(list.slice(0, 3), ['key-a', 'key-b', 'key-c'], 'duplicates are dropped and the written order is kept');
+  assert.equal(list.length, 20, 'twenty keys is the ceiling on the pool, never a cap on how many posters are hosted');
+  assert.deepEqual(parseImgBBKeys('  ,, \n , '), []);
+  assert.equal(configurePosterKeys(list), 20);
+  assert.equal(posterKeyPoolStatus().configured, 20);
+});
+
+test('uploads rotate across the pool so one key never sees a burst', async () => {
+  configurePosterKeys(['key-a', 'key-b', 'key-c']);
+  const used = [];
+  globalThis.fetch = async (url, options) => {
+    used.push(options.body.get('key'));
+    return accepted(`poster-${used.length}`);
+  };
+  for (const name of ['first', 'second', 'third', 'fourth', 'fifth']) {
+    // No apiKey is passed: with a pool configured, that is the point of the pool.
+    await uploadImageToImgBB({ buffer: Buffer.from(name), title: 'Minions' });
+  }
+  assert.deepEqual(used, ['key-a', 'key-b', 'key-c', 'key-a', 'key-b'], 'each quota carries one upload per window instead of five');
+  assert.equal(posterKeyPoolStatus().cooling, 0, 'a pool that is merely busy is not a pool in trouble');
+});
+
+test('a key that refuses is rested while the rest of the pool keeps hosting', async () => {
+  configurePosterKeys(['key-a', 'key-b', 'key-c']);
+  const used = [];
+  globalThis.fetch = async (url, options) => {
+    const key = options.body.get('key');
+    used.push(key);
+    if (key === 'key-a') {
+      return reply({ error: { message: 'Rate limit reached.' } }, { ok: false, status: 429, headers: { 'retry-after': '30' } });
+    }
+    return accepted('hosted');
+  };
+
+  const hosted = await uploadImageToImgBB({ buffer: Buffer.from('the minions poster'), title: 'Minions' });
+  assert.equal(hosted.url, 'https://i.ibb.co/y/hosted.png', 'the card is published with hosted artwork because another key took it');
+  assert.equal(used.length >= 2, true);
+  assert.equal(used[0], 'key-a');
+  assert.equal(used.at(-1), 'key-b', 'the retry went to a different key rather than back at the one that just refused');
+  assert.equal(posterKeyPoolStatus().cooling, 1, 'and the refusing key is now rested, not retried by every card in the range');
+
+  used.length = 0;
+  await uploadImageToImgBB({ buffer: Buffer.from('the gold poster'), title: 'Gold' });
+  assert.equal(used.includes('key-a'), false, 'the next card never offers the cooling key its upload');
+});
+
+test('when every key is busy the poster is deferred, not waited out for an hour', async () => {
+  configurePosterKeys(['key-a', 'key-b']);
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return reply({ error: { message: 'Rate limit reached.' } }, { ok: false, status: 429, headers: { 'retry-after': '3600' } });
+  };
+  await assert.rejects(
+    () => uploadImageToImgBB({ buffer: Buffer.from('whole pool busy'), title: 'Despicable Me' }),
+    (error) => isPosterRateLimit(error) && error.retryAfterMs >= 3_600_000,
+    'the caller publishes the card and hands the mirror to the retry queue'
+  );
+  assert.equal(calls, 2, 'both keys were tried once each, and then the publish was let go instead of parked');
+  assert.equal(posterKeyPoolStatus().cooling, 2);
 });

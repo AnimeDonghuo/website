@@ -1144,6 +1144,87 @@ function parseBatchArgument(value) {
   };
 }
 
+/**
+ * Words a release group writes around a title, and words that describe the file rather than the
+ * work. None of them ever appear in a real catalog title, which is what makes them safe to drop:
+ * the uploader's own wording is kept unless a token is only packaging.
+ */
+const RELEASE_TITLE_NOISE = new Set([
+  'mkv', 'mp4', 'avi', 'webm', 'mov', 'm4v', 'ts', 'm2ts', 'm4a', 'mp3', 'flac', 'srt', 'ass',
+  'x264', 'x265', 'h264', 'h265', 'hevc', 'avc', 'av1', 'vp9', 'aac', 'ac3', 'eac3', 'dts', 'truehd',
+  'atmos', 'hdr', 'hdr10', 'sdr', '10bit', '8bit', 'remux', 'proper', 'repack', 'uncut', 'extended',
+  'unrated', 'dual', 'multi', 'audio', 'subs', 'sub', 'subbed', 'dub', 'dubbed', 'engsub', 'hd',
+  'fhd', 'uhd', '4k', '8k', 'dvdscr', 'webdl', 'webrip', 'web', 'bluray', 'bdrip', 'brrip', 'dvdrip',
+  'hdcam', 'cam', 'ts', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'ep', 'eps',
+  // Audio labels are packaging on a file, and `cleanMediaName` already drops them for the same
+  // reason; listing them here keeps a direct call to the tidy from disagreeing with the pipeline.
+  'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'bangla', 'marathi',
+  'punjabi', 'gujarati', 'urdu', 'japanese', 'korean', 'chinese', 'mandarin', 'cantonese',
+  'indonesian', 'thai', 'vietnamese', 'spanish', 'french', 'german', 'portuguese', 'arabic', 'russian'
+]);
+const RELEASE_TITLE_YEAR = /^(?:19|20)\d{2}$/;
+// A group tag is welded to its hyphen ("-KyoGo"), or it is the one short word after a spaced
+// separator at the very end ("Minions - KyoGo"). Anything longer or numbered is read as part of the
+// title, because "K.G.F – Chapter 2" and "Baahubali – The Beginning" really are the title.
+const TRAILING_GROUP_TAG = /\s[-–—|~]\s*[A-Za-z][A-Za-z0-9]{1,11}$/;
+const HYPHEN_WELDED_TAG = /\s[-–—]\S+/g;
+
+/**
+ * Reduce a caption or filename to the release title inside it.
+ *
+ * A range of files is split into one card per release, so a caption carrying "-KyoGo mkv 🔊 #" next
+ * to a caption carrying only "Minions" used to make two cards, two announcements, and two ImgBB
+ * uploads for one film — and a whole mixed range multiplied that. Cosmetic packaging is what is
+ * removed here; the words are matched against a packaging vocabulary, never guessed at.
+ */
+export function tidyReleaseTitle(value) {
+  const raw = cleanText(value, 180).replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  const unwrapped = raw
+    .replace(/\[[^\]]{0,120}\]/g, ' ')
+    .replace(/\{[^}]{0,80}\}/g, ' ')
+    .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts|m4a|mp3|flac)$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const dehyphenated = unwrapped.replace(HYPHEN_WELDED_TAG, ' ').replace(/\s+/g, ' ').trim();
+  const withoutTag = dehyphenated.replace(TRAILING_GROUP_TAG, '').trim();
+  const source = withoutTag.length >= 3 ? withoutTag : dehyphenated;
+  const kept = [];
+  for (const [index, token] of source.split(/\s+/).entries()) {
+    const core = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+    // An emoji, a lone "#", or a bare separator says nothing about the release.
+    if (!core) continue;
+    const lowered = core.toLowerCase();
+    if (RELEASE_TITLE_NOISE.has(lowered)) continue;
+    if (/^\d{2,4}[pPi]$/.test(lowered)) continue;
+    // A year is metadata, and `cleanMediaName` has already taken most of them. One welded to a
+    // colon or leading the title is part of the name ("2001: A Space Odyssey"), so it stays.
+    if (RELEASE_TITLE_YEAR.test(lowered) && index > 0 && !/[:.]$/.test(token)) continue;
+    if (kept.length && kept[kept.length - 1].toLowerCase().replace(/[^a-z0-9]/g, '') === lowered.replace(/[^a-z0-9]/g, '')) continue;
+    // A word is kept as written, with only the wrapping that a paste adds taken off. An inner "!"
+    // (Scooby-Doo!), a colon after a year (2001: A Space Odyssey) and a hyphen inside a name are
+    // the title, not packaging, so they are never touched.
+    kept.push(token.replace(/^[#@/>*+\-–—\[{("'`]+|[)\]},;|\\_]+$/g, '').trim());
+  }
+  const tidied = cleanText(kept.join(' ').replace(/\s{2,}/g, ' ').trim(), 180);
+  // Never let the tidy eat a title whole: a short, unusual name beats an empty string.
+  return tidied.length >= 2 ? tidied : raw;
+}
+
+/** A card needs a name. "🔊 #", "mkv", and "2015" are not one, so that file follows the one above it. */
+export function isPlausibleReleaseTitle(value) {
+  const text = String(value || '').trim();
+  if (text.length < 3) return false;
+  const words = text.split(/\s+/).filter((token) => /[A-Za-zÀ-ÿ\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\uAC00-\uD7AF]{2,}/.test(token));
+  if (!words.length) return false;
+  if (/^(?:document|video|file|upload|movie|film)(?:\s*\d+)?$/i.test(text)) return false;
+  return words.some((word) => {
+    const core = word.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+    // One real word, and not a packaging word dressed up as one: "mkv" and "1080p" are not names.
+    return core.length >= 2 && !RELEASE_TITLE_NOISE.has(core);
+  });
+}
+
 export function inferBatchTitle(files = []) {
   for (const file of files) {
     // A caption may contain only an episode label while the filename carries
@@ -1152,6 +1233,13 @@ export function inferBatchTitle(files = []) {
     for (const value of [file?.displayName, file?.name]) {
       const source = cleanText(value, 180);
       if (!source) continue;
+
+      // A title that opens with a year and a colon is the work's name, not a release date, so it is
+      // tidied directly rather than through cleanMediaName (which removes years on purpose).
+      if (/^(?:19|20)\d{2}\s*:\s*\S/.test(source)) {
+        const named = tidyReleaseTitle(source);
+        if (isPlausibleReleaseTitle(named)) return named;
+      }
 
       const candidate = cleanMediaName(source)
         .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:ISODE)?)?\s*)?\d{1,3})?\b/gi, ' ')
@@ -1167,9 +1255,10 @@ export function inferBatchTitle(files = []) {
         .replace(/^[\s\-–—|:/.]+|[\s\-–—|:/.]+$/g, '')
         .trim();
 
-      if (candidate.length >= 2 && /[a-z]/i.test(candidate) && !/^(?:document|video|file|upload)(?:\s+\d+)?$/i.test(candidate)) {
-        return cleanText(candidate, 180);
-      }
+      // Tidied first, and only then judged: a caption that is nothing but packaging must not become
+      // a card of its own, and a file whose title survives the tidy is the release it names.
+      const title = tidyReleaseTitle(candidate);
+      if (isPlausibleReleaseTitle(title)) return title;
     }
   }
   return '';
@@ -2967,8 +3056,10 @@ export function withSeasonLabel(value, season, { replace = false } = {}) {
  */
 export function groupFilesByReleaseTitle(files = []) {
   const entries = (Array.isArray(files) ? files : []).map((file) => {
+    // Keyed on the tidied title, so one film captioned three ways by one uploader is one card, not
+    // three cards with three announcements and three poster uploads behind them.
     const title = cleanText(inferBatchTitle([file]), 180);
-    return { file, title, key: title ? slugify(title) : '' };
+    return { file, title, key: title ? slugify(title).replace(/[^a-z0-9]/g, '') : '' };
   });
   const groups = new Map();
   let previousKey = null;
@@ -2979,7 +3070,10 @@ export function groupFilesByReleaseTitle(files = []) {
       previousKey = key;
       continue;
     }
+    // The group keeps the shortest title that tidied to this key: "Minions" reads better on a card
+    // than the caption it merged in from, "Minions DUAL -KyoGo mkv 🔊 #".
     const current = groups.get(key) || { title: entry.title, files: [] };
+    if (entry.title && entry.title.length < current.title.length) current.title = entry.title;
     current.files.push(entry.file);
     groups.set(key, current);
     previousKey = key;

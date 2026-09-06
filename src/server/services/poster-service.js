@@ -65,8 +65,97 @@ export function configurePosterUploadOptions(next = {}) {
   return { ...posterUploadOptions, wait: undefined, now: undefined };
 }
 
-// Same bytes, one upload. A mixed release split into several cards, or a re-run after a failure,
-// used to send the identical poster to ImgBB again for no reason at all.
+/* -- the key pool -------------------------------------------------------------
+ * One ImgBB key is one quota, and a bulk publish is a burst against it. `IMGBB_API_KEYS` accepts up
+ * to 20 keys (comma, space, or newline separated; `IMGBB_API_KEY`, `IMGBB_API_KEY_2` … work too for
+ * hosts that prefer one secret per line). Uploads then rotate across the pool: each key is paced on
+ * its own clock, a key that answers 429 is cooled down and skipped while the rest keep working, and
+ * an upload is never fired back at the key that just refused.
+ */
+const IMGBB_KEY_POOL_LIMIT = 20;
+const IMGBB_KEY_COOLDOWN_MS = boundedIntegerEnv('IMGBB_KEY_COOLDOWN_MS', 60_000, 5_000, 30 * 60_000);
+
+export function parseImgBBKeys(value) {
+  const list = (Array.isArray(value) ? value : String(value ?? '').split(/[\s,;]+/))
+    .map((entry) => String(entry ?? '').trim())
+    .filter(Boolean);
+  return [...new Set(list)].slice(0, IMGBB_KEY_POOL_LIMIT);
+}
+
+const posterKeyPool = { list: null, cursor: 0, state: new Map() };
+
+function resolvePosterKeys() {
+  if (Array.isArray(posterKeyPool.list)) return posterKeyPool.list;
+  const sources = [];
+  if (process.env.IMGBB_API_KEY) sources.push(process.env.IMGBB_API_KEY);
+  if (process.env.IMGBB_API_KEYS) sources.push(process.env.IMGBB_API_KEYS);
+  for (let index = 1; index < IMGBB_KEY_POOL_LIMIT; index += 1) {
+    const value = process.env[`IMGBB_API_KEY_${index + 1}`];
+    if (value) sources.push(value);
+  }
+  posterKeyPool.list = parseImgBBKeys(sources.join(','));
+  return posterKeyPool.list;
+}
+
+function posterKeyState(key) {
+  let state = posterKeyPool.state.get(key);
+  if (!state) {
+    state = { lastUsedAt: 0, cooldownUntil: 0, refusals: 0 };
+    posterKeyPool.state.set(key, state);
+  }
+  return state;
+}
+
+/** Replace the pool: null re-reads the environment, an array pins it (a test seam, or a caller with its own list). */
+export function configurePosterKeys(keys) {
+  posterKeyPool.list = keys === null || keys === undefined ? null : parseImgBBKeys(keys);
+  posterKeyPool.cursor = 0;
+  posterKeyPool.state.clear();
+  return posterKeyPool.list ? posterKeyPool.list.length : resolvePosterKeys().length;
+}
+
+export function posterKeyPoolStatus() {
+  const list = resolvePosterKeys();
+  const at = posterUploadOptions.now();
+  const cooling = list.filter((key) => posterKeyState(key).cooldownUntil > at);
+  const soonest = list.length ? Math.min(...list.map((key) => posterKeyState(key).cooldownUntil)) : 0;
+  return {
+    configured: list.length,
+    limit: IMGBB_KEY_POOL_LIMIT,
+    cooling: cooling.length,
+    free: list.length - cooling.length,
+    waitingMs: cooling.length ? Math.max(0, soonest - at) : 0,
+    cooldownMs: IMGBB_KEY_COOLDOWN_MS,
+    spacingMs: posterUploadOptions.spacingMs
+  };
+}
+
+function pickPosterKey(keys, at) {
+  if (!keys.length) return null;
+  const rotation = ((posterKeyPool.cursor % keys.length) + keys.length) % keys.length;
+  for (let offset = 0; offset < keys.length; offset += 1) {
+    const index = (rotation + offset) % keys.length;
+    if (posterKeyState(keys[index]).cooldownUntil <= at) return { key: keys[index], index };
+  }
+  return null;
+}
+
+function coolPosterKey(key, ms) {
+  const state = posterKeyState(key);
+  state.refusals += 1;
+  // A key that keeps refusing rests proportionally longer, so a tired pool is walked around rather
+  // than hammered at the same speed by the next card.
+  const coolFor = Math.max(1_000, Number(ms) || 0) * Math.min(6, state.refusals);
+  state.cooldownUntil = Math.max(state.cooldownUntil, posterUploadOptions.now() + coolFor);
+  // The rotation is advanced by the caller, which knows whether this upload succeeded: a key is
+  // never stepped past twice for one refusal.
+  return coolFor;
+}
+
+/**
+ * Same bytes, one upload. A mixed release split into several cards, or a re-run after a failure,
+ * used to send the identical poster to ImgBB again for no reason at all.
+ */
 const posterUploadCache = new Map();
 function cachePosterUpload(key, value) {
   if (!key) return;
@@ -78,8 +167,12 @@ export function clearPosterUploadCache() {
   posterUploadCache.clear();
   return size;
 }
-let lastPosterUploadAt = 0;
-export function resetPosterUploadPace() { lastPosterUploadAt = 0; }
+
+/** Forget every key's pacing and cooldown, and start the rotation from the first key again. */
+export function resetPosterUploadPace() {
+  posterKeyPool.state.clear();
+  posterKeyPool.cursor = 0;
+}
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -489,10 +582,57 @@ export async function preparePosterImage({ sourceUrl = null, sourceIsManual = fa
   };
 }
 
-export async function uploadImageToImgBB({ buffer, title, apiKey } = {}) {
-  if (!apiKey) {
-    throw new PosterHostingError('IMGBB_API_KEY is not configured. Add it as a server-side Koyeb secret before publishing.');
+/** One upload with one key. A limit is an outcome, any other refusal is an error. */
+async function postPosterToImgBB({ buffer, title, key }) {
+  const form = new FormData();
+  form.set('key', key);
+  form.set('name', `${slugify(title).slice(0, 56)}-poster`);
+  form.set('image', buffer.toString('base64'));
+
+  let response;
+  try {
+    response = await fetch(IMGBB_UPLOAD_URL, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(30_000)
+    });
+  } catch (error) {
+    throw new PosterHostingError('ImgBB could not be reached. Please try publishing again.', { cause: error });
   }
+
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+
+  const detail = String(body?.error?.message || '');
+  if (response.ok && body?.success && body?.data?.url) {
+    return { ok: true, url: body.data.display_url || body.data.url, providerId: body.data.id || null };
+  }
+  if (!(response.status === 429 || isPosterRateLimit({ message: detail }))) {
+    throw new PosterHostingError(detail || 'ImgBB did not accept the poster.');
+  }
+  const retryAfterSeconds = Number(response.headers?.get?.('retry-after')) || Number(body?.error?.retry_after) || 0;
+  return { ok: false, limited: true, detail, retryAfterMs: retryAfterSeconds > 0 ? retryAfterSeconds * 1_000 : 0 };
+}
+
+/**
+ * Host one image, spread across the configured ImgBB keys.
+ *
+ * `attempts` is how many uploads one poster may spend — each one goes to the next free key, so a
+ * pool turns one key's throttle into a round-robin instead of a stalled publish. When every key is
+ * cooling, a short remaining wait is taken inside this call; anything longer is reported as a rate
+ * limit, which is what lets the caller publish the card and re-host the artwork later.
+ */
+export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys = null } = {}) {
+  const configured = Array.isArray(apiKeys) && apiKeys.length ? parseImgBBKeys(apiKeys) : [];
+  const keys = configured.length ? configured : (apiKey ? [apiKey] : resolvePosterKeys());
+  if (!keys.length) {
+    throw new PosterHostingError('IMGBB_API_KEY is not configured. Add it as a server-side Koyeb secret before publishing. Up to 20 keys can be pooled with IMGBB_API_KEYS so one quota never throttles a bulk publish.');
+  }
+  if (!buffer) throw new PosterHostingError('There was no poster image to upload.');
 
   const cacheKey = createHash('sha1').update(buffer).digest('hex');
   const cached = posterUploadCache.get(cacheKey);
@@ -503,61 +643,58 @@ export async function uploadImageToImgBB({ buffer, title, apiKey } = {}) {
   }
 
   const { spacingMs, attempts, backoffMs, wait, now } = posterUploadOptions;
-  const form = new FormData();
-  form.set('key', apiKey);
-  form.set('name', `${slugify(title).slice(0, 56)}-poster`);
-  form.set('image', buffer.toString('base64'));
-
   let lastRateLimit = null;
+  let restsTaken = 0;
   for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
-    // The gap is applied before every attempt, including the ones after a wait: the point of
-    // retrying a limit is not to hit the host again at the same speed.
-    if (spacingMs > 0 && lastPosterUploadAt) {
-      const since = now() - lastPosterUploadAt;
+    const picked = pickPosterKey(keys, now());
+    if (!picked) {
+      // Resting is not one of the uploads the publisher is waiting on, so it does not consume an
+      // attempt — it is capped on its own, and only ever for the rest the host actually asked for.
+      const soonest = Math.min(...keys.map((entry) => posterKeyState(entry).cooldownUntil));
+      const restMs = Math.max(0, soonest - now());
+      // Every key is busy. Waiting out a short Retry-After is cheap; parking a publish for the rest
+      // of the hour is not what the retry queue is for.
+      const pooled = new PosterRateLimitError('Every configured ImgBB key is rate limited.', { retryAfterMs: restMs });
+      lastRateLimit = lastRateLimit || pooled;
+      if (restMs > IMGBB_KEY_COOLDOWN_MS || restsTaken >= 2) break;
+      // Waiting the seconds the host asked for is what makes a cooled key usable again, so the rest
+      // of this call may use it: the pool is not punished for a wait that already happened.
+      const resting = keys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
+      restsTaken += 1;
+      await wait(restMs);
+      for (const entry of resting) posterKeyState(entry).cooldownUntil = 0;
+      attempt -= 1;
+      continue;
+    }
+    const state = posterKeyState(picked.key);
+    if (spacingMs > 0 && state.lastUsedAt) {
+      const since = now() - state.lastUsedAt;
       if (since < spacingMs) await wait(spacingMs - since);
     }
-    lastPosterUploadAt = now();
+    // The gap is measured per key, so ten keys carry ten uploads per window without any single
+    // quota seeing more than one image per spacing interval.
+    state.lastUsedAt = now();
 
-    let response;
+    let outcome = null;
     try {
-      response = await fetch(IMGBB_UPLOAD_URL, {
-        method: 'POST',
-        body: form,
-        signal: AbortSignal.timeout(30_000)
-      });
+      outcome = await postPosterToImgBB({ buffer, title, key: picked.key });
     } catch (error) {
-      throw new PosterHostingError('ImgBB could not be reached. Please try publishing again.', { cause: error });
+      posterKeyPool.cursor = picked.index + 1;
+      if (!isPosterRateLimit(error)) throw error;
+      coolPosterKey(picked.key, backoffMs * attempt);
+      lastRateLimit = new PosterRateLimitError(error.message, { retryAfterMs: backoffMs * attempt });
+      continue;
     }
 
-    let body = null;
-    try {
-      body = await response.json();
-    } catch {
-      body = null;
+    posterKeyPool.cursor = picked.index + 1;
+    if (outcome.ok) {
+      const hosted = { url: outcome.url, providerId: outcome.providerId };
+      cachePosterUpload(cacheKey, hosted);
+      return hosted;
     }
-
-    const detail = String(body?.error?.message || '');
-    const limited = response.status === 429 || isPosterRateLimit({ message: detail });
-    if (!response.ok || !body?.success || !body?.data?.url) {
-      if (limited) {
-        const retryAfterSeconds = Number(response.headers?.get?.('retry-after')) || Number(body?.error?.retry_after) || 0;
-        const retryAfterMs = retryAfterSeconds > 0 ? retryAfterSeconds * 1_000 : backoffMs * attempt;
-        lastRateLimit = new PosterRateLimitError(detail || 'ImgBB is rate limiting this server.', { retryAfterMs });
-        if (attempt < Math.max(1, attempts)) {
-          await wait(retryAfterMs);
-          continue;
-        }
-        throw lastRateLimit;
-      }
-      throw new PosterHostingError(detail || 'ImgBB did not accept the poster.');
-    }
-
-    const hosted = {
-      url: body.data.display_url || body.data.url,
-      providerId: body.data.id || null
-    };
-    cachePosterUpload(cacheKey, hosted);
-    return hosted;
+    const coolMs = outcome.retryAfterMs || Math.min(IMGBB_KEY_COOLDOWN_MS, backoffMs * attempt);
+    coolPosterKey(picked.key, coolMs);
+    lastRateLimit = new PosterRateLimitError(outcome.detail || 'ImgBB is rate limiting this server.', { retryAfterMs: coolMs });
   }
 
   throw lastRateLimit || new PosterHostingError('ImgBB did not accept the poster.');
@@ -572,7 +709,8 @@ export async function hostPosterImage({ image, title, config } = {}) {
   const hosted = await uploadImageToImgBB({
     buffer: image.buffer,
     title,
-    apiKey: config?.imgbbApiKey
+    apiKey: config?.imgbbApiKey,
+    apiKeys: config?.imgbbApiKeys
   });
   return {
     ...hosted,

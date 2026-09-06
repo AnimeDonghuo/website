@@ -22,6 +22,30 @@ function asBoolean(value, fallback = true) {
   return !/^(?:0|false|no|off)$/i.test(String(value).trim());
 }
 
+/**
+ * The ImgBB keys to rotate uploads across. One key is one quota, and a bulk publish is a burst
+ * against it, so `IMGBB_API_KEYS` (up to 20) exists next to `IMGBB_API_KEY` for publishers who hit
+ * the limit while releasing a whole range. `IMGBB_API_KEY_2` … work too for one-secret-per-line
+ * hosts. The pool is read once here so the poster service never touches the environment itself.
+ */
+function imgbbKeyPool(env) {
+  const sources = [];
+  // The primary key leads so a single-key deployment behaves exactly as it always did, and the
+  // rotation starts from the key the operator sees in their dashboard.
+  if (env.IMGBB_API_KEY) sources.push(env.IMGBB_API_KEY);
+  if (env.IMGBB_API_KEYS) sources.push(env.IMGBB_API_KEYS);
+  for (let index = 1; index < 20; index += 1) {
+    const value = env[`IMGBB_API_KEY_${index + 1}`];
+    if (value) sources.push(value);
+  }
+  return [...new Set(
+    String(sources.join(','))
+      .split(/[\s,;]+/)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+  )].slice(0, 20);
+}
+
 function csvNumbers(value) {
   return new Set(
     (value || '')
@@ -95,6 +119,7 @@ export function loadConfig(env = process.env) {
     mongodbUri: (env.MONGODB_URI || '').trim(),
     mongodbDb: (env.MONGODB_DB || 'sorabox').trim(),
     imgbbApiKey: (env.IMGBB_API_KEY || '').trim(),
+    imgbbApiKeys: imgbbKeyPool(env),
     tmdbApiKey: (env.TMDB_API_KEY || '').trim(),
     tmdbReadAccessToken: (env.TMDB_READ_ACCESS_TOKEN || '').trim(),
     omdbApiKey: (env.OMDB_API_KEY || '').trim(),

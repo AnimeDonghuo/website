@@ -61,3 +61,23 @@ test('quoted hostnames and Koyeb-style site URL aliases normalize into an announ
   assert.equal(getDeliveryRedirectPath('aB-cD_ef', 12), '/deliver/aB-cD_ef/file/12');
   assert.equal(getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 0), null);
 });
+
+test('ImgBB keys are pooled in the order the operator wrote them', () => {
+  const single = loadConfig({ ADMIN_LOGIN_CODE: 'x', IMGBB_API_KEY: 'only' });
+  assert.deepEqual(single.imgbbApiKeys, ['only'], 'one key behaves exactly as it always did');
+
+  const pooled = loadConfig({
+    ADMIN_LOGIN_CODE: 'x',
+    IMGBB_API_KEY: 'primary',
+    IMGBB_API_KEYS: 'a,b c\nd , a',
+    IMGBB_API_KEY_3: 'third'
+  });
+  assert.deepEqual(pooled.imgbbApiKeys, ['primary', 'a', 'b', 'c', 'd', 'third'], 'duplicated, and every spelling of the secret is read');
+  assert.equal(pooled.imgbbApiKey, 'primary', 'the primary key stays the one /poster names in its errors');
+
+  const many = loadConfig({ ADMIN_LOGIN_CODE: 'x', IMGBB_API_KEYS: Array.from({ length: 40 }, (unused, index) => `k${index}`).join(',') });
+  assert.equal(many.imgbbApiKeys.length, 20, 'twenty keys is the ceiling on the pool, never a cap on how many posters a publish hosts');
+
+  const none = loadConfig({ ADMIN_LOGIN_CODE: 'x' });
+  assert.deepEqual(none.imgbbApiKeys, []);
+});
