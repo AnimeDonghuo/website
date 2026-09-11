@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanDeliveryFileName, cleanMediaName, extractEpisodeRange, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
+import { cleanDeliveryFileName, cleanMediaName, extractEpisodeRange, stripPromotionalJunk, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -222,4 +222,36 @@ test('a combined-range pack is indexed as the episodes it holds, in every wordin
   assert.equal(extractEpisodeRange('The.Simpsons.S01.1080p.WEB-DL.mkv'), null);
   assert.equal(extractEpisodeRange('Some.Movie.2024.1080p.mkv'), null);
   assert.equal(extractEpisodeRange('Season 2 Pack 08 complete.mkv')?.start ?? 8, 8, 'a file that does say 08 is still Episode 08');
+});
+
+test('a channel advertising itself inside a file name does not become part of the title', () => {
+  // The handle was already stripped; what was left behind was the lead-in that carried it, so every
+  // one of these used to reach a card as a messy name (and a messy name means a second Post ID).
+  const cases = [
+    ['❤️ Join ~ [ ]King of Prison (2020) 720p HDRip x264 ESubs [Dual Audio].mkv', 'King of Prison (2020) 720p HDRip x264 ESubs [Dual Audio].mkv'],
+    ['❤️ Join ~ [@twg] King of Prison (2020) 720p.mkv', 'King of Prison (2020) 720p.mkv'],
+    ['🔥 For More Join @TheWorldGroup — King of Prison S01E01.mkv', 'King of Prison S01E01.mkv'],
+    ['Subscribe to @chan | Real Show 2024.mkv', 'Real Show 2024.mkv'],
+    ['Show.Name.1080p ❤️ Join @chan', 'Show.Name.1080p'],
+    ['[ @twg ] Demon Slayer S01E01 [1080p].mkv', 'Demon Slayer S01E01 [1080p].mkv'],
+    ['❤ Join Our Sticky Love S01 [Epi 01-06] 480p HEVC HDRip', 'Join Our Sticky Love S01 [Epi 01-06] 480p HEVC HDRip']
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(stripTelegramAttribution(input), expected, input);
+  }
+
+  // A caption that is nothing but the advertisement names no release at all, which is the answer the
+  // batch grouping wants: the file then follows the release above it instead of becoming a card.
+  assert.equal(stripTelegramAttribution('❤️ Join ~ [@twg]'), '');
+  assert.equal(cleanMediaName('❤️ Join ~ [ ]King of Prison (2020) 720p HDRip x264 ESubs [Dual Audio].mkv'), 'King of Prison');
+
+  // And a real title is never mistaken for a lead-in: without a separator or an emptied bracket to
+  // mark it as junk, the words stay.
+  for (const title of ['Join the Circus (2019).mkv', 'Follow the Money (2023) S01E02.mkv', 'JOIN or DIE 2020.mkv', 'Support Group (2021).mkv']) {
+    assert.equal(stripPromotionalJunk(title), title, title);
+  }
+
+  // The scrub must not cost an episode its number, which is read from the same cleaned text.
+  const range = extractEpisodeRange('❤️ Join ~ [ ]Our Sticky Love S01 [Epi 01-06] 480p.mkv');
+  assert.deepEqual([range?.start, range?.end], [1, 6]);
 });

@@ -1082,7 +1082,7 @@ export async function handlePostIdLookupMessage(ctx, repository, config = null) 
 }
 
 /** Validate, mirror, and store one replacement poster for a published card. */
-export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config }) {
+export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config, lookupTitle = null }) {
   const existing = await repository.findContentByAdminId(adminId);
   if (!existing) {
     await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
@@ -1131,9 +1131,10 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
     : null;
   // Choosing the artwork by hand is also the moment a card gets the rest of its identity: the same
   // provider lookup that found this poster knows its year, genres and synopsis, and a release
-  // published from a filename usually has none of them.
+  // published from a filename usually has none of them. A poster picked from a search is looked up
+  // under the name it was found as, which is the release whose details belong on the card.
   const detailsJob = updated
-    ? queuePosterRematchForTitle({ repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram })
+    ? queuePosterRematchForTitle({ repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram, lookupTitle })
     : null;
   detailsJob?.catch(() => {});
   return { existing, posterResult, updated, announcementSync };
@@ -1244,7 +1245,7 @@ export async function handlePosterAction(ctx, repository, config, action) {
       return true;
     }
     try {
-      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config });
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config, lookupTitle: candidate.title });
       if (!result) return true;
       await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
       await ctx.reply(result.updated
@@ -1396,7 +1397,11 @@ const HYPHEN_WELDED_TAG = /\s[-–—]\S+/g;
  * removed here; the words are matched against a packaging vocabulary, never guessed at.
  */
 export function tidyReleaseTitle(value) {
-  const raw = cleanText(value, 180).replace(/\s+/g, ' ').trim();
+  // A pasted caption usually arrives with the upload channel's advertising still welded to it
+  // (`❤️ Join ~ [ @twg]King of Prison (2020) 720p HDRip.mkv`), and a title beginning `Join` is also
+  // how two cards for one release end up looking like different releases to the merge guard. The
+  // same scrub the file names go through runs first, so a typed title and an inferred one agree.
+  const raw = cleanText(stripTelegramAttribution(value, 320), 180).replace(/\s+/g, ' ').trim();
   if (!raw) return '';
   const unwrapped = raw
     .replace(/\[[^\]]{0,120}\]/g, ' ')
@@ -2668,7 +2673,7 @@ export async function sweepAnnouncedCards({ repository, config = null, adminId =
  * Telegram's own waits, and never awaited by the command that queued it — and a poster ImgBB will
  * not take right now goes to the poster retry queue rather than being lost.
  */
-export function queuePosterRematchForTitle({ ctx = null, repository, config = null, content, adminId = null, telegram = null, notify = null, find = findMetadata, prepare = preparePosterImage, host = hostPosterImage } = {}) {
+export function queuePosterRematchForTitle({ ctx = null, repository, config = null, content, adminId = null, telegram = null, notify = null, lookupTitle = null, find = findMetadata, prepare = preparePosterImage, host = hostPosterImage } = {}) {
   const target = adminId || content?.adminId || null;
   if (!target || !content || typeof repository?.updateContentByAdminId !== 'function') return null;
   const poster = content.poster || {};
@@ -2684,6 +2689,11 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
     || !(Array.isArray(content.genres) && content.genres.length);
   if (!wantsMatch && !needsDetails) return null;
   const title = cleanText(content.title, 180);
+  // The name to ask the providers about. A poster picked out of a search that used a different
+  // spelling, or a title corrected in the same breath, is the release whose synopsis, year, and
+  // genres belong on this card — while `poster.title` below keeps the card's own name, so a
+  // hand-picked poster is never treated as stale the next time this runs.
+  const query = cleanText(lookupTitle, 180) || title;
   const tell = notify || (ctx ? (chat, text) => ctx.reply(text).catch(() => {}) : null);
   return enqueueAnnouncementJob({
     key: `poster:${target}`,
@@ -2694,7 +2704,7 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
       const outcome = { updated: 0, unchanged: 0, failed: 0, skipped: 0, channels: 0, reason: null };
       let metadata = null;
       try {
-        metadata = await find(title, content.category, config);
+        metadata = await find(query, content.category, config);
       } catch (error) {
         outcome.reason = automationDiagnostic(error);
         return outcome;

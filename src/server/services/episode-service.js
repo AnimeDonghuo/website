@@ -212,8 +212,51 @@ export function detectUploadSeason({ caption, filename } = {}) {
 // Captions are checked first because uploaders often put the clean title and
 // episode range there. Telegram handles and t.me links are removed before any
 // parsing, so @channel names never become part of a release/episode label.
+// A channel advertises itself inside the file name, on both ends: `❤️ Join ~ [ @twg]King of Prison
+// (2020) 720p.mkv`, `🔥 For More Join @chan — Name`, `Name | Subscribe to us`. Removing the @handle
+// alone leaves the lead-in and an empty bracket behind, which is how a card ends up titled
+// `❤️ Join King of Prison` and a release looks like a different one to the merge guard. So the phrase
+// that carried the handle goes with it — and only where it is demonstrably a lead-in or a trailer: it
+// has to be closed by a real separator, an emptied bracket, or the end of the text. A title that
+// merely begins with such a word (`Join the Circus`, `Follow the Money`) survives, because nothing
+// separates the word from the rest of the name. Every class below is spelled out rather than written
+// inline, because a template literal would eat the backslash of `\s` and quietly become `s`.
+const PROMO_PHRASE = String.raw`(?:join|joins|subscribes?|subscription|follows?|supports?|shares?|requests?|contacts?|admin|click|visit|press)(?:\s+(?:us|me|here|now|to|on|at|for|more|daily|our|my|the|official|channel|group|community|page|updates?))*|for\s+(?:more|updates?|requests?)(?:\s+(?:join|subscribe|contact|visit|daily|updates?|to|here|now))*|our\s+(?:official\s+)?(?:channel|group)`;
+/** Emoji and the padding a caption is wrapped in. */
+const PROMO_DECOR = String.raw`[\p{Extended_Pictographic}\p{Emoji_Component}️‍\s~\-\u2013\u2014=|#>*·]`;
+/** Punctuation nobody types in front of a real title, which is what marks a lead-in as junk. */
+const PROMO_HARD_SEP = String.raw`[~\-\u2013\u2014=|#>*·]`;
+const PROMO_GAP = String.raw`[\s~\-\u2013\u2014=|#>*·]`;
+/** A bracket the handle removal emptied, or a two-or-three-letter fansub tag: `[ ]`, `[GT]`. */
+const PROMO_EMPTY_BRACKET = String.raw`(?:\[\s*\]|\{\s*\}|\[[^\]\p{L}]{1,3}\]|\[[^\]]{1,3}\])`;
+/** A word boundary without the backslash: a promo phrase has to end where a letter or digit starts. */
+const PROMO_NOT_WORD = String.raw`(?![\p{L}\p{N}])`;
+
+const PROMO_PATTERNS = [
+  // an emptied or tag bracket, with its separators, at either edge of the text
+  new RegExp(String.raw`^(?:${PROMO_GAP}*(?:${PROMO_EMPTY_BRACKET})${PROMO_GAP}*)+`, 'iu'),
+  // the decorative run that sits in front of a promo phrase
+  new RegExp(String.raw`^${PROMO_DECOR}*(?:${PROMO_GAP})*(?=(?:${PROMO_PHRASE})${PROMO_NOT_WORD})`, 'iu'),
+  // the phrase is all there is, or it closes with a separator (optionally an emptied bracket)
+  new RegExp(String.raw`^(?:${PROMO_PHRASE})(?:${PROMO_GAP}*(?:${PROMO_EMPTY_BRACKET})?${PROMO_GAP}*)$`, 'iu'),
+  new RegExp(String.raw`^(?:${PROMO_PHRASE})(?:${PROMO_GAP}*)${PROMO_HARD_SEP}(?:${PROMO_GAP}*)(?:${PROMO_EMPTY_BRACKET})?(?:${PROMO_GAP}*)`, 'iu'),
+  // and the same advertisement hanging off the end of a caption
+  new RegExp(String.raw`(?:${PROMO_GAP}+|${PROMO_EMPTY_BRACKET})(?:${PROMO_DECOR}|${PROMO_GAP})*(?:${PROMO_PHRASE})(?:${PROMO_DECOR}|${PROMO_GAP})*$`, 'iu')
+];
+
+/** The promotional wrapping a channel puts around a file name, taken off. Exported so it can be tested on its own. */
+export function stripPromotionalJunk(value) {
+  let text = value;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const before = text;
+    for (const pattern of PROMO_PATTERNS) text = text.replace(pattern, '');
+    if (text === before) break;
+  }
+  return text.trim();
+}
+
 export function stripTelegramAttribution(value, maxLength = 500) {
-  return cleanText(
+  const stripped = cleanText(
     String(value || '')
       // Publisher captions frequently append a Markdown attribution such as
       // [t.is](http://t.is). It is metadata, not part of the release name.
@@ -224,9 +267,14 @@ export function stripTelegramAttribution(value, maxLength = 500) {
       // Keep square brackets until cleanMediaName can remove an entire release
       // label such as [C_B], rather than leaving its inner letters behind.
       .replace(/[{}]/g, ' ')
+      // A bracket the handle lived in is now empty, and an empty bracket says nothing anywhere.
+      .replace(/\[\s{0,4}\]/g, ' ')
       .replace(/\s{2,}/g, ' '),
     maxLength
   );
+  // The promotional lead-in is taken off last, because the emptied bracket and the dangling
+  // separator are what mark it as junk rather than as the start of a title.
+  return stripPromotionalJunk(stripped).replace(/\s{2,}/g, ' ').trim();
 }
 
 function parseRange(startValue, endValue) {

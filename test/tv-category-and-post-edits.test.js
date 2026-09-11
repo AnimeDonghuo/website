@@ -8,6 +8,9 @@ import { CATEGORIES, CATEGORY_IDS, categoryDetails, resolveCategoryId } from '..
 import {
   announcementLaneDrained,
   decidePublishCategory,
+  inferBatchTitle,
+  queuePosterRematchForTitle,
+  tidyReleaseTitle,
   handlePostIdLookupMessage,
   inferBatchCategory,
   postIdAnswerText,
@@ -381,4 +384,53 @@ test('the Post ID answer names the card, its shelf, and the commands it works wi
   assert.match(text, /K-Drama · 2026 · 4 files/);
   assert.match(text, /\/poster SB-ABC1234567/);
   assert.match(text, /\/category SB-ABC1234567 tv/);
+});
+
+// ── the upload channel's own advertising never becomes part of a name ──────────────────────────
+
+test('a caption that leads with the channel plug still yields the release name, in both flows', () => {
+  const caption = '❤️ Join ~ [ @twg]King of Prison (2020) 720p HDRip x264 ESubs [Dual Audio] [Hindi ORG - English].mkv';
+  const files = [{ displayName: caption, name: caption }];
+  assert.equal(inferBatchTitle(files), 'King of Prison', 'batch title inference');
+  const typed = tidyReleaseTitle(caption);
+  assert.ok(typed.startsWith('King of Prison'), `a typed title starts at the name: ${typed}`);
+  assert.ok(!/\bJoin\b/.test(typed), `no lead-in survives into the title: ${typed}`);
+  // Nothing left but the plug is not a title, so the file follows the release above it instead of
+  // becoming a card nobody asked for.
+  assert.equal(inferBatchTitle([{ displayName: '❤️ Join ~ [@twg]', name: 'x.mkv' }]), '');
+});
+
+test('a poster picked from a search looks its details up under the name it was found as', async () => {
+  let lookedUp = null;
+  let saved = null;
+  const outcome = await queuePosterRematchForTitle({
+    repository: {
+      async updateContentByAdminId(adminId, patch) {
+        saved = patch;
+        return { adminId, ...patch };
+      }
+    },
+    content: { adminId: 'SB-PICK000001', title: 'Old typed name', category: 'movie', posterUrl: null, poster: null, description: '', year: null, genres: [] },
+    lookupTitle: 'Fukra 2',
+    find: async (title) => {
+      lookedUp = title;
+      return {
+        matched: true,
+        title: 'Fukra 2',
+        posterOriginalUrl: 'https://image.test/fukra.jpg',
+        description: 'The provider synopsis.',
+        year: 2024,
+        genres: ['Drama'],
+        provider: 'tmdb'
+      };
+    },
+    prepare: async () => ({ buffer: Buffer.from('png'), contentType: 'image/png', sourceUrl: 'https://image.test/fukra.jpg' }),
+    host: async () => ({ url: 'https://i.ibb.co/fukra.png', providerId: 'imgbb-1', originalUrl: 'https://image.test/fukra.jpg', source: 'remote-mirror' })
+  });
+  const result = await outcome;
+  assert.equal(result.updated, 1, 'the card was written');
+  assert.equal(lookedUp, 'Fukra 2', 'the search name decided which release the details came from');
+  assert.equal(saved.description, 'The provider synopsis.');
+  assert.equal(saved.year, 2024);
+  assert.equal(saved.poster.title, 'Old typed name', 'while the poster keeps the card’s own name, so a pick is never re-searched away later');
 });
