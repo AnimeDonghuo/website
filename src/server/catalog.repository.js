@@ -3028,6 +3028,63 @@ export class MongoCatalogRepository {
   }
 }
 
+/**
+ * How long the app is willing to wait for its database at boot, and why the wait happens here.
+ *
+ * MongoDB used to be reached exactly once, and a single failed attempt ended the process. On Koyeb
+ * that is the difference between "the cluster is waking up" and a reader seeing `404: No active
+ * service` for the whole site — a paused free-tier cluster, a failover, or a resolver that is not
+ * ready yet all recover well inside a minute, which is precisely the window a deploy restarts in.
+ * So the retries and their delays live here, the reason is logged, and giving up still means
+ * giving up loudly rather than serving an empty catalog.
+ */
+export const STORE_CONNECT_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000];
+
+export async function connectCatalogStore({
+  uri,
+  database,
+  open = async () => {
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8_000, maxPoolSize: 10 });
+    try {
+      await client.connect();
+    } catch (error) {
+      // A client that never completed its handshake still owns timers and sockets.
+      await Promise.resolve(client.close?.()).catch(() => {});
+      throw error;
+    }
+    const repository = new MongoCatalogRepository(client, client.db(database));
+    await repository.init();
+    return repository;
+  },
+  delays = STORE_CONNECT_DELAYS_MS,
+  wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+  log = console
+} = {}) {
+  const attempts = Math.max(1, delays.length);
+  let lastError = null;
+  for (let index = 0; index < attempts; index += 1) {
+    if (index) {
+      const pauseMs = delays[index] ?? delays.at(-1);
+      (log.warn || console.warn).call(log, `[server] catalog storage is not answering yet (attempt ${index + 1}/${attempts}) — waiting ${Math.round(pauseMs / 1000)}s before trying again. Last error: ${lastError?.message || 'unknown'}`);
+      await wait(pauseMs);
+    }
+    let candidate = null;
+    try {
+      candidate = await open();
+      if (index) (log.info || console.info).call(log, `[server] catalog storage is reachable again after ${index + 1} attempts.`);
+      return candidate;
+    } catch (error) {
+      lastError = error;
+      // A half-open client from a failed attempt must not be left holding sockets.
+      await Promise.resolve(candidate?.close?.()).catch(() => {});
+    }
+  }
+  const reason = lastError?.message || 'the connection was refused without a message';
+  const failure = new Error(`MongoDB could not be reached after ${attempts} attempts: ${reason}. Check that the cluster is running (a paused Atlas free tier answers nothing), that this service's egress address is on its network allowlist, and that MONGODB_URI still matches its credentials.`);
+  failure.cause = lastError;
+  throw failure;
+}
+
 export async function createCatalogRepository(config) {
   if (!config.mongodbUri) {
     const repository = new MemoryCatalogRepository();
@@ -3035,12 +3092,5 @@ export async function createCatalogRepository(config) {
     return repository;
   }
 
-  const client = new MongoClient(config.mongodbUri, {
-    serverSelectionTimeoutMS: 8000,
-    maxPoolSize: 10
-  });
-  await client.connect();
-  const repository = new MongoCatalogRepository(client, client.db(config.mongodbDb));
-  await repository.init();
-  return repository;
+  return connectCatalogStore({ uri: config.mongodbUri, database: config.mongodbDb });
 }

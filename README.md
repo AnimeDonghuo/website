@@ -638,9 +638,20 @@ This repo includes a multi-stage `Dockerfile`. It builds the client once, then r
 2. In Koyeb, create a **Web Service** from that repository.
 3. Choose **Dockerfile** as the builder and select `Dockerfile` at the repository root.
 4. Expose **port `8000`** with the HTTP protocol and route `/` to it.
-5. Set health check path to **`/api/health`**.
+5. Set health check path to **`/api/health`**, with a generous grace period (about `30s`) and at least 5 attempts before a restart, so a container that is still waiting for its database is not killed mid-wait.
 6. Use **one replica only**. Telegram long polling must have exactly one active bot consumer.
 7. Add the environment variables below and deploy.
+
+### When the domain answers `404: No active service`
+
+That page is Koyeb's edge, not this app: it means the domain resolved fine but **no instance of the service is running**. Nothing to fix in a browser — open the service's **Deployments** tab and read the log of the most recent attempt, which is where the reason is printed:
+
+- `Startup failed: MongoDB could not be reached after 5 attempts…` — the cluster was unreachable while the container was starting. The app sleeps between attempts (about 75 seconds in total, worst case) precisely so a **paused free-tier Atlas cluster waking up** cannot take the website down; if it still gives up, resume the cluster, then press **Redeploy**. Also confirm this service's egress address is on the cluster's Network Access allowlist, which is what a rotated or newly scaled cluster usually breaks.
+- `Startup failed:` naming a missing variable — an environment value was lost on the new revision; re-add it and redeploy.
+- An exit code without `Startup failed`, or a container that dies shortly after `SoraBox listening on 0.0.0.0:8000` — the instance was killed (memory, or a second replica fighting over Telegram long polling, which makes both bots restart). Keep **one replica**.
+- No attempt at all, or the latest deployment left in `STOPPED`/`PENDING` — press **Redeploy** (or **Revert** to the previous revision if the newest code is at fault).
+
+Every code push needs a deploy of its own: the site only changes when a revision that contains the commit is running, so a fix that is pushed but never deployed shows up as the old behaviour, not as an error.
 
 | Variable | Koyeb type | Required | Notes |
 | --- | --- | --- | --- |
