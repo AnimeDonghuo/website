@@ -378,6 +378,12 @@ async function searchTmdbCandidates(title, type, config) {
         type,
         title: candidateTitle,
         year: yearFromDate(entry?.release_date || entry?.first_air_date),
+        // What a category decision needs, and nothing else: TMDB says where a show was made and
+        // whether it is a series, which is how a donghua stops being filed as a web series.
+        originCountry: (Array.isArray(entry?.origin_country) ? entry.origin_country : [])
+          .map((code) => cleanText(code, 4).toUpperCase())
+          .find(Boolean) || null,
+        genreIds: (Array.isArray(entry?.genre_ids) ? entry.genre_ids : []).map(Number).filter(Number.isInteger),
         posterUrl: entry?.poster_path ? `${TMDB_IMAGE_BASE}${entry.poster_path}` : null,
         backdropUrl: entry?.backdrop_path ? `${TMDB_IMAGE_BASE}${entry.backdrop_path}` : null,
         popularity: Number(entry?.popularity) || 0,
@@ -393,6 +399,8 @@ const ANILIST_PICKER_QUERY = `
       media(search: $search, sort: POPULARITY_DESC) {
         id
         type
+        format
+        countryOfOrigin
         title { romaji english native }
         startDate { year }
         popularity
@@ -430,6 +438,8 @@ async function searchAniListCandidates(title) {
         provider: 'anilist',
         externalId: entry?.id ? String(entry.id) : null,
         type: cleanText(entry?.type, 12).toLowerCase() || 'anime',
+        format: cleanText(entry?.format, 16).toUpperCase() || null,
+        countryOfOrigin: cleanText(entry?.countryOfOrigin, 4).toUpperCase() || null,
         title: best?.candidate || cleanText(titles[0], 180),
         year: Number.isInteger(entry?.startDate?.year) ? entry.startDate.year : null,
         posterUrl: entry?.coverImage?.extraLarge || entry?.coverImage?.large || entry?.coverImage?.medium || null,
@@ -475,6 +485,75 @@ export async function searchPosterCandidates(title, category = 'movie', config =
   return candidates
     .sort((first, second) => second.score - first.score || second.popularity - first.popularity)
     .slice(0, Math.max(1, Math.min(Number(limit) || 8, 10)));
+}
+
+/** TMDB's genre id for Animation, the one tag that separates a cartoon from a live-action show. */
+const ANIMATION_GENRE_ID = 16;
+/** Countries whose animated output the catalog keeps in its own shelves. */
+const ANIME_COUNTRIES = new Set(['JP']);
+const DONGHUA_COUNTRIES = new Set(['CN']);
+const KOREAN_COUNTRIES = new Set(['KR']);
+/** Broadcast/OTT homes whose shows are neither anime, donghua, nor K-Drama — the "TV & OTT" shelf. */
+const TV_FIRST_COUNTRIES = new Set(['IN', 'PK', 'BD', 'NP', 'LK', 'PH', 'ID', 'MY', 'TH']);
+
+/**
+ * Which catalog category a provider's answer describes, or null when it says nothing useful.
+ *
+ * This is a *tie-breaker*, not the first word: publisher-typed categories and the words in a
+ * caption always win, and this only decides the releases a filename cannot distinguish — where
+ * `Peerless Martial Spirit S01E02.mkv` (a donghua) and a Chinese-language web series look
+ * identical. A provider that did not match the title well enough is treated as silence, and the
+ * caller keeps its own guess, so an outage never misfiles a release.
+ */
+export function categoryFromHints({ hints = null, minimumScore = 0.62 } = {}) {
+  if (!hints || typeof hints !== 'object') return null;
+  const score = Number(hints.score) || 0;
+  if (score < minimumScore) return null;
+  const country = cleanText(hints.originCountry || hints.countryOfOrigin, 4).toUpperCase() || null;
+  const type = cleanText(hints.type, 16).toLowerCase() || null;
+  const provider = cleanText(hints.provider, 20).toLowerCase() || null;
+
+  if (provider === 'anilist') {
+    // AniList lists Chinese 3D series as anime unless the country says otherwise.
+    if (DONGHUA_COUNTRIES.has(country)) return 'donghua';
+    return 'anime';
+  }
+  if (provider !== 'tmdb') return null;
+
+  const animated = Array.isArray(hints.genreIds) && hints.genreIds.includes(ANIMATION_GENRE_ID);
+  const episodic = type === 'tv' || type === 'series' || type === 'miniseries';
+  if (KOREAN_COUNTRIES.has(country)) return episodic ? 'kdrama' : 'movie';
+  if (DONGHUA_COUNTRIES.has(country)) return animated && !episodic ? 'anime' : 'donghua';
+  if (ANIME_COUNTRIES.has(country) && animated) return 'anime';
+  if (!episodic) return 'movie';
+  if (animated) return 'cartoon';
+  // An Indian/South-East-Asian show is a broadcast or OTT release, and the catalog says so:
+  // calling it a "web series" is what had publishers fixing the category after every upload.
+  if (TV_FIRST_COUNTRIES.has(country)) return 'tv';
+  return 'web-series';
+}
+
+/**
+ * Ask the providers what kind of release a title is. Every lookup is a fallback and a timeout away
+ * from silence, so this never holds a publication open: no key, no network, or no match answers
+ * null and the caller keeps the guess it made from the caption.
+ */
+export async function searchCategoryHints(title, config = {}, { search = searchPosterCandidates, category = 'movie' } = {}) {
+  const lookupTitle = canonicalMetadataTitle(title) || cleanText(title, 180);
+  if (!lookupTitle) return null;
+  if (!config.tmdbApiKey && !config.tmdbReadAccessToken) return null;
+  let candidates = [];
+  try {
+    // `category: 'movie'` puts TMDB-movie and TMDB-tv ahead of AniList in the provider order, which
+    // is what a category question needs: the answer is read from whichever candidate matched best.
+    candidates = await search(lookupTitle, category, config, { limit: 10 });
+  } catch {
+    return null;
+  }
+  const ranked = (Array.isArray(candidates) ? candidates : [])
+    .filter((entry) => entry && Number(entry.score) > 0)
+    .sort((first, second) => Number(second.score) - Number(first.score) || Number(second.popularity) - Number(first.popularity));
+  return ranked[0] || null;
 }
 
 // Provider order is category-aware. This lets anime/donghua benefit from AniList

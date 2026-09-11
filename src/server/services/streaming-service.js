@@ -1,4 +1,4 @@
-import { cleanText } from '../lib/strings.js';
+import { cleanText, resolveCategoryId } from '../lib/strings.js';
 
 // This feature deliberately imports only a small publisher-supplied manifest.
 // It never downloads, buffers, transcodes, or relays video through Koyeb.
@@ -448,9 +448,13 @@ function compareStreamEntries(first, second) {
 }
 
 function manifestCategory(value) {
-  const raw = cleanText(value, 40).toLowerCase().replace(/[\s_]+/g, '-');
+  const raw = cleanText(value, 40).toLowerCase().replace(/[\s_.]+/g, '-');
   if (raw === 'series' || raw === 'webseries') return 'web-series';
   if (raw === 'k-drama' || raw === 'korean-drama') return 'kdrama';
+  // An imported player sheet says "OTT" or "TV Show" for the broadcast shelf, and a dropped category
+  // silently means a row with no player, so the spoken names are resolved like everywhere else.
+  const resolved = resolveCategoryId(raw);
+  if (resolved) return resolved;
   return ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series'].includes(raw) ? raw : null;
 }
 

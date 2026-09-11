@@ -10,7 +10,7 @@ import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
 import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
-const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
+const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
 // the age-confirmed browse collection.
 const homeCategoryOrder = categoryOrder.filter((category) => category !== 'adult');
@@ -21,11 +21,12 @@ const categoryCopy = {
   kdrama: { eyebrow: 'STORIES WITH A PULSE', title: 'One more episode energy.', description: 'Romance, mystery, comedy and high-stakes drama, organized for your next late-night watch.' },
   movie: { eyebrow: 'FEATURE PRESENTATION', title: 'Make tonight a movie night.', description: 'A curated shelf of features, from edge-of-your-seat thrillers to big-hearted adventures.' },
   'web-series': { eyebrow: 'BINGE-READY SERIES', title: 'The next tab-open-worthy series.', description: 'Smartly organized seasons and new episodes for your watchlist.' },
+  tv: { eyebrow: 'SCREENED AT HOME', title: 'TV and OTT, straight from the broadcaster.', description: 'Broadcast shows, streaming originals and premieres that never had a theatrical release.' },
   adult: { eyebrow: 'AGE-RESTRICTED ACCESS', title: 'A private 18+ collection.', description: 'This area is available only after you confirm that you are 18 or older.' },
   all: { eyebrow: 'EVERYTHING TO EXPLORE', title: 'A world of stories, neatly cataloged.', description: 'Browse every release across the SoraBox catalog.' }
 };
 
-const categoryLabels = Object.fromEntries(categoryOrder.map((id) => [id, id === 'adult' ? '18+' : id === 'web-series' ? 'Web Series' : id === 'kdrama' ? 'K-Drama' : id[0].toUpperCase() + id.slice(1)]));
+const categoryLabels = Object.fromEntries(categoryOrder.map((id) => [id, id === 'adult' ? '18+' : id === 'web-series' ? 'Web Series' : id === 'tv' ? 'TV & OTT' : id === 'kdrama' ? 'K-Drama' : id[0].toUpperCase() + id.slice(1)]));
 
 function useRemote(loader, dependencies = []) {
   const [state, setState] = useState({ loading: true, data: null, error: null });
@@ -289,8 +290,10 @@ function HomePage({ onGetFiles }) {
             age-confirmed browse pages, where its consent prompt is shown. */}
         <div className="category-rail__items">
           {homeCategoryOrder.map((category, index) => {
-            const label = category === 'web-series' ? 'Web Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
-            const icons = ['✦', '☺', '◇', '♡', '▶', '▣'];
+            const label = category === 'web-series' ? 'Web Series' : category === 'tv' ? 'TV & OTT' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+            // One glyph per shelf, in the same order as `categoryOrder`, so a new category never
+            // arrives with an empty icon slot in the middle of the rail.
+            const icons = ['✦', '☺', '◇', '♡', '▶', '▣', '▤'];
             return <Link className={`category-tile category-tile--${category}`} key={category} to={`/browse/${category}`}>
               <span className="category-tile__number">0{index + 1}</span>
               <span className="category-tile__icon" aria-hidden="true">{icons[index]}</span>

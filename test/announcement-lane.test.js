@@ -377,12 +377,41 @@ test('a corrected title re-matches the artwork and updates the card, its backdro
 });
 
 test('a poster chosen by hand is never re-matched away, and a busy ImgBB defers instead of failing', async () => {
+  let saved = null;
   const untouched = queuePosterRematchForTitle({
     repository: { updateContentByAdminId: async () => ({}) },
-    content: { adminId: 'SB-BBB222', title: 'Gold', category: 'movie', posterUrl: 'https://i.ibb.co/chosen.png', poster: { source: 'remote-mirror', title: 'Gold' } },
+    content: { adminId: 'SB-BBB222', title: 'Gold', category: 'movie', posterUrl: 'https://i.ibb.co/chosen.png', poster: { source: 'remote-mirror', title: 'Gold' }, description: 'Written by the publisher.', year: 2023, genres: ['Action'] },
     find: async () => ({ matched: true, posterOriginalUrl: 'https://image.test/other.jpg' })
   });
-  assert.equal(untouched, null, 'the title still matches the title the artwork was found under, so nothing is re-searched');
+  assert.equal(untouched, null, 'the title still matches the title the artwork was found under and the card already carries its details, so nothing is re-searched');
+
+  // The same card with no synopsis does get looked up — but only for its text. Artwork that was
+  // chosen by hand is never searched away, however tempting the provider's poster looks next to it.
+  const detailsOnly = await queuePosterRematchForTitle({
+    repository: {
+      async updateContentByAdminId(adminId, patch) {
+        saved = patch;
+        return { adminId, ...patch };
+      }
+    },
+    content: {
+      adminId: 'SB-BBB223',
+      title: 'Gold',
+      category: 'movie',
+      posterUrl: 'https://i.ibb.co/chosen.png',
+      poster: { source: 'remote-mirror', title: 'Gold' },
+      description: '',
+      year: null,
+      genres: []
+    },
+    find: async () => ({ matched: true, posterOriginalUrl: 'https://image.test/other.jpg', description: 'A synopsis from the provider.', year: 2024, genres: ['Drama', 'History'], status: 'Ongoing' })
+  });
+  assert.equal(detailsOnly.updated, 1, 'the card\u2019s missing details are filled from the same lookup that found the artwork');
+  assert.equal(saved.description, 'A synopsis from the provider.');
+  assert.equal(saved.year, 2024);
+  assert.deepEqual(saved.genres, ['Drama', 'History']);
+  assert.equal(saved.status, 'Ongoing', 'and a card with no status at all takes the provider\u2019s, rather than showing the default');
+  assert.equal(saved.posterUrl, undefined, 'the hand-picked artwork is left exactly where it was');
 
   const deferred = await queuePosterRematchForTitle({
     repository: { updateContentByAdminId: async () => { throw new Error('must not be called'); } },

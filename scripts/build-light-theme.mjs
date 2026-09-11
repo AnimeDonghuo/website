@@ -274,6 +274,8 @@ function generate(css) {
     '  --menu-line: rgba(18, 24, 36, 0.09);',
     '  --menu-field: #ffffff;',
     '  --menu-shadow: 0 17px 24px rgba(18, 24, 36, 0.1);',
+    '  --amber: #e08a18;',
+    '  --amber-ink: #7d4301;',
     '  --lime-ink: #3c7a12;',
     '  --violet-ink: #5b3fb8;',
     '  --cyan-ink: #0d6f66;',

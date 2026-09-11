@@ -920,6 +920,21 @@ export class MemoryCatalogRepository {
     return item ? clone(item) : null;
   }
 
+  // The announcement post is the thing a publisher can actually see in the channel, so it has to walk
+  // back to the card: forward that post to the bot and this is how its Post ID is found.
+  async findContentByAnnouncementMessage({ channelId = null, messageId = null } = {}) {
+    const wanted = Number.parseInt(messageId, 10);
+    if (!Number.isInteger(wanted) || wanted <= 0) return null;
+    const channel = cleanText(channelId, 60);
+    for (const entry of this.contents.values()) {
+      const reference = (Array.isArray(entry.announcementRefs) ? entry.announcementRefs : [])
+        .find((item) => Number.parseInt(item?.messageId, 10) === wanted
+          && (!channel || !item?.channelId || String(item.channelId) === channel));
+      if (reference) return clone(entry);
+    }
+    return null;
+  }
+
   async findContentByMergeKey(mergeKey, category = null) {
     const normalizedKey = normalizedMergeKey(mergeKey);
     const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
@@ -1923,6 +1938,19 @@ export class MongoCatalogRepository {
 
   async findContentByShareCode(shareCode) {
     return this.contents.findOne({ shareCode, published: true });
+  }
+
+  /** See the in-memory store: a forwarded announcement post resolves back to its catalog card. */
+  async findContentByAnnouncementMessage({ channelId = null, messageId = null } = {}) {
+    const wanted = Number.parseInt(messageId, 10);
+    if (!Number.isInteger(wanted) || wanted <= 0) return null;
+    const channel = cleanText(channelId, 60);
+    return this.contents.findOne({
+      'announcementRefs.messageId': wanted,
+      ...(channel
+        ? { $or: [{ 'announcementRefs.channelId': channel }, { 'announcementRefs.channelId': { $exists: false } }, { 'announcementRefs.channelId': null }] }
+        : {})
+    }, { projection: { 'poster.deleteUrl': 0 } });
   }
 
   async findContentByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {

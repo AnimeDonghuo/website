@@ -20,6 +20,8 @@
   --menu-line: rgba(18, 24, 36, 0.09);
   --menu-field: #ffffff;
   --menu-shadow: 0 17px 24px rgba(18, 24, 36, 0.1);
+  --amber: #e08a18;
+  --amber-ink: #7d4301;
   --lime-ink: #3c7a12;
   --violet-ink: #5b3fb8;
   --cyan-ink: #0d6f66;
@@ -108,6 +110,7 @@
 [data-theme='light'] .browse-hero--web-series { background: radial-gradient(ellipse 43% 150% at 89% 3%, rgba(112,169,255,.22), transparent 65%), #f9f9fb; }
 [data-theme='light'] .browse-hero--adult { background: radial-gradient(ellipse 43% 150% at 89% 3%, rgba(18, 24, 36, 0.1), transparent 65%), #fbf9fa; }
 [data-theme='light'] .browse-hero--all { background: radial-gradient(ellipse 43% 150% at 89% 3%, rgba(197,248,106,.12), transparent 65%), #f9fafb; }
+[data-theme='light'] .browse-hero--tv { background: radial-gradient(ellipse 43% 150% at 89% 3%, rgba(255,196,107,.16), transparent 65%), #fbfaf9; }
 [data-theme='light'] .browse-hero > .page-width > p { color: #3d4147; }
 [data-theme='light'] .browse-category-nav a { border: 1px solid rgba(18, 24, 36, 0.05); color: #3e4246; background: rgba(18, 24, 36, 0.05); }
 [data-theme='light'] .browse-results__top p { color: #3e4146; }

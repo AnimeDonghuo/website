@@ -143,5 +143,28 @@ export const demoContent = [
     filesCount: 10,
     art: { tone: 'orange', mark: 'PC', motif: 'comet' },
     publishedAt: daysAgo(8)
+  },
+  {
+    // The shelf a broadcaster's Saturday-night show and a streaming premiere share: neither a
+    // web series with fan-subbed episodes nor a theatrical film, and it arrives in blocks.
+    id: 'demo-latenight-nation',
+    shareCode: 'demoLate009',
+    slug: 'late-night-with-the-nation',
+    title: 'Late Night with the Nation',
+    category: 'tv',
+    year: 2026,
+    languages: ['Hindi', 'English'],
+    genres: ['Talk Show', 'Comedy'],
+    description: 'A weeknight talk show that books the people everyone was arguing about on Monday, recorded live in front of a studio that refuses to leave.',
+    status: 'New episodes',
+    releaseLabel: 'Episodes 01–12',
+    filesCount: 3,
+    episodeGroups: [
+      { start: 1, end: 4, label: 'Episodes 01–04', fileCount: 1 },
+      { start: 5, end: 8, label: 'Episodes 05–08', fileCount: 1 },
+      { start: 9, end: 12, label: 'Episodes 09–12', fileCount: 1 }
+    ],
+    art: { tone: 'amber', mark: 'LN', motif: 'spotlight' },
+    publishedAt: daysAgo(1)
   }
 ];

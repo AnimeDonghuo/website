@@ -243,11 +243,11 @@ export function extractEpisodeRange(value) {
   if (!text) return null;
 
   // S01E01, S1 E01, and a range such as S01E01-E05.
-  const seasonEpisode = text.match(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:ISODE)?)?\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:E(?:P(?:ISODE)?)?\s*)?0*(\d{1,3}))?\b/i);
+  const seasonEpisode = text.match(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*)?0*(\d{1,3}))?\b/i);
   if (seasonEpisode) return parseRange(seasonEpisode[1], seasonEpisode[2] || seasonEpisode[1]);
 
   // Explicit forms: Episode 1, EP 01, E5, Ep 1 To 5, Episodes 01-05.
-  const explicit = text.match(/\b(?:EPISODES?|EPS?|EP|E)\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:(?:EPISODES?|EPS?|EP|E)\s*)?0*(\d{1,3}))?\b/i);
+  const explicit = text.match(/\b(?:EPISODES?|EPI(?:S(?:ODE)?)?|EPS?|EP|E)\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:(?:EPISODES?|EPI(?:S(?:ODE)?)?|EPS?|EP|E)\s*)?0*(\d{1,3}))?\b/i);
   if (explicit) return parseRange(explicit[1], explicit[2] || explicit[1]);
 
   // A clean title caption sometimes only says "1 to 5". This intentionally
@@ -269,7 +269,7 @@ export function cleanMediaName(value) {
     .replace(/\b(?:19\d{2}|20\d{2})\b/g, ' ')
     // Remove only a standalone season package label. The negative lookahead
     // deliberately keeps S01E03 / Season 1 Episode 3 for episode detection.
-    .replace(/\bS(?:EASON)?\s*0*\d{1,2}(?!\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3})\b/gi, ' ')
+    .replace(/\bS(?:EASON)?\s*0*\d{1,2}(?!\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3})\b/gi, ' ')
     .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
     .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
     .replace(/\b(?:web[- ]?(?:dl|rip)?|blu[- ]?ray|brrip|hdrip|dvdrip|remux|cam|hdcam|predvd|proper|repack|uncut|extended|unrated)\b/gi, ' ')
@@ -636,7 +636,10 @@ export function detectUploadEpisode({ caption, filename }) {
   }
 
   const filenameText = cleanMediaName(filename);
-  const filenameEpisode = extractEpisodeRange(filenameText);
+  // The title cleaner keeps `S01E01` inline but drops a bracketed `[Epi 01-06]` pack marker along
+  // with the rest of the release noise, so the range is also read from the uploader's own filename.
+  // What a file contains cannot depend on how prettily its title could be cut out of it.
+  const filenameEpisode = extractEpisodeRange(filenameText) || (filenameText === filename ? null : extractEpisodeRange(filename));
   if (filenameEpisode) {
     return {
       ...filenameEpisode,
@@ -764,7 +767,9 @@ export function seasonPackOf(file) {
   if (hasEpisodeRange(file)) return null;
   const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`.trim();
   if (!raw || EXTRA_TEXT.test(raw)) return null;
-  if (/\bS\d{1,2}[\s._-]*E\d/i.test(raw) || /\b(?:ep|eps|episode)\.?\s*0*\d/i.test(raw) || /\b\d{1,3}\s*[xX]\s*\d/.test(raw)) return null;
+  // Anything that names an episode — `S01E05`, `Ep 7`, `Epi.01-06` — is a delivery of episodes,
+  // not the whole season, and must be indexed as the range it holds rather than shown as one pack.
+  if (/\bS\d{1,2}[\s._-]*E\d/i.test(raw) || /\b(?:epi(?:s(?:ode)?)?|eps?|ep)\.?\s*0*\d/i.test(raw) || /\b\d{1,3}\s*[xX]\s*\d/.test(raw)) return null;
   const detected = detectUploadSeason({ caption: file?.displayName || file?.sourceLabel, filename: file?.name });
   const season = Number(detected.season);
   if (validSeason(season)) return { season, label: `Season ${season}`, wholeSeason: true };

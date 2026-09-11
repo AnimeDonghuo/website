@@ -1,15 +1,16 @@
 import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
-import { categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, slugify } from '../lib/strings.js';
+import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, resolveCategoryId, slugify } from '../lib/strings.js';
 import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
-import { findMetadata, searchPosterCandidates } from './metadata-service.js';
+import { categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
+import { reindexContentRecord } from '../catalog.repository.js';
 import { PosterHostingError, hostPosterImage, isPosterRateLimit, mirrorPosterToImgBB, preparePosterImage } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
 
-const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'adult'];
+const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 const ADULT_CATEGORY = 'adult';
 const BATCH_PROGRESS_INTERVAL = 25;
 const BATCH_MAX_FORWARD_RETRIES = 8;
@@ -146,6 +147,9 @@ function panelKeyboard() {
       Markup.button.callback('▶ Movie', 'new:movie'),
       Markup.button.callback('▣ Web series', 'new:web-series')
     ],
+    // The broadcast/OTT shelf is its own row because it is the one publishers keep adding to:
+    // a TV or streaming-original show that is not anime, donghua, or K-Drama.
+    [Markup.button.callback('▤ TV & OTT', 'new:tv')],
     [Markup.button.callback('🔞 18+ private', 'new:adult')],
     [Markup.button.callback('Draft status', 'draft:status'), Markup.button.callback('Discard draft', 'draft:cancel')]
   ]);
@@ -186,6 +190,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'donghua', description: 'New donghua draft' },
   { command: 'kdrama', description: 'New K-Drama draft' },
   { command: 'series', description: 'New web series draft' },
+  { command: 'tv', description: 'New TV & OTT draft (/ott also works)' },
   { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
   { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
@@ -213,6 +218,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'merge', description: 'Absorb cards into one post, or drop a season/episodes' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
+  { command: 'search', description: 'Find Post IDs by title, card link, or forwarded announcement' },
   { command: 'stats', description: 'View publisher analytics' },
   { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
   { command: 'players', description: 'List or remove attached players' },
@@ -713,6 +719,7 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
   const blocked = [];
   const tidied = [];
   let rechecks = 0;
+  let rebuilt = 0;
   const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
   let queued = 0;
   for (const [index, adminId] of target.adminIds.entries()) {
@@ -731,10 +738,33 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
         continue;
       }
     }
-    const updated = await repository.updateContentByAdminId(adminId, { [field]: entryValue });
-    if (!updated) {
+    const edited = await repository.updateContentByAdminId(adminId, { [field]: entryValue });
+    if (!edited) {
       missing.push(adminId);
       continue;
+    }
+    // A corrected title or category changes how the release is read, so the episode blocks, the
+    // quality ladder, and the search text are rebuilt from the files themselves instead of being
+    // carried over. Without this, `S01 [Epi 01-06]` files keep showing on the delivery page as one
+    // flat release after a rename, because the index they were filed under was written before the
+    // caption made sense.
+    let updated = edited;
+    if (field === 'title' || field === 'category') {
+      if (typeof repository.reindexContent === 'function') {
+        // The pass /repair runs over the whole archive, scoped to this one card: it writes the
+        // rebuilt file records, episode blocks, and search text through the store.
+        const report = await repository.reindexContent({ adminId }).catch(() => null);
+        if (report?.updated) {
+          rebuilt += 1;
+          updated = (await repository.findContentByAdminId?.(adminId)) || edited;
+        }
+      } else {
+        const rebuiltIndex = reindexContentRecord(edited);
+        if (rebuiltIndex.changed) {
+          updated = (await repository.updateContentByAdminId(adminId, rebuiltIndex.patch)) || edited;
+          rebuilt += 1;
+        }
+      }
     }
     if (paired && paired[index].changed) tidied.push(adminId);
     contents.push(previous ? { ...updated, previousValue: cleanText(previous[field], 1_600) } : updated);
@@ -769,7 +799,7 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
   }
   if (!contents.length) {
     if (missing.length) {
-      await ctx.reply(`No published catalog post was found for ${missing.join(', ')}. Use /posts or /postid to find an ID.`);
+      await ctx.reply(`No published catalog post was found for ${missing.join(', ')}. Use /posts, /postid, or /search <title> to find an ID.`);
     } else if (blocked.length) {
       await ctx.reply(`No post was changed. ${blocked[0].reason}.`);
     }
@@ -789,7 +819,10 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
     lines.push(`${tidied.length} of those ${tidied.length === 1 ? 'title was' : 'titles were'} tidied from the pasted text (a file extension, brackets, underscores, dots, or a quality label). Send the line again exactly as you want it if that was the title itself.`);
   }
   if (rechecks) {
-    lines.push(`${rechecks} ${rechecks === 1 ? 'card had' : 'cards had'} no matched artwork, so its poster is being re-checked against the corrected title on the lane and will replace the card, its backdrop, and its channel copy wherever it is found.`);
+    lines.push(`${rechecks} ${rechecks === 1 ? 'card had' : 'cards had'} no matched artwork or no full details, so their poster, year, genres, and synopsis are being re-checked against the corrected title on the lane — whatever the providers recognise replaces the card, its backdrop, and its channel copy, and anything they cannot find keeps the defaults you set.`);
+  }
+  if (rebuilt) {
+    lines.push(`${rebuilt} ${rebuilt === 1 ? 'card was' : 'cards were'} re-indexed from their files, so the delivery page groups them into their episode blocks again and the announcement copy is rewritten from that.`);
   }
   if (blocked.length) {
     lines.push(`${blocked.length} post${blocked.length === 1 ? ' was' : 's were'} left alone: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}`);
@@ -802,6 +835,40 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
   }
   if (sync.channels) lines.push(announcementSyncNote(sync));
   await ctx.reply(lines.join('\n'));
+  // Renaming a card onto a title the catalog already holds is nearly always the same release
+  // published twice, and two announcements for one title is what the publisher is left with unless
+  // someone says so. So the merge is offered here with the plan already built: Yes moves every file
+  // of the newer card into the existing post and deletes the newer card and its announcement, No
+  // leaves both cards exactly as they are.
+  if (field === 'title' && contents.length === 1 && typeof repository.findContentByTitle === 'function' && typeof repository.startMergePlan === 'function') {
+    const renamed = contents[0];
+    let twins = [];
+    try {
+      twins = (await repository.findContentByTitle(renamed.title, { category: renamed.category, limit: 4 })) || [];
+    } catch {
+      twins = [];
+    }
+    const other = twins.find((entry) => entry?.adminId && entry.adminId !== renamed.adminId);
+    if (other) {
+      const fileCount = Array.isArray(renamed.files) ? renamed.files.length : Number(renamed.filesCount) || 0;
+      await repository.startMergePlan({
+        chatId: chatId(ctx),
+        ownerId: userId(ctx),
+        plan: {
+          targetAdminId: other.adminId,
+          sources: [{ adminId: renamed.adminId, title: renamed.title, files: fileCount }],
+          note: 'A rename produced a title the catalog already holds.'
+        }
+      });
+      await ctx.reply([
+        `\u201c${cleanText(other.title, 70)}\u201d is already published as ${other.adminId}, so ${renamed.adminId} is now a second card for the same release.`,
+        '',
+        `Merge them? The ${fileCount} file${fileCount === 1 ? '' : 's'} of ${renamed.adminId} move into ${other.adminId}, and ${renamed.adminId} disappears with its announcement post. Nothing is taken away from ${other.adminId}.`,
+        '',
+        'One tap applies the merge, one tap leaves both cards alone.'
+      ].join('\n'), mergeConfirmKeyboard());
+    }
+  }
   return { handled: true, content: contents[0], contents, announcementSync: sync };
 }
 
@@ -872,30 +939,153 @@ function telegramButtonText(value, maxBytes = 62) {
   return `${truncated.replace(/[\s.,:-]+$/, '')}…`;
 }
 
+/** A year is only worth printing when the provider actually gave one. */
+function posterCandidateYear(candidate) {
+  const year = Number(candidate?.year);
+  return Number.isInteger(year) && year > 1899 && year < 2200 ? String(year) : null;
+}
+
+/** `1 · 2023 · TV · TMDB` — the parts that tell two posters apart, in that order. */
+function posterCandidateLabel(candidate, index) {
+  const year = posterCandidateYear(candidate);
+  const kind = cleanText(candidate?.type, 12)?.toUpperCase() || null;
+  const provider = posterProviderLabel(candidate?.provider) || null;
+  const title = cleanText(candidate?.title, 60) || 'Untitled';
+  const front = [index + 1, year, kind, provider].filter(Boolean).join(' · ');
+  return telegramButtonText(`${front} · ${title}`);
+}
+
+/**
+ * Every candidate gets a line of its own, and the message above the buttons spells each one out in
+ * full. Two buttons across a phone screen cut the name and lost the year, which is exactly the
+ * difference between the right poster and a poster for the wrong release.
+ */
 export function posterCandidateKeyboard(candidates = []) {
-  const rows = [];
-  for (let index = 0; index < Math.min(candidates.length, 10); index += 2) {
-    rows.push(candidates.slice(index, index + 2).map((candidate, offset) => {
-      const title = cleanText(candidate.title, 60) || 'Untitled';
-      const year = Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : '';
-      const provider = posterProviderLabel(candidate.provider);
-      // The provider tag leads the label because a truncated "· TM" explains
-      // nothing, while a shortened title is still recognisable at a glance.
-      return Markup.button.callback(
-        telegramButtonText(`${index + offset + 1}.${provider ? ` ${provider} \u00b7` : ''} ${title}${year}`),
-        `poster:pick:${index + offset}`
-      );
-    }));
-  }
-  rows.push([Markup.button.callback('Search again', 'poster:retry'), Markup.button.callback('Cancel', 'poster:cancel')]);
+  const rows = candidates.slice(0, 10).map((candidate, index) => [
+    Markup.button.callback(posterCandidateLabel(candidate, index), `poster:pick:${index}`)
+  ]);
+  rows.push([Markup.button.callback('Search again', 'poster:retry')]);
+  rows.push([Markup.button.callback('Cancel', 'poster:cancel')]);
   return Markup.inlineKeyboard(rows);
+}
+
+export function posterCandidateListText(candidates = []) {
+  return candidates.slice(0, 10).map((candidate, index) => {
+    const parts = [
+      posterCandidateYear(candidate),
+      cleanText(candidate?.type, 12)?.toUpperCase() || null,
+      posterProviderLabel(candidate?.provider) || null,
+      Number(candidate?.score) ? `match ${Math.round(Number(candidate.score) * 100)}%` : null
+    ].filter(Boolean);
+    return `${index + 1}. ${cleanText(candidate?.title, 90) || 'Untitled'}${parts.length ? ` — ${parts.join(' · ')}` : ''}`;
+  }).join('\n');
+}
+
+/** One card, described the way a publisher needs it: the ID first, then how to use it. */
+export function postIdAnswerText(content, config = null) {
+  const files = Number.isInteger(Number(content.filesCount))
+    ? content.filesCount
+    : (Array.isArray(content.files) ? content.files.length : 0);
+  const link = config ? getContentPageUrl(config, content) : null;
+  const facts = [
+    categoryDetails(content.category).label,
+    Number(content.year) ? String(content.year) : null,
+    `${files} file${files === 1 ? '' : 's'}`,
+    content.published === false ? 'not published yet' : null
+  ].filter(Boolean).join(' \u00b7 ');
+  return [
+    `Post ID: ${content.adminId}`,
+    `\u201c${cleanText(content.title, 90)}\u201d \u00b7 ${facts}`,
+    link ? `Catalog page: ${link}` : null,
+    `Use it like this: /title ${content.adminId} New title \u00b7 /category ${content.adminId} tv \u00b7 /poster ${content.adminId} \u00b7 /delete ${content.adminId}`
+  ].filter(Boolean).join('\n');
+}
+
+/** Routes the app owns; anything else under the site root is a catalog card. */
+const NOT_A_CARD_ROUTE = new Set(['', 'browse', 'search', 'request', 'requests', 'new', 'help', 'top', 'calendar', 'genres', 'delivery', 'api', 'watch']);
+
+function catalogSlugFromUrl(url) {
+  const segments = String(url.pathname || '').split('/').filter(Boolean);
+  if (!segments.length || segments.length > 2) return null;
+  const slug = segments.at(-1).replace(/\.html?$/i, '');
+  if (!slug || NOT_A_CARD_ROUTE.has(segments[0]) || (segments.length === 2 && !CATEGORY_IDS.has(segments[0]))) return null;
+  return slug;
+}
+
+/**
+ * Find the Post ID behind something the publisher already has in hand.
+ *
+ * Getting at an `SB-…` id meant scrolling /posts until the right one turned up. Anything that
+ * already points at a card answers directly instead: the announcement post forwarded back to the
+ * bot, the catalog page link, or a link to the message in the storage channel. A message that is
+ * none of those is passed to the normal draft flow, so typing a title is never mistaken for a query.
+ */
+export async function handlePostIdLookupMessage(ctx, repository, config = null) {
+  const message = ctx.message;
+  if (!message) return false;
+  const origin = message.forward_origin
+    || (message.forward_from_chat ? { chat: message.forward_from_chat, message_id: message.forward_from_message_id } : null);
+  const wantedMessageId = Number(origin?.chat && origin?.message_id ? origin.message_id : 0);
+
+  if (wantedMessageId > 0) {
+    const channel = cleanText(origin.chat.id || origin.chat.username, 60);
+    const found = typeof repository.findContentByAnnouncementMessage === 'function'
+      ? await repository.findContentByAnnouncementMessage({ channelId: channel, messageId: wantedMessageId })
+      : null;
+    await ctx.reply(found
+      ? postIdAnswerText(found, config)
+      : `That forwarded post is not an announcement of mine I can match, so it has no Post ID here.\n\n/search <title> lists the cards that do, /postid finds them by the day they were uploaded, and /posts lists the newest ones.`);
+    return true;
+  }
+
+  const text = cleanText(message.text, 400);
+  const onlyLink = /^\s*https?:\/\/\S+\s*$/;
+  if (!text || !onlyLink.test(text.trim())) return false;
+  let url;
+  try {
+    url = new URL(text.trim());
+  } catch {
+    return false;
+  }
+  const host = String(url.hostname || '').toLowerCase();
+  if (host === 't.me' || host.endsWith('.t.me')) {
+    const parts = url.pathname.split('/').filter(Boolean);
+    // `/c/<internal-id>/<message-id>` or `/<channel>/<message-id>`. A bare channel link, and a
+    // `/s/…` short link, carry no message id to match on.
+    const messageId = parts[0] === 's' ? 0 : Number.parseInt(parts.at(-1), 10) || 0;
+    if (messageId <= 0 || parts.length < 2) return false;
+    const channel = parts[0] === 'c' ? `-${Number.parseInt(parts[1], 10)}` : `@${parts[0]}`;
+    const found = typeof repository.findContentByAnnouncementMessage === 'function'
+      ? await repository.findContentByAnnouncementMessage({ channelId: channel, messageId })
+      : null;
+    if (found) {
+      await ctx.reply(postIdAnswerText(found, config));
+      return true;
+    }
+    // A storage-channel message is not an announcement, but the card it fed is findable by it.
+    const viaStorage = typeof repository.findContentByStorageMessageId === 'function'
+      ? await repository.findContentByStorageMessageId(messageId, channel.replace(/^-?@?/, ''), { includeLegacy: true })
+      : null;
+    if (!viaStorage) return false;
+    const card = typeof repository.findContentByAdminId === 'function'
+      ? await repository.findContentByAdminId(viaStorage.adminId)
+      : viaStorage;
+    await ctx.reply(card ? postIdAnswerText(card, config) : `That storage message belongs to ${viaStorage.adminId}, which is no longer in the catalog.`);
+    return true;
+  }
+  const slug = catalogSlugFromUrl(url);
+  if (!slug || typeof repository.findContentBySlug !== 'function') return false;
+  const found = await repository.findContentBySlug(slug);
+  if (!found) return false;
+  await ctx.reply(postIdAnswerText(found, config));
+  return true;
 }
 
 /** Validate, mirror, and store one replacement poster for a published card. */
 export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config }) {
   const existing = await repository.findContentByAdminId(adminId);
   if (!existing) {
-    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /postid to find an ID.`);
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
     return null;
   }
   let posterResult = null;
@@ -939,6 +1129,13 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
   const announcementSync = updated
     ? await queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, config, adminId: updated.adminId, notifyChatId: chatId(ctx) })
     : null;
+  // Choosing the artwork by hand is also the moment a card gets the rest of its identity: the same
+  // provider lookup that found this poster knows its year, genres and synopsis, and a release
+  // published from a filename usually has none of them.
+  const detailsJob = updated
+    ? queuePosterRematchForTitle({ repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram })
+    : null;
+  detailsJob?.catch(() => {});
   return { existing, posterResult, updated, announcementSync };
 }
 
@@ -946,7 +1143,7 @@ export async function presentPosterCandidates({ ctx, repository, config, adminId
   const target = adminId ? await repository.findContentByAdminId(adminId) : null;
   if (adminId && !target) {
     await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
-    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /postid to find an ID.`);
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
     return false;
   }
   const searchTitle = cleanText(query, 180) || target?.title || '';
@@ -983,7 +1180,11 @@ export async function presentPosterCandidates({ ctx, repository, config, adminId
     candidates
   });
   await ctx.reply(
-    `Found ${candidates.length} match${candidates.length === 1 ? '' : 'es'} for ${adminId || 'this draft'}. Tap the artwork to mirror it to ImgBB and use it on the card.`,
+    [
+      `Found ${candidates.length} match${candidates.length === 1 ? '' : 'es'} for ${adminId || 'this draft'}. Tap one to mirror it to ImgBB and use it on the card:`,
+      '',
+      posterCandidateListText(candidates)
+    ].join('\n'),
     posterCandidateKeyboard(candidates)
   );
   return true;
@@ -1146,20 +1347,18 @@ function parseBatchArgument(value) {
 
   // An optional category prefix lets a publisher override automatic detection
   // without adding a separate, more fragile batch command syntax.
-  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series|adult|18\+?)\s*(?:\||:)\s*(.+)$/i);
+  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series|t\.?v\.?|ott|adult|18\+?)\s*(?:\||:)\s*(.+)$/i);
   if (!prefixed) return { title: supplied, category: null };
 
-  const rawCategory = prefixed[1].toLowerCase().replace(/[\s-]/g, '');
-  const category = rawCategory === 'kdrama'
-    ? 'kdrama'
-    : rawCategory === 'webseries'
-      ? 'web-series'
-      : rawCategory === 'adult' || rawCategory === '18+' || rawCategory === '18'
-        ? ADULT_CATEGORY
-        : rawCategory;
+  // Spoken names are resolved through the same alias table as /category, so `/batch tv | X`,
+  // `/batch OTT | X`, and `/batch web series | X` all mean what the publisher meant by them.
+  const spoken = prefixed[1].toLowerCase().replace(/[\s._-]+/g, '');
+  const category = /^(?:adult|18\+?|18)$/.test(spoken)
+    ? ADULT_CATEGORY
+    : resolveCategoryId(spoken === 'tv' || spoken === 'ott' ? 'tv' : spoken);
   return {
     title: cleanText(prefixed[2], 180),
-    category: PUBLISH_CATEGORIES.includes(category) ? category : null
+    category: category && PUBLISH_CATEGORIES.includes(category) ? category : null
   };
 }
 
@@ -1283,28 +1482,73 @@ export function inferBatchTitle(files = []) {
   return '';
 }
 
-export function inferBatchCategory({ title = '', files = [] } = {}) {
+export function inferBatchCategory({ title = '', files = [], withSignal = false } = {}) {
   const signals = [title, ...files.flatMap((file) => [file?.displayName, file?.name])]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
+  const said = (category) => (withSignal ? { category, evidence: true } : category);
+  const guessed = (category) => (withSignal ? { category, evidence: false } : category);
 
-  if (/\b(?:donghua|manhua|xianxia|cultivation|chinese\s+anime)\b/.test(signals)) return 'donghua';
-  if (/\b(?:k[\s-]?drama|korean\s+drama)\b/.test(signals)) return 'kdrama';
-  if (/\b(?:cartoon|animated\s+(?:series|show)|kids\s+animation)\b/.test(signals)) return 'cartoon';
-  if (/\b(?:anime|japanese\s+anime)\b/.test(signals)) return 'anime';
-  if (/\b(?:web[\s-]?series|webseries)\b/.test(signals)) return 'web-series';
+  // A publisher who wrote the word in the title or the caption means it, so this runs first and the
+  // providers are never consulted.
+  if (/\b(?:donghua|manhua|xianxia|cultivation|chinese\s+anime)\b/.test(signals)) return said('donghua');
+  if (/\b(?:k[\s-]?drama|korean\s+drama)\b/.test(signals)) return said('kdrama');
+  if (/\b(?:cartoon|animated\s+(?:series|show)|kids\s+animation)\b/.test(signals)) return said('cartoon');
+  if (/\b(?:anime|japanese\s+anime)\b/.test(signals)) return said('anime');
+  if (/\b(?:web[\s-]?series|webseries)\b/.test(signals)) return said('web-series');
+  // Only a labelled TV/OTT release counts as evidence: `Show (OTT)`, `Show | TV Premiere`. A bare
+  // `TV` is a release-group tag on a filename far too often to trust on its own.
+  if (/\b(?:ott|tv)\s+(?:original|premiere|show|series|special)\b/i.test(title)
+    || /[(|[{]\s*(?:ott|tv)\b/i.test(title)) return said('tv');
 
   // Season packaging is episodic by definition: `Fullmetal Alchemist S1` has no
   // episode numbers in the filenames, and used to be filed as a movie.
   const hasSeasonMarkers = files.some((file) => Boolean(detectUploadSeasonForFile(file)));
   if (summarizeEpisodes(files).count || hasSeasonMarkers) {
-    if (/\b(?:chinese|mandarin|cantonese)\b/.test(signals)) return 'donghua';
-    if (/\b(?:japanese|jpn)\b/.test(signals)) return 'anime';
-    if (/\b(?:korean|kor)\b/.test(signals)) return 'kdrama';
-    return 'web-series';
+    if (/\b(?:chinese|mandarin|cantonese)\b/.test(signals)) return said('donghua');
+    if (/\b(?:japanese|jpn)\b/.test(signals)) return said('anime');
+    if (/\b(?:korean|kor)\b/.test(signals)) return said('kdrama');
+    // Everything below this line is a guess from packaging alone, and `decidePublishCategory`
+    // treats it as one: that is the difference between a category and a coin toss.
+    return guessed('web-series');
   }
-  return 'movie';
+  return guessed('movie');
+}
+
+/**
+ * The category a release should be filed under.
+ *
+ * A caption that says nothing cannot tell a donghua from a web series — `Peerless Martial Spirit
+ * S01E02.mkv` is exactly as informative as a Chinese live-action show — and filing every such
+ * upload as "web series" meant publishers correcting the same field again and again. So an
+ * evidence-free guess is put to the providers before anything is written, and their answer wins
+ * when they recognised the title. No key configured, no network, or a weak match leaves the
+ * caption's own answer in place, because silence from a provider must not misfile a release.
+ */
+export async function decidePublishCategory({ title = '', files = [], chosen = null, config = null, search = searchPosterCandidates } = {}) {
+  const guess = inferBatchCategory({ title, files, withSignal: true });
+  const cleanTitle = cleanText(title, 180);
+  // A category that is not what the caption alone would produce was chosen deliberately — on the
+  // /panel keyboard, by `/batch donghua | Title`, or with /category — and a person's word outranks
+  // a provider's. Only a category nobody picked is put to the providers.
+  if (chosen && CATEGORY_IDS.has(chosen) && chosen !== guess.category) return { category: chosen, evidence: true, source: 'publisher' };
+  if (guess.evidence || !cleanTitle) return { ...guess, source: 'caption' };
+  let hints = null;
+  try {
+    hints = await searchCategoryHints(cleanTitle, config || {}, { search, category: 'movie' });
+  } catch {
+    hints = null;
+  }
+  const decided = categoryFromHints({ hints });
+  if (!decided || decided === guess.category) return { ...guess, source: 'caption' };
+  return {
+    category: decided,
+    evidence: true,
+    source: hints.provider,
+    matchedTitle: cleanText(hints.title, 80) || null,
+    was: guess.category
+  };
 }
 
 function autoPublishKeyboard(enabled) {
@@ -2431,7 +2675,14 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
   const wantsMatch = !content.posterUrl
     || poster.source === 'generated-fallback'
     || (poster.title && poster.title !== content.title);
-  if (!wantsMatch) return null;
+  // A title that was corrected (or a poster that was just chosen by hand) is also the moment the
+  // rest of the card is worth asking about: a release published from a filename usually has no
+  // synopsis, no year, and no genres. Fields the publisher never filled are filled; anything they
+  // typed is left alone.
+  const needsDetails = !cleanText(content.description, 2_000)
+    || !Number(content.year)
+    || !(Array.isArray(content.genres) && content.genres.length);
+  if (!wantsMatch && !needsDetails) return null;
   const title = cleanText(content.title, 180);
   const tell = notify || (ctx ? (chat, text) => ctx.reply(text).catch(() => {}) : null);
   return enqueueAnnouncementJob({
@@ -2449,35 +2700,69 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
         return outcome;
       }
       const sourceUrl = metadata?.posterOriginalUrl || null;
-      if (!sourceUrl || metadata?.matched === false) {
+      // Only ever artwork the card was missing: a poster chosen by hand is that way on purpose and
+      // is never searched away, even when the same lookup turns up details worth adding.
+      const hasArtwork = wantsMatch && Boolean(sourceUrl) && metadata?.matched !== false;
+      const details = {};
+      if (metadata && metadata.matched !== false) {
+        const synopsis = cleanText(metadata.description, 2_000);
+        const providerGenres = Array.isArray(metadata.genres) ? metadata.genres.filter(Boolean).slice(0, 8) : [];
+        if (synopsis && !cleanText(content.description, 2_000)) details.description = synopsis;
+        if (Number.isInteger(Number(metadata.year)) && !Number(content.year)) details.year = Number(metadata.year);
+        if (providerGenres.length && !(Array.isArray(content.genres) && content.genres.length)) details.genres = providerGenres;
+        const providerStatus = cleanText(metadata.status, 40);
+        if (providerStatus && !cleanText(content.status, 40)) details.status = providerStatus;
+        if (metadata.provider && metadata.provider !== 'fallback' && !content.metadataProvider) {
+          details.metadataProvider = metadata.provider;
+          details.tmdbId = metadata.tmdbId || content.tmdbId || null;
+          details.metadataKey = metadata.metadataKey || content.metadataKey || null;
+        }
+      }
+      if (!hasArtwork && !Object.keys(details).length) {
         outcome.skipped = 1;
-        outcome.reason = 'no provider artwork was found for the corrected title';
+        outcome.reason = 'no provider artwork or details were found for the corrected title';
         return outcome;
       }
-      const image = await prepare({ sourceUrl, title, category: content.category });
       let hosted = null;
-      try {
-        hosted = await host({ image, title, config });
-      } catch (error) {
-        if (!isPosterRateLimit(error)) throw error;
-        queuePosterRetry({ adminId: target, title, image, notifyChatId: ctx ? chatId(ctx) : null });
-        outcome.skipped = 1;
-        outcome.reason = 'ImgBB is rate limiting; the artwork is hosted on the poster queue';
-        return outcome;
+      if (hasArtwork) {
+        const image = await prepare({ sourceUrl, title, category: content.category });
+        try {
+          hosted = await host({ image, title, config });
+        } catch (error) {
+          if (!isPosterRateLimit(error)) throw error;
+          queuePosterRetry({ adminId: target, title, image, notifyChatId: ctx ? chatId(ctx) : null });
+          // A synopsis the provider already gave is worth writing even while the image host cools,
+          // so the card is not left blank because ImgBB was busy. A store that refuses the write
+          // loses nothing: the retry lane carries the artwork and the details with it.
+          if (Object.keys(details).length) {
+            const partial = await repository.updateContentByAdminId(target, details).catch(() => null);
+            outcome.updated = partial ? 1 : 0;
+          }
+          outcome.skipped = 1;
+          outcome.reason = 'ImgBB is rate limiting; the artwork is hosted on the poster queue';
+          return outcome;
+        }
       }
       const saved = await repository.updateContentByAdminId(target, {
-        posterUrl: hosted.url,
-        backdropUrl: hosted.url,
-        poster: {
-          provider: 'imgbb',
-          providerId: hosted.providerId || null,
-          originalUrl: hosted.originalUrl || sourceUrl,
-          source: hosted.source || 'remote-mirror',
-          title,
-          mirroredAt: new Date().toISOString()
-        }
+        ...(hosted
+          ? {
+            posterUrl: hosted.url,
+            backdropUrl: hosted.url,
+            poster: {
+              provider: 'imgbb',
+              providerId: hosted.providerId || null,
+              originalUrl: hosted.originalUrl || sourceUrl,
+              source: hosted.source || 'remote-mirror',
+              title,
+              mirroredAt: new Date().toISOString()
+            }
+          }
+          : {}),
+        ...details
       });
+      outcome.details = Object.keys(details).length;
       outcome.updated = saved ? 1 : 0;
+      outcome.artwork = Boolean(hosted);
       if (!saved) outcome.reason = 'that card is no longer in the catalog';
       // The channel copy is refreshed here rather than queued, because this job is already on the
       // lane: a queued follow-up goes to the back and arrives after the very edit this card's title
@@ -3850,24 +4135,25 @@ async function publishDraftSession({
   // each group its own season; a plain upload is settled by
   // `dominantReleaseSeason`, which deliberately returns null for a movie or an
   // ambiguous batch so those keep their established merge behaviour.
-  const isMovieRelease = session?.category === 'movie';
+  const draftTitle = withSeasonLabel(session.title, readSeason(season) ?? (session?.category === 'movie' ? null : dominantReleaseSeason(session?.files || [], { requireEveryFile: true })));
+  const categoryDecision = await decidePublishCategory({ title: draftTitle, files: session.files, chosen: session.category, config });
+  const category = categoryDecision.category;
+  const isMovieRelease = category === 'movie';
   const releaseSeason = readSeason(season) ?? (isMovieRelease ? null : dominantReleaseSeason(session?.files || [], { requireEveryFile: true }));
 
-  const draftTitle = withSeasonLabel(session.title, releaseSeason);
-
   try {
-    const metadata = session.metadata || (isAdultCategory(session.category)
+    const metadata = session.metadata || (isAdultCategory(category)
       ? emptyPrivateCategoryMetadata(draftTitle)
-      : await findMetadata(draftTitle, session.category, config));
+      : await findMetadata(draftTitle, category, config));
     const mergeKeys = releaseMergeKeys(session, metadata, { season: releaseSeason });
     // This final guard applies to manual uploads, /batch imports, and storage
     // automation. A later upload for the same category/title or verified
     // provider identity extends the existing post instead of making a second
     // catalog card and second delivery link.
     if (mergeKeys.length && typeof repository.appendFilesToContentByMergeKey === 'function') {
-      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, session.category, { season: releaseSeason });
+      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, category, { season: releaseSeason });
       if (existingMatch) {
-        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys, session.category);
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys, category);
         if (!content) throw new Error('The existing same-title post could not be updated.');
         if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
         const websiteUrl = getContentPageUrl(config, content);
@@ -3885,7 +4171,12 @@ async function publishDraftSession({
         return { content, metadata, merged: true, websiteUrl, deliveryUrl };
       }
     }
-    await ctx.reply('Creating a new catalog post and mirroring its poster to ImgBB now…');
+    await ctx.reply([
+      'Creating a new catalog post and mirroring its poster to ImgBB now…',
+      categoryDecision.was
+        ? `Filed under ${categoryDetails(category).label}, not ${categoryDetails(categoryDecision.was).label}: the caption said nothing either way, so this is what ${categoryDecision.source} calls “${categoryDecision.matchedTitle || draftTitle}”. /category <Post ID> ${category} or another name changes it.`
+        : null
+    ].filter(Boolean).join('\n'));
     const overrides = session.overrides || {};
     const episodeSummary = summarizeEpisodes(session.files);
     const uploadedLanguages = summarizeUploadLanguages(session.files);
@@ -3898,7 +4189,7 @@ async function publishDraftSession({
       sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
       sourceIsManual: Boolean(session.posterOriginalUrl),
       title: posterTitle,
-      category: session.category
+      category
     });
     let posterResult = null;
     try {
@@ -3928,7 +4219,7 @@ async function publishDraftSession({
     const releaseLabel = overrides.releaseLabel || episodeSummary.releaseLabel || metadata.releaseLabel || `${session.files.length} files`;
     const content = await repository.createContent({
       title,
-      category: session.category,
+      category,
       year: overrides.year || metadata.year,
       // Explicit /lang settings win. Otherwise the file caption/filename is
       // the source of truth for release audio labels (e.g. Multi Hindi + Malayalam).
@@ -6374,6 +6665,12 @@ export async function launchTelegramBot({ config, repository }) {
     await beginDraft(ctx, ADULT_CATEGORY, parseCommandArgument(ctx.message.text), repository, config);
   });
 
+  // Publishers of this shelf call it OTT as often as TV, so both words open the same draft.
+  bot.command('ott', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginDraft(ctx, 'tv', parseCommandArgument(ctx.message.text), repository, config);
+  });
+
   bot.command('batch', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config);
@@ -6650,16 +6947,12 @@ export async function launchTelegramBot({ config, repository }) {
     if (!(await requirePublisher(ctx, repository, config))) return;
     const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
     const target = parsePublishedPostEdit(argument);
-    const rawCategory = String(target?.value || '').trim().toLowerCase().replace(/[\s_-]+/g, '-');
-    const category = rawCategory === 'webseries'
-      ? 'web-series'
-      : rawCategory === 'k-drama' || rawCategory === 'kdrama'
-        ? 'kdrama'
-        : rawCategory === '18+' || rawCategory === '18'
-          ? ADULT_CATEGORY
-          : rawCategory;
-    if (!target || !PUBLISH_CATEGORIES.includes(category)) {
-      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nSeveral posts at once: /category SB-0123ABCDEF, SB-1122334455 anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, adult');
+    const rawCategory = String(target?.value || '').trim().toLowerCase().replace(/[\s._-]+/g, '');
+    const category = /^(?:adult|18\+?|18)$/.test(rawCategory)
+      ? ADULT_CATEGORY
+      : resolveCategoryId(rawCategory);
+    if (!target || !category || !PUBLISH_CATEGORIES.includes(category)) {
+      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nSeveral posts at once: /category SB-0123ABCDEF, SB-1122334455 anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, tv (also accepted: ott), adult');
       return;
     }
     // The 18+ storage boundary is decided per post: one restricted card in a
@@ -6870,6 +7163,43 @@ export async function launchTelegramBot({ config, repository }) {
     }
     await ctx.editMessageReplyMarkup?.(null)?.catch?.(() => {});
     await replyBatchDiagnostics(ctx, [mergeResultText(outcome, config)]);
+  });
+
+  // /search <text> — the Post ID list a publisher asked for. Titles, filenames, and IDs all match,
+  // and a long answer is split across messages rather than cut off, because a truncated ID is useless.
+  bot.command('search', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const query = parseCommandArgument(ctx.message.text, 140);
+    if (!query) {
+      await ctx.reply([
+        'Usage: /search Our Sticky Love',
+        'It answers with the Post ID of every card whose title, filename, or ID matches \u2014 no more scrolling through /posts.',
+        'You can also forward me the announcement post, or paste the catalog page link, and I reply with that card\u2019s Post ID.'
+      ].join('\n'));
+      return;
+    }
+    const listed = typeof repository.listContent === 'function'
+      ? await repository.listContent({ query, limit: 24 })
+      : [];
+    if (!listed.length) {
+      await ctx.reply(`No catalog card matches \u201c${query}\u201d. /posts lists the newest posts and /postid finds them by the day they were uploaded.`);
+      return;
+    }
+    const lines = listed.map((entry) => {
+      const files = Number.isInteger(Number(entry.filesCount)) ? entry.filesCount : (Array.isArray(entry.files) ? entry.files.length : 0);
+      const link = config ? getContentPageUrl(config, entry) : null;
+      const facts = [
+        categoryDetails(entry.category).label,
+        Number(entry.year) ? String(entry.year) : null,
+        `${files} file${files === 1 ? '' : 's'}`,
+        entry.published === false ? 'draft' : null
+      ].filter(Boolean).join(' \u00b7 ');
+      return [`\u25aa ${entry.adminId} \u00b7 ${cleanText(entry.title, 80)}`, `   ${facts}`, link ? `   ${link}` : null]
+        .filter(Boolean)
+        .join('\n');
+    });
+    // Split rather than truncated: an ID cut in half cannot be pasted into the next command.
+    await replyBatchDiagnostics(ctx, [`${listed.length} card${listed.length === 1 ? '' : 's'} match \u201c${query}\u201d:`, '', ...lines]);
   });
 
   bot.command('posts', async (ctx) => {
@@ -7628,7 +7958,7 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
   });
 
-  bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series|adult)$/, async (ctx) => {
+  bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series|tv|adult)$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (!(await requirePublisher(ctx, repository, config))) return;
     await beginDraft(ctx, ctx.match[1], '', repository, config);
@@ -7661,6 +7991,9 @@ export async function launchTelegramBot({ config, repository }) {
     // An armed /poster conversation takes the next message (post ID, image
     // link, or title) before it can be mistaken for a draft title.
     if (await handlePosterFlowMessage(ctx, repository, config)) return;
+    // A forwarded announcement or a pasted card link is a question about a Post ID, and it is
+    // answered here rather than being mistaken for the next title typed into a draft.
+    if (await handlePostIdLookupMessage(ctx, repository, config)) return;
     const session = await repository.findSession(chatId(ctx), userId(ctx));
 
     if (isMediaMessage(message)) {

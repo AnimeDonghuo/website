@@ -1464,8 +1464,9 @@ test('the new poster style mirrors a tapped artwork button and a failed search s
   try {
     const keyboard = posterCandidateKeyboard(candidates);
     const labels = keyboard.reply_markup.inline_keyboard.flat().map((button) => button.text);
-    assert.equal(labels[0], '1. TMDB · Picked Release (2026)', 'the provider tag leads so a cut label stays readable');
-    assert.ok(labels[1].startsWith('2. IMDb · '), labels[1]);
+    assert.equal(labels[0], '1 · 2026 · TMDB · Picked Release', 'one artwork per row, with the year and provider where a cut label cannot lose them');
+    assert.deepEqual(keyboard.reply_markup.inline_keyboard.map((row) => row.length), [1, 1, 1, 1], 'candidates are never packed two to a row');
+    assert.ok(labels[1].startsWith('2 · IMDb · '), labels[1]);
     assert.ok(labels[1].endsWith('…') && !labels[1].includes('IMDb…'), `a long non-Latin title is shortened, not the provider: ${labels[1]}`);
     assert.deepEqual(labels.at(-1), 'Cancel');
     for (const label of labels) {

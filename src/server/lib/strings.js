@@ -7,12 +7,48 @@ export const CATEGORIES = [
   { id: 'kdrama', label: 'K-Drama', shortLabel: 'K-Drama', tone: 'rose' },
   { id: 'movie', label: 'Movies', shortLabel: 'Movie', tone: 'lime' },
   { id: 'web-series', label: 'Web Series', shortLabel: 'Series', tone: 'blue' },
+  // Broadcast and streaming-original shows that are neither anime, donghua, nor K-Drama.
+  // Publishers call it both "TV" and "OTT", so both words are accepted on input (see
+  // categoryAliases below) and the shelf is labelled for both readings.
+  { id: 'tv', label: 'TV & OTT', shortLabel: 'TV', tone: 'amber' },
   // Adult releases are intentionally a first-class category so their private
   // storage source and public age gate can be enforced consistently.
   { id: 'adult', label: '18+', shortLabel: '18+', tone: 'crimson' }
 ];
 
 export const CATEGORY_IDS = new Set(CATEGORIES.map((category) => category.id));
+
+// A publisher types what the industry calls the thing, not what the site happens to name the
+// shelf. Every alias here lands on `tv`, which covers broadcast shows, streaming originals, and
+// YouTube/OTT premieres that are not web series in the fan-subbing sense.
+export const CATEGORY_ALIASES = {
+  tv: 'tv',
+  ott: 'tv',
+  'tv-show': 'tv',
+  'tv-series': 'tv',
+  television: 'tv',
+  broadcast: 'tv',
+  streaming: 'tv',
+  // The shorthands that were already typed before this table existed, kept working verbatim.
+  webseries: 'web-series',
+  series: 'web-series',
+  'k-drama': 'kdrama',
+  kdramas: 'kdrama',
+  film: 'movie',
+  films: 'movie',
+  anime: 'anime',
+  animation: 'cartoon',
+  18: 'adult',
+  '18+': 'adult'
+};
+
+/** The catalog category a word names, following the aliases a publisher is likely to type. */
+export function resolveCategoryId(value) {
+  const raw = cleanText(value, 40)?.toLowerCase().replace(/\s+/g, '-').replace(/-+/g, '-') || null;
+  if (!raw) return null;
+  const alias = CATEGORY_ALIASES[raw] || raw;
+  return CATEGORY_IDS.has(alias) ? alias : null;
+}
 
 export function categoryDetails(category) {
   return CATEGORIES.find((entry) => entry.id === category) || {

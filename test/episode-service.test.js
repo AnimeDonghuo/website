@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanDeliveryFileName, cleanMediaName, seasonPackOf, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
+import { cleanDeliveryFileName, cleanMediaName, extractEpisodeRange, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, compareQualityAscending, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, extractSeasonNumber, fileReplacementKey, groupFilesBySeason, normalizeQualityLabel, publicFileDisplayName, qualityHeight, stripTelegramAttribution, summarizeEpisodes, summarizeUploadLanguages } from '../src/server/services/episode-service.js';
 
 test('caption is cleaned of Telegram attribution before episode parsing', () => {
   const result = detectUploadEpisode({
@@ -180,4 +180,46 @@ test('a file naming a season and no episode is that season complete', () => {
   assert.equal(pack('Show S02 Episode 7 1080p.mkv'), null);
   assert.equal(seasonPackOf(null), null);
   assert.equal(seasonPackOf({}), null);
+});
+
+test('a combined-range pack is indexed as the episodes it holds, in every wording a uploader writes', () => {
+  // `[Epi 01-06]` is how K-drama and donghua packs arrive. Until the token and its separators were
+  // recognised, the whole card read as a single flat release on the delivery page, and the file was
+  // even classed as a complete season nobody had to number.
+  for (const name of [
+    'Our.Sticky.Love.S01.[Epi.01-06].480p.HEVC.HDRip.mkv',
+    'Our.Sticky.Love.S01 [Epi 01-06] 480p HEVC HDRip.mkv',
+    'Our.Sticky.Love.S01.Epi.01-06.mkv',
+    'Our.Sticky.Love.S01_EPISODES_01-06.mkv',
+    'Our.Sticky.Love S01E01-E06.mkv'
+  ]) {
+    const range = extractEpisodeRange(name);
+    assert.deepEqual([range?.start, range?.end], [1, 6], name);
+    assert.equal(range.label, 'Episodes 01\u201306', name);
+  }
+
+  const caption = detectUploadEpisode({ caption: '\u2764 Our Sticky Love S01 [Epi 01-06] 480p', filename: 'x.mkv' });
+  assert.deepEqual([caption.start, caption.end], [1, 6], 'the wording survives the caption cleaner');
+  const filename = detectUploadEpisode({ filename: 'Our.Sticky.Love.S01.[Epi.01-06].480p.mkv' });
+  assert.deepEqual([filename.start, filename.end], [1, 6], 'and the raw filename is read too, because cleanMediaName drops bracketed release noise');
+  assert.equal(filename.displayName, 'Our Sticky Love', 'while the displayed title stays tidy');
+
+  const packed = { name: 'Our.Sticky.Love.S01.[Epi.01-06].480p.mkv' };
+  assert.equal(seasonPackOf(packed), null, 'a file that names its episodes is not the whole season');
+  const [attributed] = repairEpisodeGaps([packed], { episodic: true });
+  assert.equal(hasEpisodeRange(attributed), true, 'and the stored record carries the range');
+  assert.deepEqual([attributed.episode.start, attributed.episode.end], [1, 6]);
+
+  const summary = summarizeEpisodes([
+    attributed,
+    repairEpisodeGaps([{ name: 'Our.Sticky.Love.S01.[Epi.07-12].480p.mkv' }], { episodic: true })[0]
+  ]);
+  assert.deepEqual(summary.groups.map((group) => [group.start, group.end, group.combined]), [[1, 6, true], [7, 12, true]], 'each combined range keeps its own block');
+  assert.equal(summary.count, 12);
+  assert.equal(summary.releaseLabel, '12 episodes');
+
+  // What must not start looking like an episode: a season pack with no range, a film, a bare number.
+  assert.equal(extractEpisodeRange('The.Simpsons.S01.1080p.WEB-DL.mkv'), null);
+  assert.equal(extractEpisodeRange('Some.Movie.2024.1080p.mkv'), null);
+  assert.equal(extractEpisodeRange('Season 2 Pack 08 complete.mkv')?.start ?? 8, 8, 'a file that does say 08 is still Episode 08');
 });
