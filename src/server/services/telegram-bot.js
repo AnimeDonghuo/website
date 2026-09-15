@@ -5,7 +5,7 @@ import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatByt
 import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
 import { reindexContentRecord } from '../catalog.repository.js';
-import { PosterHostingError, hostPosterImage, isPosterRateLimit, mirrorPosterToImgBB, preparePosterImage } from './poster-service.js';
+import { PosterHostingError, downloadPosterImage, hostPosterImage, isPosterRateLimit, mirrorPosterToImgBB, preparePosterImage } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
@@ -197,6 +197,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'sync', description: 'Refresh what the announcement channels show: /sync, /sync go, /sync retry, /sync db' },
   { command: 'auto', description: 'Control storage auto-publish' },
   { command: 'title', description: 'Set draft or post title' },
+  { command: 'titlebatch', description: 'Rename IDs and titles separated by spaced commas' },
   { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
   { command: 'lan', description: 'Alias for /lang' },
   { command: 'lam', description: 'Alias for /lang' },
@@ -600,7 +601,8 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
   const commandPattern = names.length
     ? new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\b[:\\s,-]*`, 'i')
     : null;
-  const lines = String(value || '').split(/\r?\n/);
+  const isTitleBatch = names.includes('titlebatch');
+  const lines = String(value || '').split(isTitleBatch ? /\r?\n|[ \t]+,[ \t]+/ : /\r?\n/);
   const entries = [];
   const invalid = [];
   const seen = new Map();
@@ -609,6 +611,7 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const body = commandPattern ? trimmed.replace(commandPattern, ' ') : trimmed;
+    if (isTitleBatch && !body.trim()) continue;
     const target = parsePublishedPostEdit(body);
     if (!target) {
       invalid.push({ line: trimmed, reason: 'no Post ID on that line' });
@@ -624,6 +627,10 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
         line: trimmed,
         reason: `${target.adminIds.length} post IDs share one ${commands[0] || 'value'}; a title belongs to one release, so give each ID its own line`
       });
+      continue;
+    }
+    if (isTitleBatch && /\bSB-[A-F0-9]{10}\b/i.test(title)) {
+      invalid.push({ line: trimmed, reason: 'another Post ID is inside the title; separate entries with space comma space ( , ) or a newline' });
       continue;
     }
     const adminId = target.adminId;
@@ -647,9 +654,13 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
  * Returns false when the message is not a bulk rename — a single line or a draft title belongs to
  * the ordinary one-post flow, whose reply is more exact than a batch report would be.
  */
-export async function applyBulkTitleEdits({ ctx, repository, text, config = null, commands = ['title', 't', 'rename'] }) {
+export async function applyBulkTitleEdits({ ctx, repository, text, config = null, commands = ['title', 't', 'rename'], force = false }) {
   const bulk = parseBulkPostEdits(text, { commands });
-  if (!(bulk.entries.length > 1 || (bulk.entries.length === 1 && bulk.invalid.length))) return false;
+  if (!force && !(bulk.entries.length > 1 || (bulk.entries.length === 1 && bulk.invalid.length))) return false;
+  if (!bulk.entries.length) {
+    await ctx.reply('Usage: /titlebatch SB-0123ABCDEF RRR , SB-1122334455 PK\nPut a space on both sides of each separating comma, or use one ID and title per line.');
+    return true;
+  }
   const result = await updatePublishedPost({ ctx, repository, config, field: 'title', fieldLabel: 'Title', edits: bulk.entries, rematchPoster: true });
   if (result?.handled && bulk.invalid.length) {
     await ctx.reply([
@@ -2815,6 +2826,28 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
  * An announcement the publisher deleted manually is forgotten rather than retried, and
  * a refused edit keeps its ref so the lane can try again later.
  */
+export async function editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download = downloadPosterImage }) {
+  const edit = (media) => telegram.editMessageMedia(
+    reference.channelId, reference.messageId, null,
+    { type: 'photo', media, caption, parse_mode: 'HTML' },
+    replyMarkup ? { reply_markup: replyMarkup } : {}
+  );
+  try {
+    return await edit(posterUrl);
+  } catch (error) {
+    if (!/failed to get HTTP URL content|wrong file identifier\/HTTP URL specified|WEBPAGE_CURL_FAILED/i.test(error?.description || error?.message || '')) throw error;
+    // Download with the poster service's URL, redirect, size and timeout protections.
+    // Never substitute generated artwork: a failure must stay pending for /sync.
+    let image;
+    try {
+      image = await download(posterUrl);
+    } catch (downloadError) {
+      throw new Error(`${error.description || error.message}; direct poster download failed: ${downloadError.message}`, { cause: downloadError });
+    }
+    return edit({ source: image.buffer, filename: image.contentType === 'image/png' ? 'poster.png' : 'poster.jpg' });
+  }
+}
+
 export async function syncPublishedAnnouncements({ telegram, repository, content, config = null, options = {} }) {
   const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
   const wait = typeof options.wait === 'function' ? options.wait : pause;
@@ -2834,6 +2867,8 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
   if (!refs.length || !telegram || isAdultCategory(source?.category)) return result;
   const caption = announcementCaption(source);
   const posterUrl = source.posterUrl || null;
+  let downloadedPoster;
+  const download = (url) => (downloadedPoster ||= downloadPosterImage(url).catch((error) => { downloadedPoster = null; throw error; }));
   const kept = [];
   let dirty = false;
 
@@ -2887,13 +2922,7 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
       // the reference so the next sweep does not spend a call learning it again.
       let attached = false;
       try {
-        await telegram.editMessageMedia(
-          reference.channelId,
-          reference.messageId,
-          null,
-          { type: 'photo', media: posterUrl, caption, parse_mode: 'HTML' },
-          replyMarkup ? { reply_markup: replyMarkup } : {}
-        );
+        await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
         if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
         attached = true;
       } catch (error) {
@@ -2922,13 +2951,7 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         if (reference.kind !== 'text' && posterUrl) {
-          await telegram.editMessageMedia(
-            reference.channelId,
-            reference.messageId,
-            null,
-            { type: 'photo', media: posterUrl, caption, parse_mode: 'HTML' },
-            replyMarkup ? { reply_markup: replyMarkup } : {}
-          );
+          await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
           // Some Bot API versions ignore reply_markup on editMessageMedia; a
           // second call is idempotent and keeps the website button present.
           if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
@@ -6692,6 +6715,11 @@ export async function launchTelegramBot({ config, repository }) {
     await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
   });
 
+  bot.command('titlebatch', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await applyBulkTitleEdits({ ctx, repository, config, text: ctx.message.text, commands: ['titlebatch', 'title'], force: true });
+  });
+
   bot.command('title', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     // A block of one-line renames is the shape this command takes most, so it is read as a batch
@@ -7189,7 +7217,7 @@ export async function launchTelegramBot({ config, repository }) {
       return;
     }
     const listed = typeof repository.listContent === 'function'
-      ? await repository.listContent({ query, limit: 24 })
+      ? await repository.listContent({ query, limit: 24, includeAdminId: true })
       : [];
     if (!listed.length) {
       await ctx.reply(`No catalog card matches \u201c${query}\u201d. /posts lists the newest posts and /postid finds them by the day they were uploaded.`);

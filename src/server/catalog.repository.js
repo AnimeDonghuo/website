@@ -1886,14 +1886,14 @@ export class MongoCatalogRepository {
     ]);
   }
 
-  async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null } = {}) {
+  async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null, includeAdminId = false } = {}) {
     const filter = contentListFilter({ category, query, hideAdult, genre });
     const start = Math.max(0, Number(offset) || 0);
 
     // The list serializer uses safe file labels to resolve legacy language tags
     // such as "Multi (Hindi + Malayalam)". It never returns `files` to clients.
     return this.contents
-      .find(filter, { projection: LIST_CONTENT_PROJECTION })
+      .find(filter, { projection: includeAdminId ? { ...LIST_CONTENT_PROJECTION, adminId: 1 } : LIST_CONTENT_PROJECTION })
       .sort({ featured: -1, publishedAt: -1 })
       .skip(start)
       .limit(Math.max(1, Math.min(Number(limit) || 60, 100)))

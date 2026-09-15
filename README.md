@@ -483,6 +483,16 @@ Only the Post IDs at the very front of the message are read as targets, so a val
 
 `/description` and `/poster` intentionally do **not** accept a list: a synopsis and artwork identify one release, so copying them across posts would be a mistake rather than a shortcut. `/delete POST_ID[, POST_ID]` already accepts a list.
 
+**Comma-separated title batches — `/titlebatch`.** Send the command and the list in one message:
+
+```text
+/titlebatch SB-0123ABCDEF RRR , SB-1122334455 PK , SB-AABBCCDDEE Jine Nahi Duga
+```
+
+Use a space on **both** sides of each separator (` , `), or put each ID/title on its own line. A comma inside a title (`Hello, World`) stays part of that title. Missing separators that leave another Post ID inside a title are reported rather than saved as one long name. Invalid entries are skipped and reported; repeated IDs use the last title. A command by itself shows usage. Existing `/title` commands still work.
+
+When Telegram cannot fetch a poster URL during an announcement update, the bot downloads the original image using the poster service's safety checks and uploads its bytes to the same message. It does not create a duplicate post or substitute artwork. If both paths fail, the update stays pending and reports the error; use `/sync go` after the host is available again.
+
 **Renaming a page of cards at once — `/title` with one line per post.** After a bulk `/done`, correcting titles used to mean one message per card. A multi-line message is now read as one request:
 
 ```text
