@@ -10,6 +10,7 @@ import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliver
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
+import { addSubsPleaseMagnets, createSubsPleaseService } from './services/subsplease-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -292,7 +293,7 @@ function apiError(res, status, message) {
   res.status(status).json({ error: message });
 }
 
-export function createApp({ config, repository, distPath = defaultDistPath }) {
+export function createApp({ config, repository, distPath = defaultDistPath, subsPlease = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.use(
@@ -466,8 +467,11 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
       if (isAdultContent(item) && !hasAdultAccess(request)) {
         return apiError(response, 403, 'Confirm that you are 18 or older to open this release.');
       }
-      response.set('Cache-Control', isAdultContent(item) ? 'private, no-store' : 'public, max-age=60, s-maxage=120');
-      return response.json({ item: toPublicContent(item, config) });
+      // Anime links are derived from the CURRENT card on every detail request.
+      // A rename/category correction cannot leave persisted stale magnet links.
+      response.set('Cache-Control', isAdultContent(item) || item.category === 'anime' ? 'private, no-store' : 'public, max-age=60, s-maxage=120');
+      const publicItem = toPublicContent(item, config);
+      return response.json({ item: addSubsPleaseMagnets(publicItem, subsPlease?.entries() || [], item) });
     } catch (error) {
       return next(error);
     }
@@ -541,7 +545,10 @@ export function createApp({ config, repository, distPath = defaultDistPath }) {
 export async function startServer() {
   const config = loadConfig();
   const repository = await createCatalogRepository(config);
-  const app = createApp({ config, repository });
+  const subsPlease = createSubsPleaseService({ repository });
+  const app = createApp({ config, repository, subsPlease });
+  // Feed outages never block server startup or Telegram publishing.
+  void subsPlease.start();
   const server = app.listen(config.port, '0.0.0.0', () => {
     console.info(`[server] SoraBox listening on 0.0.0.0:${config.port} (${repository.kind} catalog)`);
     console.info(`[server] Announcement site URL: ${config.siteUrl || 'not configured'}`);
@@ -563,6 +570,7 @@ export async function startServer() {
     closing = true;
     console.info(`[server] ${signal} received; shutting down.`);
     if (bot) bot.stop(signal);
+    await subsPlease.stop();
     await new Promise((resolve) => server.close(resolve));
     await repository.close();
     process.exit(0);
@@ -570,7 +578,7 @@ export async function startServer() {
   process.once('SIGINT', () => void close('SIGINT'));
   process.once('SIGTERM', () => void close('SIGTERM'));
 
-  return { app, server, repository, bot };
+  return { app, server, repository, bot, subsPlease };
 }
 
 const launchedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

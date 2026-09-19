@@ -747,3 +747,18 @@ npm run check
 ```
 
 Before production, test the full Telegram path with a harmless file you own: publish it, open the returned deep link from another Telegram account, and confirm the bot can copy it from the private channel.
+
+### Anime-only SubsPlease magnets
+
+The server reads `https://subsplease.org/rss/` at startup and every ten minutes. Verified releases are cached in MongoDB's `subsplease_releases` collection (in memory in demo mode). Feed errors leave previously verified links available and never block publishing, normal downloads, or server startup. No torrent or video bytes are downloaded by the website.
+
+On anime detail/episode pages, a **Magnet** action appears beside the existing file's **Get file** / **Watch** buttons. Clicking it opens the visitor's installed torrent application. It does **not** create catalog cards, Telegram files, or extra file rows. The SubsPlease release is separate from the Telegram upload: audio and subtitle languages may differ, as the row notes.
+
+Matching rules:
+
+- The current catalog title must match the feed title after punctuation/case normalization. Explicit `Season 2`, `S02`, and `2nd Season` suffixes are equivalent. Fuzzy title matching, translated-title guessing, and cross-season episode-number guessing are deliberately not used.
+- A file must have the exact same quality (`480p`, `720p`, or `1080p`). A 480p upload never gets a 720p/1080p link; unknown or unavailable qualities get no button.
+- An episode or combined episode range must match exactly. `01–13` does not point to `01–12`, and episode 1 does not point to a season batch. A whole-season upload without a known episode end can use a single unambiguous batch starting at episode 1 for that season/quality; competing batch ranges are not guessed.
+- Matching runs from the current title, category, and file metadata on each detail request. Renaming to another title or changing away from anime removes the old button on reload; changing back to a matching anime title/category restores it. No stale links are stored on the catalog card.
+
+**RSS coverage:** This is a rolling feed, not a complete historical archive. Releases already seen are retained across restarts with MongoDB. Older shows/batches not present in the feed or cache will not have a button. Differently translated/romanized titles or unparseable filenames likewise remain unmatched rather than linking to the wrong anime. The active in-memory index retains up to 50,000 recent release/quality combinations.

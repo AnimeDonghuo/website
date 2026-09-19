@@ -474,12 +474,14 @@ function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
           <div className="file-choice__meta">
             {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
             {file.size ? <span>{file.size}</span> : null}
+            {file.magnet ? <span>SubsPlease torrent · audio/subtitles may differ</span> : null}
             <span>{file.kind}</span>
             {file.episode?.combined ? <span className="file-choice__pack">Combined upload</span> : null}
             {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
           </div>
         </div>
         <div className="file-choice__actions">
+          {item.category === 'anime' && file.magnet?.url ? <a className="file-choice__action file-choice__action--watch" href={file.magnet.url} title={`SubsPlease · ${file.magnet.quality} · Opens your torrent app. This is a separate release; audio/subtitles may differ from the Telegram file.`} aria-label={`Download ${heading} via SubsPlease magnet, ${file.magnet.quality}`}><Icon name="download" size={15} /> Magnet</a> : null}
           {showWatch && hasEpisodeWatch ? <Link className="file-choice__action file-choice__action--watch" to={watchPagePath(item, file.episode)} aria-label={`Watch ${heading}`}><Icon name="play" size={15} /> Watch</Link> : null}
           {file.deliveryReady && deliveryHref ? <a className="file-choice__action" href={deliveryHref} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
         </div>

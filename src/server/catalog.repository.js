@@ -860,6 +860,19 @@ export class MemoryCatalogRepository {
 
   async init() {}
 
+  async loadSubsPleaseReleases(limit = 50_000) {
+    return [...(this.subsPleaseReleases || new Map()).values()].slice(-limit).map(clone);
+  }
+
+  async saveSubsPleaseReleases(releases) {
+    this.subsPleaseReleases ||= new Map();
+    for (const release of releases) {
+      this.subsPleaseReleases.delete(release.key);
+      this.subsPleaseReleases.set(release.key, clone(release));
+    }
+    if (this.subsPleaseReleases.size > 50_000) this.subsPleaseReleases = new Map([...this.subsPleaseReleases].slice(-50_000));
+  }
+
   async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null } = {}) {
     const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
     const normalizedQuery = cleanText(query, 100);
@@ -1844,10 +1857,12 @@ export class MongoCatalogRepository {
     this.announcementChannels = db.collection('announcement_channels');
     this.automationSettings = db.collection('automation_settings');
     this.backupSettings = db.collection('backup_settings');
+    this.subsPleaseReleases = db.collection('subsplease_releases');
   }
 
   async init() {
     await Promise.all([
+      this.subsPleaseReleases.createIndex({ seenAt: -1 }),
       this.contents.createIndex({ slug: 1 }, { unique: true }),
       this.contents.createIndex({ shareCode: 1 }, { unique: true }),
       this.contents.createIndex({ adminId: 1 }, { unique: true }),
@@ -1884,6 +1899,19 @@ export class MongoCatalogRepository {
       this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
       this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
+  }
+
+  async loadSubsPleaseReleases(limit = 50_000) {
+    // Reverse the newest-first query so the in-memory cache evicts oldest first.
+    return (await this.subsPleaseReleases.find({}).sort({ seenAt: -1 }).limit(limit).toArray()).reverse();
+  }
+
+  async saveSubsPleaseReleases(releases) {
+    if (!releases.length) return;
+    const seenAt = new Date();
+    await this.subsPleaseReleases.bulkWrite(releases.map((release) => ({
+      updateOne: { filter: { _id: release.key }, update: { $set: { ...release, seenAt } }, upsert: true }
+    })), { ordered: false });
   }
 
   async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null, includeAdminId = false } = {}) {
