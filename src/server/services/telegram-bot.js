@@ -7220,7 +7220,6 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   bot.command('search', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     const query = parseCommandArgument(ctx.message.text, 140);
-    if (/^SB-[A-F0-9]{10}$/i.test(query) && (await repository.findContentByAdminId(query.toUpperCase()))?.category === 'anime') { await magnetFlow.open(ctx, query); return; }
     if (!query) {
       await ctx.reply([
         'Usage: /search Our Sticky Love',

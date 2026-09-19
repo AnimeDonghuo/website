@@ -46,7 +46,7 @@ export function createTelegramMagnetFlow({ repository, subsPlease, serialize, no
   return {
     async open(ctx, argument) {
       const match = String(argument || '').trim().match(/^(SB-[A-F0-9]{10})(?:\s+(.{1,180}))?$/i);
-      if (!match) { await ctx.reply('Usage: /search SB-0123ABCDEF\nOr /searchm SB-0123ABCDEF SubsPlease anime title'); return; }
+      if (!match) { await ctx.reply('Usage: /searchm SB-0123ABCDEF\nOr /searchm SB-0123ABCDEF SubsPlease anime title'); return; }
       if (!subsPlease || !serialize) { await ctx.reply('Magnet search is temporarily unavailable.'); return; }
       const content = await repository.findContentByAdminId(match[1].toUpperCase());
       if (!content) { await ctx.reply('That Post ID was not found.'); return; }

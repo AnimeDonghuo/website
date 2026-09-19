@@ -767,7 +767,7 @@ Verified releases and alternate titles are retained in MongoDB (`subsplease_rele
 SubsPlease must actually carry the matching show, episode/batch and quality. Ambiguous titles, unparseable ranges, unavailable providers, and absent releases do not produce guessed download links. If the site reports a temporary lookup failure, reload after a short wait; server logs identify the failed provider.
 
 
-**Publisher episode retry:** `/search SB-0123ABCDEF` (for anime) or `/searchm SB-0123ABCDEF` shows a paginated picker of the episodes/ranges/season packs actually uploaded, with qualities grouped under each episode. Select one to retry its archive lookup. `/search Some anime title` still lists Post IDs; non-anime ID searches retain the regular listing.
+**Publisher episode retry:** Only `/searchm SB-0123ABCDEF` shows a paginated picker of the episodes/ranges/season packs actually uploaded, with qualities grouped under each episode. Select one to retry its archive lookup. `/search` retains its original catalog-search behavior for both titles and Post IDs, including anime IDs; it never opens the magnet picker.
 
 If the automatic name does not match, send `/searchm SB-0123ABCDEF Oni no Hanayome`, then select the episode. After an exact episode/quality match is found, the supplied search title is saved for that post's other uploaded episodes as well—without renaming the card or adding files. Unsuccessful searches do not save an override. Overrides are scoped to the original title and anime category, so renaming or moving the post out of anime invalidates them. Pickers expire after fifteen minutes, are publisher/chat-bound, and reject post/file changes made while the picker was open.
 

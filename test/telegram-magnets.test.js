@@ -115,3 +115,17 @@ test('file buttons keep a safe gap and tap target; successful explanatory prose 
   const app = await readFile(new URL('../src/client/App.jsx', import.meta.url), 'utf8');
   assert.doesNotMatch(app, /audio\/subtitles may differ|Magnet links open your torrent app/);
 });
+
+test('only searchm opens the magnet picker; search keeps title and ID catalog lookup', async () => {
+  const source = await readFile(new URL('../src/server/services/telegram-bot.js', import.meta.url), 'utf8');
+  const search = source.slice(source.indexOf("  bot.command('search',"), source.indexOf("  bot.command('posts',"));
+  assert.match(search, /repository\.listContent\(\{ query, limit: 24, includeAdminId: true \}\)/);
+  assert.doesNotMatch(search, /magnetFlow|findContentByAdminId/);
+  const searchm = source.slice(source.indexOf("  bot.command('searchm',"), source.indexOf("  bot.action(\/\^mg:"));
+  assert.match(searchm, /magnetFlow\.open/);
+  const f = await setup();
+  const flow = createTelegramMagnetFlow({ ...f, subsPlease: {} });
+  await flow.open(f.ctx, '');
+  assert.match(f.replies[0].text, /Usage: \/searchm /);
+  assert.doesNotMatch(f.replies[0].text, /\/search /);
+});
