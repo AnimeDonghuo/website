@@ -752,7 +752,7 @@ Before production, test the full Telegram path with a harmless file you own: pub
 
 The server reads `https://subsplease.org/rss/` at startup and every ten minutes for new releases. **It also searches the historical archive** using the same `https://subsplease.org/api/?f=search&tz=UTC&s=...` endpoint as the SubsPlease website. Old episodes and season batches do not need to have appeared in the bot's RSS cache first.
 
-On anime detail/episode pages, a **Magnet** action appears beside the existing file's **Get file** / **Watch** buttons. The normal file list loads immediately; a separate `/api/content/:slug/magnets` request fills in the buttons as archive discovery completes. The small status line distinguishes checking, no exact match, and a provider outage rather than silently leaving a missing button. Clicking a magnet opens the visitor's installed torrent application. This does **not** create catalog cards, Telegram files, or extra file rows, and the server never downloads torrent/video bytes. SubsPlease audio and subtitles can differ from the Telegram upload.
+On anime detail/episode pages, a **Magnet** action appears beside the existing file's **Get file** / **Watch** buttons. The normal file list loads immediately; a separate `/api/content/:slug/magnets` request fills in the buttons as archive discovery completes. Successful matches show only the buttons, without explanatory magnet prose. A compact error appears only for provider outages or a changed card. Buttons have at least 44px tap height and 12px separation. Clicking a magnet opens the visitor's installed torrent application. This does **not** create catalog cards, Telegram files, or extra file rows, and the server never downloads torrent/video bytes. SubsPlease audio and subtitles can differ from the Telegram upload.
 
 Matching rules:
 
@@ -765,3 +765,10 @@ Matching rules:
 Verified releases and alternate titles are retained in MongoDB (`subsplease_releases`, `subsplease_aliases`), or only in memory in demo mode. Archive requests are coalesced per title, limited to three simultaneous lookups, and have a shared ten-second HTTP deadline. Results are reused for ten minutes; provider failures are cached for thirty seconds. Feed/archive errors retain already verified links and do not block Telegram downloads or publishing. The active release index holds up to 50,000 episode/quality combinations.
 
 SubsPlease must actually carry the matching show, episode/batch and quality. Ambiguous titles, unparseable ranges, unavailable providers, and absent releases do not produce guessed download links. If the site reports a temporary lookup failure, reload after a short wait; server logs identify the failed provider.
+
+
+**Publisher episode retry:** `/search SB-0123ABCDEF` (for anime) or `/searchm SB-0123ABCDEF` shows a paginated picker of the episodes/ranges/season packs actually uploaded, with qualities grouped under each episode. Select one to retry its archive lookup. `/search Some anime title` still lists Post IDs; non-anime ID searches retain the regular listing.
+
+If the automatic name does not match, send `/searchm SB-0123ABCDEF Oni no Hanayome`, then select the episode. After an exact episode/quality match is found, the supplied search title is saved for that post's other uploaded episodes as well—without renaming the card or adding files. Unsuccessful searches do not save an override. Overrides are scoped to the original title and anime category, so renaming or moving the post out of anime invalidates them. Pickers expire after fifteen minutes, are publisher/chat-bound, and reject post/file changes made while the picker was open.
+
+Automatic matching applies to every uploaded episode (1, 2, 3, 11, etc.); the bot picker is a retry/alternate-title option, not a requirement for each new episode. The web server and bot share the same archive service and persistent cache.

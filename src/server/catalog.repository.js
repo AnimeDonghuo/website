@@ -860,6 +860,15 @@ export class MemoryCatalogRepository {
 
   async init() {}
 
+  async findSubsPleaseOverride(adminId) {
+    return clone(this.subsPleaseOverrides?.get(adminId) || null);
+  }
+
+  async saveSubsPleaseOverride(adminId, override) {
+    this.subsPleaseOverrides ||= new Map();
+    this.subsPleaseOverrides.set(adminId, clone(override));
+  }
+
   async findSubsPleaseAliases(key) {
     return clone(this.subsPleaseAliases?.get(key) || null);
   }
@@ -1909,6 +1918,14 @@ export class MongoCatalogRepository {
       this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
       this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
+  }
+
+  async findSubsPleaseOverride(adminId) {
+    return this.subsPleaseAliases.findOne({ _id: `post:${adminId}` });
+  }
+
+  async saveSubsPleaseOverride(adminId, override) {
+    await this.subsPleaseAliases.updateOne({ _id: `post:${adminId}` }, { $set: override }, { upsert: true });
   }
 
   async findSubsPleaseAliases(key) {

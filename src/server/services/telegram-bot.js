@@ -1,3 +1,4 @@
+import { createTelegramMagnetFlow } from './telegram-magnets.js';
 import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
@@ -219,6 +220,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'merge', description: 'Absorb cards into one post, or drop a season/episodes' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
+  { command: 'searchm', description: 'Retry episode magnets: Post ID and optional SubsPlease title' },
   { command: 'search', description: 'Find Post IDs by title, card link, or forwarded announcement' },
   { command: 'stats', description: 'View publisher analytics' },
   { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
@@ -6521,7 +6523,7 @@ async function handleBackupRecoveryUpload(ctx, repository, config) {
   return true;
 }
 
-export async function launchTelegramBot({ config, repository }) {
+export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
     return null;
@@ -7205,9 +7207,20 @@ export async function launchTelegramBot({ config, repository }) {
 
   // /search <text> — the Post ID list a publisher asked for. Titles, filenames, and IDs all match,
   // and a long answer is split across messages rather than cut off, because a truncated ID is useless.
+  const magnetFlow = createTelegramMagnetFlow({ repository, subsPlease, serialize: serializeMagnetContent });
+  bot.command('searchm', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await magnetFlow.open(ctx, parseCommandArgument(ctx.message.text, 240));
+  });
+  bot.action(/^mg:(ep|page):[a-f0-9]{12}:\d{1,5}$/, async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await magnetFlow.action(ctx);
+  });
+
   bot.command('search', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
     const query = parseCommandArgument(ctx.message.text, 140);
+    if (/^SB-[A-F0-9]{10}$/i.test(query) && (await repository.findContentByAdminId(query.toUpperCase()))?.category === 'anime') { await magnetFlow.open(ctx, query); return; }
     if (!query) {
       await ctx.reply([
         'Usage: /search Our Sticky Love',

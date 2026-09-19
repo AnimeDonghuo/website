@@ -136,7 +136,7 @@ test('magnet action shares the existing file row instead of creating extra cards
   const source = await readFile(new URL('../src/client/App.jsx', import.meta.url), 'utf8');
   assert.match(source, /item.category === 'anime' && file.magnet\?\.url/);
   assert.match(source, /href=\{file.magnet.url\}/);
-  assert.match(source, /Opens your torrent app/);
+  assert.doesNotMatch(source, /Opens your torrent app|SubsPlease torrent · audio\/subtitles may differ|Only matching SubsPlease qualities/);
 });
 
 test('single-season UI grouping never turns an S02 file into a season-one magnet', () => {

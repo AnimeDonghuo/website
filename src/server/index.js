@@ -471,7 +471,11 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
       // A rename/category correction cannot leave persisted stale magnet links.
       response.set('Cache-Control', 'private, no-store');
       const publicItem = toPublicContent(item, config);
-      return response.json({ item: { ...addSubsPleaseMagnets(publicItem, subsPlease?.entries() || [], item, subsPlease?.aliases?.(item.title) || []), magnetRevision: magnetContentRevision(item) } });
+      const override = item.category === 'anime' && repository.findSubsPleaseOverride
+        ? await repository.findSubsPleaseOverride(item.adminId) : null;
+      const searchTitle = override?.title === item.title && override?.category === item.category ? override.searchTitle : item.title;
+      const matched = addSubsPleaseMagnets({ ...publicItem, title: searchTitle }, subsPlease?.entries() || [], item, subsPlease?.aliases?.(searchTitle) || []);
+      return response.json({ item: { ...matched, title: publicItem.title, magnetRevision: magnetContentRevision(item) } });
     } catch (error) {
       return next(error);
     }
@@ -579,7 +583,7 @@ export async function startServer() {
 
   let bot = null;
   try {
-    bot = await launchTelegramBot({ config, repository });
+    bot = await launchTelegramBot({ config, repository, subsPlease, serializeMagnetContent: (content) => toPublicContent(content, config) });
   } catch (error) {
     console.error('[telegram] Bot did not start:', error?.message || error);
   }

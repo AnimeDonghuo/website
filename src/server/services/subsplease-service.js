@@ -206,11 +206,11 @@ export function createSubsPleaseService({ repository, fetchImpl = fetch, logger 
     })().finally(() => { pending = null; });
     return pending;
   };
-  const lookupArchive = async (title) => {
+  const lookupArchive = async (title, force = false) => {
     const key = lookupKey(title);
     if (archivePending.has(key)) return archivePending.get(key);
     const cached = lookups.get(key);
-    if (cached && cached.until > Date.now()) return cached;
+    if (!force && cached && cached.until > Date.now()) return cached;
     // Bounded concurrency, single-flight per title, short negative/error caching.
     // Different qualities of one episode do not make separate search requests.
     if (archivePending.size >= 3) return { aliases: cached?.aliases || [], state: 'unavailable' };
@@ -262,10 +262,17 @@ export function createSubsPleaseService({ repository, fetchImpl = fetch, logger 
     entries: () => [...releases.values()],
     refresh,
     aliases: (title) => lookups.get(lookupKey(title))?.aliases || [],
-    async resolve(content, source) {
+    async resolve(content, source, { force = false, searchTitle = null } = {}) {
       if (content?.category !== 'anime') return { item: addSubsPleaseMagnets(content, []), state: 'not-applicable' };
-      const found = await lookupArchive(content.title);
-      const item = addSubsPleaseMagnets(content, [...releases.values()], source, found.aliases);
+      let wanted = searchTitle;
+      if (!wanted && source?.adminId && repository?.findSubsPleaseOverride) {
+        const override = await repository.findSubsPleaseOverride(source.adminId);
+        if (override?.title === content.title && override?.category === content.category) wanted = override.searchTitle;
+      }
+      const lookupContent = wanted ? { ...content, title: wanted } : content;
+      const found = await lookupArchive(lookupContent.title, force);
+      const matched = addSubsPleaseMagnets(lookupContent, [...releases.values()], source, found.aliases);
+      const item = { ...matched, title: content.title };
       const hasMatch = item.fileChoices.some((file) => file.magnet);
       return { item, state: hasMatch ? 'ready' : found.state === 'unavailable' ? 'unavailable' : 'not-found' };
     },
