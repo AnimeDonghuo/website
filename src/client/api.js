@@ -68,3 +68,8 @@ export async function confirmAdultAccess() {
 export async function getContentBySlug(slug) {
   return request(`/content/${encodeURIComponent(slug)}`);
 }
+
+/** Archive lookups run after the normal file list has already rendered. */
+export async function getContentMagnets(slug) {
+  return request(`/content/${encodeURIComponent(slug)}/magnets`);
+}

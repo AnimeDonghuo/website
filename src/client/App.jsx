@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, Route, Routes, useLocation, useParams, useSearchParams } from 'react-router-dom';
-import { confirmAdultAccess, getCategories, getConfig, getContent, getContentBySlug, getGenres } from './api.js';
+import { confirmAdultAccess, getCategories, getConfig, getContent, getContentBySlug, getContentMagnets, getGenres } from './api.js';
 import AdultGate from './components/AdultGate.jsx';
 import DeliveryDialog from './components/DeliveryDialog.jsx';
 import Footer from './components/Footer.jsx';
@@ -450,8 +450,26 @@ function SearchPage() {
  * so the complete label is the heading and the raw upload name is its own line.
  */
 function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
+  const magnets = useRemote(
+    () => item.category === 'anime' && item.slug ? getContentMagnets(item.slug) : Promise.resolve(null),
+    [item.slug, item.category, item.magnetRevision]
+  );
+  const sameRevision = magnets.data?.revision === item.magnetRevision && Boolean(item.magnetRevision);
+  const discovered = new Map(sameRevision ? (magnets.data?.files || []).map((file) => [file.id, file.magnet]) : []);
+  const lookupState = magnets.error ? 'unavailable' : magnets.data?.state;
+  const staleMagnets = lookupState === 'stale' || lookupState === 'not-applicable' || (magnets.data?.revision && !sameRevision);
   return <div className="file-choice-list">
-    {choices.map((file) => {
+    {item.category === 'anime' ? <p className="file-choice__magnet-status" role="status">{magnets.loading
+      ? 'Checking SubsPlease for matching episode and batch magnets…'
+      : staleMagnets
+        ? 'This release changed. Reload to check its current magnet links.'
+        : lookupState === 'unavailable'
+          ? 'SubsPlease lookup is temporarily unavailable. Telegram downloads still work; reload to retry shortly.'
+          : lookupState === 'not-found'
+            ? 'No exact SubsPlease title, season, episode range and quality match was found.'
+            : 'Magnet links open your torrent app. Only matching SubsPlease qualities are shown.'}</p> : null}
+    {choices.map((original) => {
+      const file = staleMagnets ? { ...original, magnet: null } : discovered.has(original.id) ? { ...original, magnet: discovered.get(original.id) } : original;
       const heading = file.label || file.episode?.label || `Delivery file ${file.position}`;
       const rawName = file.fileName && file.fileName.toLowerCase() !== String(file.label || '').toLowerCase() ? file.fileName : '';
       const episodeIndex = file.episode

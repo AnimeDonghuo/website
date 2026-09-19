@@ -10,7 +10,7 @@ import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliver
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
-import { addSubsPleaseMagnets, createSubsPleaseService } from './services/subsplease-service.js';
+import { addSubsPleaseMagnets, createSubsPleaseService, magnetContentRevision } from './services/subsplease-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -469,12 +469,32 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
       }
       // Anime links are derived from the CURRENT card on every detail request.
       // A rename/category correction cannot leave persisted stale magnet links.
-      response.set('Cache-Control', isAdultContent(item) || item.category === 'anime' ? 'private, no-store' : 'public, max-age=60, s-maxage=120');
+      response.set('Cache-Control', 'private, no-store');
       const publicItem = toPublicContent(item, config);
-      return response.json({ item: addSubsPleaseMagnets(publicItem, subsPlease?.entries() || [], item) });
+      return response.json({ item: { ...addSubsPleaseMagnets(publicItem, subsPlease?.entries() || [], item, subsPlease?.aliases?.(item.title) || []), magnetRevision: magnetContentRevision(item) } });
     } catch (error) {
       return next(error);
     }
+  });
+
+  // Archive discovery is separate from the detail request: a slow provider must
+  // never hold up the Telegram file list. The client fills existing rows in place.
+  app.get('/api/content/:slug/magnets', async (request, response, next) => {
+    try {
+      response.set('Cache-Control', 'private, no-store');
+      const item = await repository.findContentBySlug(cleanText(request.params.slug, 80));
+      if (!item) return apiError(response, 404, 'This release is unavailable.');
+      if (item.category !== 'anime') return response.json({ state: 'not-applicable', files: [] });
+      const revision = magnetContentRevision(item);
+      const resolved = subsPlease?.resolve
+        ? await subsPlease.resolve(toPublicContent(item, config), item)
+        : { state: 'unavailable', item: { fileChoices: [] } };
+      // A publisher can rename/reclassify the card while the HTTP lookup runs.
+      // In that case return no links for the previous identity.
+      const current = await repository.findContentBySlug(item.slug);
+      if (!current || magnetContentRevision(current) !== revision) return response.json({ state: 'stale', files: [] });
+      return response.json({ state: resolved.state, revision, files: resolved.item.fileChoices.map((file) => ({ id: file.id, magnet: file.magnet })) });
+    } catch (error) { return next(error); }
   });
 
   async function redirectToCurrentDeliveryBot(request, response, filePosition = null) {

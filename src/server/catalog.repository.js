@@ -860,6 +860,15 @@ export class MemoryCatalogRepository {
 
   async init() {}
 
+  async findSubsPleaseAliases(key) {
+    return clone(this.subsPleaseAliases?.get(key) || null);
+  }
+
+  async saveSubsPleaseAliases(key, aliases) {
+    this.subsPleaseAliases ||= new Map();
+    this.subsPleaseAliases.set(key, { key, aliases: clone(aliases) });
+  }
+
   async loadSubsPleaseReleases(limit = 50_000) {
     return [...(this.subsPleaseReleases || new Map()).values()].slice(-limit).map(clone);
   }
@@ -1858,6 +1867,7 @@ export class MongoCatalogRepository {
     this.automationSettings = db.collection('automation_settings');
     this.backupSettings = db.collection('backup_settings');
     this.subsPleaseReleases = db.collection('subsplease_releases');
+    this.subsPleaseAliases = db.collection('subsplease_aliases');
   }
 
   async init() {
@@ -1899,6 +1909,14 @@ export class MongoCatalogRepository {
       this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
       this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
+  }
+
+  async findSubsPleaseAliases(key) {
+    return this.subsPleaseAliases.findOne({ _id: key });
+  }
+
+  async saveSubsPleaseAliases(key, aliases) {
+    await this.subsPleaseAliases.updateOne({ _id: key }, { $set: { key, aliases, checkedAt: new Date() } }, { upsert: true });
   }
 
   async loadSubsPleaseReleases(limit = 50_000) {

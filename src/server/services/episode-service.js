@@ -362,7 +362,7 @@ export function cleanDeliveryFileName(value) {
 export function detectMediaQuality({ caption, filename }) {
   const candidates = [stripTelegramAttribution(caption), stripTelegramAttribution(filename)].filter(Boolean);
   for (const candidate of candidates) {
-    const match = candidate.match(/\b(8k|4k|2160p|1440p|1080p|720p|576p|480p|360p)\b/i);
+    const match = candidate.match(/\b(8k|4k|2160p|1440p|1080p|720p|576p|540p|480p|360p)\b/i);
     if (match) return match[1].toUpperCase();
   }
   return null;
