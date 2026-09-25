@@ -627,7 +627,16 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
     ? new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\b[:\\s,-]*`, 'i')
     : null;
   const isTitleBatch = names.includes('titlebatch');
-  const lines = String(value || '').split(isTitleBatch ? /\r?\n|[ \t]+,[ \t]+/ : /\r?\n/);
+  let rawText = String(value || '');
+  let autoMerge = false;
+  const headerMatch = names.length
+    ? rawText.match(new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\s+(--merge|-m|--auto-merge|merge)\\b`, 'i'))
+    : null;
+  if (headerMatch) {
+    autoMerge = true;
+    rawText = rawText.replace(headerMatch[0], rawText.slice(0, rawText.indexOf(headerMatch[1])) + ' ');
+  }
+  const lines = rawText.split(isTitleBatch ? /\r?\n|[ \t]+,[ \t]+/ : /\r?\n/);
   const entries = [];
   const invalid = [];
   const seen = new Map();
@@ -670,7 +679,7 @@ export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
     entries.push({ adminId, value: tidied.title, raw: title, changed: tidied.changed });
     if (entries.length >= 1_000) break;
   }
-  return { entries, invalid, replaced, hasEdits: entries.length > 0 };
+  return { entries, invalid, replaced, hasEdits: entries.length > 0, autoMerge };
 }
 
 /**
@@ -686,7 +695,7 @@ export async function applyBulkTitleEdits({ ctx, repository, text, config = null
     await ctx.reply('Usage: /titlebatch SB-0123ABCDEF RRR , SB-1122334455 PK\nPut a space on both sides of each separating comma, or use one ID and title per line.');
     return true;
   }
-  const result = await updatePublishedPost({ ctx, repository, config, field: 'title', fieldLabel: 'Title', edits: bulk.entries, rematchPoster: true });
+  const result = await updatePublishedPost({ ctx, repository, config, field: 'title', fieldLabel: 'Title', edits: bulk.entries, rematchPoster: true, autoMerge: bulk.autoMerge });
   if (result?.handled && bulk.invalid.length) {
     await ctx.reply([
       `${bulk.invalid.length} line${bulk.invalid.length === 1 ? ' was' : 's were'} left out because ${bulk.invalid.length === 1 ? 'it makes' : 'they make'} no sense as a rename:`,
@@ -719,7 +728,8 @@ const MULTI_POST_EDITABLE_FIELDS = new Set([
  * `guard(content)` may refuse one targeted post (the 18+ storage boundary)
  * without blocking the rest of the batch.
  */
-export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null, config = null, rematchPoster = false }) {
+export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null, config = {}, rematchPoster = false, autoMerge = false }) {
+  const safeConfig = config || {};
   // `edits` is the batch shape: one value per post ID, so a page of titles is one command.
   const paired = Array.isArray(edits) && edits.length
     ? edits
@@ -876,36 +886,150 @@ export async function updatePublishedPost({ ctx, repository, argument = null, fi
   // someone says so. So the merge is offered here with the plan already built: Yes moves every file
   // of the newer card into the existing post and deletes the newer card and its announcement, No
   // leaves both cards exactly as they are.
-  if (field === 'title' && contents.length === 1 && typeof repository.findContentByTitle === 'function' && typeof repository.startMergePlan === 'function') {
-    const renamed = contents[0];
-    let twins = [];
-    try {
-      twins = (await repository.findContentByTitle(renamed.title, { category: renamed.category, limit: 4 })) || [];
-    } catch {
-      twins = [];
+  let mergeGroups = [];
+  if (field === 'title' && contents.length >= 1 && typeof repository.findContentByTitle === 'function' && typeof repository.startMergePlan === 'function') {
+    const titleGroups = new Map();
+    for (const card of contents) {
+      if (!card?.title || !card?.adminId) continue;
+      const groupKey = `${isAdultCategory(card.category) ? 'adult' : 'safe'}::${slugify(cleanText(card.title, 180))}`;
+      if (!groupKey || groupKey.endsWith('::')) continue;
+      if (!titleGroups.has(groupKey)) {
+        titleGroups.set(groupKey, { title: card.title, category: card.category, batchCards: [] });
+      }
+      titleGroups.get(groupKey).batchCards.push(card);
     }
-    const other = twins.find((entry) => entry?.adminId && entry.adminId !== renamed.adminId);
-    if (other) {
-      const fileCount = Array.isArray(renamed.files) ? renamed.files.length : Number(renamed.filesCount) || 0;
-      await repository.startMergePlan({
-        chatId: chatId(ctx),
-        ownerId: userId(ctx),
-        plan: {
-          targetAdminId: other.adminId,
-          sources: [{ adminId: renamed.adminId, title: renamed.title, files: fileCount }],
-          note: 'A rename produced a title the catalog already holds.'
-        }
+
+    const processedAdminIds = new Set();
+    for (const [, group] of titleGroups.entries()) {
+      let catalogMatches = [];
+      try {
+        catalogMatches = (await repository.findContentByTitle(group.title, { category: group.category, limit: 10 })) || [];
+      } catch {
+        catalogMatches = [];
+      }
+      if (!catalogMatches.length && group.category) {
+        try {
+          const fallbackMatches = (await repository.findContentByTitle(group.title, { limit: 10 })) || [];
+          catalogMatches = fallbackMatches.filter((item) => isAdultCategory(item?.category) === isAdultCategory(group.category));
+        } catch {}
+      }
+
+      const cardsMap = new Map();
+      for (const item of catalogMatches) {
+        if (item?.adminId) cardsMap.set(item.adminId, item);
+      }
+      for (const item of group.batchCards) {
+        if (item?.adminId) cardsMap.set(item.adminId, item);
+      }
+      for (const adminId of processedAdminIds) {
+        cardsMap.delete(adminId);
+      }
+
+      if (cardsMap.size <= 1) continue;
+
+      const allCards = Array.from(cardsMap.values());
+      allCards.sort((a, b) => {
+        const aInBatch = contents.some((c) => c.adminId === a.adminId);
+        const bInBatch = contents.some((c) => c.adminId === b.adminId);
+        if (!aInBatch && bInBatch) return -1;
+        if (aInBatch && !bInBatch) return 1;
+        const timeA = new Date(a.publishedAt || a.createdAt || 0).getTime();
+        const timeB = new Date(b.publishedAt || b.createdAt || 0).getTime();
+        if (timeA && timeB && timeA !== timeB) return timeA - timeB;
+        const idxA = contents.findIndex((c) => c.adminId === a.adminId);
+        const idxB = contents.findIndex((c) => c.adminId === b.adminId);
+        if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+        return String(a.adminId).localeCompare(String(b.adminId));
       });
-      await ctx.reply([
-        `\u201c${cleanText(other.title, 70)}\u201d is already published as ${other.adminId}, so ${renamed.adminId} is now a second card for the same release.`,
-        '',
-        `Merge them? The ${fileCount} file${fileCount === 1 ? '' : 's'} of ${renamed.adminId} move into ${other.adminId}, and ${renamed.adminId} disappears with its announcement post. Nothing is taken away from ${other.adminId}.`,
-        '',
-        'One tap applies the merge, one tap leaves both cards alone.'
-      ].join('\n'), mergeConfirmKeyboard());
+
+      const target = allCards[0];
+      const sources = allCards.slice(1).map((s) => ({
+        adminId: s.adminId,
+        title: s.title,
+        files: Array.isArray(s.files) ? s.files.length : Number(s.filesCount) || 0
+      }));
+
+      processedAdminIds.add(target.adminId);
+      for (const s of sources) processedAdminIds.add(s.adminId);
+
+      mergeGroups.push({
+        targetAdminId: target.adminId,
+        targetTitle: target.title,
+        sources
+      });
+    }
+
+    if (mergeGroups.length === 1) {
+      const group = mergeGroups[0];
+      const sourceIds = group.sources.map((s) => s.adminId).join(', ');
+      const totalFiles = group.sources.reduce((sum, s) => sum + s.files, 0);
+      const isPlural = group.sources.length > 1;
+
+      const plan = {
+        targetAdminId: group.targetAdminId,
+        targetTitle: group.targetTitle,
+        sources: group.sources,
+        note: contents.length > 1 ? 'A titlebatch produced titles the catalog already holds.' : 'A rename produced a title the catalog already holds.'
+      };
+
+      if (autoMerge) {
+        const outcome = await applyMergePlan({ bot: ctx, repository, config: safeConfig, plan });
+        if (outcome.error) {
+          await ctx.reply(`Merge failed: ${outcome.error}`);
+        } else {
+          await replyBatchDiagnostics(ctx, [mergeResultText(outcome, safeConfig)]);
+        }
+      } else {
+        await repository.startMergePlan({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          plan
+        });
+        await ctx.reply([
+          `\u201c${cleanText(group.targetTitle, 70)}\u201d is already published as ${group.targetAdminId}, so ${sourceIds} ${isPlural ? 'are' : 'is'} now ${isPlural ? 'duplicate cards' : 'a second card'} for the same release.`,
+          '',
+          `Merge them? The ${totalFiles} file${totalFiles === 1 ? '' : 's'} of ${sourceIds} move into ${group.targetAdminId}, and ${sourceIds} disappear${isPlural ? '' : 's'} with ${isPlural ? 'their' : 'its'} announcement post${isPlural ? 's' : ''}. Nothing is taken away from ${group.targetAdminId}.`,
+          '',
+          `One tap applies the merge, one tap leaves ${isPlural ? 'all' : 'both'} cards alone.`
+        ].join('\n'), mergeConfirmKeyboard());
+      }
+    } else if (mergeGroups.length > 1) {
+      const totalSources = mergeGroups.reduce((sum, g) => sum + g.sources.length, 0);
+      const totalFiles = mergeGroups.reduce((sum, g) => sum + g.sources.reduce((f, s) => f + s.files, 0), 0);
+
+      const plan = {
+        groups: mergeGroups,
+        targetAdminId: mergeGroups[0].targetAdminId,
+        targetTitle: mergeGroups[0].targetTitle,
+        sources: mergeGroups.flatMap((g) => g.sources),
+        note: 'A titlebatch produced titles the catalog already holds.'
+      };
+
+      if (autoMerge) {
+        const outcome = await applyMergePlan({ bot: ctx, repository, config: safeConfig, plan });
+        if (outcome.error) {
+          await ctx.reply(`Merge failed: ${outcome.error}`);
+        } else {
+          await replyBatchDiagnostics(ctx, [mergeResultText(outcome, safeConfig)]);
+        }
+      } else {
+        await repository.startMergePlan({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          plan
+        });
+        await ctx.reply([
+          `Duplicate releases detected for ${mergeGroups.length} titles in this batch:`,
+          ...mergeGroups.map((g) => `▪ \u201c${cleanText(g.targetTitle, 50)}\u201d: merge ${g.sources.map((s) => s.adminId).join(', ')} into ${g.targetAdminId}`),
+          '',
+          `Merge them? The ${totalFiles} file${totalFiles === 1 ? '' : 's'} move into their target cards, and ${totalSources} duplicate card${totalSources === 1 ? '' : 's'} disappear with their announcements.`,
+          '',
+          'One tap applies the merge, one tap leaves all cards alone.'
+        ].join('\n'), mergeConfirmKeyboard());
+      }
     }
   }
-  return { handled: true, content: contents[0], contents, announcementSync: sync };
+  return { handled: true, content: contents[0], contents, announcementSync: sync, mergeGroups };
 }
 
 /* ---------------------------------------------------------------------------
@@ -6194,6 +6318,21 @@ function shortFileName(file) {
 
 export function mergeResultText(outcome, config = {}) {
   if (outcome.error) return outcome.error;
+  if (outcome.plan?.groups?.length > 1) {
+    const moved = Array.isArray(outcome.moved) ? outcome.moved : [];
+    return [
+      `Merged ${moved.length || outcome.plan?.sources?.length || 0} post${(moved.length || 0) === 1 ? '' : 's'} across ${outcome.plan.groups.length} titles.`,
+      `▪ ${outcome.filesMoved || 0} file${outcome.filesMoved === 1 ? '' : 's'} moved into their target cards.`,
+      moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
+      outcome.announcementMessages?.queued
+        ? `▪ Announcement messages: ${outcome.announcementMessages.queued} copy${outcome.announcementMessages.queued === 1 ? '' : 's'} of the absorbed posts queued for deletion on the channel lane, so a Telegram limit cannot fail the merge. /sync lists what is still there.`
+        : null,
+      outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
+        ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
+        : null,
+      '▪ The private storage files were not touched, so nothing was uploaded again.'
+    ].filter(Boolean).join('\n').slice(0, 3_700);
+  }
   const content = outcome.content || {};
   const moved = Array.isArray(outcome.moved) ? outcome.moved : [];
   const totalFiles = (Array.isArray(content?.files) ? content.files : []).length;
@@ -6274,6 +6413,36 @@ export function mergeDropResultText(outcome, config = {}) {
  * than from a stale snapshot.
  */
 export async function applyMergePlan({ bot, repository, config = {}, plan = {} }) {
+  if (Array.isArray(plan.groups) && plan.groups.length > 0) {
+    const allOutcomes = [];
+    for (const group of plan.groups) {
+      const outcome = await applyMergePlan({ bot, repository, config, plan: group });
+      allOutcomes.push(outcome);
+    }
+    const successful = allOutcomes.filter((o) => !o.error);
+    if (!successful.length) {
+      return { error: allOutcomes[0]?.error || 'Nothing was merged.' };
+    }
+    const combinedMoved = successful.flatMap((o) => o.moved || []);
+    const combinedFiles = successful.reduce((sum, o) => sum + (o.filesMoved || 0), 0);
+    const combinedPlayers = successful.reduce((sum, o) => sum + (o.playersMerged || 0), 0);
+    const lastContent = successful[successful.length - 1]?.content;
+    return {
+      plan,
+      content: lastContent,
+      moved: combinedMoved,
+      missing: successful.flatMap((o) => o.missing || []),
+      blocked: successful.flatMap((o) => o.blocked || []),
+      filesMoved: combinedFiles,
+      playersMerged: combinedPlayers,
+      announcementMessages: {
+        deleted: successful.reduce((sum, o) => sum + (o.announcementMessages?.deleted || 0), 0),
+        failed: successful.reduce((sum, o) => sum + (o.announcementMessages?.failed || 0), 0),
+        queued: successful.reduce((sum, o) => sum + (o.announcementMessages?.queued || 0), 0)
+      },
+      announcementSync: successful[successful.length - 1]?.announcementSync
+    };
+  }
   const target = await repository.findContentByAdminId(plan.targetAdminId);
   if (!target) return { error: `${plan.targetAdminId} no longer exists, so nothing was merged.` };
   const movedFiles = [];

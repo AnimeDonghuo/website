@@ -205,6 +205,6 @@ export function getTelegramFileDeliveryUrl(config, shareCode, filePosition) {
 }
 
 export function getContentPageUrl(config, content) {
-  if (!config.siteUrl || !content?.category || !content?.slug) return null;
+  if (!config?.siteUrl || !content?.category || !content?.slug) return null;
   return `${config.siteUrl}/${encodeURIComponent(content.category)}/${encodeURIComponent(content.slug)}`;
 }
