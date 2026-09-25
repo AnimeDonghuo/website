@@ -107,13 +107,32 @@ function resolvePosterKeys() {
   return posterKeyPool.list;
 }
 
+export function maskApiKey(key) {
+  const str = String(key || '').trim();
+  if (!str) return 'none';
+  if (str.length <= 8) return str;
+  return `${str.slice(0, 4)}...${str.slice(-4)}`;
+}
+
 function posterKeyState(key) {
   let state = posterKeyPool.state.get(key);
   if (!state) {
-    state = { lastUsedAt: 0, cooldownUntil: 0, refusals: 0, uploads: 0, lastSuccessAt: null, lastRefusalAt: null };
+    state = { lastUsedAt: 0, cooldownUntil: 0, refusals: 0, uploads: 0, invalid: false, invalidReason: null, lastSuccessAt: null, lastRefusalAt: null };
     posterKeyPool.state.set(key, state);
   }
   return state;
+}
+
+export function markPosterKeyInvalid(key, reason = 'Invalid API v1 key.') {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return;
+  const state = posterKeyState(cleanKey);
+  state.invalid = true;
+  state.invalidReason = reason;
+  const list = resolvePosterKeys();
+  if (posterKeyPool.sticky >= 0 && list[posterKeyPool.sticky] === cleanKey) {
+    posterKeyPool.sticky = -1;
+  }
 }
 
 export function addPosterApiKey(key) {
@@ -123,7 +142,13 @@ export function addPosterApiKey(key) {
   if (!current.includes(cleanKey)) {
     const next = parseImgBBKeys([...current, cleanKey]);
     posterKeyPool.list = next;
-    posterKeyState(cleanKey);
+    const state = posterKeyState(cleanKey);
+    state.invalid = false;
+    state.invalidReason = null;
+  } else {
+    const state = posterKeyState(cleanKey);
+    state.invalid = false;
+    state.invalidReason = null;
   }
 }
 
@@ -171,11 +196,13 @@ export function getAllPosterKeyStats() {
   const stickyKey = posterKeyPool.sticky >= 0 ? list[posterKeyPool.sticky] || null : null;
   return list.map((key, index) => {
     const state = posterKeyState(key);
-    const isCooling = state.cooldownUntil > at;
+    const isCooling = !state.invalid && state.cooldownUntil > at;
     return {
       key,
       index: index + 1,
       isSticky: key === stickyKey,
+      isInvalid: Boolean(state.invalid),
+      invalidReason: state.invalidReason || null,
       isCooling,
       cooldownUntil: state.cooldownUntil,
       remainingCooldownMs: isCooling ? Math.max(0, state.cooldownUntil - at) : 0,
@@ -199,13 +226,16 @@ export function configurePosterKeys(keys) {
 export function posterKeyPoolStatus() {
   const list = resolvePosterKeys();
   const at = posterUploadOptions.now();
-  const cooling = list.filter((key) => posterKeyState(key).cooldownUntil > at);
-  const soonest = list.length ? Math.min(...list.map((key) => posterKeyState(key).cooldownUntil)) : 0;
+  const cooling = list.filter((key) => !posterKeyState(key).invalid && posterKeyState(key).cooldownUntil > at);
+  const invalid = list.filter((key) => posterKeyState(key).invalid);
+  const soonest = cooling.length ? Math.min(...cooling.map((entry) => posterKeyState(entry).cooldownUntil)) : 0;
   return {
     configured: list.length,
     limit: IMGBB_KEY_POOL_LIMIT,
     cooling: cooling.length,
-    free: list.length - cooling.length,
+    invalid: invalid.length,
+    free: Math.max(0, list.length - cooling.length - invalid.length),
+    ready: Math.max(0, list.length - cooling.length - invalid.length),
     sticky: posterKeyPool.sticky >= 0 ? list[posterKeyPool.sticky] || null : null,
     waitingMs: cooling.length ? Math.max(0, soonest - at) : 0,
     cooldownMs: IMGBB_KEY_COOLDOWN_MS,
@@ -218,13 +248,19 @@ function pickPosterKey(keys, at) {
   const sticky = posterKeyPool.sticky;
   // Stay on the key in favour while it will still take an upload. Switching keys per upload buys
   // nothing and costs a fresh quota's worth of waiting for no reason.
-  if (sticky >= 0 && sticky < keys.length && posterKeyState(keys[sticky]).cooldownUntil <= at) return { key: keys[sticky], index: sticky };
+  if (sticky >= 0 && sticky < keys.length) {
+    const stickyState = posterKeyState(keys[sticky]);
+    if (!stickyState.invalid && stickyState.cooldownUntil <= at) {
+      return { key: keys[sticky], index: sticky };
+    }
+  }
   // With no key in favour the first one is offered; after a refusal the search starts just past the
   // key that refused, so a burst walks the pool once and then settles on whatever works.
   const start = sticky >= 0 ? (sticky + 1) % keys.length : 0;
   for (let offset = 0; offset < keys.length; offset += 1) {
     const index = (start + offset) % keys.length;
-    if (posterKeyState(keys[index]).cooldownUntil <= at) {
+    const state = posterKeyState(keys[index]);
+    if (!state.invalid && state.cooldownUntil <= at) {
       posterKeyPool.sticky = index;
       return { key: keys[index], index };
     }
@@ -704,6 +740,39 @@ export async function preparePosterImage({ sourceUrl = null, sourceIsManual = fa
   };
 }
 
+/** Test a single ImgBB API key to check if ImgBB accepts it or rejects it as invalid. */
+export async function testPosterApiKey(key) {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return { ok: false, invalid: true, detail: 'Empty API key' };
+  const form = new FormData();
+  form.set('key', cleanKey);
+  form.set('name', 'test-key');
+  // Minimal 1x1 transparent PNG base64
+  form.set('image', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==');
+  try {
+    const response = await fetch(IMGBB_UPLOAD_URL, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(8_000)
+    });
+    const body = await response.json().catch(() => null);
+    const detail = String(body?.error?.message || '');
+    if (response.ok && body?.success) {
+      return { ok: true, verified: true, detail: 'Key verified and active' };
+    }
+    const isInvalid = /invalid\s*(?:api\s*(?:v1\s*)?)?key/i.test(detail) || body?.error?.code === 100;
+    if (isInvalid) {
+      return { ok: false, invalid: true, detail: detail || 'Invalid API v1 key.' };
+    }
+    if (response.status === 429 || isPosterRateLimit({ message: detail })) {
+      return { ok: true, rateLimited: true, detail: 'Key accepted by ImgBB (currently cooling)' };
+    }
+    return { ok: true, unverified: true, detail: detail || 'Added' };
+  } catch {
+    return { ok: true, unverified: true, detail: 'Added (ImgBB unreachable for immediate test)' };
+  }
+}
+
 /** One upload with one key. A limit is an outcome, any other refusal is an error. */
 async function postPosterToImgBB({ buffer, title, key }) {
   const form = new FormData();
@@ -733,6 +802,10 @@ async function postPosterToImgBB({ buffer, title, key }) {
   if (response.ok && body?.success && body?.data?.url) {
     return { ok: true, url: body.data.display_url || body.data.url, providerId: body.data.id || null };
   }
+  const isInvalidKey = /invalid\s*(?:api\s*(?:v1\s*)?)?key/i.test(detail) || body?.error?.code === 100;
+  if (isInvalidKey) {
+    return { ok: false, invalidKey: true, detail: detail || 'Invalid API v1 key.', retryAfterMs: 0 };
+  }
   if (!(response.status === 429 || isPosterRateLimit({ message: detail }))) {
     throw new PosterHostingError(detail || 'ImgBB did not accept the poster.');
   }
@@ -749,16 +822,18 @@ async function postPosterToImgBB({ buffer, title, key }) {
  * limit, which is what lets the caller publish the card and re-host the artwork later.
  */
 export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys = null, repository = null } = {}) {
-  const configured = Array.isArray(apiKeys) && apiKeys.length ? parseImgBBKeys(apiKeys) : [];
   let keys;
   if (Array.isArray(posterKeyPool.list) && posterKeyPool.list.length > 0) {
-    keys = parseImgBBKeys([...posterKeyPool.list, ...configured, ...(apiKey ? [apiKey] : [])]);
-  } else if (configured.length > 0) {
-    keys = configured;
-  } else if (apiKey) {
-    keys = [apiKey];
+    keys = posterKeyPool.list;
   } else {
-    keys = resolvePosterKeys();
+    const configured = Array.isArray(apiKeys) && apiKeys.length ? parseImgBBKeys(apiKeys) : [];
+    if (configured.length > 0) {
+      keys = configured;
+    } else if (apiKey) {
+      keys = [apiKey];
+    } else {
+      keys = resolvePosterKeys();
+    }
   }
 
   if (!keys.length) {
@@ -778,37 +853,43 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
   const { spacingMs, attempts, backoffMs, wait, now } = posterUploadOptions;
   const paceMs = keys.length >= IMGBB_POOL_SIZE ? Math.min(spacingMs, IMGBB_POOL_SPACING_MS) : spacingMs;
   let lastRateLimit = null;
+  let lastError = null;
   let restsTaken = 0;
 
   const totalKeys = keys.length;
-  const maxAttempts = Math.max(attempts, totalKeys + 1);
+  const maxAttempts = Math.max(attempts, totalKeys + 2);
   let checkedFirstKeyAfterAllFailed = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let picked = pickPosterKey(keys, now());
     if (!picked) {
-      if (!checkedFirstKeyAfterAllFailed && totalKeys > 1) {
+      const validKeys = keys.filter((k) => !posterKeyState(k).invalid);
+      if (!validKeys.length) {
+        throw lastError || new PosterHostingError('All configured ImgBB API keys are invalid or rejected by ImgBB. Use /addimgapi to add a valid key.');
+      }
+
+      if (!checkedFirstKeyAfterAllFailed && validKeys.length > 1) {
         checkedFirstKeyAfterAllFailed = true;
-        const firstKeyState = posterKeyState(keys[0]);
+        const firstKeyState = posterKeyState(validKeys[0]);
         if (firstKeyState.cooldownUntil <= now()) {
-          picked = { key: keys[0], index: 0 };
+          picked = { key: validKeys[0], index: keys.indexOf(validKeys[0]) };
         }
       }
 
       if (!picked) {
         // Every key in the pool has said it is full. The wait is reported, not sat through: the retry
         // queue's timer is what an "all keys are down" hour needs, not a stalled publish.
-        const soonest = Math.min(...keys.map((entry) => posterKeyState(entry).cooldownUntil));
+        const soonest = Math.min(...validKeys.map((entry) => posterKeyState(entry).cooldownUntil));
         const restMs = Math.max(0, soonest - now());
         const pooledWait = Math.max(restMs, 3_600_000);
         const pooled = new PosterRateLimitError('Every configured ImgBB key is rate limited.', { retryAfterMs: pooledWait });
         pooled.allKeysCooling = true;
-        pooled.poolSize = keys.length;
+        pooled.poolSize = validKeys.length;
         pooled.nextFreeInMs = pooledWait;
         lastRateLimit = pooled;
         // A short Retry-After on the only key is cheaper to wait out here than to queue around.
-        if (restMs > IMGBB_KEY_PATIENCE_MS || keys.length > 1 || restsTaken >= 2) break;
-        const resting = keys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
+        if (restMs > IMGBB_KEY_PATIENCE_MS || validKeys.length > 1 || restsTaken >= 2) break;
+        const resting = validKeys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
         restsTaken += 1;
         await wait(restMs);
         for (const entry of resting) posterKeyState(entry).cooldownUntil = 0;
@@ -849,6 +930,17 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
       cachePosterUpload(cacheKey, hosted);
       return hosted;
     }
+
+    if (outcome.invalidKey) {
+      markPosterKeyInvalid(picked.key, outcome.detail);
+      console.warn(`[poster] ImgBB key ${maskApiKey(picked.key)} is invalid (${outcome.detail}). Rotating to next key in pool.`);
+      if (repo && typeof repo.recordPosterRefusal === 'function') {
+        repo.recordPosterRefusal(picked.key).catch?.(() => {});
+      }
+      lastError = new PosterHostingError(outcome.detail || `ImgBB key ${maskApiKey(picked.key)} is invalid.`);
+      continue;
+    }
+
     const coolMs = outcome.retryAfterMs || Math.min(IMGBB_KEY_COOLDOWN_MS, backoffMs * attempt);
     coolPosterKey(picked.key, coolMs);
     if (repo && typeof repo.recordPosterRefusal === 'function') {
@@ -857,7 +949,7 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
     lastRateLimit = new PosterRateLimitError(outcome.detail || 'ImgBB is rate limiting this server.', { retryAfterMs: coolMs });
   }
 
-  throw lastRateLimit || new PosterHostingError('ImgBB did not accept the poster.');
+  throw lastRateLimit || lastError || new PosterHostingError('ImgBB did not accept the poster.');
 }
 
 /**

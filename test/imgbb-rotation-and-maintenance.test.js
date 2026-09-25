@@ -359,8 +359,63 @@ test('Telegram bot /imgapis, /addimgapi, /removeimgapi, /maintanence and /restar
   // 7. /restart command
   let restarted = false;
   replies.length = 0;
-  await handleRestartCommand(ctx, repository, config, async () => { restarted = true; });
+  await handleRestartCommand(ctx, repository, config, async () => { restarted = true; }, { delayMs: 0 });
   assert.equal(replies.length, 1);
   assert.ok(replies[0].text.includes('Restarting SoraBox service now'));
   assert.equal(restarted, true);
+
+  // 8. Stale /restart command (from before bot instance startup) is ignored
+  let staleRestarted = false;
+  replies.length = 0;
+  ctx.message.date = Math.floor((Date.now() - 60_000) / 1000); // 1 minute in the past
+  await handleRestartCommand(ctx, repository, config, async () => { staleRestarted = true; }, { delayMs: 0 });
+  assert.equal(staleRestarted, false, 'stale /restart must not trigger another restart');
+});
+
+test('ImgBB auto-rotation bypasses invalid API keys without failing the upload if another working key exists', async (t) => {
+  t.after(() => { globalThis.fetch = originalFetch; });
+  clearPosterUploadCache();
+  resetPosterUploadPace();
+  configurePosterKeys(['bad-key-12345678', 'good-key-87654321']);
+  configurePosterUploadOptions({
+    spacingMs: 0,
+    attempts: 3,
+    backoffMs: 1_000,
+    wait: async () => {},
+    now: () => 1_000
+  });
+
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const key = options?.body?.get('key');
+    calls.push(key);
+    if (key === 'bad-key-12345678') {
+      return reply({ error: { message: 'Invalid API v1 key.', code: 100 } }, { ok: false, status: 400 });
+    }
+    return accepted('hosted-with-good-key');
+  };
+
+  const hosted = await uploadImageToImgBB({
+    buffer: Buffer.from('distinct image bytes 3'),
+    title: 'Solo Leveling Ragnarok'
+  });
+
+  assert.equal(hosted.url, 'https://i.ibb.co/y/hosted-with-good-key.png');
+  assert.deepEqual(calls, ['bad-key-12345678', 'good-key-87654321'], 'tried bad key first, saw it was invalid, then immediately rotated to good key');
+
+  const stats = getAllPosterKeyStats();
+  const badStats = stats.find((s) => s.key === 'bad-key-12345678');
+  const goodStats = stats.find((s) => s.key === 'good-key-87654321');
+  assert.equal(badStats.isInvalid, true);
+  assert.equal(badStats.invalidReason, 'Invalid API v1 key.');
+  assert.equal(goodStats.isInvalid, false);
+  assert.equal(goodStats.isSticky, true);
+
+  // Subsequent upload directly uses the good key without trying the bad key
+  calls.length = 0;
+  await uploadImageToImgBB({
+    buffer: Buffer.from('distinct image bytes 4'),
+    title: 'Solo Leveling Ragnarok 2'
+  });
+  assert.deepEqual(calls, ['good-key-87654321'], 'bypassed bad key completely on subsequent upload');
 });

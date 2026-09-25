@@ -648,10 +648,14 @@ export async function startServer() {
     if (closing) return;
     closing = true;
     console.info(`[server] ${signal} received; shutting down.`);
-    if (bot) bot.stop(signal);
-    await subsPlease.stop();
-    await new Promise((resolve) => server.close(resolve));
-    await repository.close();
+    if (bot?.stop) {
+      try { bot.stop(signal); } catch {}
+    }
+    if (subsPlease?.stop) {
+      try { await subsPlease.stop(); } catch {}
+    }
+    try { await new Promise((resolve) => server.close(resolve)); } catch {}
+    try { await repository.close(); } catch {}
     process.exit(0);
   };
   process.once('SIGINT', () => void close('SIGINT'));

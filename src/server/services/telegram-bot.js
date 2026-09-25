@@ -14,13 +14,16 @@ import {
   getSharedFallbackPosterUrl,
   hostPosterImage,
   isPosterRateLimit,
+  markPosterKeyInvalid,
+  maskApiKey,
   mirrorPosterToImgBB,
   parseImgBBKeys,
   posterKeyPoolStatus,
   preparePosterImage,
   removePosterApiKey,
   setSharedFallbackPosterUrl,
-  syncPosterKeysFromRepository
+  syncPosterKeysFromRepository,
+  testPosterApiKey
 } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
@@ -6574,12 +6577,7 @@ async function handleBackupRecoveryUpload(ctx, repository, config) {
   return true;
 }
 
-export function maskApiKey(key) {
-  const str = String(key || '').trim();
-  if (!str) return 'none';
-  if (str.length <= 8) return str;
-  return `${str.slice(0, 4)}...${str.slice(-4)}`;
-}
+export { maskApiKey };
 
 export function maintenanceStatusText(active) {
   return [
@@ -6626,7 +6624,7 @@ export async function handleImgApisCommand(ctx, repository, config) {
     '',
     `• Total keys: ${statsList.length} (limit: ${poolStatus.limit})`,
     `• Active / sticky key: ${poolStatus.sticky ? maskApiKey(poolStatus.sticky) : 'None (rotates next upload)'}`,
-    `• Cooling / rate limited: ${poolStatus.cooling} of ${statsList.length}`,
+    `• Pool status: ${poolStatus.ready} ready, ${poolStatus.cooling} cooling, ${poolStatus.invalid} invalid`,
     `• Retry queue: ${queueStatus.waiting || 0} poster${queueStatus.waiting === 1 ? '' : 's'} waiting`,
     fallbackUrl ? `• Shared fallback poster: ${fallbackUrl}` : '• Shared fallback poster: Not hosted yet',
     '',
@@ -6634,20 +6632,23 @@ export async function handleImgApisCommand(ctx, repository, config) {
   ];
 
   statsList.forEach((item, index) => {
-    const statusIcon = item.isCooling ? '🔴 Rate Limited' : '🟢 Ready';
-    const cooldownNote = item.isCooling
-      ? ` (cooling down, free in ${shortDuration(item.remainingCooldownMs)})`
-      : '';
+    let statusIcon = '🟢 Ready';
+    if (item.isInvalid) {
+      statusIcon = `🔴 Invalid (${item.invalidReason || 'Rejected by ImgBB'})`;
+    } else if (item.isCooling) {
+      statusIcon = `🟡 Rate Limited (free in ${shortDuration(item.remainingCooldownMs)})`;
+    }
     const stickyNote = item.isSticky ? ' [ACTIVE]' : '';
     lines.push(
       `#${index + 1} ${maskApiKey(item.key)}${stickyNote}`,
-      `  Status: ${statusIcon}${cooldownNote}`,
+      `  Status: ${statusIcon}`,
       `  Uploads: ${item.uploads || 0} picture${item.uploads === 1 ? '' : 's'}`,
       `  Rate limit hits: ${item.refusals || 0}`
     );
   });
 
   lines.push('', '💡 To add more keys: /addimgapi <api_key>');
+  lines.push('🗑️ To remove an invalid key: /removeimgapi <number>');
   await ctx.reply(lines.join('\n'));
 }
 
@@ -6656,7 +6657,7 @@ export async function handleAddImgApiCommand(ctx, repository, config) {
   const argument = parseCommandArgument(ctx.message?.text, 1000);
   if (!argument) {
     await ctx.reply(
-      'Usage: /addimgapi <api_key>\n\nExample: /addimgapi 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\n\nYou can pass one or more comma-separated ImgBB API keys. The keys will be added to the rotation pool and saved to the database so they survive server restarts.'
+      'Usage: /addimgapi <api_key>\n\nExample: /addimgapi 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\n\nYou can pass one or more comma-separated ImgBB API keys. The keys will be verified, added to the rotation pool, and saved to the database so they survive server restarts.'
     );
     return;
   }
@@ -6668,23 +6669,35 @@ export async function handleAddImgApiCommand(ctx, repository, config) {
   }
 
   const added = [];
+  const rejected = [];
   const alreadyPresent = [];
   for (const key of rawKeys) {
-    if (key.length < 8) continue;
+    if (key.length < 8) {
+      rejected.push(`${maskApiKey(key)} (too short)`);
+      continue;
+    }
     const existing = typeof repository?.getPosterApiKeys === 'function' ? await repository.getPosterApiKeys() : [];
     if (existing.includes(key)) {
       alreadyPresent.push(maskApiKey(key));
-    } else {
-      if (typeof repository?.addPosterApiKey === 'function') {
-        await repository.addPosterApiKey(key, userId(ctx));
-      }
-      addPosterApiKey(key);
-      if (config) {
-        config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), key]);
-        if (!config.imgbbApiKey) config.imgbbApiKey = key;
-      }
-      added.push(maskApiKey(key));
+      continue;
     }
+
+    const testResult = await testPosterApiKey(key);
+    if (testResult.invalid) {
+      rejected.push(`${maskApiKey(key)} (${testResult.detail})`);
+      continue;
+    }
+
+    if (typeof repository?.addPosterApiKey === 'function') {
+      await repository.addPosterApiKey(key, userId(ctx));
+    }
+    addPosterApiKey(key);
+    if (config) {
+      config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), key]);
+      if (!config.imgbbApiKey) config.imgbbApiKey = key;
+    }
+    const note = testResult.verified ? ' [verified]' : testResult.rateLimited ? ' [cooling]' : '';
+    added.push(`${maskApiKey(key)}${note}`);
   }
 
   const total = posterKeyPoolStatus().configured;
@@ -6697,7 +6710,10 @@ export async function handleAddImgApiCommand(ctx, repository, config) {
   if (alreadyPresent.length) {
     responseLines.push(`Already in pool: ${alreadyPresent.join(', ')}`);
   }
-  if (!added.length && !alreadyPresent.length) {
+  if (rejected.length) {
+    responseLines.push(`⚠️ Rejected keys: ${rejected.join(', ')}`);
+  }
+  if (!added.length && !alreadyPresent.length && !rejected.length) {
     responseLines.push('No valid API keys were found in your command. ImgBB API keys are usually 32 characters long.');
   }
   await ctx.reply(responseLines.join('\n'));
@@ -6729,6 +6745,9 @@ export async function handleRemoveImgApiCommand(ctx, repository, config) {
   removePosterApiKey(targetKey);
   if (config) {
     config.imgbbApiKeys = (config.imgbbApiKeys || []).filter((k) => k !== targetKey);
+    if (config.imgbbApiKey === targetKey) {
+      config.imgbbApiKey = config.imgbbApiKeys[0] || '';
+    }
   }
   await ctx.reply(`✓ Removed ImgBB API key: ${maskApiKey(targetKey)}. Remaining keys: ${posterKeyPoolStatus().configured}`);
 }
@@ -6770,20 +6789,33 @@ export async function handleMaintenanceAction(ctx, repository, config, action = 
   }
 }
 
-export async function handleRestartCommand(ctx, repository, config, onRestart = null) {
+let botInstanceStartedAt = Date.now();
+
+export async function handleRestartCommand(ctx, repository, config, onRestart = null, { delayMs = 2000 } = {}) {
   if (!(await requirePublisher(ctx, repository, config))) return;
+  const messageDateMs = (ctx.message?.date || 0) * 1000;
+  if (messageDateMs > 0 && typeof botInstanceStartedAt === 'number' && messageDateMs < botInstanceStartedAt - 5000) {
+    console.warn('[telegram] Ignoring stale /restart command received from before bot startup.');
+    return;
+  }
   await ctx.reply('🔄 Restarting SoraBox service now... The bot and website will be back up in a few seconds.');
-  if (typeof onRestart === 'function') {
-    try {
-      await onRestart();
-    } catch (err) {
-      console.error('[telegram] onRestart failed:', err);
-    }
-  } else {
-    setTimeout(() => {
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+  const doRestart = async () => {
+    if (typeof onRestart === 'function') {
+      try {
+        await onRestart();
+      } catch (err) {
+        console.error('[telegram] onRestart failed:', err);
+      }
+    } else {
       console.info('[server] Restart command received; exiting process for container restart.');
       process.exit(0);
-    }, 1000);
+    }
+  };
+  if (waitMs > 0) {
+    setTimeout(doRestart, waitMs).unref?.();
+  } else {
+    await doRestart();
   }
 }
 
@@ -6793,20 +6825,24 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     return null;
   }
 
-  // Load persisted ImgBB API keys from repository into the active pool
+  botInstanceStartedAt = Date.now();
+
+  // Load persisted ImgBB API keys from repository and config into the active pool
+  const initialKeys = [...(config?.imgbbApiKeys || []), ...(config?.imgbbApiKey ? [config.imgbbApiKey] : [])];
   if (typeof repository?.getPosterApiKeys === 'function') {
     try {
       const persistedKeys = await repository.getPosterApiKeys();
       if (persistedKeys?.length) {
-        syncPosterKeysFromRepository(repository, persistedKeys);
-        if (config) {
-          config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), ...persistedKeys]);
-          if (!config.imgbbApiKey) config.imgbbApiKey = config.imgbbApiKeys[0] || '';
-        }
+        initialKeys.push(...persistedKeys);
       }
     } catch (error) {
       console.warn('[telegram] Could not load persisted ImgBB keys:', automationDiagnostic(error));
     }
+  }
+  syncPosterKeysFromRepository(repository, initialKeys);
+  if (config) {
+    config.imgbbApiKeys = parseImgBBKeys(initialKeys);
+    if (!config.imgbbApiKey && config.imgbbApiKeys[0]) config.imgbbApiKey = config.imgbbApiKeys[0];
   }
   if (typeof repository?.getFallbackPosterUrl === 'function') {
     try {
