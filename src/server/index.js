@@ -324,6 +324,67 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
   app.use(compression());
   app.use(express.json({ limit: '32kb' }));
   app.use(async (request, response, next) => {
+    let isMaintenance = false;
+    try {
+      if (typeof repository.isMaintenanceActive === 'function') {
+        isMaintenance = await repository.isMaintenanceActive();
+      }
+    } catch {
+      isMaintenance = false;
+    }
+    if (!isMaintenance) return next();
+
+    if (request.path === '/api/health') {
+      response.set('Cache-Control', 'no-store');
+      return response.json({
+        ok: true,
+        maintenance: true,
+        catalogStore: repository.kind,
+        persistent: repository.persistent,
+        telegramPolling: Boolean(config.telegram.botToken && config.telegram.mode === 'polling'),
+        deliveryBotUsername: config.telegram.botUsername || null,
+        announcementSiteUrl: config.siteUrl || null,
+        now: new Date().toISOString()
+      });
+    }
+
+    const maintenanceMessage = 'site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box';
+    response.status(404);
+    response.set('Cache-Control', 'no-store');
+
+    if (request.path.startsWith('/api/')) {
+      return response.json({ error: maintenanceMessage });
+    }
+
+    if (request.accepts('html')) {
+      return response.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>404 - Site Under Maintenance</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e1e7ec; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; text-align: center; }
+    .card { max-width: 540px; background: #1a1e29; border: 1px solid #2d3446; border-radius: 16px; padding: 40px 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    h1 { font-size: 2.5rem; margin: 0 0 16px; color: #f87171; }
+    p { font-size: 1.1rem; line-height: 1.6; margin: 0 0 24px; color: #cbd5e1; }
+    a { display: inline-block; background: #2563eb; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; transition: background 0.2s; }
+    a:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>404</h1>
+    <p>site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box</p>
+    <a href="https://t.me/Sora_Box" target="_blank" rel="noopener noreferrer">Join Telegram Channel</a>
+  </div>
+</body>
+</html>`);
+    }
+
+    return response.type('text').send(`404 ${maintenanceMessage}`);
+  });
+  app.use(async (request, response, next) => {
     if (!isTrackableSiteVisit(request) || typeof repository.recordSiteVisit !== 'function') return next();
     try {
       await repository.recordSiteVisit({
@@ -581,14 +642,8 @@ export async function startServer() {
     }
   });
 
-  let bot = null;
-  try {
-    bot = await launchTelegramBot({ config, repository, subsPlease, serializeMagnetContent: (content) => toPublicContent(content, config) });
-  } catch (error) {
-    console.error('[telegram] Bot did not start:', error?.message || error);
-  }
-
   let closing = false;
+  let bot = null;
   const close = async (signal) => {
     if (closing) return;
     closing = true;
@@ -601,6 +656,18 @@ export async function startServer() {
   };
   process.once('SIGINT', () => void close('SIGINT'));
   process.once('SIGTERM', () => void close('SIGTERM'));
+
+  try {
+    bot = await launchTelegramBot({
+      config,
+      repository,
+      subsPlease,
+      serializeMagnetContent: (content) => toPublicContent(content, config),
+      onRestart: () => close('RESTART')
+    });
+  } catch (error) {
+    console.error('[telegram] Bot did not start:', error?.message || error);
+  }
 
   return { app, server, repository, bot, subsPlease };
 }

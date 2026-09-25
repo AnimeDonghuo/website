@@ -6,7 +6,22 @@ import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatByt
 import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
 import { reindexContentRecord } from '../catalog.repository.js';
-import { PosterHostingError, downloadPosterImage, hostPosterImage, isPosterRateLimit, mirrorPosterToImgBB, preparePosterImage } from './poster-service.js';
+import {
+  PosterHostingError,
+  addPosterApiKey,
+  downloadPosterImage,
+  getAllPosterKeyStats,
+  getSharedFallbackPosterUrl,
+  hostPosterImage,
+  isPosterRateLimit,
+  mirrorPosterToImgBB,
+  parseImgBBKeys,
+  posterKeyPoolStatus,
+  preparePosterImage,
+  removePosterApiKey,
+  setSharedFallbackPosterUrl,
+  syncPosterKeysFromRepository
+} from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
@@ -231,6 +246,11 @@ export const PUBLISHER_COMMANDS = [
   { command: 'channels', description: 'List announcement channels' },
   { command: 'removechannel', description: 'Remove an announcement channel' },
   { command: 'requests', description: 'Manage catalog requests' },
+  { command: 'imgapis', description: 'View ImgBB API keys, status, and upload counts' },
+  { command: 'addimgapi', description: 'Add an ImgBB API key to the rotation pool' },
+  { command: 'removeimgapi', description: 'Remove an ImgBB API key from the rotation pool' },
+  { command: 'maintanence', description: 'Toggle site maintenance mode ON/OFF' },
+  { command: 'restart', description: 'Restart the SoraBox bot and server' },
   { command: 'logout', description: 'Lock publisher controls' }
 ];
 
@@ -1110,17 +1130,30 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
       sourceIsManual: true,
       title: existing.title,
       category: existing.category,
-      config
+      config,
+      repository
     });
   } catch (error) {
     // A busy image host is the one reason an artwork change can wait: the choice is kept in the
     // retry queue, so the operator never has to pick it again and the card keeps its old poster.
     if (!isPosterRateLimit(error)) throw error;
     const image = await preparePosterImage({ sourceUrl, sourceIsManual: true, title: existing.title, category: existing.category });
-    queuePosterRetry({ adminId, title: existing.title, image, notifyChatId: chatId(ctx) });
-    await ctx.reply(
-      `\u25aa ImgBB is rate limiting right now, so ${adminId} keeps its current poster for the moment. The artwork you chose is queued and I will update this card and its channel post as soon as the host takes it \u2014 nothing to resend, and your choice was not lost.`
-    );
+    queuePosterRetry({
+      adminId,
+      title: existing.title,
+      image,
+      notifyChatId: chatId(ctx),
+      retryAfterMs: error.retryAfterMs || (error.allKeysCooling ? 3_600_000 : undefined)
+    });
+    if (error.allKeysCooling) {
+      await ctx.reply(
+        `\u25aa All ${error.poolSize || 'configured'} ImgBB API keys are rate limited right now. Checked 1st API key and it is still rate limited. The artwork you chose for ${adminId} is queued and will automatically retry in about ${shortDuration(error.retryAfterMs || 3_600_000)} once the rate limit is removed \u2014 nothing to resend, and your choice was not lost.`
+      );
+    } else {
+      await ctx.reply(
+        `\u25aa ImgBB is rate limiting right now, so ${adminId} keeps its current poster for the moment. The artwork you chose is queued and I will update this card and its channel post as soon as the host takes it \u2014 nothing to resend, and your choice was not lost.`
+      );
+    }
     return null;
   }
   const updated = await repository.updateContentByAdminId(adminId, {
@@ -4063,12 +4096,13 @@ export function createPosterRetryQueue({
       if (!item.adminId || !item.image) return null;
       const key = String(item.adminId);
       const previous = pending.get(key);
+      const waitMs = Number(item.retryAfterMs) > 0 ? Number(item.retryAfterMs) : intervalMs;
       pending.set(key, {
         title: item.title || null,
         image: item.image,
         notifyChatId: item.notifyChatId || null,
         attempts: previous?.attempts || 0,
-        nextAt: previous?.nextAt || now() + intervalMs
+        nextAt: previous?.nextAt || now() + waitMs
       });
       return pending.get(key);
     },
@@ -4093,7 +4127,7 @@ export function createPosterRetryQueue({
         handled += 1;
         const named = `${adminId}${entry.title ? ` \u00b7 ${cleanText(entry.title, 48)}` : ''}`;
         try {
-          const result = await host({ image: entry.image, title: entry.title, config });
+          const result = await host({ image: entry.image, title: entry.title, config, repository });
           const saved = typeof repository?.updateContentByAdminId === 'function'
             ? await repository.updateContentByAdminId(adminId, {
               posterUrl: result.url,
@@ -4228,7 +4262,7 @@ async function publishDraftSession({
     });
     let posterResult = null;
     try {
-      posterResult = await hostPosterImage({ image: posterImage, title: posterTitle, config });
+      posterResult = await hostPosterImage({ image: posterImage, title: posterTitle, config, repository });
     } catch (error) {
       // A rate limit at the image host must not decide whether this release exists. The card is
       // published with the artwork it already has and the mirror is retried on its own queue, so a
@@ -4293,7 +4327,24 @@ async function publishDraftSession({
       files: session.files
     });
     if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
-    if (posterResult.deferred) queuePosterRetry({ adminId: content.adminId, title: content.title, image: posterImage, notifyChatId: chatId(ctx) });
+    if (posterResult.deferred) {
+      queuePosterRetry({
+        adminId: content.adminId,
+        title: content.title,
+        image: posterImage,
+        notifyChatId: chatId(ctx),
+        retryAfterMs: posterResult.retryAfterMs || (posterResult.allKeysCooling ? 3_600_000 : undefined)
+      });
+      if (posterResult.allKeysCooling) {
+        try {
+          await ctx.reply(
+            `⚠️ Rate limit note: All ${posterResult.poolSize || 'configured'} ImgBB API keys are currently rate limited.\n` +
+            `Checked 1st API key and it is still rate limited.\n` +
+            `The artwork for “${content.title}” is queued and will retry automatically in about ${shortDuration(posterResult.retryAfterMs || 3_600_000)} once the rate limit is removed.`
+          );
+        } catch {}
+      }
+    }
 
     const url = getTelegramDeliveryUrl(config, content.shareCode);
     const websiteUrl = getContentPageUrl(config, content);
@@ -6523,10 +6574,245 @@ async function handleBackupRecoveryUpload(ctx, repository, config) {
   return true;
 }
 
-export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null }) {
+export function maskApiKey(key) {
+  const str = String(key || '').trim();
+  if (!str) return 'none';
+  if (str.length <= 8) return str;
+  return `${str.slice(0, 4)}...${str.slice(-4)}`;
+}
+
+export function maintenanceStatusText(active) {
+  return [
+    '🛠 Website Maintenance Mode',
+    '',
+    `Current Status: ${active ? '🔴 ON (Maintenance Active)' : '🟢 OFF (Site Online)'}`,
+    '',
+    active
+      ? 'When active: The website returns HTTP 404 with message:\n“site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box”'
+      : 'When inactive: The website is live and fully accessible.',
+    '',
+    'Click a button below to turn maintenance mode ON or OFF:'
+  ].join('\n');
+}
+
+export function maintenanceInlineKeyboard(active) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(active ? '🔴 ON (Active)' : 'Turn ON', 'maint:on'),
+      Markup.button.callback(!active ? '🟢 OFF (Online)' : 'Turn OFF', 'maint:off')
+    ],
+    [
+      Markup.button.callback('🔄 Refresh Status', 'maint:status')
+    ]
+  ]);
+}
+
+export async function handleImgApisCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const poolStatus = posterKeyPoolStatus();
+  const statsList = getAllPosterKeyStats();
+  const queueStatus = activePosterRetryQueue?.status?.() || { waiting: 0 };
+  const fallbackUrl = (typeof repository?.getFallbackPosterUrl === 'function' ? await repository.getFallbackPosterUrl() : null) || getSharedFallbackPosterUrl();
+
+  if (!statsList.length) {
+    await ctx.reply(
+      'No ImgBB API keys configured.\n\nUse /addimgapi <api_key> to add your first key.'
+    );
+    return;
+  }
+
+  const lines = [
+    '📸 ImgBB API Keys & Rotation Pool',
+    '',
+    `• Total keys: ${statsList.length} (limit: ${poolStatus.limit})`,
+    `• Active / sticky key: ${poolStatus.sticky ? maskApiKey(poolStatus.sticky) : 'None (rotates next upload)'}`,
+    `• Cooling / rate limited: ${poolStatus.cooling} of ${statsList.length}`,
+    `• Retry queue: ${queueStatus.waiting || 0} poster${queueStatus.waiting === 1 ? '' : 's'} waiting`,
+    fallbackUrl ? `• Shared fallback poster: ${fallbackUrl}` : '• Shared fallback poster: Not hosted yet',
+    '',
+    'Keys Detail:'
+  ];
+
+  statsList.forEach((item, index) => {
+    const statusIcon = item.isCooling ? '🔴 Rate Limited' : '🟢 Ready';
+    const cooldownNote = item.isCooling
+      ? ` (cooling down, free in ${shortDuration(item.remainingCooldownMs)})`
+      : '';
+    const stickyNote = item.isSticky ? ' [ACTIVE]' : '';
+    lines.push(
+      `#${index + 1} ${maskApiKey(item.key)}${stickyNote}`,
+      `  Status: ${statusIcon}${cooldownNote}`,
+      `  Uploads: ${item.uploads || 0} picture${item.uploads === 1 ? '' : 's'}`,
+      `  Rate limit hits: ${item.refusals || 0}`
+    );
+  });
+
+  lines.push('', '💡 To add more keys: /addimgapi <api_key>');
+  await ctx.reply(lines.join('\n'));
+}
+
+export async function handleAddImgApiCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const argument = parseCommandArgument(ctx.message?.text, 1000);
+  if (!argument) {
+    await ctx.reply(
+      'Usage: /addimgapi <api_key>\n\nExample: /addimgapi 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\n\nYou can pass one or more comma-separated ImgBB API keys. The keys will be added to the rotation pool and saved to the database so they survive server restarts.'
+    );
+    return;
+  }
+
+  const rawKeys = argument.split(/[\s,;]+/).map((k) => k.trim()).filter(Boolean);
+  if (!rawKeys.length) {
+    await ctx.reply('Please provide at least one valid ImgBB API key.');
+    return;
+  }
+
+  const added = [];
+  const alreadyPresent = [];
+  for (const key of rawKeys) {
+    if (key.length < 8) continue;
+    const existing = typeof repository?.getPosterApiKeys === 'function' ? await repository.getPosterApiKeys() : [];
+    if (existing.includes(key)) {
+      alreadyPresent.push(maskApiKey(key));
+    } else {
+      if (typeof repository?.addPosterApiKey === 'function') {
+        await repository.addPosterApiKey(key, userId(ctx));
+      }
+      addPosterApiKey(key);
+      if (config) {
+        config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), key]);
+        if (!config.imgbbApiKey) config.imgbbApiKey = key;
+      }
+      added.push(maskApiKey(key));
+    }
+  }
+
+  const total = posterKeyPoolStatus().configured;
+  const responseLines = [];
+  if (added.length) {
+    responseLines.push(`✓ Added ${added.length} ImgBB API key${added.length === 1 ? '' : 's'}: ${added.join(', ')}`);
+    responseLines.push(`Total active keys in pool: ${total}.`);
+    responseLines.push('These keys are saved in the database and will survive restarts. Uploads will rotate automatically if one is rate limited.');
+  }
+  if (alreadyPresent.length) {
+    responseLines.push(`Already in pool: ${alreadyPresent.join(', ')}`);
+  }
+  if (!added.length && !alreadyPresent.length) {
+    responseLines.push('No valid API keys were found in your command. ImgBB API keys are usually 32 characters long.');
+  }
+  await ctx.reply(responseLines.join('\n'));
+}
+
+export async function handleRemoveImgApiCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const argument = parseCommandArgument(ctx.message?.text, 500);
+  if (!argument) {
+    await ctx.reply('Usage: /removeimgapi <api_key_or_number>\nExample: /removeimgapi 1 or /removeimgapi <key>');
+    return;
+  }
+  const pool = getAllPosterKeyStats();
+  let targetKey = null;
+  const indexNum = Number.parseInt(argument, 10);
+  if (Number.isInteger(indexNum) && indexNum >= 1 && indexNum <= pool.length) {
+    targetKey = pool[indexNum - 1].key;
+  } else {
+    const match = pool.find((entry) => entry.key === argument || entry.key.includes(argument));
+    if (match) targetKey = match.key;
+  }
+  if (!targetKey) {
+    await ctx.reply(`Key not found: "${argument}". Use /imgapis to view active keys.`);
+    return;
+  }
+  if (typeof repository?.removePosterApiKey === 'function') {
+    await repository.removePosterApiKey(targetKey);
+  }
+  removePosterApiKey(targetKey);
+  if (config) {
+    config.imgbbApiKeys = (config.imgbbApiKeys || []).filter((k) => k !== targetKey);
+  }
+  await ctx.reply(`✓ Removed ImgBB API key: ${maskApiKey(targetKey)}. Remaining keys: ${posterKeyPoolStatus().configured}`);
+}
+
+export async function handleMaintenanceCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const active = typeof repository?.isMaintenanceActive === 'function' ? await repository.isMaintenanceActive() : false;
+  await ctx.reply(maintenanceStatusText(active), maintenanceInlineKeyboard(active));
+}
+
+export async function handleMaintenanceAction(ctx, repository, config, action = null) {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await acknowledgeTap(ctx, 'Publisher access required.', { alert: true });
+    return;
+  }
+  const act = action || ctx.match?.[0] || ctx.match?.[1];
+  let active = typeof repository?.isMaintenanceActive === 'function' ? await repository.isMaintenanceActive() : false;
+
+  if (act === 'maint:on') {
+    if (typeof repository?.setMaintenanceSettings === 'function') {
+      await repository.setMaintenanceSettings({ enabled: true, updatedBy: userId(ctx) });
+    }
+    active = true;
+    await acknowledgeTap(ctx, 'Maintenance mode turned ON');
+  } else if (act === 'maint:off') {
+    if (typeof repository?.setMaintenanceSettings === 'function') {
+      await repository.setMaintenanceSettings({ enabled: false, updatedBy: userId(ctx) });
+    }
+    active = false;
+    await acknowledgeTap(ctx, 'Maintenance mode turned OFF');
+  } else {
+    await acknowledgeTap(ctx, 'Status refreshed');
+  }
+
+  try {
+    await ctx.editMessageText(maintenanceStatusText(active), maintenanceInlineKeyboard(active));
+  } catch {
+    // Message text may be identical
+  }
+}
+
+export async function handleRestartCommand(ctx, repository, config, onRestart = null) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  await ctx.reply('🔄 Restarting SoraBox service now... The bot and website will be back up in a few seconds.');
+  if (typeof onRestart === 'function') {
+    try {
+      await onRestart();
+    } catch (err) {
+      console.error('[telegram] onRestart failed:', err);
+    }
+  } else {
+    setTimeout(() => {
+      console.info('[server] Restart command received; exiting process for container restart.');
+      process.exit(0);
+    }, 1000);
+  }
+}
+
+export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null, onRestart = null }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
     return null;
+  }
+
+  // Load persisted ImgBB API keys from repository into the active pool
+  if (typeof repository?.getPosterApiKeys === 'function') {
+    try {
+      const persistedKeys = await repository.getPosterApiKeys();
+      if (persistedKeys?.length) {
+        syncPosterKeysFromRepository(repository, persistedKeys);
+        if (config) {
+          config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), ...persistedKeys]);
+          if (!config.imgbbApiKey) config.imgbbApiKey = config.imgbbApiKeys[0] || '';
+        }
+      }
+    } catch (error) {
+      console.warn('[telegram] Could not load persisted ImgBB keys:', automationDiagnostic(error));
+    }
+  }
+  if (typeof repository?.getFallbackPosterUrl === 'function') {
+    try {
+      const fallbackUrl = await repository.getFallbackPosterUrl();
+      if (fallbackUrl) setSharedFallbackPosterUrl(fallbackUrl);
+    } catch {}
   }
 
   const bot = new Telegraf(config.telegram.botToken, { handlerTimeout: TELEGRAM_HANDLER_TIMEOUT_MS });
@@ -7915,6 +8201,17 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     const requests = await repository.listRequests({ status: 'open', limit: 200 });
     await ctx.reply(requestManagerText(requests.length), requestManagerKeyboard());
   });
+
+  bot.command('imgapis', async (ctx) => handleImgApisCommand(ctx, repository, config));
+  bot.command('addimgapi', async (ctx) => handleAddImgApiCommand(ctx, repository, config));
+  for (const cmd of ['removeimgapi', 'delimgapi']) {
+    bot.command(cmd, async (ctx) => handleRemoveImgApiCommand(ctx, repository, config));
+  }
+  for (const cmd of ['maintanence', 'maintenance']) {
+    bot.command(cmd, async (ctx) => handleMaintenanceCommand(ctx, repository, config));
+  }
+  bot.action(/^maint:(?:on|off|status)$/, async (ctx) => handleMaintenanceAction(ctx, repository, config, ctx.match?.[0]));
+  bot.command('restart', async (ctx) => handleRestartCommand(ctx, repository, config, onRestart));
 
   bot.action('requests:select', async (ctx) => {
     await ctx.answerCbQuery();

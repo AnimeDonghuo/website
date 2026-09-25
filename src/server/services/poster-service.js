@@ -92,7 +92,7 @@ export function parseImgBBKeys(value) {
 
 // `sticky` is the key currently in favour. Uploads stay on one key until it says it is full, which
 // is what an operator wants: one connection, one pace, and a switch only when it is forced.
-const posterKeyPool = { list: null, sticky: -1, state: new Map() };
+const posterKeyPool = { list: null, sticky: -1, state: new Map(), repository: null };
 
 function resolvePosterKeys() {
   if (Array.isArray(posterKeyPool.list)) return posterKeyPool.list;
@@ -110,10 +110,82 @@ function resolvePosterKeys() {
 function posterKeyState(key) {
   let state = posterKeyPool.state.get(key);
   if (!state) {
-    state = { lastUsedAt: 0, cooldownUntil: 0, refusals: 0 };
+    state = { lastUsedAt: 0, cooldownUntil: 0, refusals: 0, uploads: 0, lastSuccessAt: null, lastRefusalAt: null };
     posterKeyPool.state.set(key, state);
   }
   return state;
+}
+
+export function addPosterApiKey(key) {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return;
+  const current = resolvePosterKeys();
+  if (!current.includes(cleanKey)) {
+    const next = parseImgBBKeys([...current, cleanKey]);
+    posterKeyPool.list = next;
+    posterKeyState(cleanKey);
+  }
+}
+
+export function removePosterApiKey(key) {
+  const cleanKey = String(key || '').trim();
+  const current = resolvePosterKeys();
+  posterKeyPool.list = current.filter((k) => k !== cleanKey);
+  posterKeyPool.state.delete(cleanKey);
+  if (posterKeyPool.sticky >= posterKeyPool.list.length) {
+    posterKeyPool.sticky = -1;
+  }
+}
+
+export function syncPosterKeysFromRepository(repository, persistedKeys = null) {
+  posterKeyPool.repository = repository;
+  const keys = Array.isArray(persistedKeys) ? persistedKeys : [];
+  if (keys.length) {
+    const current = resolvePosterKeys();
+    const merged = parseImgBBKeys([...current, ...keys]);
+    posterKeyPool.list = merged;
+  }
+  if (repository && typeof repository.getPosterKeyStats === 'function') {
+    repository.getPosterKeyStats().then((stats) => {
+      if (stats && typeof stats === 'object') {
+        for (const [key, keyStats] of Object.entries(stats)) {
+          const state = posterKeyState(key);
+          if (Number.isInteger(keyStats?.uploads)) state.uploads = Math.max(state.uploads, keyStats.uploads);
+          if (Number.isInteger(keyStats?.refusals)) state.refusals = Math.max(state.refusals, keyStats.refusals);
+          if (keyStats?.lastSuccessAt) state.lastSuccessAt = keyStats.lastSuccessAt;
+          if (keyStats?.lastRefusalAt) state.lastRefusalAt = keyStats.lastRefusalAt;
+        }
+      }
+    }).catch?.(() => {});
+  }
+  if (repository && typeof repository.getFallbackPosterUrl === 'function') {
+    repository.getFallbackPosterUrl().then((url) => {
+      if (url) sharedNoImageFoundUrl = url;
+    }).catch?.(() => {});
+  }
+}
+
+export function getAllPosterKeyStats() {
+  const list = resolvePosterKeys();
+  const at = posterUploadOptions.now();
+  const stickyKey = posterKeyPool.sticky >= 0 ? list[posterKeyPool.sticky] || null : null;
+  return list.map((key, index) => {
+    const state = posterKeyState(key);
+    const isCooling = state.cooldownUntil > at;
+    return {
+      key,
+      index: index + 1,
+      isSticky: key === stickyKey,
+      isCooling,
+      cooldownUntil: state.cooldownUntil,
+      remainingCooldownMs: isCooling ? Math.max(0, state.cooldownUntil - at) : 0,
+      uploads: state.uploads || 0,
+      refusals: state.refusals || 0,
+      lastUsedAt: state.lastUsedAt || null,
+      lastSuccessAt: state.lastSuccessAt || null,
+      lastRefusalAt: state.lastRefusalAt || null
+    };
+  });
 }
 
 /** Replace the pool: null re-reads the environment, an array pins it (a test seam, or a caller with its own list). */
@@ -163,6 +235,7 @@ function pickPosterKey(keys, at) {
 function coolPosterKey(key, ms) {
   const state = posterKeyState(key);
   state.refusals += 1;
+  state.lastRefusalAt = posterUploadOptions.now();
   // A key that keeps refusing rests proportionally longer, so a tired pool is walked around rather
   // than hammered at the same speed by the next card.
   const coolFor = Math.max(1_000, Number(ms) || 0) * Math.min(6, state.refusals);
@@ -170,6 +243,12 @@ function coolPosterKey(key, ms) {
   // The refused key stops being the favoured one, so the next upload in this call picks another.
   posterKeyPool.sticky = -1;
   return coolFor;
+}
+
+function recordKeySuccess(key) {
+  const state = posterKeyState(key);
+  state.uploads = (state.uploads || 0) + 1;
+  state.lastSuccessAt = posterUploadOptions.now();
 }
 
 /**
@@ -185,6 +264,7 @@ function cachePosterUpload(key, value) {
 export function clearPosterUploadCache() {
   const size = posterUploadCache.size;
   posterUploadCache.clear();
+  sharedNoImageFoundUrl = null;
   return size;
 }
 
@@ -359,8 +439,27 @@ const PALETTES = {
   movie: [[161, 193, 35], [230, 255, 119], [26, 39, 18]],
   'web-series': [[40, 112, 231], [123, 190, 255], [13, 31, 82]],
   tv: [[176, 108, 12], [255, 196, 107], [46, 24, 6]],
-  adult: [[173, 39, 65], [255, 150, 166], [48, 11, 20]]
+  adult: [[173, 39, 65], [255, 150, 166], [48, 11, 20]],
+  default: [[50, 56, 75], [120, 140, 180], [18, 22, 32]]
 };
+
+let sharedNoImageFoundBuffer = null;
+let sharedNoImageFoundUrl = null;
+
+export function getNoImageFoundPosterPng() {
+  if (!sharedNoImageFoundBuffer) {
+    sharedNoImageFoundBuffer = createFallbackPosterPng('No Image Found', 'default');
+  }
+  return sharedNoImageFoundBuffer;
+}
+
+export function getSharedFallbackPosterUrl() {
+  return sharedNoImageFoundUrl;
+}
+
+export function setSharedFallbackPosterUrl(url) {
+  sharedNoImageFoundUrl = String(url || '').trim() || null;
+}
 
 function blend(first, second, factor) {
   return Math.max(0, Math.min(255, Math.round(first + (second - first) * factor)));
@@ -589,9 +688,10 @@ export async function preparePosterImage({ sourceUrl = null, sourceIsManual = fa
 
   if (!image) {
     image = {
-      buffer: createFallbackPosterPng(title, category),
+      buffer: getNoImageFoundPosterPng(),
       contentType: 'image/png',
-      sourceUrl: null
+      sourceUrl: null,
+      isNoImageFallback: true
     };
   }
 
@@ -599,7 +699,8 @@ export async function preparePosterImage({ sourceUrl = null, sourceIsManual = fa
     buffer: image.buffer,
     contentType: image.contentType,
     sourceUrl: originalUrl,
-    usedFallback
+    usedFallback,
+    isNoImageFallback: Boolean(image.isNoImageFallback)
   };
 }
 
@@ -647,9 +748,19 @@ async function postPosterToImgBB({ buffer, title, key }) {
  * cooling, a short remaining wait is taken inside this call; anything longer is reported as a rate
  * limit, which is what lets the caller publish the card and re-host the artwork later.
  */
-export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys = null } = {}) {
+export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys = null, repository = null } = {}) {
   const configured = Array.isArray(apiKeys) && apiKeys.length ? parseImgBBKeys(apiKeys) : [];
-  const keys = configured.length ? configured : (apiKey ? [apiKey] : resolvePosterKeys());
+  let keys;
+  if (Array.isArray(posterKeyPool.list) && posterKeyPool.list.length > 0) {
+    keys = parseImgBBKeys([...posterKeyPool.list, ...configured, ...(apiKey ? [apiKey] : [])]);
+  } else if (configured.length > 0) {
+    keys = configured;
+  } else if (apiKey) {
+    keys = [apiKey];
+  } else {
+    keys = resolvePosterKeys();
+  }
+
   if (!keys.length) {
     throw new PosterHostingError('IMGBB_API_KEY is not configured. Add it as a server-side Koyeb secret before publishing. Up to 20 keys can be pooled with IMGBB_API_KEYS so one quota never throttles a bulk publish.');
   }
@@ -663,30 +774,47 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
     return { ...cached, cached: true };
   }
 
+  const repo = repository || posterKeyPool.repository;
   const { spacingMs, attempts, backoffMs, wait, now } = posterUploadOptions;
   const paceMs = keys.length >= IMGBB_POOL_SIZE ? Math.min(spacingMs, IMGBB_POOL_SPACING_MS) : spacingMs;
   let lastRateLimit = null;
   let restsTaken = 0;
-  for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
-    const picked = pickPosterKey(keys, now());
+
+  const totalKeys = keys.length;
+  const maxAttempts = Math.max(attempts, totalKeys + 1);
+  let checkedFirstKeyAfterAllFailed = false;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let picked = pickPosterKey(keys, now());
     if (!picked) {
-      // Every key in the pool has said it is full. The wait is reported, not sat through: the retry
-      // queue's timer is what an "all keys are down" hour needs, not a stalled publish.
-      const soonest = Math.min(...keys.map((entry) => posterKeyState(entry).cooldownUntil));
-      const restMs = Math.max(0, soonest - now());
-      const pooled = new PosterRateLimitError('Every configured ImgBB key is rate limited.', { retryAfterMs: restMs });
-      pooled.allKeysCooling = true;
-      pooled.poolSize = keys.length;
-      pooled.nextFreeInMs = restMs;
-      lastRateLimit = lastRateLimit || pooled;
-      // A short Retry-After on the only key is cheaper to wait out here than to queue around.
-      if (restMs > IMGBB_KEY_PATIENCE_MS || keys.length > 1 || restsTaken >= 2) break;
-      const resting = keys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
-      restsTaken += 1;
-      await wait(restMs);
-      for (const entry of resting) posterKeyState(entry).cooldownUntil = 0;
-      attempt -= 1;
-      continue;
+      if (!checkedFirstKeyAfterAllFailed && totalKeys > 1) {
+        checkedFirstKeyAfterAllFailed = true;
+        const firstKeyState = posterKeyState(keys[0]);
+        if (firstKeyState.cooldownUntil <= now()) {
+          picked = { key: keys[0], index: 0 };
+        }
+      }
+
+      if (!picked) {
+        // Every key in the pool has said it is full. The wait is reported, not sat through: the retry
+        // queue's timer is what an "all keys are down" hour needs, not a stalled publish.
+        const soonest = Math.min(...keys.map((entry) => posterKeyState(entry).cooldownUntil));
+        const restMs = Math.max(0, soonest - now());
+        const pooledWait = Math.max(restMs, 3_600_000);
+        const pooled = new PosterRateLimitError('Every configured ImgBB key is rate limited.', { retryAfterMs: pooledWait });
+        pooled.allKeysCooling = true;
+        pooled.poolSize = keys.length;
+        pooled.nextFreeInMs = pooledWait;
+        lastRateLimit = pooled;
+        // A short Retry-After on the only key is cheaper to wait out here than to queue around.
+        if (restMs > IMGBB_KEY_PATIENCE_MS || keys.length > 1 || restsTaken >= 2) break;
+        const resting = keys.filter((entry) => posterKeyState(entry).cooldownUntil <= soonest + 1);
+        restsTaken += 1;
+        await wait(restMs);
+        for (const entry of resting) posterKeyState(entry).cooldownUntil = 0;
+        attempt -= 1;
+        continue;
+      }
     }
     const state = posterKeyState(picked.key);
     if (paceMs > 0 && state.lastUsedAt) {
@@ -703,6 +831,9 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
     } catch (error) {
       if (!isPosterRateLimit(error)) throw error;
       coolPosterKey(picked.key, backoffMs * attempt);
+      if (repo && typeof repo.recordPosterRefusal === 'function') {
+        repo.recordPosterRefusal(picked.key).catch?.(() => {});
+      }
       lastRateLimit = new PosterRateLimitError(error.message, { retryAfterMs: backoffMs * attempt });
       continue;
     }
@@ -710,12 +841,19 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
     if (outcome.ok) {
       // Success keeps this key in favour: the next poster goes to the same quota, one pace later.
       posterKeyPool.sticky = picked.index;
+      recordKeySuccess(picked.key);
+      if (repo && typeof repo.recordPosterUpload === 'function') {
+        repo.recordPosterUpload(picked.key).catch?.(() => {});
+      }
       const hosted = { url: outcome.url, providerId: outcome.providerId };
       cachePosterUpload(cacheKey, hosted);
       return hosted;
     }
     const coolMs = outcome.retryAfterMs || Math.min(IMGBB_KEY_COOLDOWN_MS, backoffMs * attempt);
     coolPosterKey(picked.key, coolMs);
+    if (repo && typeof repo.recordPosterRefusal === 'function') {
+      repo.recordPosterRefusal(picked.key).catch?.(() => {});
+    }
     lastRateLimit = new PosterRateLimitError(outcome.detail || 'ImgBB is rate limiting this server.', { retryAfterMs: coolMs });
   }
 
@@ -726,14 +864,44 @@ export async function uploadImageToImgBB({ buffer, title, apiKey = null, apiKeys
  * Host an already-prepared image. Split out of `mirrorPosterToImgBB` so a publish that must not be
  * lost can keep the artwork it already has and hand this call to a retry queue instead.
  */
-export async function hostPosterImage({ image, title, config } = {}) {
+export async function hostPosterImage({ image, title, config, repository = null } = {}) {
   if (!image?.buffer) throw new PosterHostingError('There was no poster image to upload.');
+
+  if (image.isNoImageFallback) {
+    if (!sharedNoImageFoundUrl && repository && typeof repository.getFallbackPosterUrl === 'function') {
+      try {
+        sharedNoImageFoundUrl = await repository.getFallbackPosterUrl();
+      } catch {}
+    }
+    if (sharedNoImageFoundUrl) {
+      return {
+        url: sharedNoImageFoundUrl,
+        providerId: null,
+        originalUrl: null,
+        source: 'generated-fallback',
+        contentType: image.contentType,
+        cached: true
+      };
+    }
+  }
+
   const hosted = await uploadImageToImgBB({
     buffer: image.buffer,
-    title,
+    title: image.isNoImageFallback ? 'No Image Found' : title,
     apiKey: config?.imgbbApiKey,
-    apiKeys: config?.imgbbApiKeys
+    apiKeys: config?.imgbbApiKeys,
+    repository
   });
+
+  if (image.isNoImageFallback && hosted?.url) {
+    sharedNoImageFoundUrl = hosted.url;
+    if (repository && typeof repository.setFallbackPosterUrl === 'function') {
+      try {
+        await repository.setFallbackPosterUrl(hosted.url);
+      } catch {}
+    }
+  }
+
   return {
     ...hosted,
     originalUrl: image.sourceUrl || null,
@@ -742,7 +910,7 @@ export async function hostPosterImage({ image, title, config } = {}) {
   };
 }
 
-export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, title, category, config }) {
+export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, title, category, config, repository = null }) {
   const image = await preparePosterImage({ sourceUrl, sourceIsManual, title, category });
-  return hostPosterImage({ image, title, config });
+  return hostPosterImage({ image, title, config, repository });
 }

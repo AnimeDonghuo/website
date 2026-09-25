@@ -856,6 +856,8 @@ export class MemoryCatalogRepository {
     this.announcementChannels = new Map();
     this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
     this.backupSettings = { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
+    this.maintenanceSettings = { enabled: false, updatedAt: null, updatedBy: null };
+    this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
   }
 
   async init() {}
@@ -1764,6 +1766,90 @@ export class MemoryCatalogRepository {
     return clone(this.autoPublishSettings);
   }
 
+  async getMaintenanceSettings() {
+    return clone(this.maintenanceSettings || { enabled: false, updatedAt: null, updatedBy: null });
+  }
+
+  async setMaintenanceSettings({ enabled, updatedBy = null }) {
+    this.maintenanceSettings = {
+      enabled: Boolean(enabled),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    return clone(this.maintenanceSettings);
+  }
+
+  async isMaintenanceActive() {
+    return Boolean(this.maintenanceSettings?.enabled);
+  }
+
+  async getPosterSettings() {
+    return clone(this.imgbbSettings || { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null });
+  }
+
+  async getPosterApiKeys() {
+    return clone(this.imgbbSettings?.keys || []);
+  }
+
+  async addPosterApiKey(key, addedBy = null) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return this.getPosterApiKeys();
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.keys.includes(cleanKey)) {
+      this.imgbbSettings.keys.push(cleanKey);
+      this.imgbbSettings.updatedAt = new Date().toISOString();
+      this.imgbbSettings.updatedBy = addedBy ? String(addedBy) : null;
+    }
+    return clone(this.imgbbSettings.keys);
+  }
+
+  async removePosterApiKey(key) {
+    const cleanKey = String(key || '').trim();
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    this.imgbbSettings.keys = (this.imgbbSettings.keys || []).filter((k) => k !== cleanKey);
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+    return clone(this.imgbbSettings.keys);
+  }
+
+  async getPosterKeyStats() {
+    return clone(this.imgbbSettings?.stats || {});
+  }
+
+  async recordPosterUpload(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.stats[cleanKey]) {
+      this.imgbbSettings.stats[cleanKey] = { uploads: 0, refusals: 0, lastSuccessAt: null, lastRefusalAt: null };
+    }
+    this.imgbbSettings.stats[cleanKey].uploads = (this.imgbbSettings.stats[cleanKey].uploads || 0) + 1;
+    this.imgbbSettings.stats[cleanKey].lastSuccessAt = new Date().toISOString();
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+  }
+
+  async recordPosterRefusal(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.stats[cleanKey]) {
+      this.imgbbSettings.stats[cleanKey] = { uploads: 0, refusals: 0, lastSuccessAt: null, lastRefusalAt: null };
+    }
+    this.imgbbSettings.stats[cleanKey].refusals = (this.imgbbSettings.stats[cleanKey].refusals || 0) + 1;
+    this.imgbbSettings.stats[cleanKey].lastRefusalAt = new Date().toISOString();
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+  }
+
+  async getFallbackPosterUrl() {
+    return this.imgbbSettings?.fallbackPosterUrl || null;
+  }
+
+  async setFallbackPosterUrl(url) {
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    this.imgbbSettings.fallbackPosterUrl = String(url || '').trim() || null;
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+    return this.imgbbSettings.fallbackPosterUrl;
+  }
+
   async exportBackupData() {
     return backupSnapshot({
       content: [...this.contents.values()].map(clone),
@@ -1773,7 +1859,11 @@ export class MemoryCatalogRepository {
       site_visitors: [...this.siteVisitors.values()].map(clone),
       site_visits: this.siteVisits.map(clone),
       announcement_channels: [...this.announcementChannels.values()].map(clone),
-      automation_settings: [{ _id: 'auto-publish', ...clone(this.autoPublishSettings) }],
+      automation_settings: [
+        { _id: 'auto-publish', ...clone(this.autoPublishSettings) },
+        ...(this.maintenanceSettings?.enabled ? [{ _id: 'maintenance-mode', ...clone(this.maintenanceSettings) }] : []),
+        ...(this.imgbbSettings?.keys?.length || this.imgbbSettings?.fallbackPosterUrl ? [{ _id: 'imgbb-settings', ...clone(this.imgbbSettings) }] : [])
+      ],
       backup_settings: [{ _id: 'monthly-backup', ...clone(this.backupSettings) }]
     });
   }
@@ -1797,6 +1887,16 @@ export class MemoryCatalogRepository {
     this.autoPublishSettings = autoSettings
       ? clone(savedAutoSettings)
       : { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
+    const maintSettings = collections.automation_settings.find((item) => String(item._id) === 'maintenance-mode');
+    if (maintSettings) {
+      const { _id: ignoredMaintId, ...savedMaint } = maintSettings;
+      this.maintenanceSettings = clone(savedMaint);
+    }
+    const imgbbSettingsDoc = collections.automation_settings.find((item) => String(item._id) === 'imgbb-settings');
+    if (imgbbSettingsDoc) {
+      const { _id: ignoredImgbbId, ...savedImgbb } = imgbbSettingsDoc;
+      this.imgbbSettings = clone(savedImgbb);
+    }
     const backupSettings = collections.backup_settings.find((item) => String(item._id) === 'monthly-backup');
     const { _id: ignoredBackupSettingsId, ...savedBackupSettings } = backupSettings || {};
     this.backupSettings = backupSettings
@@ -1877,6 +1977,7 @@ export class MongoCatalogRepository {
     this.backupSettings = db.collection('backup_settings');
     this.subsPleaseReleases = db.collection('subsplease_releases');
     this.subsPleaseAliases = db.collection('subsplease_aliases');
+    this._maintenanceActive = undefined;
   }
 
   async init() {
@@ -1918,6 +2019,12 @@ export class MongoCatalogRepository {
       this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
       this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
     ]);
+    try {
+      const maint = await this.getMaintenanceSettings();
+      this._maintenanceActive = Boolean(maint?.enabled);
+    } catch {
+      this._maintenanceActive = false;
+    }
   }
 
   async findSubsPleaseOverride(adminId) {
@@ -2945,6 +3052,133 @@ export class MongoCatalogRepository {
       { upsert: true }
     );
     return settings;
+  }
+
+  async getMaintenanceSettings() {
+    return (await this.automationSettings.findOne({ _id: 'maintenance-mode' })) || {
+      enabled: false,
+      updatedAt: null,
+      updatedBy: null
+    };
+  }
+
+  async setMaintenanceSettings({ enabled, updatedBy = null }) {
+    const settings = {
+      enabled: Boolean(enabled),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    await this.automationSettings.updateOne(
+      { _id: 'maintenance-mode' },
+      { $set: settings },
+      { upsert: true }
+    );
+    this._maintenanceActive = settings.enabled;
+    return settings;
+  }
+
+  async isMaintenanceActive() {
+    if (this._maintenanceActive !== undefined) return this._maintenanceActive;
+    const settings = await this.getMaintenanceSettings();
+    this._maintenanceActive = Boolean(settings?.enabled);
+    return this._maintenanceActive;
+  }
+
+  async getPosterSettings() {
+    return (await this.automationSettings.findOne({ _id: 'imgbb-settings' })) || {
+      keys: [],
+      stats: {},
+      fallbackPosterUrl: null,
+      updatedAt: null
+    };
+  }
+
+  async getPosterApiKeys() {
+    const settings = await this.getPosterSettings();
+    return Array.isArray(settings.keys) ? settings.keys : [];
+  }
+
+  async addPosterApiKey(key, addedBy = null) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return this.getPosterApiKeys();
+    const settings = await this.getPosterSettings();
+    const currentKeys = Array.isArray(settings.keys) ? settings.keys : [];
+    if (!currentKeys.includes(cleanKey)) {
+      currentKeys.push(cleanKey);
+      await this.automationSettings.updateOne(
+        { _id: 'imgbb-settings' },
+        {
+          $set: {
+            keys: currentKeys,
+            updatedAt: new Date().toISOString(),
+            updatedBy: addedBy === null || addedBy === undefined ? null : String(addedBy)
+          }
+        },
+        { upsert: true }
+      );
+    }
+    return currentKeys;
+  }
+
+  async removePosterApiKey(key) {
+    const cleanKey = String(key || '').trim();
+    const settings = await this.getPosterSettings();
+    const currentKeys = (Array.isArray(settings.keys) ? settings.keys : []).filter((k) => k !== cleanKey);
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      { $set: { keys: currentKeys, updatedAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+    return currentKeys;
+  }
+
+  async getPosterKeyStats() {
+    const settings = await this.getPosterSettings();
+    return settings.stats || {};
+  }
+
+  async recordPosterUpload(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      {
+        $inc: { [`stats.${cleanKey}.uploads`]: 1 },
+        $set: { [`stats.${cleanKey}.lastSuccessAt`]: now, updatedAt: now }
+      },
+      { upsert: true }
+    );
+  }
+
+  async recordPosterRefusal(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      {
+        $inc: { [`stats.${cleanKey}.refusals`]: 1 },
+        $set: { [`stats.${cleanKey}.lastRefusalAt`]: now, updatedAt: now }
+      },
+      { upsert: true }
+    );
+  }
+
+  async getFallbackPosterUrl() {
+    const settings = await this.getPosterSettings();
+    return settings.fallbackPosterUrl || null;
+  }
+
+  async setFallbackPosterUrl(url) {
+    const cleanUrl = String(url || '').trim() || null;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      { $set: { fallbackPosterUrl: cleanUrl, updatedAt: now } },
+      { upsert: true }
+    );
+    return cleanUrl;
   }
 
   async exportBackupData() {
