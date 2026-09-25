@@ -28,6 +28,7 @@ import {
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
+import { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 const ADULT_CATEGORY = 'adult';
@@ -228,6 +229,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'poster', description: 'Set artwork: old link style or search & pick' },
   { command: 'p', description: 'Short alias for /poster' },
   { command: 'imgdd', description: 'Add artwork with the same old/new poster flow' },
+  { command: 'scrape', description: 'Scrape info & artwork from web: /scrape SB-ID URL' },
   { command: 'category', description: 'Set the category of one or many posts' },
   { command: 'release', description: 'Set a release label on one or many posts' },
   { command: 'done', description: 'Publish current draft' },
@@ -6988,6 +6990,183 @@ export async function handleRestartCommand(ctx, repository, config, onRestart = 
   }
 }
 
+export async function handleScrapeCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return { handled: false, error: 'Unauthorized' };
+
+  const parsed = parseScrapeArguments(ctx.message?.text);
+  if (parsed.empty || !parsed.url) {
+    await ctx.reply([
+      'Usage: /scrape <Post ID> <URL>',
+      'Example: /scrape SB-0123ABCDEF https://www.imdb.com/title/tt43056433/',
+      '',
+      'You can also use /scrape <URL> while editing an active draft.',
+      '',
+      'Supported sites: IMDb, Netflix, MyAnimeList, AniList, Wikipedia, and any web page with movie/series info and artwork.'
+    ].join('\n'));
+    return { handled: true, error: 'Usage prompt displayed' };
+  }
+
+  let adminId = parsed.adminId;
+  let isDraft = false;
+  let session = null;
+
+  if (!adminId) {
+    session = await repository.findSession?.(chatId(ctx), userId(ctx));
+    if (session) {
+      isDraft = true;
+    } else {
+      await ctx.reply(`Provide a Post ID or start an active draft first.\nExample: /scrape SB-0123ABCDEF ${parsed.url}`);
+      return { handled: true, error: 'No Post ID or active draft' };
+    }
+  }
+
+  let existing = null;
+  if (!isDraft) {
+    existing = await repository.findContentByAdminId(adminId);
+    if (!existing) {
+      await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts, /postid, or /search <title> to find an ID.`);
+      return { handled: true, error: 'Post not found' };
+    }
+  }
+
+  let domain = 'web page';
+  try {
+    domain = new URL(parsed.url).hostname.replace(/^www\./, '');
+  } catch {}
+
+  await ctx.reply(`Scraping info and artwork from ${domain}…`);
+
+  const scraped = await scrapeMetadataFromUrl(parsed.url, { config });
+  if (scraped.error || (!scraped.title && !scraped.description && !scraped.posterUrl)) {
+    await ctx.reply(`Could not scrape metadata: ${scraped.error || 'No media information found on that page.'}`);
+    return { handled: true, error: scraped.error || 'No metadata' };
+  }
+
+  let mirroredPosterUrl = null;
+  if (scraped.posterUrl) {
+    const titleForArt = scraped.title || (isDraft ? session?.title : existing?.title) || 'Scraped Artwork';
+    const categoryForArt = (isDraft ? session?.category : existing?.category) || 'movie';
+    try {
+      const mirrorResult = await mirrorPosterToImgBB({
+        sourceUrl: scraped.posterUrl,
+        sourceIsManual: true,
+        title: titleForArt,
+        category: categoryForArt,
+        config: config || {},
+        repository
+      });
+      mirroredPosterUrl = mirrorResult?.url || null;
+    } catch (err) {
+      if (isPosterRateLimit(err) && !isDraft && existing) {
+        try {
+          const image = await preparePosterImage({
+            sourceUrl: scraped.posterUrl,
+            sourceIsManual: true,
+            title: titleForArt,
+            category: categoryForArt
+          });
+          queuePosterRetry({
+            adminId,
+            title: titleForArt,
+            image,
+            notifyChatId: chatId(ctx),
+            retryAfterMs: err.retryAfterMs || (err.allKeysCooling ? 3_600_000 : undefined)
+          });
+        } catch {}
+      }
+      mirroredPosterUrl = scraped.posterUrl;
+    }
+  }
+
+  if (isDraft) {
+    const draftUpdates = {};
+    if (scraped.title) draftUpdates.title = scraped.title;
+    if (scraped.year) draftUpdates.year = scraped.year;
+    if (scraped.description) draftUpdates.description = scraped.description;
+    if (Array.isArray(scraped.genres) && scraped.genres.length) draftUpdates.genres = scraped.genres;
+    if (Array.isArray(scraped.languages) && scraped.languages.length) draftUpdates.languages = scraped.languages;
+    if (scraped.releaseLabel) draftUpdates.releaseLabel = scraped.releaseLabel;
+    if (scraped.category && !session?.category) draftUpdates.category = scraped.category;
+    if (mirroredPosterUrl) {
+      draftUpdates.posterOriginalUrl = mirroredPosterUrl;
+      draftUpdates.posterUrl = mirroredPosterUrl;
+    }
+    await repository.updateSession(chatId(ctx), userId(ctx), draftUpdates);
+
+    const lines = [
+      `Scraped from ${domain} and updated active draft:`,
+      draftUpdates.title ? `▪ Title: ${draftUpdates.title}` : null,
+      draftUpdates.year ? `▪ Year: ${draftUpdates.year}` : null,
+      draftUpdates.genres?.length ? `▪ Genres: ${draftUpdates.genres.join(', ')}` : null,
+      draftUpdates.languages?.length ? `▪ Languages: ${draftUpdates.languages.join(', ')}` : null,
+      draftUpdates.releaseLabel ? `▪ Type: ${draftUpdates.releaseLabel}` : null,
+      draftUpdates.description ? `▪ Synopsis: ${cleanText(draftUpdates.description, 140)}` : null,
+      mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : '▪ Artwork: None found',
+      '',
+      'Use /status to inspect the draft or /done to publish.'
+    ].filter(Boolean);
+    await ctx.reply(lines.join('\n'));
+    return { handled: true, isDraft: true, scraped, updates: draftUpdates };
+  }
+
+  // Published post
+  const patch = {};
+  if (scraped.title) patch.title = scraped.title;
+  if (scraped.year) patch.year = scraped.year;
+  if (scraped.description) patch.description = scraped.description;
+  if (Array.isArray(scraped.genres) && scraped.genres.length) patch.genres = scraped.genres;
+  if (Array.isArray(scraped.languages) && scraped.languages.length) patch.languages = scraped.languages;
+  if (scraped.releaseLabel) patch.releaseLabel = scraped.releaseLabel;
+  if (mirroredPosterUrl) {
+    patch.posterUrl = mirroredPosterUrl;
+    patch.backdropUrl = mirroredPosterUrl;
+    patch.poster = {
+      provider: 'imgbb',
+      originalUrl: scraped.posterUrl,
+      source: scraped.provider || domain,
+      title: scraped.title || existing.title,
+      mirroredAt: new Date().toISOString()
+    };
+  }
+
+  let updated = await repository.updateContentByAdminId(adminId, patch);
+  if (typeof repository.reindexContent === 'function') {
+    await repository.reindexContent({ adminId }).catch(() => {});
+    updated = (await repository.findContentByAdminId?.(adminId)) || updated;
+  } else if (patch.title && updated) {
+    const rebuiltIndex = reindexContentRecord(updated);
+    if (rebuiltIndex.changed) {
+      updated = (await repository.updateContentByAdminId(adminId, rebuiltIndex.patch)) || updated;
+    }
+  }
+  await queueAnnouncementSync({
+    telegram: ctx.telegram,
+    repository,
+    content: updated || existing,
+    config,
+    adminId: (updated || existing).adminId,
+    notifyChatId: chatId(ctx)
+  });
+
+  const pageUrl = updated ? getContentPageUrl(config || {}, updated) : null;
+  const lines = [
+    `Scraped from ${domain} and updated ${(updated || existing).adminId} · ${(updated || existing).title}:`,
+    patch.title ? `▪ Title: ${patch.title}` : null,
+    patch.year ? `▪ Year: ${patch.year}` : null,
+    patch.genres?.length ? `▪ Genres: ${patch.genres.join(', ')}` : null,
+    patch.languages?.length ? `▪ Languages: ${patch.languages.join(', ')}` : null,
+    patch.releaseLabel ? `▪ Type: ${patch.releaseLabel}` : null,
+    patch.description ? `▪ Synopsis: ${cleanText(patch.description, 140)}` : null,
+    mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : null,
+    '▪ Channel announcement: Queued for update',
+    pageUrl ? `Card: ${pageUrl}` : null
+  ].filter(Boolean);
+  await ctx.reply(lines.join('\n'));
+  return { handled: true, isDraft: false, scraped, updated, patch };
+}
+
+export { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
+
 export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null, onRestart = null }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
@@ -7467,6 +7646,7 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   // /p is the short form publishers asked for, and /imgdd follows the identical
   // old/new flow so artwork handling has exactly one behaviour to learn.
   for (const command of ['poster', 'p', 'imgdd']) bot.command(command, handlePosterCommand);
+  bot.command('scrape', async (ctx) => handleScrapeCommand(ctx, repository, config));
 
   bot.action(/^poster:(?:style:(?:old|new)|cancel|retry|pick:\d{1,2})$/, async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
