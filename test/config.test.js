@@ -81,3 +81,26 @@ test('ImgBB keys are pooled in the order the operator wrote them', () => {
   const none = loadConfig({ ADMIN_LOGIN_CODE: 'x' });
   assert.deepEqual(none.imgbbApiKeys, []);
 });
+
+test('playback configuration loads player origin, issuer key, and multiple Telegram storage channels', () => {
+  const custom = loadConfig({
+    WATCH_PLAYER_ORIGIN: ' "https://player-service.koyeb.app/ " ',
+    PLAYBACK_ISSUER_KEY: 'secret-token-key-123',
+    PLAYBACK_SESSION_SECRET: 'session-secret-456',
+    TELEGRAM_CHANNEL_IDS: '-1002617067511, -1002456789012, 2987654321',
+    PLAYBACK_RATE_LIMIT_MAX: '50',
+    PLAYBACK_RATE_LIMIT_WINDOW_MS: '30000'
+  });
+
+  assert.equal(custom.playback.playerOrigin, 'https://player-service.koyeb.app');
+  assert.equal(custom.playback.issuerKey, 'secret-token-key-123');
+  assert.equal(custom.playback.sessionSecret, 'session-secret-456');
+  assert.deepEqual(custom.playback.allowedChannelIds, ['-1002617067511', '-1002456789012', '2987654321']);
+  assert.equal(custom.playback.rateLimitMax, 50);
+  assert.equal(custom.playback.rateLimitWindowMs, 30000);
+
+  const fallback = loadConfig({});
+  assert.equal(fallback.playback.playerOrigin, 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app');
+  assert.equal(fallback.playback.issuerKey, '');
+  assert.deepEqual(fallback.playback.allowedChannelIds, ['-1002617067511']);
+});

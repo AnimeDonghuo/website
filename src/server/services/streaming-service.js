@@ -20,7 +20,10 @@ export const DEFAULT_STREAMING_HOSTS = [
   'doo.sh',
   'streamwish.to',
   'mixdrop.to',
-  'streamtape.com'
+  'streamtape.com',
+  't.me',
+  'telegram.me',
+  'v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
 ];
 
 // One-click download hosts are a different product: the page a visitor lands on is
@@ -267,6 +270,14 @@ export function embeddablePlayerUrl(value) {
     };
   }
 
+  if (host === 't.me' || host.endsWith('.t.me') || host === 'telegram.me' || host.endsWith('.telegram.me')) {
+    const postMatch = url.pathname.match(/\/c\/([1-9]\d*)\/([1-9]\d*)/i);
+    if (postMatch) {
+      const canonical = `https://t.me/c/${postMatch[1]}/${postMatch[2]}`;
+      return { embedUrl: canonical, watchUrl: canonical, telegramUrl: canonical };
+    }
+  }
+
   // Every other approved host is already an embed path the provider published
   // (dood's and StreamWish's own /f/<id>, a copied <iframe src>, a SeekStreaming
   // export), so the URL is stored as given and framed as-is.
@@ -294,6 +305,7 @@ export function streamServerName(value) {
   if (host.includes('streamtape')) return 'StreamTape server';
   if (host.includes('mixdrop')) return 'Mixdrop server';
   if (host.includes('vimeo')) return 'Vimeo server';
+  if (host.includes('telegram') || host === 't.me' || host.includes('grassfirepooltheee') || host.includes('koyebcdn')) return 'Telegram server';
   const base = host.split('.')[0];
   if (!base || base === 'provider') return 'Direct player';
   return `${base.charAt(0).toUpperCase()}${base.slice(1)} server`;
@@ -636,10 +648,16 @@ function normalizedStoredEntry(entry, { allowedHosts = DEFAULT_STREAMING_HOSTS }
     episode = parseEpisode(columns);
   }
   const server = streamServerName(embedUrl || watchUrl);
+  const telegramUrl = object.telegramUrl ||
+    (embedUrl && /t\.me\/c\/[1-9]\d*\/[1-9]\d*/i.test(embedUrl) ? embedUrl.match(/(https?:\/\/t\.me\/c\/[1-9]\d*\/[1-9]\d*)/i)?.[1] : null) ||
+    (watchUrl && /t\.me\/c\/[1-9]\d*\/[1-9]\d*/i.test(watchUrl) ? watchUrl.match(/(https?:\/\/t\.me\/c\/[1-9]\d*\/[1-9]\d*)/i)?.[1] : null) || null;
+  const watchId = cleanText(object.watchId || object.videoId, 100) || null;
   return {
     label: cleanText(object.label, 100) || episode?.label || 'Main player',
     episode,
     videoId: cleanText(object.videoId, 100) || null,
+    watchId,
+    telegramUrl,
     provider: cleanText(object.provider, 60) || server,
     // Derived from the URL on every read, so links saved before server naming
     // existed display correctly without touching stored data.
@@ -696,7 +714,9 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
       // Identity above is computed from the stored URL; the frame policy the visitor
       // receives is tidied here, so players attached before this change behave the same.
       embedUrl: dailymotionPlayerUrl(entry.embedUrl || null),
-      watchUrl: entry.watchUrl || null
+      watchUrl: entry.watchUrl || null,
+      telegramUrl: entry.telegramUrl || null,
+      watchId: entry.watchId || null
     }));
   return {
     available: entries.length > 0,

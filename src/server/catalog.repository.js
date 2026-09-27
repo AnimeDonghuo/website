@@ -454,6 +454,10 @@ function sanitizeStoredFileRecord(file) {
   };
 }
 
+function channelDigits(value) {
+  return String(value || '').replace(/^-100/, '').replace(/^-/, '').trim();
+}
+
 function storageReferenceMatches(file, storageMessageId, storageChannelId = null, includeLegacy = true) {
   const fileId = file?.storageMessageId === null || file?.storageMessageId === undefined
     ? ''
@@ -466,7 +470,8 @@ function storageReferenceMatches(file, storageMessageId, storageChannelId = null
   // normal database channel only. Adult callers set includeLegacy=false so an
   // equal message ID in the isolated 18+ channel can never be mistaken for an
   // old normal-storage file.
-  return fileChannel ? fileChannel === requestedChannel : includeLegacy;
+  if (!fileChannel) return includeLegacy;
+  return fileChannel === requestedChannel || (Boolean(channelDigits(fileChannel)) && channelDigits(fileChannel) === channelDigits(requestedChannel));
 }
 
 function uniqueFiles(existingFiles = [], additionalFiles = [], { supersedeExisting = false } = {}) {
@@ -772,7 +777,7 @@ function normalizeContent(input) {
     searchText: [title, description, category, ...languages, ...subtitleLanguages, ...genres,
       episodeSearchText(episodeGroups, episodeCount)].join(' ').replace(/\s+/g, ' ').trim().toLowerCase(),
     featured: Boolean(input.featured),
-    published: true,
+    published: input.published === false ? false : true,
     publishedAt: input.publishedAt || now,
     createdAt: input.createdAt || now,
     updatedAt: now
@@ -2127,17 +2132,20 @@ export class MongoCatalogRepository {
     const asNumber = Number(storageMessageId);
     const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
     const sourceChannel = storageReferenceChannel(storageChannelId);
-    const fileMatch = sourceChannel
+    const channelVariants = sourceChannel
+      ? [...new Set([sourceChannel, sourceChannel.replace(/^-100/, ''), `-100${sourceChannel.replace(/^-100/, '')}`])].filter(Boolean)
+      : [];
+    const fileMatch = channelVariants.length
       ? {
         storageMessageId: { $in: values },
         ...(includeLegacy
-          ? { $or: [{ storageChannelId: sourceChannel }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
-          : { storageChannelId: sourceChannel })
+          ? { $or: [{ storageChannelId: { $in: channelVariants } }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
+          : { storageChannelId: { $in: channelVariants } })
       }
       : { storageMessageId: { $in: values } };
     return this.contents.findOne(
       { files: { $elemMatch: fileMatch } },
-      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1, category: 1 } }
+      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1, category: 1, published: 1 } }
     );
   }
 

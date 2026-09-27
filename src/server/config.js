@@ -89,9 +89,8 @@ function normalizeSiteUrl(value) {
 }
 
 function resolveSiteUrl(env) {
-  // PUBLIC_SITE_URL is the documented variable. The aliases make a deployment
-  // resilient to common Koyeb/dashboard names and let a valid alias win if a
-  // stale primary value was left blank or malformed.
+  // PUBLIC_SITE_URL is required for announcement buttons to open the catalog
+  // page first instead of sending visitors straight to the Telegram deep link.
   for (const candidate of [
     env.PUBLIC_SITE_URL,
     env.WEBSITE_URL,
@@ -105,6 +104,47 @@ function resolveSiteUrl(env) {
     if (url) return url;
   }
   return '';
+}
+
+export function normalizePlayerOrigin(value) {
+  let candidate = (value || '').trim().replace(/^['"]|['"]$/g, '').trim().replace(/\/+$/, '');
+  if (!candidate) return 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app';
+
+  if (!/^https?:\/\//i.test(candidate) && /^[a-z0-9.-]+(?::\d+)?(?:\/.*)?$/i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  try {
+    const url = new URL(candidate);
+    if (!['https:', 'http:'].includes(url.protocol) || !url.hostname) {
+      return 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app';
+    }
+    return `${url.origin}${url.pathname === '/' ? '' : url.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app';
+  }
+}
+
+export function resolvePlaybackChannels(env = {}) {
+  const list = [];
+  if (env.TELEGRAM_CHANNEL_IDS) {
+    for (const item of String(env.TELEGRAM_CHANNEL_IDS).split(',')) {
+      const clean = item.trim();
+      if (clean) list.push(clean);
+    }
+  }
+  for (const candidate of [
+    env.TELEGRAM_STORAGE_CHANNEL_ID,
+    env.TELEGRAM_ADULT_STORAGE_CHANNEL_ID,
+    env.TELEGRAM_18_STORAGE_CHANNEL_ID
+  ]) {
+    const clean = (candidate || '').trim();
+    if (clean) list.push(clean);
+  }
+  if (!list.length) {
+    list.push('-1002617067511');
+  }
+  return [...new Set(list)];
 }
 
 export function loadConfig(env = process.env) {
@@ -153,6 +193,15 @@ export function loadConfig(env = process.env) {
       allowedHosts: csvValues(env.STREAMING_ALLOWED_HOSTS),
       manifestMaxBytes: asBoundedInteger(env.STREAMING_MANIFEST_MAX_BYTES, 512 * 1024, 1_024, 2 * 1024 * 1024),
       downloadTimeoutMs: asBoundedInteger(env.STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS, 15_000, 1_000, 60_000)
+    },
+    playback: {
+      playerOrigin: normalizePlayerOrigin(env.WATCH_PLAYER_ORIGIN),
+      issuerKey: (env.PLAYBACK_ISSUER_KEY || '').trim(),
+      sessionSecret: (env.PLAYBACK_SESSION_SECRET || env.ADMIN_LOGIN_CODE || env.BACKUP_SIGNING_SECRET || 'sorabox-playback-session-secret').trim(),
+      allowedChannelIds: resolvePlaybackChannels(env),
+      tokenTimeoutMs: asBoundedInteger(env.PLAYBACK_TOKEN_TIMEOUT_MS, 8_000, 1_000, 30_000),
+      rateLimitMax: asBoundedInteger(env.PLAYBACK_RATE_LIMIT_MAX, 60, 5, 500),
+      rateLimitWindowMs: asBoundedInteger(env.PLAYBACK_RATE_LIMIT_WINDOW_MS, 60_000, 10_000, 300_000)
     },
     telegram: {
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),

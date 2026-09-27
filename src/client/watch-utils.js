@@ -338,3 +338,69 @@ export function watchPagePath(item, episode = null) {
   const season = episodeSeason(episode);
   return `${base}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
 }
+
+export function getProtectedPlaybackTarget(entry) {
+  if (!entry) return null;
+
+  // 1. Direct telegramUrl property
+  if (entry.telegramUrl && typeof entry.telegramUrl === 'string') {
+    const match = entry.telegramUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+    if (match) {
+      return { type: 'url', url: `https://t.me/c/${match[1]}/${match[2]}` };
+    }
+    return { type: 'url', url: entry.telegramUrl };
+  }
+
+  // 2. Direct watchId property
+  if (entry.watchId && typeof entry.watchId === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(entry.watchId)) {
+    return { type: 'id', id: entry.watchId };
+  }
+
+  // 3. Inspect embedUrl or watchUrl
+  const candidateUrl = String(entry.embedUrl || entry.watchUrl || '').trim();
+  if (candidateUrl) {
+    const tgMatch = candidateUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+    if (tgMatch) {
+      return { type: 'url', url: `https://t.me/c/${tgMatch[1]}/${tgMatch[2]}` };
+    }
+
+    try {
+      const parsed = new URL(candidateUrl);
+      if (parsed.searchParams.has('url')) {
+        const innerUrl = parsed.searchParams.get('url');
+        const innerMatch = innerUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+        if (innerMatch) {
+          return { type: 'url', url: `https://t.me/c/${innerMatch[1]}/${innerMatch[2]}` };
+        }
+      }
+      const watchMatch = parsed.pathname.match(/^\/watch\/([a-zA-Z0-9_-]{1,100})$/i);
+      if (watchMatch) {
+        return { type: 'id', id: watchMatch[1] };
+      }
+    } catch {
+      // not a full URL
+    }
+  }
+
+  return null;
+}
+
+export function ensurePlayerEmbedScript(origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app') {
+  if (typeof document === 'undefined') return;
+  const normalizedOrigin = String(origin || '').replace(/\/+$/, '');
+  const scriptSrc = `${normalizedOrigin}/embed.js`;
+  const existing = document.querySelector('script[data-token-endpoint="/api/playback-token"]');
+
+  if (existing) {
+    if (existing.getAttribute('src') !== scriptSrc && !existing.src.endsWith('/embed.js')) {
+      existing.src = scriptSrc;
+    }
+    return;
+  }
+
+  const script = document.createElement('script');
+  script.defer = true;
+  script.src = scriptSrc;
+  script.setAttribute('data-token-endpoint', '/api/playback-token');
+  document.head.appendChild(script);
+}

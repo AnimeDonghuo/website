@@ -8,7 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
+import { ensurePlayerEmbedScript, episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
@@ -911,6 +911,18 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   }
 
   const selectedTitle = playerDisplayName(selected);
+  const target = useMemo(() => getProtectedPlaybackTarget(selected), [selected]);
+  const nextEpisodeGroup = useMemo(() => {
+    if (!requestedEpisode || !Array.isArray(item?.episodeGroups)) return null;
+    const currentEnd = Number(requestedEpisode.end) || Number(requestedEpisode.start);
+    return item.episodeGroups.find((g) => Number(g.start) > currentEnd) || null;
+  }, [requestedEpisode, item?.episodeGroups]);
+  const nextEpisodeUrl = nextEpisodeGroup ? watchPagePath(item, nextEpisodeGroup) : null;
+
+  useEffect(() => {
+    ensurePlayerEmbedScript();
+  }, []);
+
   // The Watch page announces the episode and its place in the season, not the
   // release title repeated; a movie has no season, so its languages are shown.
   const heading = watchHeading(item, {
@@ -922,7 +934,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   // experience, and its URL already carries the playback-only chrome the frame needs. The
   // external link stays for a source that publishes no embeddable player at all (an OK.ru
   // live broadcast), where a link is the only way to watch rather than a way to leave.
-  const externalPlayerUrl = selected.embedUrl ? null : selected.watchUrl || null;
+  const externalPlayerUrl = (target || selected.embedUrl) ? null : selected.watchUrl || null;
   const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
   const hasEpisodeDelivery = matchingFiles.length > 0;
   const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
@@ -945,22 +957,56 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
             </div>
           </div>
           <div className="watch-player-shell">
-            {selected.embedUrl ? <iframe
-              key={selected.id}
-              ref={playerFrame}
-              className="watch-player-shell__frame"
-              src={selected.embedUrl}
-              title={`${item.title} — ${selectedFileTitle}`}
-              allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
-              referrerPolicy="strict-origin-when-cross-origin"
-              allowFullScreen
-            /> : <div className="watch-player-shell__fallback"><Icon name="play" size={24} /><strong>This video opens in its approved player.</strong><p>Use the play button to continue.</p>{selected.watchUrl ? <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">Play video <Icon name="arrow" size={16} /></a> : null}</div>}
+            {target ? (
+              <div
+                key={selected.id}
+                ref={playerFrame}
+                className="watch-player-shell__frame watch-player-shell__protected"
+                data-telegram-url={target.type === 'url' ? target.url : undefined}
+                data-watch-id={target.type === 'id' ? target.id : undefined}
+                data-title={`${item.title} — ${selectedFileTitle}`}
+                data-label={playerShortName(selected)}
+                data-avatar={item.posterUrl || undefined}
+                data-poster={item.posterUrl || undefined}
+                data-next={nextEpisodeUrl || undefined}
+                style={{ width: '100%', height: '100%', aspectRatio: '16 / 9', display: 'block' }}
+              />
+            ) : selected.embedUrl ? (
+              <iframe
+                key={selected.id}
+                ref={playerFrame}
+                className="watch-player-shell__frame"
+                src={selected.embedUrl}
+                title={`${item.title} — ${selectedFileTitle}`}
+                allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+                referrerPolicy="strict-origin-when-cross-origin"
+                allowFullScreen
+              />
+            ) : (
+              <div className="watch-player-shell__fallback">
+                <Icon name="play" size={24} />
+                <strong>This video opens in its approved player.</strong>
+                <p>Use the play button to continue.</p>
+                {selected.watchUrl ? (
+                  <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">
+                    Play video <Icon name="arrow" size={16} />
+                  </a>
+                ) : null}
+              </div>
+            )}
           </div>
-          {selected.embedUrl && canFullScreen ? <div className="watch-player-controls">
-            <button type="button" onClick={toggleFullScreen} aria-pressed={fullScreen} title="Fill the screen with the player, as its own full-screen button would">
-              <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
-            </button>
-          </div> : null}
+          {(target || selected.embedUrl) && canFullScreen ? (
+            <div className="watch-player-controls">
+              <button
+                type="button"
+                onClick={toggleFullScreen}
+                aria-pressed={fullScreen}
+                title="Fill the screen with the player, as its own full-screen button would"
+              >
+                <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
+              </button>
+            </div>
+          ) : null}
           {externalPlayerUrl ? <div className="watch-player-note">
             <span>This source has no embeddable player URL.</span>
             <a href={externalPlayerUrl} target="_blank" rel="noreferrer">Open on {playerShortName(selected)} <Icon name="arrow" size={14} /></a>

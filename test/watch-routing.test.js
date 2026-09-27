@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episodeNameFromLabel, episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
+import { episodeNameFromLabel, episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
 
 function episode(number) {
   return { start: number, end: number, label: `Episode ${String(number).padStart(2, '0')}` };
@@ -186,4 +186,24 @@ test('a Watch page names the episode and its season, and a movie only its langua
     'a movie shows its languages and never a season or episode number'
   );
   assert.equal(watchHeading(movie, {}).title, 'RRR');
+});
+
+test('protected playback target detects Telegram players and preserves external providers', () => {
+  // Telegram stream target
+  const tgEntry = { id: 'tg-1', embedUrl: 'https://t.me/c/2617067511/22047' };
+  assert.deepEqual(getProtectedPlaybackTarget(tgEntry), {
+    type: 'url',
+    url: 'https://t.me/c/2617067511/22047'
+  });
+
+  // Watch ID target
+  const idEntry = { id: 'id-1', watchId: 'episode-01-vip' };
+  assert.deepEqual(getProtectedPlaybackTarget(idEntry), {
+    type: 'id',
+    id: 'episode-01-vip'
+  });
+
+  // External providers (StreamTape, Rumble, etc.) are not protected Telegram players
+  const external = { id: 'ext-1', provider: 'StreamTape', embedUrl: 'https://streamtape.com/e/12345' };
+  assert.equal(getProtectedPlaybackTarget(external), null);
 });

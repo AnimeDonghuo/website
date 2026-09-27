@@ -10,6 +10,15 @@ import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliver
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
+import {
+  BoundedRateLimiter,
+  getClientIp,
+  parseAndValidatePlaybackTarget,
+  requestPlaybackGrant,
+  resolveCatalogContent,
+  resolveOrCreatePlaybackSession,
+  verifyPlaybackCsrf
+} from './services/playback-service.js';
 import { addSubsPleaseMagnets, createSubsPleaseService, magnetContentRevision } from './services/subsplease-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
@@ -293,9 +302,19 @@ function apiError(res, status, message) {
   res.status(status).json({ error: message });
 }
 
+function playerCspOrigin(origin) {
+  if (!origin) return null;
+  try {
+    return new URL(origin).origin;
+  } catch {
+    return null;
+  }
+}
+
 export function createApp({ config, repository, distPath = defaultDistPath, subsPlease = null }) {
   const app = express();
   app.disable('x-powered-by');
+  const configuredPlayerOrigin = playerCspOrigin(config.playback?.playerOrigin);
   app.use(
     helmet({
       crossOriginEmbedderPolicy: false,
@@ -308,13 +327,13 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
           fontSrc: ["'self'", 'https:', 'data:'],
           imgSrc: ["'self'", 'https:', 'data:'],
           objectSrc: ["'none'"],
-          scriptSrc: ["'self'"],
+          scriptSrc: ["'self'", configuredPlayerOrigin].filter(Boolean),
           styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
           connectSrc: ["'self'"],
           // /watch embeds only approved HTTPS player hosts. Koyeb serves the
           // page; the video itself remains at the provider and never transits
           // this process.
-          frameSrc: ["'self'", ...streamingFrameSources(config.streaming || {})],
+          frameSrc: ["'self'", configuredPlayerOrigin, ...streamingFrameSources(config.streaming || {})].filter(Boolean),
           frameAncestors: null,
           upgradeInsecureRequests: config.environment === 'production' ? [] : null
         }
@@ -412,6 +431,11 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
     });
   });
 
+  const playbackLimiter = new BoundedRateLimiter({
+    maxRequests: config.playback?.rateLimitMax || 60,
+    windowMs: config.playback?.rateLimitWindowMs || 60_000
+  });
+
   app.get('/api/config', (_request, response) => {
     response.set('Cache-Control', 'public, max-age=300');
     response.json({
@@ -419,8 +443,63 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
       categories: CATEGORIES,
       deliveryConfigured: Boolean(config.telegram.botUsername),
       announcementSiteConfigured: Boolean(config.siteUrl),
-      demoMode: !repository.persistent
+      demoMode: !repository.persistent,
+      watchPlayerOrigin: config.playback?.playerOrigin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
     });
+  });
+
+  app.post('/api/playback-token', async (request, response) => {
+    response.set('Cache-Control', 'no-store');
+
+    // 1. CSRF defense: verify fetch metadata and origin
+    const csrfCheck = verifyPlaybackCsrf(request, config);
+    if (!csrfCheck.valid) {
+      return apiError(response, 403, csrfCheck.error);
+    }
+
+    // 2. Session verification and HttpOnly guest session issuance
+    const session = resolveOrCreatePlaybackSession(request, response, config);
+
+    // 3. Bounded per-session/IP rate limiting
+    const clientIp = getClientIp(request);
+    const rateLimitKey = `${session.visitorId}:${clientIp}`;
+    const rateCheck = playbackLimiter.isAllowed(rateLimitKey);
+    if (!rateCheck.allowed) {
+      response.set('Retry-After', String(rateCheck.retryAfterSeconds));
+      return apiError(response, 429, 'Too many playback token requests. Please wait before retrying.');
+    }
+
+    // 4. Target validation and channel verification
+    const targetCheck = parseAndValidatePlaybackTarget(request.body, config.playback?.allowedChannelIds);
+    if (!targetCheck.valid) {
+      return apiError(response, targetCheck.status || 400, targetCheck.error);
+    }
+
+    // 5. Catalog resolution against published records
+    const resolution = await resolveCatalogContent({
+      target: targetCheck,
+      repository,
+      allowedChannelIds: config.playback?.allowedChannelIds
+    });
+    if (!resolution.found) {
+      return apiError(response, resolution.status || 404, resolution.error);
+    }
+
+    // 6. Adult content permission check
+    if (resolution.isAdult && !hasAdultAccess(request)) {
+      return apiError(response, 403, 'Age confirmation is required to access adult video playback.');
+    }
+
+    // 7. Request grant from upstream player service
+    const grantResult = await requestPlaybackGrant({
+      target: targetCheck,
+      config
+    });
+    if (!grantResult.success) {
+      return apiError(response, grantResult.status || 502, grantResult.error);
+    }
+
+    return response.json(grantResult.data);
   });
 
   app.post('/api/adult-access', (request, response) => {
