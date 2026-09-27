@@ -27,7 +27,7 @@ import {
 } from './poster-service.js';
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
-import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
+import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeContentStreamWithTelegramFiles, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
 import { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
@@ -125,9 +125,32 @@ function hasAllowedPublisherId(ctx, config) {
   return Boolean(userId(ctx) && isTelegramAdmin(config, userId(ctx)));
 }
 
+const publisherSessionCache = new Map();
+const PUBLISHER_SESSION_CACHE_TTL_MS = 30_000;
+
+export function clearPublisherSessionCache(chatId = null, ownerId = null) {
+  if (chatId && ownerId) {
+    publisherSessionCache.delete(`${chatId}:${ownerId}`);
+  } else {
+    publisherSessionCache.clear();
+  }
+}
+
 async function isPublisher(ctx, repository, config) {
   if (!hasAllowedPublisherId(ctx, config) || !config.adminLoginCode) return false;
-  return Boolean(await repository.findAdminSession(chatId(ctx), userId(ctx)));
+  const cId = chatId(ctx);
+  const uId = userId(ctx);
+  if (!cId || !uId) return false;
+  const key = `${cId}:${uId}`;
+  const now = Date.now();
+  const cached = publisherSessionCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.valid;
+  }
+  const session = await repository.findAdminSession(cId, uId);
+  const valid = Boolean(session);
+  publisherSessionCache.set(key, { valid, expiresAt: now + PUBLISHER_SESSION_CACHE_TTL_MS });
+  return valid;
 }
 
 function sameSecret(candidate, expected) {
@@ -6508,6 +6531,12 @@ export async function applyMergePlan({ bot, repository, config = {}, plan = {} }
   }
 
   const content = await repository.findContentByAdminId(target.adminId);
+  if (content && typeof repository.updateContentStreamByAdminId === 'function' && content.stream) {
+    const refreshed = mergeContentStreamWithTelegramFiles(content.stream, content, config);
+    if (refreshed) {
+      await repository.updateContentStreamByAdminId(target.adminId, refreshed);
+    }
+  }
   // The merged card shows a new episode summary, so its own announcement must
   // say the same thing.
   const sync = await queueAnnouncementSync({ telegram, repository, content, config, adminId: content?.adminId });
@@ -7222,13 +7251,12 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   installLongReplyPagination(bot);
   // Private Telegram activity is tracked only in the publisher-side repository
   // for aggregate analytics; it is never exposed from the public site API.
-  bot.use(async (ctx, next) => {
+  // Handled non-blocking in background so bot commands and interactions are immediate.
+  bot.use((ctx, next) => {
     if (ctx.from && !ctx.from.is_bot && typeof repository.recordBotUser === 'function') {
-      try {
-        await repository.recordBotUser(ctx.from);
-      } catch (error) {
+      repository.recordBotUser(ctx.from).catch((error) => {
         console.warn('[telegram] could not record bot activity:', automationDiagnostic(error));
-      }
+      });
     }
     return next();
   });
@@ -7293,12 +7321,14 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     }
     const expiresAt = new Date(Date.now() + config.adminSessionHours * 60 * 60 * 1000);
     await repository.createAdminSession({ chatId: chatId(ctx), ownerId: userId(ctx), expiresAt });
+    clearPublisherSessionCache(chatId(ctx), userId(ctx));
     await setPublisherCommands(bot, ctx);
     await ctx.reply(`Publisher session unlocked for ${config.adminSessionHours} hour${config.adminSessionHours === 1 ? '' : 's'}.`, panelKeyboard());
   });
 
   bot.command('logout', async (ctx) => {
     await repository.deleteAdminSession(chatId(ctx), userId(ctx));
+    clearPublisherSessionCache(chatId(ctx), userId(ctx));
     // Keep the owner scope registered: visible command names never grant
     // access, while deleting the scope made Telegram intermittently hide
     // /posts and /postid until its command-menu cache refreshed.
@@ -8888,7 +8918,14 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     }
   }
 
-  await bot.launch({ dropPendingUpdates: false }, () => {
+  await bot.launch({
+    dropPendingUpdates: false,
+    polling: {
+      timeout: 20,
+      limit: 100,
+      allowedUpdates: ['message', 'edited_message', 'channel_post', 'edited_channel_post', 'callback_query']
+    }
+  }, () => {
     const deliveryBot = synchronizeDeliveryBotUsername(config, bot.botInfo);
     if (deliveryBot.changed) {
       console.warn(

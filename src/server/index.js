@@ -9,7 +9,7 @@ import { createCatalogRepository } from './catalog.repository.js';
 import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
 import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
 import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
-import { publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
+import { mergeContentStreamWithTelegramFiles, publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
 import {
   BoundedRateLimiter,
   getClientIp,
@@ -265,6 +265,7 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
   const telegramUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
   const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
   const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode, content) : [];
+  const effectiveStream = mergeContentStreamWithTelegramFiles(content.stream, content, config);
 
   return {
     id: String(content._id || content.id || content.slug),
@@ -287,7 +288,7 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
     fileChoices,
     // This contains only previously validated provider URLs. It deliberately
     // has no upload token, dashboard URL, or private storage data.
-    stream: publicStreamingData(content.stream, config.streaming || {}),
+    stream: publicStreamingData(effectiveStream, config.streaming || {}),
     episodeGroups: publicEpisodeGroups(content.episodeGroups),
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),

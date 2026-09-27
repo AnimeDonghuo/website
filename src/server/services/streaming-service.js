@@ -1,4 +1,6 @@
 import { cleanText, resolveCategoryId } from '../lib/strings.js';
+import { detectMediaQuality, qualityHeight } from './episode-service.js';
+import { bareChannelId } from './playback-service.js';
 
 // This feature deliberately imports only a small publisher-supplied manifest.
 // It never downloads, buffers, transcodes, or relays video through Koyeb.
@@ -765,5 +767,153 @@ export function removeStreamingEntries(stream, { indexes = null, ids = null, epi
     removed,
     remaining: remaining?.entries?.length || 0,
     unmatched: 0
+  };
+}
+
+export function compareFilesByQualityAscending(first, second) {
+  const q1 = first?.quality || detectMediaQuality({ filename: first?.name, caption: first?.sourceLabel || first?.displayName });
+  const q2 = second?.quality || detectMediaQuality({ filename: second?.name, caption: second?.sourceLabel || second?.displayName });
+
+  const height1 = qualityHeight(q1);
+  const height2 = qualityHeight(q2);
+
+  if (height1 !== null && height2 !== null) {
+    if (height1 !== height2) return height1 - height2;
+  } else if (height1 !== null && height2 === null) {
+    if (height1 <= 720) return -1;
+  } else if (height1 === null && height2 !== null) {
+    if (height2 <= 720) return 1;
+  }
+
+  // Fallback to file size (smaller bytes = lower quality / bitrate)
+  const size1 = Number(first?.size) || 0;
+  const size2 = Number(second?.size) || 0;
+  if (size1 > 0 && size2 > 0 && size1 !== size2) {
+    return size1 - size2;
+  }
+
+  return (Number(first?.storageMessageId) || 0) - (Number(second?.storageMessageId) || 0);
+}
+
+function isPlayableFile(file) {
+  if (!file || Number(file.storageMessageId) <= 0) return false;
+  if (file.kind === 'photo') return false;
+  const name = String(file.name || file.displayName || file.sourceLabel || '').toLowerCase();
+  if (/\.(?:srt|vtt|ass|ssa|sub|idx|nfo|txt|jpg|jpeg|png|webp|torrent)$/i.test(name)) return false;
+  return true;
+}
+
+function fileChannelNumber(file, content, config = {}) {
+  const rawChannel = file?.storageChannelId ||
+    (content?.category === 'adult'
+      ? (config?.telegram?.adultStorageChannelId || config?.telegram?.storageChannelId)
+      : config?.telegram?.storageChannelId) ||
+    (Array.isArray(config?.playback?.allowedChannelIds) && config.playback.allowedChannelIds[0]) ||
+    '-1002617067511';
+  return bareChannelId(rawChannel) || '2617067511';
+}
+
+/**
+ * Automatically derive Telegram streaming player entries for every post and episode
+ * using the lowest quality DB post URL available to avoid server overload.
+ * If only 1080p is available, 1080p is still used.
+ */
+export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
+  if (!content) return [];
+  const allFiles = Array.isArray(content.files) ? content.files : [];
+  const playableFiles = allFiles.filter(isPlayableFile);
+  if (!playableFiles.length) return [];
+
+  const isEpisodic = content.episodeCount > 0 ||
+    ['anime', 'cartoon', 'donghua', 'kdrama', 'tv', 'web-series'].includes(content.category) ||
+    playableFiles.some((f) => f.episode && Number.isInteger(Number(f.episode.start)));
+
+  if (!isEpisodic) {
+    // Standalone / Movie release: pick single lowest quality file across the release
+    const sorted = [...playableFiles].sort(compareFilesByQualityAscending);
+    const lowest = sorted[0];
+    const channelNumber = fileChannelNumber(lowest, content, config);
+    const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
+    return [{
+      id: `tg-${channelNumber}-${lowest.storageMessageId}`,
+      label: 'Main player',
+      episode: null,
+      provider: 'Telegram',
+      server: 'Telegram server',
+      embedUrl: postUrl,
+      watchUrl: postUrl,
+      telegramUrl: postUrl
+    }];
+  }
+
+  // Episodic: group files by episode and pick lowest quality for each episode
+  const groups = new Map();
+  for (const file of playableFiles) {
+    let key;
+    if (file.episode && Number.isInteger(Number(file.episode.start))) {
+      const season = Number(file.season) || 1;
+      const start = Number(file.episode.start);
+      const end = Number(file.episode.end) || start;
+      key = `${season}:${start}-${end}`;
+    } else {
+      key = `file-${file.storageMessageId}`;
+    }
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(file);
+  }
+
+  const entries = [];
+  for (const group of groups.values()) {
+    group.sort(compareFilesByQualityAscending);
+    const lowest = group[0];
+    const channelNumber = fileChannelNumber(lowest, content, config);
+    const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
+    const epLabel = lowest.episode?.label || (lowest.episode?.start ? `Episode ${String(lowest.episode.start).padStart(2, '0')}` : 'Main player');
+    entries.push({
+      id: `tg-${channelNumber}-${lowest.storageMessageId}`,
+      label: epLabel,
+      episode: lowest.episode || null,
+      provider: 'Telegram',
+      server: 'Telegram server',
+      embedUrl: postUrl,
+      watchUrl: postUrl,
+      telegramUrl: postUrl
+    });
+  }
+
+  return entries.sort((a, b) => {
+    const aStart = Number(a.episode?.start) || 0;
+    const bStart = Number(b.episode?.start) || 0;
+    return aStart - bStart;
+  });
+}
+
+/**
+ * Merge existing external streaming entries with derived lowest-quality Telegram stream entries.
+ */
+export function mergeContentStreamWithTelegramFiles(existingStream, content, config = {}) {
+  const telegramEntries = deriveLowestQualityTelegramStreamEntries(content, config);
+  const existingEntries = Array.isArray(existingStream?.entries) ? existingStream.entries : [];
+
+  if (!telegramEntries.length && !existingEntries.length) {
+    return existingStream;
+  }
+
+  // Keep non-Telegram external entries (e.g. Streamtape, Seek, Rumble, etc.)
+  const nonTelegramEntries = existingEntries.filter((entry) => {
+    const isTg = entry.provider === 'Telegram' ||
+      entry.server === 'Telegram server' ||
+      Boolean(entry.telegramUrl) ||
+      /t\.me\/c\/[1-9]\d*\/[1-9]\d*/i.test(entry.embedUrl || entry.watchUrl || '');
+    return !isTg;
+  });
+
+  const merged = [...telegramEntries, ...nonTelegramEntries];
+  return {
+    provider: existingStream?.provider || 'Telegram',
+    entries: merged,
+    updatedAt: existingStream?.updatedAt || new Date().toISOString()
   };
 }
