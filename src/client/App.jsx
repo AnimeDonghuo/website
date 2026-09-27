@@ -715,7 +715,7 @@ function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdul
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">
-        <div className="section-heading"><div><Eyebrow>MORE IN {item.categoryLabel.toUpperCase()}</Eyebrow><h2 id="related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
+        <div className="section-heading"><div><Eyebrow>MORE IN {String(item?.categoryLabel || item?.category || '').toUpperCase()}</Eyebrow><h2 id="related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
         <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
       </section> : null}
     </PageShell>
@@ -801,13 +801,13 @@ function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdu
 
       <section className="file-choice-section file-choice-section--episode page-width" aria-labelledby="episode-file-choice-title">
         <div className="file-choice-section__heading">
-          <div><Eyebrow>FILES FOR {episodeLabel.toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
+          <div><Eyebrow>FILES FOR {String(episodeLabel || '').toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
           <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> Episode guide</Link>
         </div>
         <EpisodeWatchPanel item={item} episode={requestedEpisode} entries={watchEntries} />
         {choices.length ? <>
           <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} />
-          {hiddenPackCount ? <p className="episode-section__note"><Icon name="info" size={14} /> {hiddenPackCount} combined upload{hiddenPackCount === 1 ? ' is' : 's are'} also available for this release in the pack list on the release page — they are kept out of this episode on purpose so every option here covers exactly {episodeLabel.toLowerCase()}.</p> : null}
+          {hiddenPackCount ? <p className="episode-section__note"><Icon name="info" size={14} /> {hiddenPackCount} combined upload{hiddenPackCount === 1 ? ' is' : 's are'} also available for this release in the pack list on the release page — they are kept out of this episode on purpose so every option here covers exactly {String(episodeLabel || '').toLowerCase()}.</p> : null}
         </> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
       </section>
     </PageShell>
@@ -901,7 +901,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
   }
   if (requestedEpisode && !entries.length) {
-    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>No player is attached to {requestedEpisode.label.toLowerCase()} yet.</h1><p>{item.title} has a Watch link for other episodes, and SoraBox will not play an unrelated one here. Open this episode page to see its delivery files, or pick another episode from the guide.</p><div className="not-found__actions"><Link className="button button--primary" to={episodePagePath(item, requestedEpisode)}><Icon name="telegram" size={18} /> Episode files</Link><Link className="button button--secondary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></div></section></PageShell>;
+    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>No player is attached to {String(requestedEpisode?.label || '').toLowerCase()} yet.</h1><p>{item.title} has a Watch link for other episodes, and SoraBox will not play an unrelated one here. Open this episode page to see its delivery files, or pick another episode from the guide.</p><div className="not-found__actions"><Link className="button button--primary" to={episodePagePath(item, requestedEpisode)}><Icon name="telegram" size={18} /> Episode files</Link><Link className="button button--secondary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></div></section></PageShell>;
   }
   if (!selected) {
     if (!requestedEpisode && allEntries.some((entry) => entry?.episode?.start)) {
@@ -911,43 +911,41 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   }
 
   const selectedTitle = playerDisplayName(selected);
-  const target = useMemo(() => getProtectedPlaybackTarget(selected), [selected]);
-  const nextEpisodeGroup = useMemo(() => {
-    if (!requestedEpisode || !Array.isArray(item?.episodeGroups)) return null;
-    const currentEnd = Number(requestedEpisode.end) || Number(requestedEpisode.start);
-    return item.episodeGroups.find((g) => Number(g.start) > currentEnd) || null;
-  }, [requestedEpisode, item?.episodeGroups]);
+  const target = getProtectedPlaybackTarget(selected);
+  const nextEpisodeGroup = requestedEpisode && Array.isArray(item?.episodeGroups)
+    ? item.episodeGroups.find((g) => {
+        const currentEnd = Number(requestedEpisode.end) || Number(requestedEpisode.start);
+        return Number(g.start) > currentEnd;
+      }) || null
+    : null;
   const nextEpisodeUrl = nextEpisodeGroup ? watchPagePath(item, nextEpisodeGroup) : null;
 
   // The Watch page announces the episode and its place in the season, not the
   // release title repeated; a movie has no season, so its languages are shown.
   const heading = watchHeading(item, {
-    episode: requestedEpisode || selected.episode || null,
+    episode: requestedEpisode || selected?.episode || null,
     fileLabel: requestedEpisode ? matchingFiles[0]?.label || null : null
   });
   const selectedFileTitle = heading.title;
 
-  const playerIframeSrc = useMemo(() => {
-    if (target) {
-      return getPlayerIframeUrl(target, {
-        title: `${item.title} — ${selectedFileTitle}`,
-        label: playerShortName(selected),
-        poster: item.posterUrl || '',
-        next: nextEpisodeUrl || ''
-      });
-    }
-    if (selected.embedUrl && !/t\.me\/c\//i.test(selected.embedUrl)) {
-      return selected.embedUrl;
-    }
-    return null;
-  }, [target, selected, item, selectedFileTitle, nextEpisodeUrl]);
+  let playerIframeSrc = null;
+  if (target) {
+    playerIframeSrc = getPlayerIframeUrl(target, {
+      title: `${item.title} — ${selectedFileTitle}`,
+      label: playerShortName(selected),
+      poster: item.posterUrl || '',
+      next: nextEpisodeUrl || ''
+    });
+  } else if (selected?.embedUrl && !/t\.me\/c\//i.test(selected.embedUrl)) {
+    playerIframeSrc = selected.embedUrl;
+  }
 
   // Nothing here sends a visitor to the provider to watch: the framed player is the whole
   // experience, and its URL already carries the playback-only chrome the frame needs. The
   // external link stays for a source that publishes no embeddable player at all (an OK.ru
   // live broadcast), where a link is the only way to watch rather than a way to leave.
-  const externalPlayerUrl = (playerIframeSrc || selected.embedUrl) ? null : selected.watchUrl || null;
-  const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
+  const externalPlayerUrl = (playerIframeSrc || selected?.embedUrl) ? null : selected?.watchUrl || null;
+  const episodeContext = requestedEpisode?.label || selected?.episode?.label || null;
   const hasEpisodeDelivery = matchingFiles.length > 0;
   const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
 
@@ -959,7 +957,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
           <div className="watch-hero__heading">
             <div>
-              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${String(item.categoryLabel || '').toUpperCase()}`}</Eyebrow>
+              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${String(item?.categoryLabel || item?.category || '').toUpperCase()}`}</Eyebrow>
               <h1>{selectedFileTitle}</h1>
               <p className="watch-hero__meta">
                 {heading.meta.map((line) => <span className="watch-hero__episode" key={line}>{line}</span>)}
@@ -971,7 +969,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <div className="watch-player-shell">
             {playerIframeSrc ? (
               <iframe
-                key={selected.id}
+                key={selected?.id || 'main-player'}
                 ref={playerFrame}
                 className="watch-player-shell__frame"
                 src={playerIframeSrc}
@@ -1032,7 +1030,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
       </section> : null}
 
       {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="watch-related-title">
-        <div className="section-heading"><div><Eyebrow>MORE IN {item.categoryLabel.toUpperCase()}</Eyebrow><h2 id="watch-related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
+        <div className="section-heading"><div><Eyebrow>MORE IN {String(item?.categoryLabel || item?.category || '').toUpperCase()}</Eyebrow><h2 id="watch-related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
         <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
       </section> : null}
     </PageShell>
