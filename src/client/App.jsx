@@ -8,7 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { ensurePlayerEmbedScript, episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
+import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getPlayerIframeUrl, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
@@ -919,10 +919,6 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   }, [requestedEpisode, item?.episodeGroups]);
   const nextEpisodeUrl = nextEpisodeGroup ? watchPagePath(item, nextEpisodeGroup) : null;
 
-  useEffect(() => {
-    ensurePlayerEmbedScript();
-  }, []);
-
   // The Watch page announces the episode and its place in the season, not the
   // release title repeated; a movie has no season, so its languages are shown.
   const heading = watchHeading(item, {
@@ -930,11 +926,27 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     fileLabel: requestedEpisode ? matchingFiles[0]?.label || null : null
   });
   const selectedFileTitle = heading.title;
+
+  const playerIframeSrc = useMemo(() => {
+    if (target) {
+      return getPlayerIframeUrl(target, {
+        title: `${item.title} — ${selectedFileTitle}`,
+        label: playerShortName(selected),
+        poster: item.posterUrl || '',
+        next: nextEpisodeUrl || ''
+      });
+    }
+    if (selected.embedUrl && !/t\.me\/c\//i.test(selected.embedUrl)) {
+      return selected.embedUrl;
+    }
+    return null;
+  }, [target, selected, item, selectedFileTitle, nextEpisodeUrl]);
+
   // Nothing here sends a visitor to the provider to watch: the framed player is the whole
   // experience, and its URL already carries the playback-only chrome the frame needs. The
   // external link stays for a source that publishes no embeddable player at all (an OK.ru
   // live broadcast), where a link is the only way to watch rather than a way to leave.
-  const externalPlayerUrl = (target || selected.embedUrl) ? null : selected.watchUrl || null;
+  const externalPlayerUrl = (playerIframeSrc || selected.embedUrl) ? null : selected.watchUrl || null;
   const episodeContext = requestedEpisode?.label || selected.episode?.label || null;
   const hasEpisodeDelivery = matchingFiles.length > 0;
   const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
@@ -947,7 +959,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
           <div className="watch-hero__heading">
             <div>
-              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${item.categoryLabel.toUpperCase()}`}</Eyebrow>
+              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${String(item.categoryLabel || '').toUpperCase()}`}</Eyebrow>
               <h1>{selectedFileTitle}</h1>
               <p className="watch-hero__meta">
                 {heading.meta.map((line) => <span className="watch-hero__episode" key={line}>{line}</span>)}
@@ -957,26 +969,12 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
             </div>
           </div>
           <div className="watch-player-shell">
-            {target ? (
-              <div
-                key={selected.id}
-                ref={playerFrame}
-                className="watch-player-shell__frame watch-player-shell__protected"
-                data-telegram-url={target.type === 'url' ? target.url : undefined}
-                data-watch-id={target.type === 'id' ? target.id : undefined}
-                data-title={`${item.title} — ${selectedFileTitle}`}
-                data-label={playerShortName(selected)}
-                data-avatar={item.posterUrl || undefined}
-                data-poster={item.posterUrl || undefined}
-                data-next={nextEpisodeUrl || undefined}
-                style={{ width: '100%', height: '100%', aspectRatio: '16 / 9', display: 'block' }}
-              />
-            ) : selected.embedUrl ? (
+            {playerIframeSrc ? (
               <iframe
                 key={selected.id}
                 ref={playerFrame}
                 className="watch-player-shell__frame"
-                src={selected.embedUrl}
+                src={playerIframeSrc}
                 title={`${item.title} — ${selectedFileTitle}`}
                 allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
                 referrerPolicy="strict-origin-when-cross-origin"
@@ -995,7 +993,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               </div>
             )}
           </div>
-          {(target || selected.embedUrl) && canFullScreen ? (
+          {playerIframeSrc && canFullScreen ? (
             <div className="watch-player-controls">
               <button
                 type="button"

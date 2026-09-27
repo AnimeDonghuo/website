@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { episodeNameFromLabel, episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
+import { episodeNameFromLabel, episodePagePath, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, getPlayerIframeUrl, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, streamEntriesForEpisode, watchHeading, watchPagePath } from '../src/client/watch-utils.js';
 
 function episode(number) {
   return { start: number, end: number, label: `Episode ${String(number).padStart(2, '0')}` };
@@ -206,4 +206,20 @@ test('protected playback target detects Telegram players and preserves external 
   // External providers (StreamTape, Rumble, etc.) are not protected Telegram players
   const external = { id: 'ext-1', provider: 'StreamTape', embedUrl: 'https://streamtape.com/e/12345' };
   assert.equal(getProtectedPlaybackTarget(external), null);
+});
+
+test('getPlayerIframeUrl formats target into playable iframe URL', () => {
+  const urlTarget = { type: 'url', url: 'https://t.me/c/2617067511/22047' };
+  const playerUrl = getPlayerIframeUrl(urlTarget, {
+    title: 'Demon Slayer — Episode 01',
+    label: 'Telegram'
+  });
+
+  assert.ok(playerUrl.startsWith('https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app/watch'));
+  assert.ok(playerUrl.includes('url=https%3A%2F%2Ft.me%2Fc%2F2617067511%2F22047'));
+  assert.ok(playerUrl.includes('title=Demon+Slayer'));
+
+  const idTarget = { type: 'id', id: 'video-abc' };
+  const idPlayerUrl = getPlayerIframeUrl(idTarget);
+  assert.equal(idPlayerUrl, 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app/watch/video-abc');
 });

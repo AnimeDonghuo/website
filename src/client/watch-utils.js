@@ -385,22 +385,23 @@ export function getProtectedPlaybackTarget(entry) {
   return null;
 }
 
-export function ensurePlayerEmbedScript(origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app') {
-  if (typeof document === 'undefined') return;
-  const normalizedOrigin = String(origin || '').replace(/\/+$/, '');
-  const scriptSrc = `${normalizedOrigin}/embed.js`;
-  const existing = document.querySelector('script[data-token-endpoint="/api/playback-token"]');
-
-  if (existing) {
-    if (existing.getAttribute('src') !== scriptSrc && !existing.src.endsWith('/embed.js')) {
-      existing.src = scriptSrc;
-    }
-    return;
+export function getPlayerIframeUrl(target, { title = '', label = '', poster = '', next = '', origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app' } = {}) {
+  if (!target) return null;
+  const base = String(origin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app').replace(/\/+$/, '');
+  const url = new URL(target.type === 'id' ? `/watch/${encodeURIComponent(target.id)}` : '/watch', base);
+  if (target.type === 'url') {
+    url.searchParams.set('url', target.url);
   }
+  if (title) url.searchParams.set('title', title);
+  if (label) url.searchParams.set('label', label);
+  if (poster) {
+    url.searchParams.set('avatar', poster);
+    url.searchParams.set('poster', poster);
+  }
+  if (next) url.searchParams.set('next', next);
+  return url.toString();
+}
 
-  const script = document.createElement('script');
-  script.defer = true;
-  script.src = scriptSrc;
-  script.setAttribute('data-token-endpoint', '/api/playback-token');
-  document.head.appendChild(script);
+export function ensurePlayerEmbedScript(origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app') {
+  // Retained for backward compatibility; player is now framed directly via getPlayerIframeUrl
 }

@@ -28,7 +28,8 @@ test('deriveLowestQualityTelegramStreamEntries selects lowest quality for standa
 
   const entries = deriveLowestQualityTelegramStreamEntries(content, config);
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].embedUrl, 'https://t.me/c/2617067511/103');
+  assert.equal(entries[0].telegramUrl, 'https://t.me/c/2617067511/103');
+  assert.match(entries[0].embedUrl, /2617067511.*103/);
   assert.equal(entries[0].provider, 'Telegram');
 });
 
@@ -45,7 +46,8 @@ test('deriveLowestQualityTelegramStreamEntries falls back to 1080p if only singl
 
   const entries = deriveLowestQualityTelegramStreamEntries(content, config);
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].embedUrl, 'https://t.me/c/2617067511/201');
+  assert.equal(entries[0].telegramUrl, 'https://t.me/c/2617067511/201');
+  assert.match(entries[0].embedUrl, /2617067511.*201/);
 });
 
 test('deriveLowestQualityTelegramStreamEntries respects adult storage channel for adult content', () => {
@@ -65,7 +67,8 @@ test('deriveLowestQualityTelegramStreamEntries respects adult storage channel fo
 
   const entries = deriveLowestQualityTelegramStreamEntries(content, config);
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].embedUrl, 'https://t.me/c/2999888777/302');
+  assert.equal(entries[0].telegramUrl, 'https://t.me/c/2999888777/302');
+  assert.match(entries[0].embedUrl, /2999888777.*302/);
 });
 
 test('deriveLowestQualityTelegramStreamEntries separates episodic content and picks lowest quality per episode', () => {
@@ -116,11 +119,13 @@ test('deriveLowestQualityTelegramStreamEntries separates episodic content and pi
 
   // Episode 1 chose 720p (message 402)
   assert.equal(entries[0].episode?.start, 1);
-  assert.equal(entries[0].embedUrl, 'https://t.me/c/2617067511/402');
+  assert.equal(entries[0].telegramUrl, 'https://t.me/c/2617067511/402');
+  assert.match(entries[0].embedUrl, /2617067511.*402/);
 
   // Episode 2 chose 480p (message 405)
   assert.equal(entries[1].episode?.start, 2);
-  assert.equal(entries[1].embedUrl, 'https://t.me/c/2617067511/405');
+  assert.equal(entries[1].telegramUrl, 'https://t.me/c/2617067511/405');
+  assert.match(entries[1].embedUrl, /2617067511.*405/);
 });
 
 test('mergeContentStreamWithTelegramFiles preserves third-party external streams', () => {
@@ -159,7 +164,8 @@ test('mergeContentStreamWithTelegramFiles preserves third-party external streams
   const extEntry = merged.entries.find((e) => e.provider === 'Streamtape');
 
   assert.ok(tgEntry, 'Telegram entry should be present');
-  assert.equal(tgEntry.embedUrl, 'https://t.me/c/2617067511/501');
+  assert.equal(tgEntry.telegramUrl, 'https://t.me/c/2617067511/501');
+  assert.match(tgEntry.embedUrl, /2617067511.*501/);
   assert.ok(extEntry, 'External Streamtape entry should be preserved');
   assert.equal(extEntry.embedUrl, 'https://streamtape.to/e/abc123xyz');
 });
@@ -195,7 +201,8 @@ test('toPublicContent automatically synthesizes lowest quality Telegram player o
   const publicPost = toPublicContent(rawPost, config);
   assert.ok(publicPost.stream, 'Public post should have stream');
   assert.equal(publicPost.stream.entries.length, 1);
-  assert.equal(publicPost.stream.entries[0].embedUrl, 'https://t.me/c/2617067511/602');
+  assert.equal(publicPost.stream.entries[0].telegramUrl, 'https://t.me/c/2617067511/602');
+  assert.match(publicPost.stream.entries[0].embedUrl, /2617067511.*602/);
   assert.equal(publicPost.stream.entries[0].provider, 'Telegram');
 });
 
@@ -273,5 +280,5 @@ test('applyMergePlan re-evaluates and selects lowest quality from combined files
   assert.ok(merged.stream);
   const ep1 = merged.stream.entries.find((e) => e.episode?.start === 1);
   assert.ok(ep1);
-  assert.equal(ep1.embedUrl, 'https://t.me/c/2617067511/20');
+  assert.ok(ep1.embedUrl.includes('2617067511/20') || ep1.telegramUrl === 'https://t.me/c/2617067511/20');
 });

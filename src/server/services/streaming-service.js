@@ -276,7 +276,8 @@ export function embeddablePlayerUrl(value) {
     const postMatch = url.pathname.match(/\/c\/([1-9]\d*)\/([1-9]\d*)/i);
     if (postMatch) {
       const canonical = `https://t.me/c/${postMatch[1]}/${postMatch[2]}`;
-      return { embedUrl: canonical, watchUrl: canonical, telegramUrl: canonical };
+      const embedUrl = `https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app/watch?url=${encodeURIComponent(canonical)}`;
+      return { embedUrl, watchUrl: canonical, telegramUrl: canonical };
     }
   }
 
@@ -828,19 +829,22 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
     ['anime', 'cartoon', 'donghua', 'kdrama', 'tv', 'web-series'].includes(content.category) ||
     playableFiles.some((f) => f.episode && Number.isInteger(Number(f.episode.start)));
 
+  const playerOrigin = (config?.playback?.playerOrigin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app').replace(/\/+$/, '');
+
   if (!isEpisodic) {
     // Standalone / Movie release: pick single lowest quality file across the release
     const sorted = [...playableFiles].sort(compareFilesByQualityAscending);
     const lowest = sorted[0];
     const channelNumber = fileChannelNumber(lowest, content, config);
     const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
+    const embedUrl = `${playerOrigin}/watch?url=${encodeURIComponent(postUrl)}`;
     return [{
       id: `tg-${channelNumber}-${lowest.storageMessageId}`,
       label: 'Main player',
       episode: null,
       provider: 'Telegram',
       server: 'Telegram server',
-      embedUrl: postUrl,
+      embedUrl,
       watchUrl: postUrl,
       telegramUrl: postUrl
     }];
@@ -871,13 +875,14 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
     const channelNumber = fileChannelNumber(lowest, content, config);
     const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
     const epLabel = lowest.episode?.label || (lowest.episode?.start ? `Episode ${String(lowest.episode.start).padStart(2, '0')}` : 'Main player');
+    const embedUrl = `${playerOrigin}/watch?url=${encodeURIComponent(postUrl)}`;
     entries.push({
       id: `tg-${channelNumber}-${lowest.storageMessageId}`,
       label: epLabel,
       episode: lowest.episode || null,
       provider: 'Telegram',
       server: 'Telegram server',
-      embedUrl: postUrl,
+      embedUrl,
       watchUrl: postUrl,
       telegramUrl: postUrl
     });
