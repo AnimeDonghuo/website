@@ -339,29 +339,64 @@ export function watchPagePath(item, episode = null) {
   return `${base}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
 }
 
-export function getProtectedPlaybackTarget(entry) {
+export function getEntryQualities(entry) {
+  if (!entry || !Array.isArray(entry.qualities)) return [];
+  return entry.qualities.filter((opt) => opt && (opt.telegramUrl || opt.watchUrl || opt.embedUrl));
+}
+
+export function resolveActiveQualityOption(entry, selectedQuality = null) {
+  const qualities = getEntryQualities(entry);
+  if (!qualities.length) return null;
+  if (selectedQuality) {
+    const targetKey = String(selectedQuality).trim().toLowerCase();
+    const matched = qualities.find(
+      (opt) => String(opt.id || '').toLowerCase() === targetKey
+        || String(opt.quality || '').toLowerCase() === targetKey
+        || String(opt.label || '').toLowerCase() === targetKey
+    );
+    if (matched) return matched;
+  }
+  return qualities[0];
+}
+
+export function getProtectedPlaybackTarget(entry, { selectedQuality = null } = {}) {
   if (!entry) return null;
 
+  const activeQuality = resolveActiveQualityOption(entry, selectedQuality);
+  const source = activeQuality || entry;
+
   // 1. Direct telegramUrl property
-  if (entry.telegramUrl && typeof entry.telegramUrl === 'string') {
-    const match = entry.telegramUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+  if (source.telegramUrl && typeof source.telegramUrl === 'string') {
+    const match = source.telegramUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
     if (match) {
-      return { type: 'url', url: `https://t.me/c/${match[1]}/${match[2]}` };
+      return {
+        type: 'url',
+        url: `https://t.me/c/${match[1]}/${match[2]}`,
+        ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+      };
     }
-    return { type: 'url', url: entry.telegramUrl };
+    return {
+      type: 'url',
+      url: source.telegramUrl,
+      ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+    };
   }
 
   // 2. Direct watchId property
-  if (entry.watchId && typeof entry.watchId === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(entry.watchId)) {
-    return { type: 'id', id: entry.watchId };
+  if (source.watchId && typeof source.watchId === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(source.watchId)) {
+    return { type: 'id', id: source.watchId };
   }
 
   // 3. Inspect embedUrl or watchUrl
-  const candidateUrl = String(entry.embedUrl || entry.watchUrl || '').trim();
+  const candidateUrl = String(source.embedUrl || source.watchUrl || entry.embedUrl || entry.watchUrl || '').trim();
   if (candidateUrl) {
     const tgMatch = candidateUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
     if (tgMatch) {
-      return { type: 'url', url: `https://t.me/c/${tgMatch[1]}/${tgMatch[2]}` };
+      return {
+        type: 'url',
+        url: `https://t.me/c/${tgMatch[1]}/${tgMatch[2]}`,
+        ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+      };
     }
 
     try {
@@ -370,7 +405,11 @@ export function getProtectedPlaybackTarget(entry) {
         const innerUrl = parsed.searchParams.get('url');
         const innerMatch = innerUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
         if (innerMatch) {
-          return { type: 'url', url: `https://t.me/c/${innerMatch[1]}/${innerMatch[2]}` };
+          return {
+            type: 'url',
+            url: `https://t.me/c/${innerMatch[1]}/${innerMatch[2]}`,
+            ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+          };
         }
       }
       const watchMatch = parsed.pathname.match(/^\/watch\/([a-zA-Z0-9_-]{1,100})$/i);
@@ -385,7 +424,18 @@ export function getProtectedPlaybackTarget(entry) {
   return null;
 }
 
-export function getPlayerIframeUrl(target, { title = '', label = '', poster = '', next = '', origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app' } = {}) {
+export function getPlayerIframeUrl(target, {
+  title = '',
+  label = '',
+  poster = '',
+  next = '',
+  quality = '',
+  qualities = [],
+  subUrl = '',
+  subLabel = '',
+  noAudioSelect = false,
+  origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
+} = {}) {
   if (!target) return null;
   const base = String(origin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app').replace(/\/+$/, '');
   const url = new URL(target.type === 'id' ? `/watch/${encodeURIComponent(target.id)}` : '/watch', base);
@@ -399,6 +449,22 @@ export function getPlayerIframeUrl(target, { title = '', label = '', poster = ''
     url.searchParams.set('poster', poster);
   }
   if (next) url.searchParams.set('next', next);
+  const effectiveQuality = quality || target.quality || '';
+  if (effectiveQuality) url.searchParams.set('quality', effectiveQuality);
+  if (Array.isArray(qualities) && qualities.length > 1) {
+    const serialized = qualities
+      .filter((q) => q && (q.quality || q.label) && (q.telegramUrl || q.watchUrl))
+      .map((q) => `${q.quality || q.label}:${q.telegramUrl || q.watchUrl}`)
+      .join(',');
+    if (serialized) url.searchParams.set('qualities', serialized);
+  }
+  if (subUrl) {
+    url.searchParams.set('sub', subUrl);
+    if (subLabel) url.searchParams.set('subLabel', subLabel);
+  }
+  if (noAudioSelect) {
+    url.searchParams.set('audio', '0');
+  }
   return url.toString();
 }
 

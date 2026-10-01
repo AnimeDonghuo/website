@@ -400,18 +400,23 @@ async function readResponseBody(response) {
   return Buffer.concat(chunks, total);
 }
 
-export async function downloadPosterImage(sourceUrl) {
-  let currentUrl = sourceUrl;
+async function downloadSinglePosterUrl(sourceUrl) {
+  let currentUrl = String(sourceUrl || '').trim();
+  if (/^http:\/\//i.test(currentUrl)) {
+    currentUrl = currentUrl.replace(/^http:\/\//i, 'https://');
+  }
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
     const safeUrl = await assertPublicImageUrl(currentUrl);
     let response;
     try {
       response = await fetch(safeUrl, {
         redirect: 'manual',
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(12_000),
         headers: {
-          Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-          'User-Agent': 'SoraBoxPosterMirror/1.0'
+          Accept: 'image/jpeg,image/png,image/webp,image/apng,image/*,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Referer: `${safeUrl.origin}/`
         }
       });
     } catch (error) {
@@ -422,6 +427,9 @@ export async function downloadPosterImage(sourceUrl) {
       const location = response.headers.get('location');
       if (!location) throw new PosterHostingError('The poster host sent an invalid redirect.');
       currentUrl = new URL(location, safeUrl).toString();
+      if (/^http:\/\//i.test(currentUrl)) {
+        currentUrl = currentUrl.replace(/^http:\/\//i, 'https://');
+      }
       continue;
     }
 
@@ -429,13 +437,47 @@ export async function downloadPosterImage(sourceUrl) {
       throw new PosterHostingError(`The poster host responded with ${response.status}.`);
     }
     const contentType = (response.headers.get('content-type') || '').split(';')[0].toLowerCase();
-    if (!contentType.startsWith('image/')) {
+    if (!contentType.startsWith('image/') && contentType !== 'application/octet-stream') {
       throw new PosterHostingError('The poster URL did not return an image.');
     }
-    return { buffer: await readResponseBody(response), contentType, sourceUrl: currentUrl };
+    return {
+      buffer: await readResponseBody(response),
+      contentType: contentType.startsWith('image/') ? contentType : 'image/jpeg',
+      sourceUrl: currentUrl
+    };
   }
 
   throw new PosterHostingError('The poster redirected too many times.');
+}
+
+function buildPosterDownloadFallbacks(sourceUrl) {
+  const candidates = [];
+  const str = String(sourceUrl || '').trim();
+  if (!str) return candidates;
+  candidates.push(str);
+  if ((str.includes('media-amazon.com') || str.includes('imdb.com')) && /\._V1_/i.test(str)) {
+    const sizedJpg = str.replace(/\.?_V1_.*?(\.(?:jpe?g|png|webp))$/i, '._V1_FMjpg_UX1000_.jpg');
+    const sxJpg = str.replace(/\.?_V1_.*?(\.(?:jpe?g|png|webp))$/i, '._V1_SX1000.jpg');
+    if (!candidates.includes(sizedJpg)) candidates.push(sizedJpg);
+    if (!candidates.includes(sxJpg)) candidates.push(sxJpg);
+  }
+  return candidates;
+}
+
+export async function downloadPosterImage(sourceUrl) {
+  const candidates = buildPosterDownloadFallbacks(sourceUrl);
+  if (!candidates.length) {
+    return downloadSinglePosterUrl(sourceUrl);
+  }
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return await downloadSinglePosterUrl(candidate);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new PosterHostingError('The poster could not be downloaded.');
 }
 
 function crc32(buffer) {
@@ -705,17 +747,31 @@ export function createFallbackPosterPng(title, category) {
  * rate-limited host can be retried later with the same image in hand, without asking the publisher
  * to re-send anything.
  */
-export async function preparePosterImage({ sourceUrl = null, sourceIsManual = false, title, category } = {}) {
+export async function preparePosterImage({ sourceUrl = null, fallbackUrls = [], sourceIsManual = false, title, category } = {}) {
   let image = null;
   let originalUrl = null;
   let usedFallback = false;
 
-  if (sourceUrl) {
-    try {
-      image = await downloadPosterImage(sourceUrl);
-      originalUrl = image.sourceUrl;
-    } catch (error) {
-      if (sourceIsManual) throw error;
+  const urlQueue = [
+    sourceUrl,
+    ...(Array.isArray(fallbackUrls) ? fallbackUrls : [])
+  ].map((u) => String(u || '').trim()).filter(Boolean);
+  const uniqueUrls = [...new Set(urlQueue)];
+
+  if (uniqueUrls.length) {
+    let lastError = null;
+    for (const candidateUrl of uniqueUrls) {
+      try {
+        image = await downloadPosterImage(candidateUrl);
+        originalUrl = image.sourceUrl;
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!image) {
+      if (sourceIsManual && lastError) throw lastError;
       usedFallback = true;
     }
   } else {
@@ -1002,7 +1058,7 @@ export async function hostPosterImage({ image, title, config, repository = null 
   };
 }
 
-export async function mirrorPosterToImgBB({ sourceUrl, sourceIsManual = false, title, category, config, repository = null }) {
-  const image = await preparePosterImage({ sourceUrl, sourceIsManual, title, category });
+export async function mirrorPosterToImgBB({ sourceUrl, fallbackUrls = [], sourceIsManual = false, title, category, config, repository = null }) {
+  const image = await preparePosterImage({ sourceUrl, fallbackUrls, sourceIsManual, title, category });
   return hostPosterImage({ image, title, config, repository });
 }

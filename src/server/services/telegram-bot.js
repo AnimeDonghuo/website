@@ -3,8 +3,8 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, resolveCategoryId, slugify } from '../lib/strings.js';
-import { attributeUploadSeasons, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
-import { categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { canonicalMetadataTitle, categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
 import { reindexContentRecord } from '../catalog.repository.js';
 import {
   PosterHostingError,
@@ -260,6 +260,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'teststorage', description: 'Check the storage channel connection' },
   { command: 'cancel', description: 'Discard current upload draft' },
   { command: 'delete', description: 'Delete one or more post IDs' },
+  { command: 'removefile', description: 'Choose a post and remove specific episode/movie/series files' },
   { command: 'merge', description: 'Absorb cards into one post, or drop a season/episodes' },
   { command: 'posts', description: 'List recent post IDs for deletion' },
   { command: 'postid', description: 'Find uploaded post IDs by time' },
@@ -411,7 +412,7 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
   const filename = source?.file_name || `${kind}-${message.message_id}`;
   const caption = cleanStorageCaption(message.caption);
   const episode = detectUploadEpisode({ caption, filename });
-  const quality = detectMediaQuality({ caption, filename });
+  const quality = detectMediaQuality({ caption, filename, height: source?.height, width: source?.width });
   const audioLanguages = detectUploadLanguages({ caption, filename });
   const subtitleLanguages = detectUploadSubtitleLanguages({ caption, filename });
   const file = {
@@ -428,6 +429,8 @@ export function fileFromMessage(message, storedMessageId, storageMethod = 'copy'
     sourceLabel: cleanText(caption || filename, 500),
     displayName: episode.displayName,
     quality,
+    ...(Number.isInteger(Number(source?.height)) ? { height: Number(source.height) } : {}),
+    ...(Number.isInteger(Number(source?.width)) ? { width: Number(source.width) } : {}),
     // `languages` stays as a compatibility alias for existing catalog records.
     languages: audioLanguages,
     audioLanguages,
@@ -1267,12 +1270,15 @@ export async function handlePostIdLookupMessage(ctx, repository, config = null) 
 }
 
 /** Validate, mirror, and store one replacement poster for a published card. */
-export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config, lookupTitle = null }) {
+export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config, lookupTitle = null, inferredCategory = null }) {
   const existing = await repository.findContentByAdminId(adminId);
   if (!existing) {
     await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
     return null;
   }
+  const resolvedCategory = inferredCategory && CATEGORY_IDS.has(inferredCategory) && existing.category !== ADULT_CATEGORY && !(inferredCategory === 'movie' && Number(existing.episodeCount) > 1)
+    ? inferredCategory
+    : null;
   let posterResult = null;
   try {
     posterResult = await mirrorPosterToImgBB({
@@ -1281,7 +1287,7 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
       // generated poster the publisher never chose.
       sourceIsManual: true,
       title: existing.title,
-      category: existing.category,
+      category: resolvedCategory || existing.category,
       config,
       repository
     });
@@ -1289,7 +1295,7 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
     // A busy image host is the one reason an artwork change can wait: the choice is kept in the
     // retry queue, so the operator never has to pick it again and the card keeps its old poster.
     if (!isPosterRateLimit(error)) throw error;
-    const image = await preparePosterImage({ sourceUrl, sourceIsManual: true, title: existing.title, category: existing.category });
+    const image = await preparePosterImage({ sourceUrl, sourceIsManual: true, title: existing.title, category: resolvedCategory || existing.category });
     queuePosterRetry({
       adminId,
       title: existing.title,
@@ -1309,6 +1315,7 @@ export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, s
     return null;
   }
   const updated = await repository.updateContentByAdminId(adminId, {
+    ...(resolvedCategory ? { category: resolvedCategory } : {}),
     posterUrl: posterResult.url,
     backdropUrl: posterResult.url,
     // `title` is what the artwork was matched against. A later /title correction is the signal that
@@ -1431,19 +1438,24 @@ export async function handlePosterAction(ctx, repository, config, action) {
       return true;
     }
     await acknowledgeTap(ctx, `Mirroring ${cleanText(candidate.title, 60) || 'poster'}…`);
+    const candidateCategory = categoryFromHints({ hints: candidate, minimumScore: 0.3 });
     if (!flow.targetAdminId) {
       const session = await repository.findSession(chatId(ctx), userId(ctx));
       if (!session) {
         await ctx.reply('That draft is no longer active, so the artwork has nowhere to go. Start one with /panel, or edit a published post with /poster SB-… <name>.');
         return true;
       }
-      await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl: candidate.posterUrl });
+      const draftPatch = {
+        posterOriginalUrl: candidate.posterUrl,
+        ...(candidateCategory && session.category !== ADULT_CATEGORY ? { category: candidateCategory } : {})
+      };
+      await repository.updateSession(chatId(ctx), userId(ctx), draftPatch);
       await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
       await ctx.reply(`Draft artwork selected: ${cleanText(candidate.title, 80)}${Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : ''}. Publish with /done to mirror it to ImgBB.`);
       return true;
     }
     try {
-      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config, lookupTitle: candidate.title });
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config, lookupTitle: candidate.title, inferredCategory: candidateCategory });
       if (!result) return true;
       await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
       await ctx.reply(result.updated
@@ -1569,10 +1581,17 @@ function parseBatchArgument(value) {
 const RELEASE_TITLE_NOISE = new Set([
   'mkv', 'mp4', 'avi', 'webm', 'mov', 'm4v', 'ts', 'm2ts', 'm4a', 'mp3', 'flac', 'srt', 'ass',
   'x264', 'x265', 'h264', 'h265', 'hevc', 'avc', 'av1', 'vp9', 'aac', 'ac3', 'eac3', 'dts', 'truehd',
-  'atmos', 'hdr', 'hdr10', 'sdr', '10bit', '8bit', 'remux', 'proper', 'repack', 'uncut', 'extended',
-  'unrated', 'dual', 'multi', 'audio', 'subs', 'sub', 'subbed', 'dub', 'dubbed', 'engsub', 'hd',
-  'fhd', 'uhd', '4k', '8k', 'dvdscr', 'webdl', 'webrip', 'web', 'bluray', 'bdrip', 'brrip', 'dvdrip',
-  'hdcam', 'cam', 'ts', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'ep', 'eps',
+  'ddp', 'ddp5', 'ddp2', 'dd', 'lpcm', 'opus', 'hi10p', 'dovi', 'dv', 'hlg',
+  'atmos', 'hdr', 'hdr10', 'sdr', '10bit', '8bit', 'remux', 'proper', 'repack', 'rerip', 'uncut', 'extended',
+  'unrated', 'remastered', 'dual', 'multi', 'audio', 'subs', 'sub', 'subbed', 'dub', 'dubbed', 'engsub', 'esub', 'esubs', 'msub', 'msubs', 'multisub', 'multisubs', 'korsub',
+  'org', 'original', 'hq', 'hc', 'hd', 'sd', 'qhd', '2k', '5k', '6k',
+  'fhd', 'uhd', '4k', '8k', 'dvdscr', 'webdl', 'webrip', 'webhd', 'web', 'bluray', 'bdrip', 'brrip', 'brip', 'hdrip', 'dvdrip',
+  'hdcam', 'cam', 'hdts', 'telesync', 'telecine', 'predvd', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'epi', 'ep', 'eps',
+  'nf', 'netflix', 'amzn', 'amazon', 'prime', 'primevideo', 'dsnp', 'dsnk', 'disney', 'hotstar', 'jiohotstar', 'jiocinema',
+  'zee5', 'sonyliv', 'sliv', 'sunnxt', 'snxt', 'aha', 'hoichoi', 'voot', 'ullu', 'chaupal', 'stage', 'hulu', 'hbomax', 'hmax',
+  'atvp', 'pcok', 'peacock', 'pmtp', 'paramount', 'lionsgate', 'lgp', 'crunchyroll', 'cr', 'bilibili', 'bglobal', 'wetv', 'iqiyi',
+  'youku', 'mgtv', 'tencent', 'viki', 'viu', 'wavve', 'tving', 'hidive', 'funimation', 'muse', 'anione',
+  'rarbg', 'yts', 'yify', 'psa', 'pahe', 'tgx', 'kayoanime', 'animekayo', 'subsplease', 'horriblesubs', 'nyaa', 'ember', 'judas', 'flux', 'ntb', 'ethel', 'playweb',
   // Audio labels are packaging on a file, and `cleanMediaName` already drops them for the same
   // reason; listing them here keeps a direct call to the tidy from disagreeing with the pipeline.
   'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'bangla', 'marathi',
@@ -1605,6 +1624,8 @@ export function tidyReleaseTitle(value) {
     .replace(/\[[^\]]{0,120}\]/g, ' ')
     .replace(/\{[^}]{0,80}\}/g, ' ')
     .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts|m4a|mp3|flac)$/i, ' ')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|gib|mib)\b/gi, ' ')
+    .replace(/\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   const dehyphenated = unwrapped.replace(HYPHEN_WELDED_TAG, ' ').replace(/\s+/g, ' ').trim();
@@ -1617,7 +1638,8 @@ export function tidyReleaseTitle(value) {
     if (!core) continue;
     const lowered = core.toLowerCase();
     if (RELEASE_TITLE_NOISE.has(lowered)) continue;
-    if (/^\d{2,4}[pPi]$/.test(lowered)) continue;
+    if (/^\d{2,4}[pPi]$/i.test(lowered)) continue;
+    if (/^(?:ddp?|eac3|ac3|aac|dts|truehd|h\.?26[45]|x\.?26[45])[\d.]*$/i.test(lowered)) continue;
     // A year is metadata, and `cleanMediaName` has already taken most of them. One welded to a
     // colon or leading the title is part of the name ("2001: A Space Odyssey"), so it stays.
     if (RELEASE_TITLE_YEAR.test(lowered) && index > 0 && !/[:.]$/.test(token)) continue;
@@ -1626,6 +1648,18 @@ export function tidyReleaseTitle(value) {
     // (Scooby-Doo!), a colon after a year (2001: A Space Odyssey) and a hyphen inside a name are
     // the title, not packaging, so they are never touched.
     kept.push(token.replace(/^[#@/>*+\-–—\[{("'`]+|[)\]},;|\\_]+$/g, '').trim());
+  }
+  while (kept.length > 1) {
+    const tail = kept[kept.length - 1].replace(/[^\p{L}\p{N}]/gu, '');
+    if (
+      /^[b-df-hj-np-tv-xz]{4,6}$/i.test(tail)
+      && new Set(tail.toLowerCase()).size >= 3
+      && !/^(?:part|ii|iii|iv|vi|vii|viii|ix|xi|xii)$/i.test(tail)
+    ) {
+      kept.pop();
+    } else {
+      break;
+    }
   }
   const tidied = cleanText(kept.join(' ').replace(/\s{2,}/g, ' ').trim(), 180);
   // Never let the tidy eat a title whole: a short, unusual name beats an empty string.
@@ -1639,6 +1673,10 @@ export function isPlausibleReleaseTitle(value) {
   const words = text.split(/\s+/).filter((token) => /[A-Za-zÀ-ÿ\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\uAC00-\uD7AF]{2,}/.test(token));
   if (!words.length) return false;
   if (/^(?:document|video|file|upload|movie|film)(?:\s*\d+)?$/i.test(text)) return false;
+  if (words.length === 1) {
+    const singleCore = words[0].replace(/[^\p{L}]/gu, '');
+    if (/^[b-df-hj-np-tv-xz]{4,}$/i.test(singleCore) && new Set(singleCore.toLowerCase()).size >= 3) return false;
+  }
   return words.some((word) => {
     const core = word.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
     // One real word, and not a packaging word dressed up as one: "mkv" and "1080p" are not names.
@@ -1663,14 +1701,15 @@ export function inferBatchTitle(files = []) {
       }
 
       const candidate = cleanMediaName(source)
-        .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:ISODE)?)?\s*)?\d{1,3})?\b/gi, ' ')
-        .replace(/\b(?:EPISODES?|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\b(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
         // Keep sequel numbers (Cocktail 2), but remove a standalone season
         // marker because it describes packaging rather than the series title.
         .replace(/\b(?:S(?:EASON)?\s*0*\d{1,2})\b/gi, ' ')
-        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|eng|indo|cc)\b/gi, ' ')
+        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|esubs?|msubs?|eng|indo|cc)\b/gi, ' ')
         .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|indonesian|thai|vietnamese|spanish|french|german|portuguese|arabic|russian)\b/gi, ' ')
-        .replace(/\b(?:360|480|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
+        .replace(/\b(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})\s*[pPiI]\b/g, ' ')
+        .replace(/\b(?:144|240|288|360|480|540|544|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
         .replace(/[+]+/g, ' ')
         .replace(/\s{2,}/g, ' ')
         .replace(/^[\s\-–—|:/.]+|[\s\-–—|:/.]+$/g, '')
@@ -2925,6 +2964,25 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
           details.tmdbId = metadata.tmdbId || content.tmdbId || null;
           details.metadataKey = metadata.metadataKey || content.metadataKey || null;
         }
+        const hasCategoryEvidence = Boolean(
+          metadata.inferredCategory
+          || metadata.provider
+          || metadata.type
+          || (Array.isArray(metadata.originCountry) && metadata.originCountry.length)
+          || (Array.isArray(metadata.genreIds) && metadata.genreIds.length)
+          || providerGenres.some((genre) => /animation|animated|cartoon|anime|donghua/i.test(String(genre)))
+        );
+        const inferredCategory = metadata.inferredCategory
+          || (hasCategoryEvidence ? categoryFromHints({ hints: metadata, minimumScore: 0.3 }) : null);
+        if (
+          inferredCategory
+          && CATEGORY_IDS.has(inferredCategory)
+          && inferredCategory !== content.category
+          && content.category !== ADULT_CATEGORY
+          && !(inferredCategory === 'movie' && Number(content.episodeCount) > 1)
+        ) {
+          details.category = inferredCategory;
+        }
       }
       if (!hasArtwork && !Object.keys(details).length) {
         outcome.skipped = 1;
@@ -2933,7 +2991,7 @@ export function queuePosterRematchForTitle({ ctx = null, repository, config = nu
       }
       let hosted = null;
       if (hasArtwork) {
-        const image = await prepare({ sourceUrl, title, category: content.category });
+        const image = await prepare({ sourceUrl, title, category: details.category || content.category });
         try {
           hosted = await host({ image, title, config });
         } catch (error) {
@@ -3022,7 +3080,7 @@ export async function editAnnouncementPhoto({ telegram, reference, posterUrl, ca
   try {
     return await edit(posterUrl);
   } catch (error) {
-    if (!/failed to get HTTP URL content|wrong file identifier\/HTTP URL specified|WEBPAGE_CURL_FAILED/i.test(error?.description || error?.message || '')) throw error;
+    if (!/failed to get HTTP URL|wrong file identifier\/HTTP URL specified|WEBPAGE_CURL_FAILED|WEBPAGE_MEDIA_EMPTY|IMAGE_PROCESS_FAILED|PHOTO_INVALID_DIMENSIONS|PHOTO_SAVE_FILE_INVALID|FILE_PARTS_INVALID|wrong type of the web page content/i.test(error?.description || error?.message || '')) throw error;
     // Download with the poster service's URL, redirect, size and timeout protections.
     // Never substitute generated artwork: a failure must stay pending for /sync.
     let image;
@@ -3138,7 +3196,19 @@ export async function syncPublishedAnnouncements({ telegram, repository, content
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         if (reference.kind !== 'text' && posterUrl) {
-          await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
+          try {
+            await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
+          } catch (photoError) {
+            const photoDesc = cleanText(photoError?.description || photoError?.message, 200);
+            const canFallbackToCaption = typeof telegram.editMessageCaption === 'function'
+              && !/message is not modified|not found|chat not found|deleted|message to edit|too many requests|flood|retry after/i.test(photoDesc)
+              && classifyAnnouncementEditFailure(photoDesc).kind === 'retry';
+            if (!canFallbackToCaption) throw photoError;
+            await telegram.editMessageCaption(reference.channelId, reference.messageId, null, caption, {
+              parse_mode: 'HTML',
+              ...extra
+            });
+          }
           // Some Bot API versions ignore reply_markup on editMessageMedia; a
           // second call is idempotent and keeps the website button present.
           if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
@@ -7071,13 +7141,15 @@ export async function handleScrapeCommand(ctx, repository, config) {
     return { handled: true, error: scraped.error || 'No metadata' };
   }
 
+  const inferredCategory = scraped.category || categoryFromHints({ hints: scraped, minimumScore: 0.3 }) || null;
   let mirroredPosterUrl = null;
   if (scraped.posterUrl) {
     const titleForArt = scraped.title || (isDraft ? session?.title : existing?.title) || 'Scraped Artwork';
-    const categoryForArt = (isDraft ? session?.category : existing?.category) || 'movie';
+    const categoryForArt = inferredCategory || (isDraft ? session?.category : existing?.category) || 'movie';
     try {
       const mirrorResult = await mirrorPosterToImgBB({
         sourceUrl: scraped.posterUrl,
+        fallbackUrls: scraped.posterFallbackUrls || [],
         sourceIsManual: true,
         title: titleForArt,
         category: categoryForArt,
@@ -7090,6 +7162,7 @@ export async function handleScrapeCommand(ctx, repository, config) {
         try {
           const image = await preparePosterImage({
             sourceUrl: scraped.posterUrl,
+            fallbackUrls: scraped.posterFallbackUrls || [],
             sourceIsManual: true,
             title: titleForArt,
             category: categoryForArt
@@ -7113,9 +7186,16 @@ export async function handleScrapeCommand(ctx, repository, config) {
     if (scraped.year) draftUpdates.year = scraped.year;
     if (scraped.description) draftUpdates.description = scraped.description;
     if (Array.isArray(scraped.genres) && scraped.genres.length) draftUpdates.genres = scraped.genres;
-    if (Array.isArray(scraped.languages) && scraped.languages.length) draftUpdates.languages = scraped.languages;
+    // Never overwrite audio/subtitle languages from scraped websites; only use what the draft files actually have.
+    const draftFiles = Array.isArray(session?.files) ? session.files : [];
+    const draftFileAudio = summarizeUploadLanguages(draftFiles);
+    const draftFileSubs = summarizeSubtitleLanguages(draftFiles);
+    if (draftFileAudio.length) draftUpdates.languages = draftFileAudio;
+    if (draftFileSubs.length && session?.subtitleLanguageSource !== 'manual') draftUpdates.subtitleLanguages = draftFileSubs;
     if (scraped.releaseLabel) draftUpdates.releaseLabel = scraped.releaseLabel;
-    if (scraped.category && !session?.category) draftUpdates.category = scraped.category;
+    if (inferredCategory && CATEGORY_IDS.has(inferredCategory) && session?.category !== ADULT_CATEGORY) {
+      draftUpdates.category = inferredCategory;
+    }
     if (mirroredPosterUrl) {
       draftUpdates.posterOriginalUrl = mirroredPosterUrl;
       draftUpdates.posterUrl = mirroredPosterUrl;
@@ -7125,9 +7205,10 @@ export async function handleScrapeCommand(ctx, repository, config) {
     const lines = [
       `Scraped from ${domain} and updated active draft:`,
       draftUpdates.title ? `▪ Title: ${draftUpdates.title}` : null,
+      draftUpdates.category ? `▪ Category: ${draftUpdates.category}` : null,
       draftUpdates.year ? `▪ Year: ${draftUpdates.year}` : null,
       draftUpdates.genres?.length ? `▪ Genres: ${draftUpdates.genres.join(', ')}` : null,
-      draftUpdates.languages?.length ? `▪ Languages: ${draftUpdates.languages.join(', ')}` : null,
+      draftUpdates.languages?.length ? `▪ Languages (from files): ${draftUpdates.languages.join(', ')}` : null,
       draftUpdates.releaseLabel ? `▪ Type: ${draftUpdates.releaseLabel}` : null,
       draftUpdates.description ? `▪ Synopsis: ${cleanText(draftUpdates.description, 140)}` : null,
       mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : '▪ Artwork: None found',
@@ -7144,7 +7225,28 @@ export async function handleScrapeCommand(ctx, repository, config) {
   if (scraped.year) patch.year = scraped.year;
   if (scraped.description) patch.description = scraped.description;
   if (Array.isArray(scraped.genres) && scraped.genres.length) patch.genres = scraped.genres;
-  if (Array.isArray(scraped.languages) && scraped.languages.length) patch.languages = scraped.languages;
+  // Never overwrite audio/subtitle languages from scraped websites; only use what the stored files actually have.
+  const existingFiles = Array.isArray(existing?.files) ? existing.files : [];
+  if (existingFiles.length) {
+    const fileAudio = summarizeUploadLanguages(existingFiles);
+    const fileSubs = summarizeSubtitleLanguages(existingFiles);
+    if (fileAudio.length && existing.languageSource !== 'manual') {
+      patch.languages = fileAudio;
+      patch.languageSource = 'upload';
+    }
+    if (fileSubs.length && existing.subtitleLanguageSource !== 'manual') {
+      patch.subtitleLanguages = fileSubs;
+      patch.subtitleLanguageSource = 'upload';
+    }
+  }
+  if (
+    inferredCategory
+    && CATEGORY_IDS.has(inferredCategory)
+    && existing.category !== ADULT_CATEGORY
+    && !(inferredCategory === 'movie' && Number(existing.episodeCount) > 1)
+  ) {
+    patch.category = inferredCategory;
+  }
   if (scraped.releaseLabel) patch.releaseLabel = scraped.releaseLabel;
   if (mirroredPosterUrl) {
     patch.posterUrl = mirroredPosterUrl;
@@ -7157,6 +7259,15 @@ export async function handleScrapeCommand(ctx, repository, config) {
       mirroredAt: new Date().toISOString()
     };
   }
+  if (Array.isArray(existing?.announcementRefs) && existing.announcementRefs.length) {
+    patch.announcementRefs = existing.announcementRefs.map((ref) => {
+      if (!ref || (!ref.syncError && !ref.posterUpgrade)) return ref;
+      const cleanedRef = { ...ref };
+      delete cleanedRef.syncError;
+      delete cleanedRef.posterUpgrade;
+      return cleanedRef;
+    });
+  }
 
   let updated = await repository.updateContentByAdminId(adminId, patch);
   if (typeof repository.reindexContent === 'function') {
@@ -7168,7 +7279,7 @@ export async function handleScrapeCommand(ctx, repository, config) {
       updated = (await repository.updateContentByAdminId(adminId, rebuiltIndex.patch)) || updated;
     }
   }
-  await queueAnnouncementSync({
+  const syncJob = queueAnnouncementSync({
     telegram: ctx.telegram,
     repository,
     content: updated || existing,
@@ -7176,18 +7287,23 @@ export async function handleScrapeCommand(ctx, repository, config) {
     adminId: (updated || existing).adminId,
     notifyChatId: chatId(ctx)
   });
+  const syncOutcome = await settleQueuedJob(syncJob);
 
   const pageUrl = updated ? getContentPageUrl(config || {}, updated) : null;
+  const syncLine = syncOutcome?.settled && syncOutcome.result
+    ? `▪ Channel announcement: ${announcementSyncNote(syncOutcome.result)}`
+    : '▪ Channel announcement: Queued for update';
   const lines = [
     `Scraped from ${domain} and updated ${(updated || existing).adminId} · ${(updated || existing).title}:`,
     patch.title ? `▪ Title: ${patch.title}` : null,
+    patch.category ? `▪ Category: ${patch.category}` : null,
     patch.year ? `▪ Year: ${patch.year}` : null,
     patch.genres?.length ? `▪ Genres: ${patch.genres.join(', ')}` : null,
-    patch.languages?.length ? `▪ Languages: ${patch.languages.join(', ')}` : null,
+    patch.languages?.length ? `▪ Languages (from files): ${patch.languages.join(', ')}` : null,
     patch.releaseLabel ? `▪ Type: ${patch.releaseLabel}` : null,
     patch.description ? `▪ Synopsis: ${cleanText(patch.description, 140)}` : null,
     mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : null,
-    '▪ Channel announcement: Queued for update',
+    syncLine,
     pageUrl ? `Card: ${pageUrl}` : null
   ].filter(Boolean);
   await ctx.reply(lines.join('\n'));
@@ -7195,6 +7311,298 @@ export async function handleScrapeCommand(ctx, repository, config) {
 }
 
 export { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
+
+const REMOVE_FILE_POSTS_PAGE_SIZE = 8;
+const REMOVE_FILE_ITEMS_PAGE_SIZE = 8;
+
+export function formatRemoveFileButtonLabel(file, index = 0) {
+  const quality = cleanText(file?.quality || detectMediaQuality({
+    caption: file?.sourceLabel || file?.displayName,
+    filename: file?.name,
+    height: file?.height,
+    width: file?.width
+  }), 24);
+  const episodeLabel = cleanText(
+    file?.episodeLabel
+    || (Number.isInteger(Number(file?.episode?.start))
+      ? (Number.isInteger(Number(file?.seasonNumber))
+        ? `S${file.seasonNumber} E${file.episode.start}`
+        : `Episode ${file.episode.start}`)
+      : ''),
+    32
+  );
+  const cleanedName = cleanText(
+    cleanDeliveryFileName(file?.displayName || file?.name || file?.sourceLabel || '')
+    || file?.displayName
+    || file?.name
+    || `File ${index + 1}`,
+    48
+  );
+  const parts = [];
+  if (episodeLabel) {
+    parts.push(episodeLabel);
+    if (cleanedName && cleanedName.toLowerCase() !== episodeLabel.toLowerCase()) {
+      parts.push(cleanedName);
+    }
+  } else {
+    parts.push(cleanedName || `File ${index + 1}`);
+  }
+  const base = parts.join(' · ');
+  return telegramButtonText(quality ? `${base} [${quality}]` : base);
+}
+
+async function listPostsForFileRemoval(repository, query = '') {
+  let posts = [];
+  if (typeof repository?.listRecentContentForAdmin === 'function') {
+    posts = await repository.listRecentContentForAdmin(100, { includeAdult: true });
+  } else if (typeof repository?.listAdminContent === 'function') {
+    posts = await repository.listAdminContent({ limit: 100 });
+  }
+  const list = Array.isArray(posts) ? posts : [];
+  const trimmed = cleanText(query, 120).toLowerCase();
+  if (!trimmed) return list;
+  return list.filter((post) => {
+    const title = cleanText(post?.title, 180).toLowerCase();
+    const adminId = cleanText(post?.adminId, 40).toLowerCase();
+    const slug = cleanText(post?.slug, 180).toLowerCase();
+    return title.includes(trimmed) || adminId.includes(trimmed) || slug.includes(trimmed);
+  });
+}
+
+async function renderRemoveFilePostsPicker(ctx, repository, { page = 0, query = '', edit = false } = {}) {
+  const posts = await listPostsForFileRemoval(repository, query);
+  if (!posts.length) {
+    const text = query
+      ? `No published posts matched "${cleanText(query, 80)}". Try /removefile with a Post ID (e.g. /removefile SB-0123ABCDEF) or /removefile with no arguments to browse recent posts.`
+      : 'No published posts were found in the catalog.';
+    if (edit) await replaceInteractiveMessage(ctx, text);
+    else await ctx.reply(text);
+    return { handled: true, mode: 'empty-posts' };
+  }
+  const totalPages = Math.max(1, Math.ceil(posts.length / REMOVE_FILE_POSTS_PAGE_SIZE));
+  const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const slice = posts.slice(clampedPage * REMOVE_FILE_POSTS_PAGE_SIZE, (clampedPage + 1) * REMOVE_FILE_POSTS_PAGE_SIZE);
+  const rows = slice.map((post) => {
+    const fileCount = Array.isArray(post?.files) ? post.files.length : (Number(post?.fileCount) || 0);
+    const label = telegramButtonText(`🎬 ${cleanText(post.title, 30)} (${post.adminId} · ${fileCount} file${fileCount === 1 ? '' : 's'})`);
+    return [Markup.button.callback(label, `rmfile:post:${post.adminId}:0`)];
+  });
+  if (totalPages > 1) {
+    const nav = [];
+    if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:posts:${clampedPage - 1}`));
+    nav.push(Markup.button.callback(`Page ${clampedPage + 1}/${totalPages}`, 'rmfile:noop'));
+    if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:posts:${clampedPage + 1}`));
+    rows.push(nav);
+  }
+  const text = [
+    'Select a post below to inspect or remove its episodes, movie files, or series files:',
+    query ? `Filter: "${cleanText(query, 60)}" (${posts.length} matching post${posts.length === 1 ? '' : 's'})` : `Showing ${slice.length} of ${posts.length} recent post${posts.length === 1 ? '' : 's'}.`,
+    'You can also jump directly with: /removefile SB-0123ABCDEF'
+  ].join('\n');
+  const keyboard = Markup.inlineKeyboard(rows);
+  if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+  else await ctx.reply(text, keyboard);
+  return { handled: true, mode: 'posts', page: clampedPage, total: posts.length };
+}
+
+export async function renderRemoveFileListForPost(ctx, repository, adminId, { page = 0, edit = false, notice = null } = {}) {
+  const content = await repository.findContentByAdminId?.(adminId);
+  if (!content) {
+    const text = `No published catalog post was found for ${adminId}. Use /removefile to choose from recent posts.`;
+    const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Choose a post', 'rmfile:posts:0')]]);
+    if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+    else await ctx.reply(text, keyboard);
+    return { handled: true, mode: 'missing-post' };
+  }
+  const files = Array.isArray(content.files) ? content.files : [];
+  if (!files.length) {
+    const text = [
+      notice,
+      `${content.adminId} · ${content.title} has no remaining files attached.`,
+      'You can delete the empty post or go back to choose another post.'
+    ].filter(Boolean).join('\n\n');
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(`🗑 Delete empty post ${content.adminId}`, `rmfile:delpost:${content.adminId}`)],
+      [Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0')]
+    ]);
+    if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+    else await ctx.reply(text, keyboard);
+    return { handled: true, mode: 'empty-files', content };
+  }
+  const totalPages = Math.max(1, Math.ceil(files.length / REMOVE_FILE_ITEMS_PAGE_SIZE));
+  const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const startIdx = clampedPage * REMOVE_FILE_ITEMS_PAGE_SIZE;
+  const slice = files.slice(startIdx, startIdx + REMOVE_FILE_ITEMS_PAGE_SIZE);
+  const rows = slice.map((file, offset) => {
+    const fileIndex = startIdx + offset;
+    return [Markup.button.callback(
+      formatRemoveFileButtonLabel(file, fileIndex),
+      `rmfile:pick:${content.adminId}:${fileIndex}:${clampedPage}`
+    )];
+  });
+  if (totalPages > 1) {
+    const nav = [];
+    if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:post:${content.adminId}:${clampedPage - 1}`));
+    nav.push(Markup.button.callback(`Page ${clampedPage + 1}/${totalPages}`, 'rmfile:noop'));
+    if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:post:${content.adminId}:${clampedPage + 1}`));
+    rows.push(nav);
+  }
+  rows.push([Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0')]);
+  const text = [
+    notice,
+    `▸ ${content.adminId} · ${content.title} (${files.length} file${files.length === 1 ? '' : 's'})`,
+    'Tap any episode, movie file, or series file below to remove it:'
+  ].filter(Boolean).join('\n\n');
+  const keyboard = Markup.inlineKeyboard(rows);
+  if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+  else await ctx.reply(text, keyboard);
+  return { handled: true, mode: 'files', content, page: clampedPage, count: files.length };
+}
+
+export async function handleRemoveFileCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return { handled: false, error: 'Unauthorized' };
+  const argument = parseCommandArgument(ctx.message?.text, 300).trim();
+  const explicitIds = postIdsFromCommand(argument);
+  if (explicitIds.length) {
+    return renderRemoveFileListForPost(ctx, repository, explicitIds[0], { page: 0, edit: false });
+  }
+  if (argument) {
+    const matched = await listPostsForFileRemoval(repository, argument);
+    if (matched.length === 1) {
+      return renderRemoveFileListForPost(ctx, repository, matched[0].adminId, { page: 0, edit: false });
+    }
+    return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: argument, edit: false });
+  }
+  return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: '', edit: false });
+}
+
+export async function handleRemoveFileAction(ctx, repository, config, actionData = '') {
+  if (!(await isPublisher(ctx, repository, config))) return false;
+  const key = String(actionData || ctx.callbackQuery?.data || '');
+  if (!key.startsWith('rmfile:')) return false;
+
+  if (key === 'rmfile:noop') {
+    await acknowledgeTap(ctx);
+    return true;
+  }
+
+  const postsPageMatch = key.match(/^rmfile:posts:(\d{1,3})$/);
+  if (postsPageMatch) {
+    await acknowledgeTap(ctx);
+    await renderRemoveFilePostsPicker(ctx, repository, { page: Number(postsPageMatch[1]), edit: true });
+    return true;
+  }
+
+  const postMatch = key.match(/^rmfile:post:(SB-[A-F0-9]{10}):(\d{1,3})$/i);
+  if (postMatch) {
+    await acknowledgeTap(ctx);
+    await renderRemoveFileListForPost(ctx, repository, postMatch[1].toUpperCase(), { page: Number(postMatch[2]), edit: true });
+    return true;
+  }
+
+  const pickMatch = key.match(/^rmfile:pick:(SB-[A-F0-9]{10}):(\d{1,4}):(\d{1,3})$/i);
+  if (pickMatch) {
+    const adminId = pickMatch[1].toUpperCase();
+    const fileIndex = Number(pickMatch[2]);
+    const page = Number(pickMatch[3]) || 0;
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    const file = files[fileIndex];
+    if (!content || !file) {
+      await acknowledgeTap(ctx, 'That file is no longer in this post.', { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page, edit: true, notice: '⚠ That file was already removed.' });
+      return true;
+    }
+    await acknowledgeTap(ctx);
+    const label = formatRemoveFileButtonLabel(file, fileIndex);
+    const quality = cleanText(file.quality || detectMediaQuality({
+      caption: file.sourceLabel || file.displayName,
+      filename: file.name,
+      height: file.height,
+      width: file.width
+    }), 24);
+    const audio = (Array.isArray(file.audioLanguages) && file.audioLanguages.length ? file.audioLanguages : (file.languages || [])).join(', ');
+    const text = [
+      `Selected file in ${content.adminId} · ${content.title}:`,
+      `▪ Name: ${label}`,
+      file.name ? `▪ Filename: ${cleanText(file.name, 120)}` : null,
+      file.episodeLabel ? `▪ Episode: ${file.episodeLabel}` : null,
+      quality ? `▪ Quality: ${quality}` : null,
+      audio ? `▪ Audio: ${audio}` : null,
+      file.storageMessageId ? `▪ Storage ID: ${file.storageMessageId}` : null,
+      '',
+      'Would you like to remove this file from the post, or go back?'
+    ].filter(Boolean).join('\n');
+    const msgToken = file.storageMessageId != null ? String(file.storageMessageId) : 'idx';
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('⬅️ Go back', `rmfile:post:${content.adminId}:${page}`),
+        Markup.button.callback('🗑 Remove', `rmfile:do:${content.adminId}:${fileIndex}:${msgToken}:${page}`)
+      ]
+    ]);
+    await replaceInteractiveMessage(ctx, text, keyboard);
+    return true;
+  }
+
+  const doMatch = key.match(/^rmfile:do:(SB-[A-F0-9]{10}):(\d{1,4}):([A-Za-z0-9_-]+):(\d{1,3})$/i);
+  if (doMatch) {
+    const adminId = doMatch[1].toUpperCase();
+    const fileIndex = Number(doMatch[2]);
+    const storageToken = doMatch[3];
+    const page = Number(doMatch[4]) || 0;
+    if (typeof repository.removeFileFromContentByAdminId !== 'function') {
+      await acknowledgeTap(ctx, 'File removal is not supported by this repository.', { alert: true });
+      return true;
+    }
+    const outcome = await repository.removeFileFromContentByAdminId(adminId, {
+      fileIndex,
+      storageMessageId: storageToken === 'idx' ? null : storageToken
+    });
+    if (!outcome || !outcome.removed) {
+      await acknowledgeTap(ctx, 'That file was already removed.', { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page, edit: true, notice: '⚠ That file was already removed.' });
+      return true;
+    }
+    const removedLabel = formatRemoveFileButtonLabel(outcome.removed, fileIndex);
+    await acknowledgeTap(ctx, `Removed ${removedLabel}`);
+    if (outcome.content && outcome.remainingCount > 0) {
+      queueAnnouncementSync({
+        telegram: ctx.telegram,
+        repository,
+        content: outcome.content,
+        config,
+        adminId: outcome.content.adminId,
+        notifyChatId: chatId(ctx)
+      }, { detached: true });
+    }
+    await renderRemoveFileListForPost(ctx, repository, adminId, {
+      page,
+      edit: true,
+      notice: `✓ Removed "${removedLabel}" from ${adminId} (${outcome.remainingCount} file${outcome.remainingCount === 1 ? '' : 's'} remaining).`
+    });
+    return true;
+  }
+
+  const delPostMatch = key.match(/^rmfile:delpost:(SB-[A-F0-9]{10})$/i);
+  if (delPostMatch) {
+    const adminId = delPostMatch[1].toUpperCase();
+    const deleted = await repository.deleteContentByAdminId?.(adminId);
+    if (deleted) {
+      const references = Array.isArray(deleted.announcementRefs) ? deleted.announcementRefs : [];
+      if (references.length) {
+        queueAnnouncementDeletion({ telegram: ctx.telegram, repository: null, content: deleted, references }, { detached: true });
+      }
+      await acknowledgeTap(ctx, `Deleted ${adminId}`);
+      await renderRemoveFilePostsPicker(ctx, repository, { page: 0, edit: true });
+    } else {
+      await acknowledgeTap(ctx, `${adminId} was already deleted.`, { alert: true });
+      await renderRemoveFilePostsPicker(ctx, repository, { page: 0, edit: true });
+    }
+    return true;
+  }
+
+  return false;
+}
 
 export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null, onRestart = null }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
@@ -7371,7 +7779,8 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
           'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it. /title renames a whole list in one message: one line per post ID, with or without /title at the start of each line, and titles pasted from a filename are tidied as they are saved.',
           'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
           'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
-          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /addchannel CHANNEL_ID · /channels · /requests · /logout'
+          'Remove specific files/episodes: /removefile (or /removefile SB-0123ABCDEF) lets you choose a post, view buttons for every episode, movie file, or series file in that post, and tap any file to choose Go back or Remove.',
+          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /removefile · /addchannel CHANNEL_ID · /channels · /requests · /logout'
         ].join('\n'),
         panelKeyboard()
       );
@@ -7677,6 +8086,13 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   // old/new flow so artwork handling has exactly one behaviour to learn.
   for (const command of ['poster', 'p', 'imgdd']) bot.command(command, handlePosterCommand);
   bot.command('scrape', async (ctx) => handleScrapeCommand(ctx, repository, config));
+  for (const command of ['removefile', 'rmfile', 'delfile', 'deletefile', 'files']) {
+    bot.command(command, async (ctx) => handleRemoveFileCommand(ctx, repository, config));
+  }
+  bot.action(/^rmfile:/, async (ctx) => {
+    const handled = await handleRemoveFileAction(ctx, repository, config, ctx.callbackQuery?.data || '');
+    if (!handled) await acknowledgeTap(ctx, 'That file action is no longer active.');
+  });
 
   bot.action(/^poster:(?:style:(?:old|new)|cancel|retry|pick:\d{1,2})$/, async (ctx) => {
     if (!(await isPublisher(ctx, repository, config))) return;
@@ -8089,11 +8505,14 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   // site up after a deploy, without re-uploading a single file.
   const repairReportText = async ({ dryRun, adminId = null, ctx = null }) => {
     const report = await repository.reindexContent({ dryRun, adminId });
+    const mediaReport = typeof repository.reconcileCatalogMediaFromFiles === 'function'
+      ? await repository.reconcileCatalogMediaFromFiles({ dryRun, adminId }).catch(() => ({ checked: 0, updated: 0, cards: [] }))
+      : { checked: 0, updated: 0, cards: [] };
     if (adminId && !report.checked) {
       return `No published catalog post was found for ${adminId}. Use /posts or /postid to find its current ID.`;
     }
     const lines = [];
-    lines.push(`▸ ${dryRun ? 'Preview · ' : ''}${report.checked} published card${report.checked === 1 ? '' : 's'} checked — ${report.updated} ${dryRun ? 'would be re-indexed' : 're-indexed'}.`);
+    lines.push(`▸ ${dryRun ? 'Preview · ' : ''}${report.checked} published card${report.checked === 1 ? '' : 's'} checked — ${report.updated} ${dryRun ? 'would be re-indexed' : 're-indexed'}${mediaReport.updated ? `, ${mediaReport.updated} ${dryRun ? 'would have' : 'had'} audio/subtitles/qualities synced from files` : ''}.`);
     for (const card of report.cards.slice(0, 10)) {
       lines.push([
         `▪ ${cleanText(card.title, 48)} (${card.adminId})`,
@@ -8105,20 +8524,24 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     const seasonWord = report.seasonPacks
       ? ` ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} on these cards ${report.seasonPacks === 1 ? 'is' : 'are'} filed by season, and`
       : ' and';
-    lines.push(report.updated
+    lines.push(report.updated || mediaReport.updated
       ? `▪ Nothing was dropped${seasonWord} ${report.unindexed} file${report.unindexed === 1 ? ' has' : 's have'} no episode number at all.${dryRun ? ' Re-send those with a caption like “Ep 12” only if a number was really missed.' : ' They stay in the card’s file list and are delivered as files.'}`
       : `▪ Every card already matches the indexing rules in this build${report.seasonPacks ? `, including ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} filed by season` : ''}. Nothing was written.`);
     // The channel post lists how many files and episodes a release carries, so a card
     // whose index changed has an announcement that no longer matches it. Same lane as
     // every other edit, so a site-wide repair cannot burst its way into a flood limit.
-    if (!dryRun && report.updated && ctx && typeof repository.listAnnouncedContent === 'function') {
+    const changedIds = new Set([
+      ...(report.cards || []).map((c) => c.adminId),
+      ...(mediaReport.cards || []).map((c) => c.adminId)
+    ]);
+    if (!dryRun && changedIds.size && ctx && typeof repository.listAnnouncedContent === 'function') {
       const announced = new Set((await repository.listAnnouncedContent({ adminId })).map((entry) => entry.adminId));
       let queuedAnnouncements = 0;
-      for (const card of report.cards) {
-        if (!announced.has(card.adminId)) continue;
-        const content = await repository.findContentByAdminId?.(card.adminId);
+      for (const changedAdminId of changedIds) {
+        if (!announced.has(changedAdminId)) continue;
+        const content = await repository.findContentByAdminId?.(changedAdminId);
         if (!content) continue;
-        queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: card.adminId, notifyChatId: chatId(ctx) }, { detached: true });
+        queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: changedAdminId, notifyChatId: chatId(ctx) }, { detached: true });
         queuedAnnouncements += 1;
       }
       if (queuedAnnouncements) {
@@ -8942,6 +9365,28 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   await runAutomationQueue();
   const automationTimer = setInterval(() => { void runAutomationQueue(); }, AUTO_QUEUE_INTERVAL_MS);
   automationTimer.unref?.();
+
+  // Automatically reconcile stored posts' audio/subtitle languages and video qualities
+  // from their actual files on startup/redeploy (leaving posts without file language tags untouched).
+  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
+    Promise.resolve(repository.reconcileCatalogMediaFromFiles({ dryRun: false }))
+      .then(async (reconciled) => {
+        if (!reconciled?.updated) return;
+        console.info(`[telegram] startup media reconciliation updated ${reconciled.updated} of ${reconciled.checked} catalog post(s) from their file metadata.`);
+        if (typeof repository.listAnnouncedContent === 'function') {
+          const announced = new Set((await repository.listAnnouncedContent()).map((entry) => entry.adminId));
+          for (const card of reconciled.cards || []) {
+            if (!announced.has(card.adminId)) continue;
+            const content = await repository.findContentByAdminId?.(card.adminId);
+            if (!content) continue;
+            queueAnnouncementSync({ telegram: bot.telegram, repository, content, config, adminId: card.adminId }, { detached: true });
+          }
+        }
+      })
+      .catch((error) => {
+        console.warn('[telegram] startup media reconciliation skipped:', automationDiagnostic(error));
+      });
+  }
 
   let monthlyBackupPromise = null;
   const runMonthlyBackupSafely = () => {

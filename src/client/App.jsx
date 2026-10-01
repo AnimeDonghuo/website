@@ -8,7 +8,7 @@ import Header from './components/Header.jsx';
 import { Icon } from './components/Icons.jsx';
 import Artwork from './components/Artwork.jsx';
 import ReleaseCard from './components/ReleaseCard.jsx';
-import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getPlayerIframeUrl, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
+import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getEntryQualities, getPlayerIframeUrl, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, resolveActiveQualityOption, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
 
 const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
 // 18+ stays out of the public homepage rail; it is reachable from the menu and
@@ -842,6 +842,9 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
     ? fileChoicesForEpisode(item?.fileChoices, requestedEpisode)
     : [];
   const [selectedId, setSelectedId] = useState(null);
+  const [selectedQuality, setSelectedQuality] = useState(null);
+  const [manualSubtitle, setManualSubtitle] = useState(null);
+  const subtitleFileInputRef = useRef(null);
   const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
   // The framed provider owns its controls; this is the one thing our side has to offer,
   // because a framed player cannot ask the browser for a screen of its own. It is asked of
@@ -886,7 +889,29 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
 
   useEffect(() => {
     setSelectedId(entries[0]?.id || null);
+    setSelectedQuality(null);
+    setManualSubtitle(null);
   }, [slug, episodeRange, item?.stream?.updatedAt]);
+
+  useEffect(() => {
+    setSelectedQuality(null);
+  }, [selected?.id]);
+
+  function handleManualSubtitleFile(event) {
+    const file = event.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setManualSubtitle({
+          url: reader.result,
+          label: file.name.replace(/\.(srt|vtt|ass|ssa)$/i, '') || 'Manual Sub'
+        });
+      }
+    };
+    reader.readAsDataURL(file);
+    event.target.value = '';
+  }
 
   if (adultLocked) {
     return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
@@ -911,7 +936,10 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
   }
 
   const selectedTitle = playerDisplayName(selected);
-  const target = getProtectedPlaybackTarget(selected);
+  const availableQualities = getEntryQualities(selected);
+  const activeQualityOption = resolveActiveQualityOption(selected, selectedQuality);
+  const activeQualityKey = activeQualityOption?.id || activeQualityOption?.quality || selectedQuality || null;
+  const target = getProtectedPlaybackTarget(selected, { selectedQuality: activeQualityKey });
   const nextEpisodeGroup = requestedEpisode && Array.isArray(item?.episodeGroups)
     ? item.episodeGroups.find((g) => {
         const currentEnd = Number(requestedEpisode.end) || Number(requestedEpisode.start);
@@ -934,7 +962,12 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
       title: `${item.title} — ${selectedFileTitle}`,
       label: playerShortName(selected),
       poster: item.posterUrl || '',
-      next: nextEpisodeUrl || ''
+      next: nextEpisodeUrl || '',
+      quality: activeQualityOption?.quality || selected?.quality || '',
+      qualities: availableQualities,
+      subUrl: manualSubtitle?.url || '',
+      subLabel: manualSubtitle?.label || '',
+      noAudioSelect: true
     });
   } else if (selected?.embedUrl && !/t\.me\/c\//i.test(selected.embedUrl)) {
     playerIframeSrc = selected.embedUrl;
@@ -961,6 +994,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               <h1>{selectedFileTitle}</h1>
               <p className="watch-hero__meta">
                 {heading.meta.map((line) => <span className="watch-hero__episode" key={line}>{line}</span>)}
+                {activeQualityOption?.quality ? <span className="watch-hero__episode">{activeQualityOption.quality}</span> : null}
                 {entries.length > 1 ? <span>{entries.length} players available</span> : null}
                 <span>Now playing on {selectedTitle}</span>
               </p>
@@ -969,7 +1003,7 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
           <div className="watch-player-shell">
             {playerIframeSrc ? (
               <iframe
-                key={selected?.id || 'main-player'}
+                key={`${selected?.id || 'main-player'}:${activeQualityKey || 'default'}:${manualSubtitle?.label || 'nosub'}`}
                 ref={playerFrame}
                 className="watch-player-shell__frame"
                 src={playerIframeSrc}
@@ -991,16 +1025,63 @@ function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult
               </div>
             )}
           </div>
-          {playerIframeSrc && canFullScreen ? (
+          {playerIframeSrc ? (
             <div className="watch-player-controls">
+              {canFullScreen ? (
+                <button
+                  type="button"
+                  onClick={toggleFullScreen}
+                  aria-pressed={fullScreen}
+                  title="Fill the screen with the player, as its own full-screen button would"
+                >
+                  <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
+                </button>
+              ) : null}
+              <input
+                ref={subtitleFileInputRef}
+                type="file"
+                accept=".srt,.vtt,.ass,.ssa"
+                style={{ display: 'none' }}
+                onChange={handleManualSubtitleFile}
+              />
               <button
                 type="button"
-                onClick={toggleFullScreen}
-                aria-pressed={fullScreen}
-                title="Fill the screen with the player, as its own full-screen button would"
+                onClick={() => subtitleFileInputRef.current?.click()}
+                title="Load a manual subtitle file (.srt or .vtt)"
               >
-                <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
+                <Icon name="layers" size={13} /> {manualSubtitle ? `Subtitle: ${manualSubtitle.label}` : 'Add manual subtitle'}
               </button>
+              {manualSubtitle ? (
+                <button
+                  type="button"
+                  onClick={() => setManualSubtitle(null)}
+                  title="Remove manual subtitle"
+                >
+                  Clear subtitle
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {availableQualities.length > 0 ? (
+            <div className="watch-player-options watch-player-options--quality" aria-label="Quality options">
+              <span>Quality</span>
+              <div>
+                {availableQualities.map((qOpt) => {
+                  const optKey = qOpt.id || qOpt.quality;
+                  const isActive = (activeQualityOption?.id || activeQualityOption?.quality) === optKey;
+                  return (
+                    <button
+                      className={isActive ? 'is-active' : ''}
+                      type="button"
+                      key={optKey}
+                      onClick={() => setSelectedQuality(optKey)}
+                      aria-pressed={isActive}
+                    >
+                      <Icon name="play" size={13} /> {qOpt.label || qOpt.quality}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           ) : null}
           {externalPlayerUrl ? <div className="watch-player-note">

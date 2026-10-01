@@ -207,7 +207,12 @@ function publicFileChoices(files, config, shareCode, content) {
   const choices = files.map((file, index) => {
     const episode = publicEpisodeGroups([file?.episode])[0] || null;
     const season = attributedSeasons[index] ?? null;
-    const quality = cleanText(file?.quality, 20) || detectMediaQuality({ filename: file?.name, caption: file?.sourceLabel || file?.displayName });
+    const quality = cleanText(file?.quality, 20) || detectMediaQuality({
+      filename: file?.name,
+      caption: file?.sourceLabel || file?.displayName,
+      height: file?.height,
+      width: file?.width
+    });
     const label = publicFileChoiceLabel(file, content, index);
     const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
     const deliveryUrl = getDeliveryRedirectPath(shareCode, index + 1);
@@ -710,6 +715,11 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
 export async function startServer() {
   const config = loadConfig();
   const repository = await createCatalogRepository(config);
+  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
+    await repository.reconcileCatalogMediaFromFiles({ dryRun: false }).catch((error) => {
+      console.warn('[server] startup media reconciliation skipped:', error?.message || error);
+    });
+  }
   const subsPlease = createSubsPleaseService({ repository });
   const app = createApp({ config, repository, subsPlease });
   // Feed outages never block server startup or Telegram publishing.

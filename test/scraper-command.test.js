@@ -386,7 +386,8 @@ test('handleScrapeCommand updates an active draft session when no Post ID is giv
   assert.equal(updatedSession.title, 'Scraped Movie');
   assert.equal(updatedSession.year, 2024);
   assert.deepEqual(updatedSession.genres, ['Action', 'Adventure']);
-  assert.deepEqual(updatedSession.languages, ['English']);
+  // Scraped website languages must NOT overwrite draft/post languages unless derived from files
+  assert.equal(updatedSession.languages, undefined);
   assert.equal(updatedSession.posterUrl, 'https://i.ibb.co/abc/scraped-mirrored.png');
 
   assert.ok(replies.some((r) => r.includes('Scraped from imdb.com and updated active draft')));
@@ -488,6 +489,8 @@ test('handleScrapeCommand updates an existing published post with scraped metada
 
   const updated = await repository.findContentByAdminId(adminId);
   assert.equal(updated.title, 'Cyberpunk: Edgerunners');
+  assert.equal(updated.category, 'anime');
+  assert.deepEqual(updated.languages, ['Hindi']);
   assert.equal(updated.releaseLabel, 'TV Series');
   assert.ok(updated.description.includes('body modification-obsessed'));
   assert.deepEqual(updated.genres, ['Anime', 'Sci-Fi', 'Action']);
@@ -496,7 +499,7 @@ test('handleScrapeCommand updates an existing published post with scraped metada
   assert.equal(updated.poster?.originalUrl, 'https://occ.a.nflxso.net/cyberpunk.jpg');
 
   assert.ok(replies.some((r) => r.includes(`Scraped from netflix.com and updated ${adminId}`)));
-  assert.ok(replies.some((r) => r.includes('Card: https://sorabox.in/movie/')));
+  assert.ok(replies.some((r) => r.includes('Card: https://sorabox.in/anime/')));
 });
 
 test('handleScrapeCommand falls back gracefully when ImgBB is rate limited', async (t) => {

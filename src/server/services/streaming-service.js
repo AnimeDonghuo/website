@@ -1,5 +1,5 @@
 import { cleanText, resolveCategoryId } from '../lib/strings.js';
-import { detectMediaQuality, qualityHeight } from './episode-service.js';
+import { detectMediaQuality, normalizeQualityLabel, qualityHeight } from './episode-service.js';
 import { bareChannelId } from './playback-service.js';
 
 // This feature deliberately imports only a small publisher-supplied manifest.
@@ -655,12 +655,29 @@ function normalizedStoredEntry(entry, { allowedHosts = DEFAULT_STREAMING_HOSTS }
     (embedUrl && /t\.me\/c\/[1-9]\d*\/[1-9]\d*/i.test(embedUrl) ? embedUrl.match(/(https?:\/\/t\.me\/c\/[1-9]\d*\/[1-9]\d*)/i)?.[1] : null) ||
     (watchUrl && /t\.me\/c\/[1-9]\d*\/[1-9]\d*/i.test(watchUrl) ? watchUrl.match(/(https?:\/\/t\.me\/c\/[1-9]\d*\/[1-9]\d*)/i)?.[1] : null) || null;
   const watchId = cleanText(object.watchId || object.videoId, 100) || null;
+  const quality = object.quality ? normalizeQualityLabel(object.quality) : null;
+  const qualities = Array.isArray(object.qualities)
+    ? object.qualities
+        .filter((q) => q && typeof q === 'object' && (q.telegramUrl || q.embedUrl || q.watchUrl))
+        .map((q) => ({
+          id: cleanText(q.id, 100) || null,
+          quality: normalizeQualityLabel(q.quality || q.label) || cleanText(q.label, 30) || 'AUTO',
+          label: cleanText(q.label || q.quality, 30) || 'Auto',
+          height: Number.isInteger(Number(q.height)) ? Number(q.height) : qualityHeight(q.quality || q.label),
+          storageMessageId: Number.isInteger(Number(q.storageMessageId)) ? Number(q.storageMessageId) : null,
+          telegramUrl: cleanText(q.telegramUrl || q.watchUrl, 300) || null,
+          watchUrl: cleanText(q.watchUrl || q.telegramUrl, 300) || null,
+          embedUrl: cleanText(q.embedUrl, 400) || null
+        }))
+    : [];
   return {
     label: cleanText(object.label, 100) || episode?.label || 'Main player',
     episode,
     videoId: cleanText(object.videoId, 100) || null,
     watchId,
     telegramUrl,
+    quality,
+    qualities,
     provider: cleanText(object.provider, 60) || server,
     // Derived from the URL on every read, so links saved before server naming
     // existed display correctly without touching stored data.
@@ -719,7 +736,9 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
       embedUrl: dailymotionPlayerUrl(entry.embedUrl || null),
       watchUrl: entry.watchUrl || null,
       telegramUrl: entry.telegramUrl || null,
-      watchId: entry.watchId || null
+      watchId: entry.watchId || null,
+      quality: entry.quality || null,
+      qualities: Array.isArray(entry.qualities) ? entry.qualities : []
     }));
   return {
     available: entries.length > 0,
@@ -772,8 +791,8 @@ export function removeStreamingEntries(stream, { indexes = null, ids = null, epi
 }
 
 export function compareFilesByQualityAscending(first, second) {
-  const q1 = first?.quality || detectMediaQuality({ filename: first?.name, caption: first?.sourceLabel || first?.displayName });
-  const q2 = second?.quality || detectMediaQuality({ filename: second?.name, caption: second?.sourceLabel || second?.displayName });
+  const q1 = first?.quality || detectMediaQuality({ filename: first?.name, caption: first?.sourceLabel || first?.displayName, height: first?.height, width: first?.width });
+  const q2 = second?.quality || detectMediaQuality({ filename: second?.name, caption: second?.sourceLabel || second?.displayName, height: second?.height, width: second?.width });
 
   const height1 = qualityHeight(q1);
   const height2 = qualityHeight(q2);
@@ -814,10 +833,48 @@ function fileChannelNumber(file, content, config = {}) {
   return bareChannelId(rawChannel) || '2617067511';
 }
 
+function buildTelegramQualityOptions(sortedFiles, content, config, playerOrigin) {
+  const options = [];
+  const seen = new Set();
+  for (let index = 0; index < sortedFiles.length; index += 1) {
+    const file = sortedFiles[index];
+    const channelNumber = fileChannelNumber(file, content, config);
+    const postUrl = `https://t.me/c/${channelNumber}/${file.storageMessageId}`;
+    const rawQuality = file?.quality || detectMediaQuality({
+      filename: file?.name,
+      caption: file?.sourceLabel || file?.displayName,
+      height: file?.height,
+      width: file?.width
+    });
+    const normalizedQuality = rawQuality ? normalizeQualityLabel(rawQuality) : null;
+    const height = qualityHeight(normalizedQuality);
+    const baseLabel = normalizedQuality || (sortedFiles.length === 1 ? 'Auto' : `Source ${index + 1}`);
+    let label = baseLabel;
+    let suffix = 2;
+    while (seen.has(label.toUpperCase())) {
+      label = `${baseLabel} (${suffix})`;
+      suffix += 1;
+    }
+    seen.add(label.toUpperCase());
+    const embedUrl = `${playerOrigin}/watch?url=${encodeURIComponent(postUrl)}`;
+    options.push({
+      id: `tg-${channelNumber}-${file.storageMessageId}`,
+      quality: normalizedQuality || label.toUpperCase(),
+      label,
+      height: height || null,
+      storageMessageId: Number(file.storageMessageId),
+      telegramUrl: postUrl,
+      watchUrl: postUrl,
+      embedUrl
+    });
+  }
+  return options;
+}
+
 /**
  * Automatically derive Telegram streaming player entries for every post and episode
- * using the lowest quality DB post URL available to avoid server overload.
- * If only 1080p is available, 1080p is still used.
+ * using the lowest quality DB post URL available to avoid server overload,
+ * while exposing all available quality variants so the player can switch post links.
  */
 export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
   if (!content) return [];
@@ -838,6 +895,7 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
     const channelNumber = fileChannelNumber(lowest, content, config);
     const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
     const embedUrl = `${playerOrigin}/watch?url=${encodeURIComponent(postUrl)}`;
+    const qualities = buildTelegramQualityOptions(sorted, content, config, playerOrigin);
     return [{
       id: `tg-${channelNumber}-${lowest.storageMessageId}`,
       label: 'Main player',
@@ -846,7 +904,9 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
       server: 'Telegram server',
       embedUrl,
       watchUrl: postUrl,
-      telegramUrl: postUrl
+      telegramUrl: postUrl,
+      quality: qualities[0]?.quality || null,
+      qualities
     }];
   }
 
@@ -876,6 +936,7 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
     const postUrl = `https://t.me/c/${channelNumber}/${lowest.storageMessageId}`;
     const epLabel = lowest.episode?.label || (lowest.episode?.start ? `Episode ${String(lowest.episode.start).padStart(2, '0')}` : 'Main player');
     const embedUrl = `${playerOrigin}/watch?url=${encodeURIComponent(postUrl)}`;
+    const qualities = buildTelegramQualityOptions(group, content, config, playerOrigin);
     entries.push({
       id: `tg-${channelNumber}-${lowest.storageMessageId}`,
       label: epLabel,
@@ -884,7 +945,9 @@ export function deriveLowestQualityTelegramStreamEntries(content, config = {}) {
       server: 'Telegram server',
       embedUrl,
       watchUrl: postUrl,
-      telegramUrl: postUrl
+      telegramUrl: postUrl,
+      quality: qualities[0]?.quality || null,
+      qualities
     });
   }
 

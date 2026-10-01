@@ -125,11 +125,11 @@ const QUALITY_HEIGHTS = new Map([
 ]);
 const K_RESOLUTION_HEIGHTS = new Map([[2, 1440], [4, 2160], [5, 2880], [6, 3840], [8, 4320]]);
 
-/** `1080p`, `1080`, `FHD` and `4K` all collapse into one comparable label. */
+/** `1080p`, `1080`, `544p`, `288p`, `144p`, `FHD` and `4K` all collapse into one comparable label. */
 export function normalizeQualityLabel(value) {
   const raw = cleanText(value, 24).toUpperCase().replace(/\s+/g, '');
   if (!raw) return null;
-  const pixels = raw.match(/^(\d{3,4})P?$/);
+  const pixels = raw.match(/^(\d{3,4})[PI]?$/);
   if (pixels) return `${pixels[1]}P`;
   const k = raw.match(/^(\d{1,2})K$/);
   if (k) return `${k[1]}K`;
@@ -306,6 +306,11 @@ export function extractEpisodeRange(value) {
   return null;
 }
 
+const QUALITY_NOISE_REGEX = /\b(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})\s*[pPiI]\b|\b(?:144|180|240|270|288|360|400|480|504|540|544|576|640|720|800|900|1080|1440|2160|4320)\s*[pPiI]?\b|\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/gi;
+const PROVIDER_NOISE_REGEX = /\b(?:nf|netflix|amzn|amazon|prime(?:video)?|dsnp|dsnk|disney\+?|(?:jio\s*)?hotstar|jio\s*cinema|zee\s*5?|sony\s*liv|sliv|sun\s*nxt|snxt|mx(?:\s*player)?|alt\s*balaji|aha|hoichoi|voot|hulu|hbo(?:\s*max)?|hmax|max|atvp|apple\s*tv\+?|pcok|peacock|pmtp|paramount\+?|lionsgate(?:\s*play)?|lgp|eros(?:\s*now)?|ullu|chaupal|stage|addatimes|klikk|shemaroo(?:me)?|discovery\+?|dplus|bbc|iplayer|itvx|stan|youtube|tubi|crunchyroll|cr|bilibili|b-global|bglobal|wetv|iqiyi|youku|mgtv|tencent|viki|viu|wavve|tving|coupang|hidive|funimation|muse|ani-one|anione|abema)\b/gi;
+const ENCODER_AND_RIP_NOISE_REGEX = /\b(?:web[- ]?(?:dl|rip|hd)?|webdl|webrip|webhd|blu[- ]?ray|bdrip|brrip|brip|hdrip|dvdrip|dvdscr|remux|cam|hdcam|hdts|telesync|telecine|predvd|proper|repack|rerip|uncut|extended|unrated|remastered|rarbg|yts|yify|psa|pahe|tgx|kayoanime|animekayo|subsplease|erai-raws|horriblesubs|nyaa|ember|judas|flux|ntb|ethel|playweb)\b/gi;
+const CODEC_AND_SIZE_NOISE_REGEX = /\b(?:x\s*26[45]|h\s*\.?\s*26[45]|hevc|av1|avc1?|vp9|10[- ]?bit|8[- ]?bit|hi10p)\b|\b(?:ddp?|dd\+|eac3|ac3|truehd|dts(?:[- ]?hd)?|aac|opus|flac|mp3|lpcm)(?:[- .\s]*\d+(?:[.\s]\d+)?)?\b|\b(?:atmos|dolby[- ]?vision|dovi|dv|hdr10(?:\+)?|hdr|hlg|sdr)\b|\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|gib|mib)\b/gi;
+
 export function cleanMediaName(value) {
   const withoutAttribution = stripTelegramAttribution(value)
     // Release extensions and bracketed group/source labels do not identify a title.
@@ -318,15 +323,13 @@ export function cleanMediaName(value) {
     // Remove only a standalone season package label. The negative lookahead
     // deliberately keeps S01E03 / Season 1 Episode 3 for episode detection.
     .replace(/\bS(?:EASON)?\s*0*\d{1,2}(?!\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3})\b/gi, ' ')
-    .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
-    .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
-    .replace(/\b(?:web[- ]?(?:dl|rip)?|blu[- ]?ray|brrip|hdrip|dvdrip|remux|cam|hdcam|predvd|proper|repack|uncut|extended|unrated)\b/gi, ' ')
-    .replace(/\b(?:x\s*26[45]|h\s*26[45]|hevc|av1|avc|vp9|10bit|8bit)\b/gi, ' ')
-    .replace(/\b(?:ddp?|eac3|ac3|truehd|dts(?:[- ]?hd)?|aac|opus|flac|mp3)\s*\d+(?:\s+\d+)?\b/gi, ' ')
-    .replace(/\b(?:atmos|dolby[- ]?vision|hdr10(?:\+)?|sdr)\b/gi, ' ')
+    .replace(QUALITY_NOISE_REGEX, ' ')
+    .replace(/\b(?:2k|4k|5k|6k|8k|uhd|qhd|fhd|hd|sd)\b/gi, ' ')
+    .replace(ENCODER_AND_RIP_NOISE_REGEX, ' ')
+    .replace(CODEC_AND_SIZE_NOISE_REGEX, ' ')
     // Common providers/release labels found in direct Telegram uploads.
-    .replace(/\b(?:nf|netflix|amzn|amazon|prime(?:video)?|zee\s*5?|jiocinema|jiohotstar|hotstar|sonyliv|sony\s*liv|mx(?:player)?|altbalaji|aha|hoichoi|voot|hulu|hbo(?:max)?|max|atvp|apple\s*tv\+?|disney\+?|youtube|tubi|crunchyroll|bilibili|wetv|iqiyi)\b/gi, ' ')
-    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio)\b/gi, ' ')
+    .replace(PROVIDER_NOISE_REGEX, ' ')
+    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio|org|hq|hc|korsub|msubs?|multisubs?)\b/gi, ' ')
     .replace(RELEASE_SUBTITLE_TAG, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -345,25 +348,38 @@ export function cleanDeliveryFileName(value) {
     .replace(/[\[\(][^\]\)]{0,160}[\]\)]/g, ' ')
     .replace(/[._~|]+/g, ' ')
     .replace(/\b(?:19\d{2}|20\d{2})\b/g, ' ')
-    .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
-    .replace(/\b(?:4k|8k|uhd|fhd|hd)\b/gi, ' ')
-    .replace(/\b(?:web[- ]?(?:dl|rip)?|blu[- ]?ray|brrip|hdrip|dvdrip|remux|cam|hdcam|predvd|proper|repack|uncut|extended|unrated)\b/gi, ' ')
-    .replace(/\b(?:x\s*26[45]|h\s*26[45]|hevc|av1|avc|vp9|10bit|8bit)\b/gi, ' ')
-    .replace(/\b(?:ddp?|eac3|ac3|truehd|dts(?:[- ]?hd)?|aac|opus|flac|mp3)\s*\d+(?:\s+\d+)?\b/gi, ' ')
-    .replace(/\b(?:atmos|dolby[- ]?vision|hdr10(?:\+)?|sdr)\b/gi, ' ')
-    .replace(/\b(?:nf|netflix|amzn|amazon|prime(?:video)?|zee\s*5?|jiocinema|jiohotstar|hotstar|sonyliv|sony\s*liv|mx(?:player)?|altbalaji|aha|hoichoi|voot|hulu|hbo(?:max)?|max|atvp|apple\s*tv\+?|disney\+?|youtube|tubi|crunchyroll|bilibili|wetv|iqiyi)\b/gi, ' ')
-    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio)\b/gi, ' ')
+    .replace(QUALITY_NOISE_REGEX, ' ')
+    .replace(/\b(?:2k|4k|5k|6k|8k|uhd|qhd|fhd|hd|sd)\b/gi, ' ')
+    .replace(ENCODER_AND_RIP_NOISE_REGEX, ' ')
+    .replace(CODEC_AND_SIZE_NOISE_REGEX, ' ')
+    .replace(PROVIDER_NOISE_REGEX, ' ')
+    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio|org|hq|hc|korsub|msubs?|multisubs?)\b/gi, ' ')
     .replace(RELEASE_SUBTITLE_TAG, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return cleanText(label, 180);
 }
 
-export function detectMediaQuality({ caption, filename }) {
+export function detectMediaQuality({ caption, filename, height = null, width = null } = {}) {
   const candidates = [stripTelegramAttribution(caption), stripTelegramAttribution(filename)].filter(Boolean);
   for (const candidate of candidates) {
-    const match = candidate.match(/\b(8k|4k|2160p|1440p|1080p|720p|576p|540p|480p|360p)\b/i);
-    if (match) return match[1].toUpperCase();
+    const match = candidate.match(/\b(8k|6k|5k|4k|2k|(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})[pPiI])\b/i);
+    if (match) return normalizeQualityLabel(match[1]);
+    const dimMatch = candidate.match(/\b(\d{3,4})\s*[xX×]\s*(\d{3,4})\b/);
+    if (dimMatch) {
+      const w = Number(dimMatch[1]);
+      const h = Number(dimMatch[2]);
+      const vertical = Math.min(w, h);
+      if (vertical >= 120 && vertical <= 4320) return `${vertical}P`;
+    }
+  }
+  const numericHeight = Number(height);
+  const numericWidth = Number(width);
+  if (Number.isInteger(numericHeight) && numericHeight >= 120 && numericHeight <= 4320) {
+    const vertical = Number.isInteger(numericWidth) && numericWidth > 0
+      ? Math.min(numericHeight, numericWidth)
+      : numericHeight;
+    if (vertical >= 120 && vertical <= 4320) return `${vertical}P`;
   }
   return null;
 }
@@ -394,7 +410,10 @@ export function publicFileDisplayName(value) {
 export function trailingEpisodeHint(file) {
   const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`;
   const scrubbed = raw
-    .replace(/\b(?:240|360|480|720|1080|1440|2160)[pPiI]?\b/g, ' ')
+    .replace(/\b(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})[pPiI]\b/g, ' ')
+    .replace(/\b(?:144|180|240|270|288|360|400|480|504|540|544|576|640|720|800|900|1080|1440|2160|4320)[pPiI]?\b/g, ' ')
+    .replace(/\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/g, ' ')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|gib|mib)\b/gi, ' ')
     .replace(/\b(?:19|20)\d{2}\b/g, ' ')
     .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts)\b/gi, ' ');
   const numbers = [...scrubbed.matchAll(/\b0*(\d{1,3})\b/g)].map((match) => Number(match[1]));

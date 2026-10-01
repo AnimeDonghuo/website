@@ -1,7 +1,8 @@
 import { MongoClient } from 'mongodb';
 import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
-import { cleanMediaName, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { cleanMediaName, detectMediaQuality, detectUploadLanguages, detectUploadSubtitleLanguages, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { mergeContentStreamWithTelegramFiles } from './services/streaming-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -662,8 +663,12 @@ function contentMetadataPatch(content, requested = {}) {
     year,
     languages: visibleLanguages,
     subtitleLanguages,
-    subtitleLanguageSource: requested.subtitleLanguages === undefined ? content.subtitleLanguageSource || null : 'manual',
-    languageSource: requested.languages === undefined ? content.languageSource || null : 'manual',
+    subtitleLanguageSource: requested.subtitleLanguageSource !== undefined
+      ? requested.subtitleLanguageSource
+      : (requested.subtitleLanguages === undefined ? content.subtitleLanguageSource || null : 'manual'),
+    languageSource: requested.languageSource !== undefined
+      ? requested.languageSource
+      : (requested.languages === undefined ? content.languageSource || null : 'manual'),
     genres,
     description,
     status,
@@ -827,6 +832,208 @@ export function reindexContentRecord(content) {
     notes,
     unindexed,
     seasonPacks
+  };
+}
+
+/**
+ * Automatically check and fix a stored content record's file qualities, audio languages,
+ * and subtitle languages using what its files actually have.
+ * If the files do not specify any audio or subtitle languages, no change is made to audio or sub.
+ */
+export function reconcileContentMediaRecord(content, config = null) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content, changed: false, patch: {}, notes: [] };
+  }
+  const notes = [];
+  let filesChanged = false;
+  const enrichedFiles = content.files.map((file) => {
+    if (!file || typeof file !== 'object') return file;
+    let nextFile = file;
+    const caption = file.sourceLabel || file.displayName || '';
+    const filename = file.name || '';
+    if (!file.quality) {
+      const detectedQuality = detectMediaQuality({ caption, filename, height: file.height, width: file.width });
+      if (detectedQuality) {
+        nextFile = { ...nextFile, quality: detectedQuality };
+        filesChanged = true;
+      }
+    }
+    if (!Array.isArray(file.audioLanguages) || !file.audioLanguages.length) {
+      const detectedAudio = detectUploadLanguages({ caption, filename });
+      if (Array.isArray(detectedAudio) && detectedAudio.length) {
+        nextFile = { ...nextFile, audioLanguages: detectedAudio, languages: detectedAudio };
+        filesChanged = true;
+      }
+    }
+    if (!Array.isArray(file.subtitleLanguages) || !file.subtitleLanguages.length) {
+      const detectedSubs = detectUploadSubtitleLanguages({ caption, filename });
+      if (Array.isArray(detectedSubs) && detectedSubs.length) {
+        nextFile = { ...nextFile, subtitleLanguages: detectedSubs };
+        filesChanged = true;
+      }
+    }
+    return nextFile;
+  });
+
+  const baseRecord = filesChanged ? { ...content, files: enrichedFiles } : content;
+  const reindexed = reindexContentRecord(baseRecord);
+  const patchFields = { ...reindexed.patch };
+  if (filesChanged && !patchFields.files) {
+    patchFields.files = reindexed.content.files;
+  }
+  notes.push(...reindexed.notes);
+
+  const effectiveFiles = patchFields.files || content.files || [];
+  const fileAudio = summarizeUploadLanguages(effectiveFiles);
+  const fileSubs = summarizeSubtitleLanguages(effectiveFiles);
+
+  if (fileAudio.length > 0) {
+    if (JSON.stringify(content.languages || []) !== JSON.stringify(fileAudio) || content.languageSource !== 'upload') {
+      patchFields.languages = fileAudio;
+      patchFields.languageSource = 'upload';
+      notes.push(`audio → ${fileAudio.join(', ')}`);
+    }
+  }
+
+  if (fileSubs.length > 0) {
+    if (JSON.stringify(content.subtitleLanguages || []) !== JSON.stringify(fileSubs) || content.subtitleLanguageSource !== 'upload') {
+      patchFields.subtitleLanguages = fileSubs;
+      patchFields.subtitleLanguageSource = 'upload';
+      notes.push(`subtitles → ${fileSubs.join(', ')}`);
+    }
+  } else if (content.subtitleLanguageSource !== 'manual' && Array.isArray(content.subtitleLanguages) && content.subtitleLanguages.length > 0 && fileAudio.length > 0) {
+    patchFields.subtitleLanguages = [];
+    patchFields.subtitleLanguageSource = null;
+    notes.push('subtitles cleared (not in files)');
+  }
+
+  if (patchFields.languages || patchFields.subtitleLanguages) {
+    const nextLanguages = patchFields.languages || content.languages || [];
+    const nextSubtitles = patchFields.subtitleLanguages || content.subtitleLanguages || [];
+    const nextGroups = patchFields.episodeGroups || content.episodeGroups || [];
+    const nextCount = patchFields.episodeCount !== undefined ? patchFields.episodeCount : content.episodeCount;
+    patchFields.searchText = [
+      content.title,
+      content.description,
+      content.category,
+      ...nextLanguages,
+      ...nextSubtitles,
+      ...(content.genres || []),
+      episodeSearchText(nextGroups, nextCount)
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  if (filesChanged && effectiveFiles.length > 0) {
+    const updatedStream = mergeContentStreamWithTelegramFiles(content.stream, { ...content, ...patchFields, files: effectiveFiles }, config || {});
+    if (JSON.stringify(updatedStream?.entries || []) !== JSON.stringify(content.stream?.entries || [])) {
+      patchFields.stream = updatedStream;
+    }
+  }
+
+  const changed = Object.keys(patchFields).length > 0;
+  return {
+    content: changed ? { ...content, ...patchFields } : content,
+    changed,
+    patch: patchFields,
+    notes
+  };
+}
+
+function removeFileFromContentRecord(content, { storageMessageId = null, fileIndex = null, config = null } = {}) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content: null, removedFile: null, patch: null };
+  }
+  const files = [...content.files];
+  let targetIdx = -1;
+  if (storageMessageId !== null && storageMessageId !== undefined && Number(storageMessageId) > 0) {
+    targetIdx = files.findIndex((f) => Number(f?.storageMessageId) === Number(storageMessageId));
+  }
+  if (targetIdx === -1 && fileIndex !== null && fileIndex !== undefined && Number.isInteger(Number(fileIndex))) {
+    const idx = Number(fileIndex);
+    if (idx >= 0 && idx < files.length) targetIdx = idx;
+  }
+  if (targetIdx === -1) {
+    return { content, removedFile: null, patch: null };
+  }
+
+  const [removedFile] = files.splice(targetIdx, 1);
+  const repairedFiles = repairEpisodeGaps(files, {
+    episodic: isEpisodicCategory(content.category)
+  }).map(sanitizeStoredFileRecord).filter(Boolean);
+  const episodeSummary = summarizeEpisodes(repairedFiles);
+  const episodeGroups = episodeSummary.groups;
+  const episodeCount = episodeSummary.count || 0;
+  const filesCount = repairedFiles.length;
+  const hasDelivery = filesCount > 0;
+  const releaseLabel = episodeSummary.releaseLabel || (filesCount === 1 ? 'Feature' : filesCount > 1 ? `${filesCount} files` : 'No files');
+
+  const fileAudio = summarizeUploadLanguages(repairedFiles);
+  const fileSubs = summarizeSubtitleLanguages(repairedFiles);
+  const languages = fileAudio.length > 0 ? fileAudio : (content.languages || []);
+  const subtitleLanguages = fileSubs.length > 0 ? fileSubs : (content.subtitleLanguages || []);
+  const languageSource = fileAudio.length > 0 ? 'upload' : (content.languageSource || null);
+  const subtitleLanguageSource = fileSubs.length > 0 ? 'upload' : (content.subtitleLanguageSource || null);
+
+  const nextCandidate = {
+    ...content,
+    files: repairedFiles,
+    fileCount: filesCount,
+    filesCount,
+    episodeGroups,
+    episodeCount,
+    releaseLabel,
+    hasDelivery,
+    languages,
+    subtitleLanguages,
+    languageSource,
+    subtitleLanguageSource
+  };
+
+  // Strip any stored Telegram stream entry pointing to the removed file's storageMessageId
+  let cleanedExistingStream = content.stream;
+  if (cleanedExistingStream && Array.isArray(cleanedExistingStream.entries) && Number(removedFile?.storageMessageId) > 0) {
+    const msgId = Number(removedFile.storageMessageId);
+    const filteredEntries = cleanedExistingStream.entries.filter((entry) => {
+      const url = `${entry?.telegramUrl || ''} ${entry?.embedUrl || ''} ${entry?.watchUrl || ''}`;
+      return !new RegExp(`/${msgId}(?:\\b|$|[?&])`).test(url);
+    });
+    cleanedExistingStream = filteredEntries.length ? { ...cleanedExistingStream, entries: filteredEntries } : null;
+  }
+  const stream = repairedFiles.length > 0
+    ? mergeContentStreamWithTelegramFiles(cleanedExistingStream, nextCandidate, config || {})
+    : cleanedExistingStream;
+
+  const searchText = [
+    content.title,
+    content.description,
+    content.category,
+    ...languages,
+    ...subtitleLanguages,
+    ...(content.genres || []),
+    episodeSearchText(episodeGroups, episodeCount)
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+
+  const patch = {
+    files: repairedFiles,
+    fileCount: filesCount,
+    filesCount,
+    episodeGroups,
+    episodeCount,
+    releaseLabel,
+    hasDelivery,
+    languages,
+    subtitleLanguages,
+    languageSource,
+    subtitleLanguageSource,
+    stream: stream || null,
+    searchText,
+    updatedAt: new Date().toISOString()
+  };
+
+  return {
+    content: { ...content, ...patch },
+    removedFile,
+    patch
   };
 }
 
@@ -1117,6 +1324,43 @@ export class MemoryCatalogRepository {
       report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
     }
     return report;
+  }
+
+  async reconcileCatalogMediaFromFiles({ dryRun = false, limit = 5_000, adminId = null, config = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [] };
+    for (const [slug, saved] of [...this.contents.entries()]) {
+      if (wanted && saved.adminId !== wanted) continue;
+      if (report.checked >= Math.max(1, Number(limit) || 5_000)) break;
+      report.checked += 1;
+      const result = reconcileContentMediaRecord(saved, config);
+      if (!result.changed) continue;
+      const nextSaved = { ...result.content, updatedAt: new Date().toISOString() };
+      if (!dryRun) this.contents.set(slug, nextSaved);
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, content: clone(nextSaved) });
+    }
+    return report;
+  }
+
+  async removeFileFromContentByAdminId(adminId, options = {}) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const saved = this.contents.get(item.slug);
+    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!removedFile || !patch) {
+      return { content: clone(saved), removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+    }
+    Object.assign(saved, patch);
+    this.contents.set(saved.slug, saved);
+    const clonedRemoved = clone(removedFile);
+    return {
+      content: clone(saved),
+      removed: clonedRemoved,
+      removedFile: clonedRemoved,
+      remainingCount: Array.isArray(saved.files) ? saved.files.length : 0
+    };
   }
 
   /**
@@ -2325,6 +2569,47 @@ export class MongoCatalogRepository {
       report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
     }
     return report;
+  }
+
+  async reconcileCatalogMediaFromFiles({ dryRun = false, limit = 5_000, adminId = null, config = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [] };
+    const cursor = this.contents.find(wanted ? { adminId: wanted } : {}, { limit: Math.max(1, Number(limit) || 5_000) });
+    for await (const saved of cursor) {
+      report.checked += 1;
+      const result = reconcileContentMediaRecord(saved, config);
+      if (!result.changed) continue;
+      const updatedAt = new Date().toISOString();
+      if (!dryRun) {
+        await this.contents.updateOne(
+          { _id: saved._id },
+          { $set: { ...result.patch, updatedAt } }
+        );
+      }
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, content: { ...saved, ...result.patch, updatedAt } });
+    }
+    return report;
+  }
+
+  async removeFileFromContentByAdminId(adminId, options = {}) {
+    const saved = await this.findContentByAdminId(adminId);
+    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!removedFile || !patch) {
+      return { content: saved, removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+    }
+    const updated = await this.contents.findOneAndUpdate(
+      { _id: saved._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+    return {
+      content: updated,
+      removed: removedFile,
+      removedFile,
+      remainingCount: Array.isArray(updated?.files) ? updated.files.length : 0
+    };
   }
 
   async listAnnouncedContent({ adminId = null, limit = 2_000 } = {}) {
