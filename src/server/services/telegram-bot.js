@@ -1,0 +1,9735 @@
+import { createTelegramMagnetFlow } from './telegram-magnets.js';
+import crypto from 'node:crypto';
+import { Markup, Telegraf } from 'telegraf';
+import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
+import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, resolveCategoryId, slugify } from '../lib/strings.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { canonicalMetadataTitle, categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
+import { reindexContentRecord } from '../catalog.repository.js';
+import {
+  PosterHostingError,
+  addPosterApiKey,
+  downloadPosterImage,
+  getAllPosterKeyStats,
+  getSharedFallbackPosterUrl,
+  hostPosterImage,
+  isPosterRateLimit,
+  markPosterKeyInvalid,
+  maskApiKey,
+  mirrorPosterToImgBB,
+  parseImgBBKeys,
+  posterKeyPoolStatus,
+  preparePosterImage,
+  removePosterApiKey,
+  setSharedFallbackPosterUrl,
+  syncPosterKeysFromRepository,
+  testPosterApiKey
+} from './poster-service.js';
+import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
+import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
+import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeContentStreamWithTelegramFiles, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
+import { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
+
+const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
+const ADULT_CATEGORY = 'adult';
+const BATCH_PROGRESS_INTERVAL = 25;
+const BATCH_MAX_FORWARD_RETRIES = 8;
+// Storage channel uploads can arrive as a burst of hundreds of separate
+// channel posts. Persist a quiet-period deadline, rather than publishing each
+// event immediately, so one release becomes one catalog record.
+const AUTO_PUBLISH_OWNER_PREFIX = 'auto-storage-group-';
+const AUTO_PUBLISH_LATE_OWNER_PREFIX = 'auto-storage-late-';
+const AUTO_COLLECTION_IDLE_MS = 90_000;
+const AUTO_COLLECTION_MAX_WAIT_MS = 15 * 60_000;
+const AUTO_QUEUE_INTERVAL_MS = 15_000;
+// Telegram lets a bot remove the messages it created in a private chat. Keep
+// delivered copies brief by default, while making the limitation explicit: a
+// bot cannot recall a file someone has already saved or forwarded elsewhere.
+export const DELIVERY_FILE_DELETE_AFTER_MS = 5 * 60_000;
+const DELIVERY_FILE_DELETE_SPACING_MS = 80;
+let deliveryDeletionQueue = Promise.resolve();
+
+function userId(ctx) {
+  return ctx.from?.id;
+}
+
+function chatId(ctx) {
+  return ctx.chat?.id;
+}
+
+function categoryCommandLabel(category) {
+  if (category === 'web-series') return 'series';
+  // Telegram command menus use a conservative letter-first command for the
+  // adult category. The requested /18db alias is registered separately below.
+  if (category === ADULT_CATEGORY) return 'adultdb';
+  return category;
+}
+
+function isAdultCategory(category) {
+  return category === ADULT_CATEGORY;
+}
+
+function storageChannelForCategory(config, category) {
+  return isAdultCategory(category)
+    ? config?.telegram?.adultStorageChannelId || ''
+    : config?.telegram?.storageChannelId || '';
+}
+
+function hasDedicatedAdultStorage(config) {
+  const adultStorage = String(config?.telegram?.adultStorageChannelId || '').trim();
+  const normalStorage = String(config?.telegram?.storageChannelId || '').trim();
+  return Boolean(adultStorage) && adultStorage !== normalStorage;
+}
+
+function adultStorageConfigurationHint(config) {
+  if (!storageChannelForCategory(config, ADULT_CATEGORY)) {
+    return 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID is required. Add the bot as an admin in a separate private 18+ database channel and configure its numeric -100… ID.';
+  }
+  return 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID must be different from TELEGRAM_STORAGE_CHANNEL_ID so 18+ files remain isolated.';
+}
+
+function storageEnvironmentName(category) {
+  return isAdultCategory(category) ? 'TELEGRAM_ADULT_STORAGE_CHANNEL_ID' : 'TELEGRAM_STORAGE_CHANNEL_ID';
+}
+
+function storageChannelDescription(category) {
+  return isAdultCategory(category) ? 'private 18+ database channel' : 'private database channel';
+}
+
+function emptyPrivateCategoryMetadata(title) {
+  return {
+    matched: false,
+    title: cleanText(title, 180),
+    year: null,
+    languages: [],
+    genres: [],
+    description: '',
+    status: 'New release',
+    releaseLabel: null,
+    posterOriginalUrl: null,
+    provider: 'private',
+    metadataKey: null,
+    tmdbId: null
+  };
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function hasAllowedPublisherId(ctx, config) {
+  return Boolean(userId(ctx) && isTelegramAdmin(config, userId(ctx)));
+}
+
+const publisherSessionCache = new Map();
+const PUBLISHER_SESSION_CACHE_TTL_MS = 30_000;
+
+export function clearPublisherSessionCache(chatId = null, ownerId = null) {
+  if (chatId && ownerId) {
+    publisherSessionCache.delete(`${chatId}:${ownerId}`);
+  } else {
+    publisherSessionCache.clear();
+  }
+}
+
+async function isPublisher(ctx, repository, config) {
+  if (!hasAllowedPublisherId(ctx, config) || !config.adminLoginCode) return false;
+  const cId = chatId(ctx);
+  const uId = userId(ctx);
+  if (!cId || !uId) return false;
+  const key = `${cId}:${uId}`;
+  const now = Date.now();
+  const cached = publisherSessionCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.valid;
+  }
+  const session = await repository.findAdminSession(cId, uId);
+  const valid = Boolean(session);
+  publisherSessionCache.set(key, { valid, expiresAt: now + PUBLISHER_SESSION_CACHE_TTL_MS });
+  return valid;
+}
+
+function sameSecret(candidate, expected) {
+  if (!candidate || !expected) return false;
+  const candidateBytes = Buffer.from(String(candidate));
+  const expectedBytes = Buffer.from(String(expected));
+  return candidateBytes.length === expectedBytes.length && crypto.timingSafeEqual(candidateBytes, expectedBytes);
+}
+
+// Delivery URLs are generated at request time rather than stored in MongoDB.
+// Resolving the username from the active token means rotating a token — or
+// switching to a replacement bot — updates every catalog-page link at once.
+export function synchronizeDeliveryBotUsername(config, botInfo) {
+  const username = cleanText(botInfo?.username, 64).replace(/^@/, '').replace(/\s+/g, '');
+  if (!/^[A-Za-z][A-Za-z0-9_]{4,63}$/.test(username)) {
+    return { username: config.telegram.botUsername || null, previousUsername: config.telegram.botUsername || null, changed: false };
+  }
+
+  const previousUsername = config.telegram.botUsername || null;
+  config.telegram.botUsername = username;
+  return {
+    username,
+    previousUsername,
+    changed: Boolean(previousUsername && previousUsername.toLowerCase() !== username.toLowerCase())
+  };
+}
+
+function panelKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✦ Anime', 'new:anime'),
+      Markup.button.callback('☻ Cartoon', 'new:cartoon'),
+      Markup.button.callback('◇ Donghua', 'new:donghua')
+    ],
+    [
+      Markup.button.callback('♡ K-Drama', 'new:kdrama'),
+      Markup.button.callback('▶ Movie', 'new:movie'),
+      Markup.button.callback('▣ Web series', 'new:web-series')
+    ],
+    // The broadcast/OTT shelf is its own row because it is the one publishers keep adding to:
+    // a TV or streaming-original show that is not anime, donghua, or K-Drama.
+    [Markup.button.callback('▤ TV & OTT', 'new:tv')],
+    [Markup.button.callback('🔞 18+ private', 'new:adult')],
+    [Markup.button.callback('Draft status', 'draft:status'), Markup.button.callback('Discard draft', 'draft:cancel')]
+  ]);
+}
+
+function uploadKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Draft status', 'draft:status'), Markup.button.callback('Publish now', 'draft:done')],
+    [Markup.button.callback('Discard draft', 'draft:cancel')]
+  ]);
+}
+
+function deliveryKeyboard(url) {
+  return url
+    ? Markup.inlineKeyboard([[Markup.button.url('Open Telegram delivery', url)]])
+    : undefined;
+}
+
+function publicationKeyboard(websiteUrl, deliveryUrl) {
+  if (!websiteUrl) return deliveryKeyboard(deliveryUrl);
+  const rows = [[Markup.button.url('✨ VIEW CATALOG PAGE', websiteUrl)]];
+  if (deliveryUrl) rows.push([Markup.button.url('Open all files in Telegram', deliveryUrl)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+const VISITOR_COMMANDS = [
+  { command: 'request', description: 'Request a title for the catalog' },
+  { command: 'login', description: 'Unlock publisher controls' },
+  { command: 'help', description: 'Get bot help' }
+];
+
+export const PUBLISHER_COMMANDS = [
+  ...VISITOR_COMMANDS,
+  { command: 'panel', description: 'Open the publisher panel' },
+  { command: 'movie', description: 'New movie draft' },
+  { command: 'anime', description: 'New anime draft' },
+  { command: 'cartoon', description: 'New cartoon draft' },
+  { command: 'donghua', description: 'New donghua draft' },
+  { command: 'kdrama', description: 'New K-Drama draft' },
+  { command: 'series', description: 'New web series draft' },
+  { command: 'tv', description: 'New TV & OTT draft (/ott also works)' },
+  { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
+  { command: 'batch', description: 'Import a private storage range' },
+  { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
+  { command: 'sync', description: 'Refresh what the announcement channels show: /sync, /sync go, /sync retry, /sync db' },
+  { command: 'auto', description: 'Control storage auto-publish' },
+  { command: 'title', description: 'Set draft or post title' },
+  { command: 'titlebatch', description: 'Rename IDs and titles separated by spaced commas' },
+  { command: 'lang', description: 'Set audio languages: draft, post, or many posts' },
+  { command: 'lan', description: 'Alias for /lang' },
+  { command: 'lam', description: 'Alias for /lang' },
+  { command: 'subtitles', description: 'Set subtitle languages: draft, post, or many posts' },
+  { command: 'subs', description: 'Alias for /subtitles' },
+  { command: 'year', description: 'Set year on one or many posts' },
+  { command: 'genres', description: 'Set genres on one or many posts' },
+  { command: 'description', description: 'Set draft or post synopsis' },
+  { command: 'poster', description: 'Set artwork: old link style or search & pick' },
+  { command: 'p', description: 'Short alias for /poster' },
+  { command: 'imgdd', description: 'Add artwork with the same old/new poster flow' },
+  { command: 'scrape', description: 'Scrape info & artwork from web: /scrape SB-ID URL' },
+  { command: 'category', description: 'Set the category of one or many posts' },
+  { command: 'release', description: 'Set a release label on one or many posts' },
+  { command: 'done', description: 'Publish current draft' },
+  { command: 'status', description: 'Show current draft, or set post status' },
+  { command: 'teststorage', description: 'Check the storage channel connection' },
+  { command: 'cancel', description: 'Discard current upload draft' },
+  { command: 'delete', description: 'Delete one or more post IDs' },
+  { command: 'removefile', description: 'Choose a post and remove specific episode/movie/series files' },
+  { command: 'merge', description: 'Absorb cards into one post, or drop a season/episodes' },
+  { command: 'posts', description: 'List recent post IDs for deletion' },
+  { command: 'postid', description: 'Find uploaded post IDs by time' },
+  { command: 'searchm', description: 'Retry episode magnets: Post ID and optional SubsPlease title' },
+  { command: 'search', description: 'Find Post IDs by title, card link, or forwarded announcement' },
+  { command: 'stats', description: 'View publisher analytics' },
+  { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
+  { command: 'players', description: 'List or remove attached players' },
+  { command: 'backup', description: 'Send a signed private data backup' },
+  { command: 'recover', description: 'Restore a signed backup file' },
+  { command: 'addchannel', description: 'Add an announcement channel' },
+  { command: 'channels', description: 'List announcement channels' },
+  { command: 'removechannel', description: 'Remove an announcement channel' },
+  { command: 'requests', description: 'Manage catalog requests' },
+  { command: 'imgapis', description: 'View ImgBB API keys, status, and upload counts' },
+  { command: 'addimgapi', description: 'Add an ImgBB API key to the rotation pool' },
+  { command: 'removeimgapi', description: 'Remove an ImgBB API key from the rotation pool' },
+  { command: 'maintanence', description: 'Toggle site maintenance mode ON/OFF' },
+  { command: 'restart', description: 'Restart the SoraBox bot and server' },
+  { command: 'logout', description: 'Lock publisher controls' }
+];
+
+async function setPublisherCommands(bot, ctx) {
+  try {
+    await bot.telegram.setMyCommands(PUBLISHER_COMMANDS, {
+      scope: { type: 'chat', chat_id: chatId(ctx) }
+    });
+  } catch (error) {
+    console.warn('[telegram] Could not set publisher command scope:', error?.message || 'Unknown error');
+  }
+}
+
+async function setConfiguredPublisherCommandScopes(bot, config, repository) {
+  const chatIds = new Set([...(config?.telegram?.adminIds || [])].map(String));
+  if (typeof repository?.listActiveAdminSessions === 'function') {
+    try {
+      const sessions = await repository.listActiveAdminSessions();
+      for (const session of sessions) {
+        if (session?.chatId) chatIds.add(String(session.chatId));
+      }
+    } catch (error) {
+      console.warn('[telegram] Could not read active publisher command scopes:', error?.message || 'Unknown error');
+    }
+  }
+  await Promise.all([...chatIds].map(async (id) => {
+    try {
+      // In a private Telegram chat the chat ID is the owner user ID. Restoring
+      // this per-chat scope at startup avoids Telegram menu-cache gaps after a
+      // Koyeb/bot restart for publishers who still have an active login.
+      await bot.telegram.setMyCommands(PUBLISHER_COMMANDS, {
+        scope: { type: 'chat', chat_id: id }
+      });
+    } catch (error) {
+      console.warn('[telegram] Could not set configured publisher command scope:', error?.message || 'Unknown error');
+    }
+  }));
+}
+
+function publisherWelcomeText() {
+  return [
+    'SoraBox publisher unlocked.',
+    '',
+    'Start with a category below or send /movie Title. Upload files to this private chat and finish with /done.',
+    'Artwork is matched from AniList, TMDB, or OMDb when available, then mirrored to ImgBB. Files are copied into the private storage channel.'
+  ].join('\n');
+}
+
+function visitorWelcomeText(canLogIn) {
+  const lines = [
+    'Welcome to SoraBox.',
+    '',
+    'Open a catalog delivery link to receive its available files here.',
+    'Looking for something? Send /request followed by the title, series, movie, or other item you would like to see.'
+  ];
+  if (canLogIn) lines.push('', 'Publisher access is available with /login followed by your private passcode.');
+  return lines.join('\n');
+}
+
+function draftSeasonSummary(files = []) {
+  const seasons = new Set();
+  for (const file of files) {
+    const season = detectUploadSeasonForFile(file);
+    if (season) seasons.add(season);
+  }
+  if (!seasons.size) return 'No season marker detected';
+  const labels = [...seasons].sort((first, second) => first - second).map((season) => formatSeasonLabel(season));
+  if (labels.length === 1) return `${labels[0]} · every file matches this season`;
+  return `${labels.length} seasons detected (${labels.join(', ')}) — /done publishes one post per season`;
+}
+
+function displayDraft(session) {
+  const category = categoryDetails(session.category).label;
+  const title = session.title || 'Waiting for title';
+  const files = session.files?.length || 0;
+  const matched = session.metadata?.matched ? `${String(session.metadata.provider || 'metadata').toUpperCase()} match ready` : 'Fallback artwork ready';
+  const detectedLanguages = summarizeUploadLanguages(session.files || []);
+  const detectedSubtitles = summarizeSubtitleLanguages(session.files || []);
+  const language = session.overrides?.languages?.length
+    ? `${session.overrides.languages.join(', ')} (manual)`
+    : detectedLanguages.length
+      ? `${detectedLanguages.join(', ')} (from uploaded file details)`
+      : (session.metadata?.languages || []).filter((item) => !/^multi(?:\s+language)?$/i.test(String(item || ''))).join(', ') || 'Not set';
+  const episodeSummary = summarizeEpisodes(session.files || []);
+
+  return [
+    `Draft · ${category}`,
+    `Mode: ${session.workflow === 'batch' ? 'Batch import' : session.workflow === 'automation' ? 'Storage auto-publish' : 'Manual upload'}`,
+    `Title: ${title}`,
+    `Files: ${files}`,
+    `Episodes: ${episodeSummary.releaseLabel || 'No episode labels detected yet'}`,
+    `Seasons: ${draftSeasonSummary(session.files || [])}`,
+    `Poster: ${session.posterOriginalUrl ? 'Manual poster selected' : matched}`,
+    `Audio: ${language}`,
+    `Subtitles: ${session.overrides?.subtitleLanguages?.length ? `${session.overrides.subtitleLanguages.join(', ')} (manual)` : detectedSubtitles.length ? `${detectedSubtitles.join(', ')} (from uploaded file details)` : 'Not set'}`,
+    '',
+    'Caption episode labels are checked before filenames. Telegram @channel names are removed automatically.',
+    session.workflow === 'batch'
+      ? `Batch stage: ${session.batch?.stage || 'waiting'}. Send the required private storage link, or use /cancel.`
+      : 'Upload more files, then use /done to publish.'
+  ].join('\n');
+}
+
+function mediaDescriptor(message) {
+  const kind = message.document
+    ? 'document'
+    : message.video
+      ? 'video'
+      : message.audio
+        ? 'audio'
+        : message.animation
+          ? 'animation'
+          : message.photo
+            ? 'photo'
+            : 'file';
+  const source = message.document || message.video || message.audio || message.animation || message.photo?.at(-1);
+  return { kind, source };
+}
+
+// Use the same attribution cleaner for parsing, catalog metadata, and the
+// caption written into Telegram storage. Keeping one boundary prevents a raw
+// @channel promotion from surviving in a copied message while its public label
+// looks clean.
+export function cleanStorageCaption(value) {
+  return cleanText(stripTelegramAttribution(value, 1_024), 1_024);
+}
+
+export function fileFromMessage(message, storedMessageId, storageMethod = 'copy', storageChannelId = null) {
+  const { kind, source } = mediaDescriptor(message);
+  const filename = source?.file_name || `${kind}-${message.message_id}`;
+  const caption = cleanStorageCaption(message.caption);
+  const episode = detectUploadEpisode({ caption, filename });
+  const quality = detectMediaQuality({ caption, filename, height: source?.height, width: source?.width });
+  const audioLanguages = detectUploadLanguages({ caption, filename });
+  const subtitleLanguages = detectUploadSubtitleLanguages({ caption, filename });
+  const file = {
+    storageMessageId: storedMessageId,
+    // Message IDs are unique only within a channel. Persist the source channel
+    // so the normal and isolated 18+ stores can safely use the same ID.
+    storageChannelId: cleanText(storageChannelId, 80) || null,
+    storageMethod,
+    telegramFileId: source?.file_id || null,
+    name: cleanText(filename, 180),
+    // Native Telegram video uploads may have no file_name, so retain a useful
+    // sanitized caption as the display source. Raw Telegram promotion handles
+    // are never persisted in a catalog file record.
+    sourceLabel: cleanText(caption || filename, 500),
+    displayName: episode.displayName,
+    quality,
+    ...(Number.isInteger(Number(source?.height)) ? { height: Number(source.height) } : {}),
+    ...(Number.isInteger(Number(source?.width)) ? { width: Number(source.width) } : {}),
+    // `languages` stays as a compatibility alias for existing catalog records.
+    languages: audioLanguages,
+    audioLanguages,
+    subtitleLanguages,
+    mimeType: cleanText(source?.mime_type || '', 80),
+    size: Number(source?.file_size) || 0,
+    kind,
+    episode: episode.start ? {
+      start: episode.start,
+      end: episode.end,
+      label: episode.label,
+      source: episode.source
+    } : null,
+    // A season number is stored separately from the episode so a multi-season
+    // upload can be split into one catalog post per season later.
+    season: Number.isInteger(episode.season) && episode.season >= 1 ? episode.season : null,
+    seasonSource: episode.seasonSource || null,
+    addedAt: new Date().toISOString()
+  };
+  const trackCapable = isInspectableMediaFile(file);
+  const needsInspection = trackCapable && needsMediaTrackInspection({
+    ...file,
+    // This is sanitized too. The detector still sees useful Dual/Multi,
+    // quality, language, season, and episode labels without source promotion.
+    displayName: caption || filename
+  });
+  return {
+    ...file,
+    mediaInfo: {
+      status: trackCapable ? (needsInspection ? 'pending' : 'filename') : 'not-media',
+      needsInspection
+    }
+  };
+}
+
+function isBackupArchiveMessage(message) {
+  const document = message?.document;
+  if (!document) return false;
+  const filename = String(document.file_name || '').toLowerCase();
+  const mimeType = String(document.mime_type || '').toLowerCase();
+  return /\.json(?:\.gz)?$/.test(filename) || /(?:application\/json|application\/(?:x-)?gzip)/.test(mimeType);
+}
+
+function isMediaMessage(message) {
+  // A signed backup is sent into the same private storage channel as media.
+  // Never let its document update turn into an accidental auto-publish card.
+  if (isBackupArchiveMessage(message)) return false;
+  return Boolean(message?.document || message?.video || message?.audio || message?.animation || message?.photo?.length);
+}
+
+function telegramErrorText(error) {
+  return String(error?.description || error?.response?.description || error?.message || '').toLowerCase();
+}
+
+export function storageErrorHint(error) {
+  const details = [error, error?.copyError, error?.fallbackError]
+    .map(telegramErrorText)
+    .filter(Boolean)
+    .join(' | ');
+
+  if (/chat not found|peer_id_invalid/.test(details)) {
+    return 'Telegram cannot find the storage channel. Use its numeric -100… channel ID, not an invite link, and restart the service after changing the Koyeb variable.';
+  }
+  if (/not enough rights|not allowed|administrator|write access|forbidden/.test(details)) {
+    return 'The bot can see the channel but cannot post there. In the channel admin settings enable Post Messages, then retry.';
+  }
+  if (/protected content|can.t be copied|can.t be forwarded|message can.t be copied/.test(details)) {
+    return 'Telegram marked the source as protected. Upload the original file directly to this bot instead of forwarding it from a protected channel.';
+  }
+  if (/file is too big|file.*too large|request entity too large/.test(details)) {
+    return 'Telegram rejected this file size for the bot API. Send a smaller file or use a Telegram-compatible size/account configuration.';
+  }
+  return 'Telegram could not store this item. Check that the configured channel ID is correct and that the bot has Post Messages permission.';
+}
+
+async function sendByFileId(telegram, destinationChatId, message) {
+  const { kind, source } = mediaDescriptor(message);
+  if (!source?.file_id) throw new Error('The received message did not include a reusable Telegram file ID.');
+  const extra = { disable_notification: true };
+  // A file-id resend creates a fresh Telegram message, so omitting an empty
+  // sanitized caption is enough to remove an attribution-only original.
+  if (message.caption) {
+    const caption = cleanStorageCaption(message.caption);
+    if (caption) extra.caption = caption;
+  }
+
+  if (kind === 'document') return telegram.sendDocument(destinationChatId, source.file_id, extra);
+  if (kind === 'video') return telegram.sendVideo(destinationChatId, source.file_id, extra);
+  if (kind === 'audio') return telegram.sendAudio(destinationChatId, source.file_id, extra);
+  if (kind === 'animation') return telegram.sendAnimation(destinationChatId, source.file_id, extra);
+  if (kind === 'photo') return telegram.sendPhoto(destinationChatId, source.file_id, extra);
+  throw new Error('This Telegram media type is not supported by the storage fallback.');
+}
+
+function copiedCaptionOptions(message) {
+  const originalCaption = typeof message?.caption === 'string' ? message.caption : '';
+  if (!originalCaption) return { disable_notification: true };
+  const original = cleanText(originalCaption, 1_024);
+  const caption = cleanStorageCaption(originalCaption);
+  // `copyMessage` otherwise retains the original caption. Explicitly pass an
+  // empty string too, so a caption containing only @promotion data is scrubbed
+  // rather than silently copied into the private database channel.
+  return caption === original
+    ? { disable_notification: true }
+    : { disable_notification: true, caption };
+}
+
+// copyMessage is fastest and preserves the original message. Some forwarded or
+// protected-origin items cannot be copied, however. In that case Telegram often
+// still lets a bot re-send the file it received by its file_id, so we attempt a
+// type-safe fallback before reporting a storage failure to the publisher.
+export async function storeMediaInChannel(telegram, destinationChatId, sourceChatId, message) {
+  try {
+    const copied = await telegram.copyMessage(
+      destinationChatId,
+      sourceChatId,
+      message.message_id,
+      copiedCaptionOptions(message)
+    );
+    return { storageMessageId: copied.message_id, storageChannelId: String(destinationChatId), method: 'copy' };
+  } catch (copyError) {
+    try {
+      const sent = await sendByFileId(telegram, destinationChatId, message);
+      return { storageMessageId: sent.message_id, storageChannelId: String(destinationChatId), method: 'file-id-fallback' };
+    } catch (fallbackError) {
+      const error = new Error('Telegram could not persist the uploaded media.');
+      error.copyError = copyError;
+      error.fallbackError = fallbackError;
+      throw error;
+    }
+  }
+}
+
+function parseDelimitedList(value) {
+  return cleanText(value, 300)
+    .split(/[,|]/)
+    .map((entry) => cleanText(entry, 40))
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+/**
+ * Parse `/field SB-ABC… value` without confusing an active-draft value, and the
+ * many-at-once form `/field SB-ABC…, SB-DEF… value`. Only a leading run of post
+ * IDs is consumed, so a value that itself contains commas ("Hindi, English") or
+ * a word that merely starts with SB- stays part of the value.
+ */
+export function parsePublishedPostEdit(value) {
+  const text = String(value || '').trim();
+  const ids = [];
+  let rest = text;
+  const leadingId = /^\s*[,;:]?\s*(SB-[A-F0-9]{10})(?=$|[\s,;:])\s*[,;:]?\s*/i;
+  let match = rest.match(leadingId);
+  while (match && ids.length < 1_000) {
+    const adminId = match[1].toUpperCase();
+    if (!ids.includes(adminId)) ids.push(adminId);
+    rest = rest.slice(match[0].length);
+    match = rest.match(leadingId);
+  }
+  if (!ids.length) return null;
+  return {
+    adminId: ids[0],
+    adminIds: ids,
+    value: cleanText(rest, 1_600)
+  };
+}
+
+/**
+ * Tidy text a publisher typed by hand, without second-guessing it.
+ *
+ * Only the furniture a pasted filename carries is removed — a release extension, a bracketed group
+ * tag, underscores, dot-separated words, and a trailing quality or codec label. A year, a season
+ * number, an apostrophe-less word, or an "&" is left exactly as written: the publisher's own wording
+ * is the source of truth for a title, and `cleanMediaName` is far too aggressive for text someone
+ * chose deliberately.
+ */
+export function tidyTypedTitle(value) {
+  const raw = cleanText(value, 1_600).replace(/\s+/g, ' ').trim();
+  if (!raw) return { title: '', changed: false };
+  const extension = /\.(mkv|mp4|avi|webm|mov|m4v|ts|m4a)$/i;
+  const dottedParts = raw.replace(extension, '').split('.');
+  // "Vampires.Of.The.Velvet.Lounge" is one filename; "Dr. No" and "O.R.Y.X" are titles.
+  const dottedFile = !/\s/.test(raw) && dottedParts.length >= 3 && dottedParts.every((part) => part.trim().length >= 2);
+  const looksLikeFile = extension.test(raw) || raw.includes('_') || dottedFile;
+  let title = raw
+    .replace(extension, ' ')
+    // Square brackets are a release group or a codec note; parentheses can be part of the title.
+    .replace(/[[{][^\]}]{0,120}[\]}]/g, ' ')
+    .replace(/_/g, ' ');
+  if (dottedFile) title = title.replace(/\./g, ' ');
+  if (looksLikeFile) {
+    title = title
+      .replace(/\b(?:360|480|576|720|1080|1440|2160|4320)\s*p?\b/gi, ' ')
+      .replace(/\b(?:4k|8k|uhd|fhd|hd|remux|web[- ]?dl|webrip|blu[- ]?ray|bdrip|brrip|dvdrip|x\s*26[45]|h\s*26[45]|hevc|av1|avc|10 ?bit|8 ?bit)\b/gi, ' ');
+  }
+  title = title
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/^[\s\-–—|:,*>]+/, '')
+    .replace(/[\s\-–—|:,<]+$/, '')
+    .replace(/\s+([,:;!?.'’"])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+  if (title.length < 2) title = raw;
+  // A line pasted out of a list ends in a comma, and that is not worth telling the publisher about:
+  // `changed` means the words themselves were reshaped, so a trailing separator does not count.
+  const changed = title !== raw && raw.replace(/[\s.,;:]+$/, '') !== title;
+  return { title, changed };
+}
+
+/**
+ * Read a pasted block of `SB-… New title` lines as one rename request.
+ *
+ * Correcting the titles of a hundred-card `/done` used to mean a hundred messages, each with its own
+ * edit and its own announcement refresh. Every line is still an independent edit — a missing post ID
+ * or an empty title skips only that line — but the block is applied and reported in one go, with no
+ * limit on how many lines it names. A repeated `/title` prefix on each line, and a comma-separated
+ * ID list on one line, are both accepted because both are how the paste arrives.
+ */
+export function parseBulkPostEdits(value, { commands = ['title'] } = {}) {
+  const names = commands.filter(Boolean).map((name) => String(name).replace(/[^a-z]/gi, ''));
+  const commandPattern = names.length
+    ? new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\b[:\\s,-]*`, 'i')
+    : null;
+  const isTitleBatch = names.includes('titlebatch');
+  let rawText = String(value || '');
+  let autoMerge = false;
+  const headerMatch = names.length
+    ? rawText.match(new RegExp(`^\\s*[/!]?\\s*(?:${names.join('|')})(?:@[A-Za-z0-9_]{3,64})?\\s+(--merge|-m|--auto-merge|merge)\\b`, 'i'))
+    : null;
+  if (headerMatch) {
+    autoMerge = true;
+    rawText = rawText.replace(headerMatch[0], rawText.slice(0, rawText.indexOf(headerMatch[1])) + ' ');
+  }
+  const lines = rawText.split(isTitleBatch ? /\r?\n|[ \t]+,[ \t]+/ : /\r?\n/);
+  const entries = [];
+  const invalid = [];
+  const seen = new Map();
+  let replaced = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const body = commandPattern ? trimmed.replace(commandPattern, ' ') : trimmed;
+    if (isTitleBatch && !body.trim()) continue;
+    const target = parsePublishedPostEdit(body);
+    if (!target) {
+      invalid.push({ line: trimmed, reason: 'no Post ID on that line' });
+      continue;
+    }
+    const title = cleanText(target.value, 1_600);
+    if (!title) {
+      invalid.push({ line: trimmed, reason: `no ${commands[0] || 'value'} after the post ID` });
+      continue;
+    }
+    if (target.adminIds.length > 1) {
+      invalid.push({
+        line: trimmed,
+        reason: `${target.adminIds.length} post IDs share one ${commands[0] || 'value'}; a title belongs to one release, so give each ID its own line`
+      });
+      continue;
+    }
+    if (isTitleBatch && /\bSB-[A-F0-9]{10}\b/i.test(title)) {
+      invalid.push({ line: trimmed, reason: 'another Post ID is inside the title; separate entries with space comma space ( , ) or a newline' });
+      continue;
+    }
+    const adminId = target.adminId;
+    const tidied = tidyTypedTitle(title);
+    if (seen.has(adminId)) {
+      // The last line for a card wins, because a paste with a note under it usually corrects it.
+      entries[seen.get(adminId)] = { adminId, value: tidied.title, raw: title, changed: tidied.changed };
+      replaced += 1;
+      continue;
+    }
+    seen.set(adminId, entries.length);
+    entries.push({ adminId, value: tidied.title, raw: title, changed: tidied.changed });
+    if (entries.length >= 1_000) break;
+  }
+  return { entries, invalid, replaced, hasEdits: entries.length > 0, autoMerge };
+}
+
+/**
+ * Apply a pasted block of renames in one go, and report the lines that made no sense.
+ *
+ * Returns false when the message is not a bulk rename — a single line or a draft title belongs to
+ * the ordinary one-post flow, whose reply is more exact than a batch report would be.
+ */
+export async function applyBulkTitleEdits({ ctx, repository, text, config = null, commands = ['title', 't', 'rename'], force = false }) {
+  const bulk = parseBulkPostEdits(text, { commands });
+  if (!force && !(bulk.entries.length > 1 || (bulk.entries.length === 1 && bulk.invalid.length))) return false;
+  if (!bulk.entries.length) {
+    await ctx.reply('Usage: /titlebatch SB-0123ABCDEF RRR , SB-1122334455 PK\nPut a space on both sides of each separating comma, or use one ID and title per line.');
+    return true;
+  }
+  const result = await updatePublishedPost({ ctx, repository, config, field: 'title', fieldLabel: 'Title', edits: bulk.entries, rematchPoster: true, autoMerge: bulk.autoMerge });
+  if (result?.handled && bulk.invalid.length) {
+    await ctx.reply([
+      `${bulk.invalid.length} line${bulk.invalid.length === 1 ? ' was' : 's were'} left out because ${bulk.invalid.length === 1 ? 'it makes' : 'they make'} no sense as a rename:`,
+      ...bulk.invalid.slice(0, 25).map((entry) => `▪ ${cleanText(entry.line, 90)} — ${entry.reason}`),
+      bulk.invalid.length > 25 ? `…and ${bulk.invalid.length - 25} more line${bulk.invalid.length - 25 === 1 ? '' : 's'}.` : null,
+      'Nothing else was changed. Send those lines again with their Post ID and the title.'
+    ].filter((line) => line !== null).join('\n'));
+  }
+  if (result?.handled && bulk.replaced) {
+    await ctx.reply(`${bulk.replaced} post ID appeared on more than one line, so the last title for it won.`);
+  }
+  return result || { handled: true, content: null, entries: bulk.entries, invalid: bulk.invalid };
+}
+
+/**
+ * Fields that describe how a release is labelled can be set across posts at
+ * once; a title or synopsis is unique to one release, so those stay singular.
+ */
+const MULTI_POST_EDITABLE_FIELDS = new Set([
+  'category', 'languages', 'subtitleLanguages', 'genres', 'status', 'releaseLabel', 'year'
+]);
+
+/**
+ * Apply one metadata edit to every post the publisher named. A correction that
+ * spans several releases (a wrong category, a missing subtitle language) used
+ * to mean repeating the command once per post ID and re-editing each
+ * announcement; now it is one line, and each affected announcement is still
+ * updated in place.
+ *
+ * `guard(content)` may refuse one targeted post (the 18+ storage boundary)
+ * without blocking the rest of the batch.
+ */
+export async function updatePublishedPost({ ctx, repository, argument = null, field, value, fieldLabel, guard = null, edits = null, config = {}, rematchPoster = false, autoMerge = false }) {
+  const safeConfig = config || {};
+  // `edits` is the batch shape: one value per post ID, so a page of titles is one command.
+  const paired = Array.isArray(edits) && edits.length
+    ? edits
+      .map((entry) => ({
+        adminId: cleanText(entry?.adminId, 40).toUpperCase(),
+        value: cleanText(entry?.value, 1_600),
+        changed: Boolean(entry?.changed)
+      }))
+      .filter((entry) => /^SB-[A-F0-9]{10}$/.test(entry.adminId) && entry.value)
+    : null;
+  const target = paired
+    ? { adminIds: paired.map((entry) => entry.adminId), adminId: paired[0].adminId, value: null }
+    : parsePublishedPostEdit(argument);
+  if (!target) return null;
+  const multi = MULTI_POST_EDITABLE_FIELDS.has(field);
+  if (!paired && target.adminIds.length > 1 && !multi) {
+    await ctx.reply(`${fieldLabel} is set one post at a time, because every release needs its own ${fieldLabel.toLowerCase()}. Send /${field} ${target.adminIds[0]} …`);
+    return { handled: true, content: null };
+  }
+  if (!paired && !target.value && value === undefined) {
+    await ctx.reply(multi
+      ? `Add a ${fieldLabel} after the post ID${target.adminIds.length > 1 ? 's' : ''}. Example: /${field} ${target.adminIds[0]}${multi ? ', SB-SECONDID' : ''} value`
+      : `Add a ${fieldLabel} after the post ID. Example: /${field} ${target.adminId} value`);
+    return { handled: true, content: null };
+  }
+  if (typeof repository.updateContentByAdminId !== 'function') {
+    await ctx.reply('Published-post editing is not available in this catalog store.');
+    return { handled: true, content: null };
+  }
+  const patchValue = value === undefined ? target.value : value;
+  const contents = [];
+  const missing = [];
+  const blocked = [];
+  const tidied = [];
+  let rechecks = 0;
+  let rebuilt = 0;
+  const sync = { updated: 0, unchanged: 0, failed: 0, dropped: 0, channels: 0 };
+  let queued = 0;
+  for (const [index, adminId] of target.adminIds.entries()) {
+    const entryValue = paired ? paired[index].value : patchValue;
+    let previous = null;
+    if (guard || paired) {
+      const existing = await repository.findContentByAdminId?.(adminId);
+      if (!existing) {
+        missing.push(adminId);
+        continue;
+      }
+      previous = existing;
+      const refusal = guard ? guard(existing) : null;
+      if (refusal) {
+        blocked.push({ adminId, title: existing.title, reason: refusal });
+        continue;
+      }
+    }
+    const edited = await repository.updateContentByAdminId(adminId, { [field]: entryValue });
+    if (!edited) {
+      missing.push(adminId);
+      continue;
+    }
+    // A corrected title or category changes how the release is read, so the episode blocks, the
+    // quality ladder, and the search text are rebuilt from the files themselves instead of being
+    // carried over. Without this, `S01 [Epi 01-06]` files keep showing on the delivery page as one
+    // flat release after a rename, because the index they were filed under was written before the
+    // caption made sense.
+    let updated = edited;
+    if (field === 'title' || field === 'category') {
+      if (typeof repository.reindexContent === 'function') {
+        // The pass /repair runs over the whole archive, scoped to this one card: it writes the
+        // rebuilt file records, episode blocks, and search text through the store.
+        const report = await repository.reindexContent({ adminId }).catch(() => null);
+        if (report?.updated) {
+          rebuilt += 1;
+          updated = (await repository.findContentByAdminId?.(adminId)) || edited;
+        }
+      } else {
+        const rebuiltIndex = reindexContentRecord(edited);
+        if (rebuiltIndex.changed) {
+          updated = (await repository.updateContentByAdminId(adminId, rebuiltIndex.patch)) || edited;
+          rebuilt += 1;
+        }
+      }
+    }
+    if (paired && paired[index].changed) tidied.push(adminId);
+    contents.push(previous ? { ...updated, previousValue: cleanText(previous[field], 1_600) } : updated);
+    // A corrected title is the one edit that can also fix the artwork: the card may have been given
+    // a generated placeholder only because the name it was matched under was wrong.
+    if (rematchPoster && field === 'title') {
+      const job = queuePosterRematchForTitle({ ctx, repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram });
+      if (job) {
+        job.catch(() => {});
+        rechecks += 1;
+      }
+    }
+    // Anything the announcement channel shows must stay in sync, so the same edit is
+    // applied to the posted message instead of leaving it stale — through the lane,
+    // because a batch would otherwise fire one edit per post per channel at once and
+    // Telegram answers that with a flood limit. A single post still waits for its own
+    // result, so its reply stays exact.
+    const job = queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, adminId: updated.adminId, notifyChatId: chatId(ctx) });
+    if (target.adminIds.length === 1) {
+      // A single post used to wait for its channel edit so the reply could be exact. That is only
+      // safe while the lane is idle, so the wait is now bounded and the answer says "queued".
+      const { settled, result } = await settleQueuedJob(job);
+      for (const key of Object.keys(sync)) sync[key] += (result?.[key]) || 0;
+      if (!settled) {
+        job.catch(() => {});
+        queued += 1;
+      }
+    } else {
+      job.catch(() => {});
+      queued += 1;
+    }
+  }
+  if (!contents.length) {
+    if (missing.length) {
+      await ctx.reply(`No published catalog post was found for ${missing.join(', ')}. Use /posts, /postid, or /search <title> to find an ID.`);
+    } else if (blocked.length) {
+      await ctx.reply(`No post was changed. ${blocked[0].reason}.`);
+    }
+    return { handled: true, content: null };
+  }
+  const lines = contents.length === 1
+    ? [`${fieldLabel} updated for ${contents[0].adminId} · ${contents[0].title}.`]
+    : [
+      `${fieldLabel} updated for ${contents.length} posts:`,
+      ...contents.map((content) => `▪ ${content.adminId} · ${cleanText(content.title, 70)}${paired
+        && content.previousValue
+        && content.previousValue !== content.title
+        ? ` \u2014 was ${cleanText(content.previousValue, 60)}`
+        : ''}`)
+    ];
+  if (tidied.length) {
+    lines.push(`${tidied.length} of those ${tidied.length === 1 ? 'title was' : 'titles were'} tidied from the pasted text (a file extension, brackets, underscores, dots, or a quality label). Send the line again exactly as you want it if that was the title itself.`);
+  }
+  if (rechecks) {
+    lines.push(`${rechecks} ${rechecks === 1 ? 'card had' : 'cards had'} no matched artwork or no full details, so their poster, year, genres, and synopsis are being re-checked against the corrected title on the lane — whatever the providers recognise replaces the card, its backdrop, and its channel copy, and anything they cannot find keeps the defaults you set.`);
+  }
+  if (rebuilt) {
+    lines.push(`${rebuilt} ${rebuilt === 1 ? 'card was' : 'cards were'} re-indexed from their files, so the delivery page groups them into their episode blocks again and the announcement copy is rewritten from that.`);
+  }
+  if (blocked.length) {
+    lines.push(`${blocked.length} post${blocked.length === 1 ? ' was' : 's were'} left alone: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}`);
+  }
+  if (missing.length) {
+    lines.push(`Not found and skipped: ${missing.join(', ')}.`);
+  }
+  if (queued) {
+    lines.push(`Telegram announcements: ${queued} channel post${queued === 1 ? '' : 's'} queued on the lane — one edit at a time, a Telegram limit waited out and retried rather than dropped. /sync shows what is still waiting.`);
+  }
+  if (sync.channels) lines.push(announcementSyncNote(sync));
+  await ctx.reply(lines.join('\n'));
+  // Renaming a card onto a title the catalog already holds is nearly always the same release
+  // published twice, and two announcements for one title is what the publisher is left with unless
+  // someone says so. So the merge is offered here with the plan already built: Yes moves every file
+  // of the newer card into the existing post and deletes the newer card and its announcement, No
+  // leaves both cards exactly as they are.
+  let mergeGroups = [];
+  if (field === 'title' && contents.length >= 1 && typeof repository.findContentByTitle === 'function' && typeof repository.startMergePlan === 'function') {
+    const titleGroups = new Map();
+    for (const card of contents) {
+      if (!card?.title || !card?.adminId) continue;
+      const groupKey = `${isAdultCategory(card.category) ? 'adult' : 'safe'}::${slugify(cleanText(card.title, 180))}`;
+      if (!groupKey || groupKey.endsWith('::')) continue;
+      if (!titleGroups.has(groupKey)) {
+        titleGroups.set(groupKey, { title: card.title, category: card.category, batchCards: [] });
+      }
+      titleGroups.get(groupKey).batchCards.push(card);
+    }
+
+    const processedAdminIds = new Set();
+    for (const [, group] of titleGroups.entries()) {
+      let catalogMatches = [];
+      try {
+        catalogMatches = (await repository.findContentByTitle(group.title, { category: group.category, limit: 10 })) || [];
+      } catch {
+        catalogMatches = [];
+      }
+      if (!catalogMatches.length && group.category) {
+        try {
+          const fallbackMatches = (await repository.findContentByTitle(group.title, { limit: 10 })) || [];
+          catalogMatches = fallbackMatches.filter((item) => isAdultCategory(item?.category) === isAdultCategory(group.category));
+        } catch {}
+      }
+
+      const cardsMap = new Map();
+      for (const item of catalogMatches) {
+        if (item?.adminId) cardsMap.set(item.adminId, item);
+      }
+      for (const item of group.batchCards) {
+        if (item?.adminId) cardsMap.set(item.adminId, item);
+      }
+      for (const adminId of processedAdminIds) {
+        cardsMap.delete(adminId);
+      }
+
+      if (cardsMap.size <= 1) continue;
+
+      const allCards = Array.from(cardsMap.values());
+      allCards.sort((a, b) => {
+        const aInBatch = contents.some((c) => c.adminId === a.adminId);
+        const bInBatch = contents.some((c) => c.adminId === b.adminId);
+        if (!aInBatch && bInBatch) return -1;
+        if (aInBatch && !bInBatch) return 1;
+        const timeA = new Date(a.publishedAt || a.createdAt || 0).getTime();
+        const timeB = new Date(b.publishedAt || b.createdAt || 0).getTime();
+        if (timeA && timeB && timeA !== timeB) return timeA - timeB;
+        const idxA = contents.findIndex((c) => c.adminId === a.adminId);
+        const idxB = contents.findIndex((c) => c.adminId === b.adminId);
+        if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+        return String(a.adminId).localeCompare(String(b.adminId));
+      });
+
+      const target = allCards[0];
+      const sources = allCards.slice(1).map((s) => ({
+        adminId: s.adminId,
+        title: s.title,
+        files: Array.isArray(s.files) ? s.files.length : Number(s.filesCount) || 0
+      }));
+
+      processedAdminIds.add(target.adminId);
+      for (const s of sources) processedAdminIds.add(s.adminId);
+
+      mergeGroups.push({
+        targetAdminId: target.adminId,
+        targetTitle: target.title,
+        sources
+      });
+    }
+
+    if (mergeGroups.length === 1) {
+      const group = mergeGroups[0];
+      const sourceIds = group.sources.map((s) => s.adminId).join(', ');
+      const totalFiles = group.sources.reduce((sum, s) => sum + s.files, 0);
+      const isPlural = group.sources.length > 1;
+
+      const plan = {
+        targetAdminId: group.targetAdminId,
+        targetTitle: group.targetTitle,
+        sources: group.sources,
+        note: contents.length > 1 ? 'A titlebatch produced titles the catalog already holds.' : 'A rename produced a title the catalog already holds.'
+      };
+
+      if (autoMerge) {
+        const outcome = await applyMergePlan({ bot: ctx, repository, config: safeConfig, plan });
+        if (outcome.error) {
+          await ctx.reply(`Merge failed: ${outcome.error}`);
+        } else {
+          await replyBatchDiagnostics(ctx, [mergeResultText(outcome, safeConfig)]);
+        }
+      } else {
+        await repository.startMergePlan({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          plan
+        });
+        await ctx.reply([
+          `\u201c${cleanText(group.targetTitle, 70)}\u201d is already published as ${group.targetAdminId}, so ${sourceIds} ${isPlural ? 'are' : 'is'} now ${isPlural ? 'duplicate cards' : 'a second card'} for the same release.`,
+          '',
+          `Merge them? The ${totalFiles} file${totalFiles === 1 ? '' : 's'} of ${sourceIds} move into ${group.targetAdminId}, and ${sourceIds} disappear${isPlural ? '' : 's'} with ${isPlural ? 'their' : 'its'} announcement post${isPlural ? 's' : ''}. Nothing is taken away from ${group.targetAdminId}.`,
+          '',
+          `One tap applies the merge, one tap leaves ${isPlural ? 'all' : 'both'} cards alone.`
+        ].join('\n'), mergeConfirmKeyboard());
+      }
+    } else if (mergeGroups.length > 1) {
+      const totalSources = mergeGroups.reduce((sum, g) => sum + g.sources.length, 0);
+      const totalFiles = mergeGroups.reduce((sum, g) => sum + g.sources.reduce((f, s) => f + s.files, 0), 0);
+
+      const plan = {
+        groups: mergeGroups,
+        targetAdminId: mergeGroups[0].targetAdminId,
+        targetTitle: mergeGroups[0].targetTitle,
+        sources: mergeGroups.flatMap((g) => g.sources),
+        note: 'A titlebatch produced titles the catalog already holds.'
+      };
+
+      if (autoMerge) {
+        const outcome = await applyMergePlan({ bot: ctx, repository, config: safeConfig, plan });
+        if (outcome.error) {
+          await ctx.reply(`Merge failed: ${outcome.error}`);
+        } else {
+          await replyBatchDiagnostics(ctx, [mergeResultText(outcome, safeConfig)]);
+        }
+      } else {
+        await repository.startMergePlan({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          plan
+        });
+        await ctx.reply([
+          `Duplicate releases detected for ${mergeGroups.length} titles in this batch:`,
+          ...mergeGroups.map((g) => `▪ \u201c${cleanText(g.targetTitle, 50)}\u201d: merge ${g.sources.map((s) => s.adminId).join(', ')} into ${g.targetAdminId}`),
+          '',
+          `Merge them? The ${totalFiles} file${totalFiles === 1 ? '' : 's'} move into their target cards, and ${totalSources} duplicate card${totalSources === 1 ? '' : 's'} disappear with their announcements.`,
+          '',
+          'One tap applies the merge, one tap leaves all cards alone.'
+        ].join('\n'), mergeConfirmKeyboard());
+      }
+    }
+  }
+  return { handled: true, content: contents[0], contents, announcementSync: sync, mergeGroups };
+}
+
+/* ---------------------------------------------------------------------------
+ * Publisher artwork commands (/poster, /p, /imgdd)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Acknowledge an inline-keyboard tap. Telegraf exposes `answerCbQuery(text,
+ * extra)`; other Bot API wrappers expose `answerCallbackQuery({ text })`. The
+ * acknowledgement is only cosmetic, so a missing method, an already-answered
+ * callback, or a 400 from Telegram must never abort the action behind the tap.
+ */
+async function acknowledgeTap(ctx, text, { alert = false } = {}) {
+  const note = cleanText(text, 190);
+  try {
+    if (typeof ctx.answerCbQuery === 'function') {
+      await ctx.answerCbQuery(note || undefined, { show_alert: alert });
+      return;
+    }
+    if (typeof ctx.answerCallbackQuery === 'function') {
+      await ctx.answerCallbackQuery({ text: note, show_alert: alert });
+    }
+  } catch {
+    // The chat reply is what the publisher actually needs; tap feedback is not
+    // worth losing it over, and Telegram rejects an expired callback anyway.
+  }
+}
+
+const POSTER_COMMAND_USAGE = [
+  'Poster commands accept both styles:',
+  '',
+  '• Old style — /poster SB-0123ABCDEF https://public-image-host.example/poster.jpg',
+  '• New style — /poster SB-0123ABCDEF Exact Title, then tap the artwork you want',
+  '• Draft — /poster https://public-image-host.example/poster.jpg',
+  '',
+  'Send /poster on its own and I will ask which style you want. /p and /imgdd do exactly the same thing.'
+].join('\n');
+
+export function posterStyleKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔗 Old style · ID + image link', 'poster:style:old')],
+    [Markup.button.callback('✨ New style · search & pick artwork', 'poster:style:new')],
+    [Markup.button.callback('Cancel', 'poster:cancel')]
+  ]);
+}
+
+export function posterCancelKeyboard() {
+  return Markup.inlineKeyboard([[Markup.button.callback('Cancel', 'poster:cancel')]]);
+}
+
+// Publishers recognise the service people actually quote, not the raw API id.
+const POSTER_PROVIDER_LABELS = { anilist: 'AniList', tmdb: 'TMDB', omdb: 'IMDb', imdb: 'IMDb' };
+
+export function posterProviderLabel(provider) {
+  const key = cleanText(provider, 20).toLowerCase();
+  return POSTER_PROVIDER_LABELS[key] || (key ? key.toUpperCase() : '');
+}
+
+/** Telegram measures a button label in UTF-8 bytes, not JavaScript characters. */
+function telegramButtonText(value, maxBytes = 62) {
+  const text = cleanText(value, 160);
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let truncated = text;
+  while (truncated.length && Buffer.byteLength(`${truncated}…`, 'utf8') > maxBytes) {
+    truncated = truncated.slice(0, -1);
+  }
+  return `${truncated.replace(/[\s.,:-]+$/, '')}…`;
+}
+
+/** A year is only worth printing when the provider actually gave one. */
+function posterCandidateYear(candidate) {
+  const year = Number(candidate?.year);
+  return Number.isInteger(year) && year > 1899 && year < 2200 ? String(year) : null;
+}
+
+/** `1 · 2023 · TV · TMDB` — the parts that tell two posters apart, in that order. */
+function posterCandidateLabel(candidate, index) {
+  const year = posterCandidateYear(candidate);
+  const kind = cleanText(candidate?.type, 12)?.toUpperCase() || null;
+  const provider = posterProviderLabel(candidate?.provider) || null;
+  const title = cleanText(candidate?.title, 60) || 'Untitled';
+  const front = [index + 1, year, kind, provider].filter(Boolean).join(' · ');
+  return telegramButtonText(`${front} · ${title}`);
+}
+
+/**
+ * Every candidate gets a line of its own, and the message above the buttons spells each one out in
+ * full. Two buttons across a phone screen cut the name and lost the year, which is exactly the
+ * difference between the right poster and a poster for the wrong release.
+ */
+export function posterCandidateKeyboard(candidates = []) {
+  const rows = candidates.slice(0, 10).map((candidate, index) => [
+    Markup.button.callback(posterCandidateLabel(candidate, index), `poster:pick:${index}`)
+  ]);
+  rows.push([Markup.button.callback('Search again', 'poster:retry')]);
+  rows.push([Markup.button.callback('Cancel', 'poster:cancel')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function posterCandidateListText(candidates = []) {
+  return candidates.slice(0, 10).map((candidate, index) => {
+    const parts = [
+      posterCandidateYear(candidate),
+      cleanText(candidate?.type, 12)?.toUpperCase() || null,
+      posterProviderLabel(candidate?.provider) || null,
+      Number(candidate?.score) ? `match ${Math.round(Number(candidate.score) * 100)}%` : null
+    ].filter(Boolean);
+    return `${index + 1}. ${cleanText(candidate?.title, 90) || 'Untitled'}${parts.length ? ` — ${parts.join(' · ')}` : ''}`;
+  }).join('\n');
+}
+
+/** One card, described the way a publisher needs it: the ID first, then how to use it. */
+export function postIdAnswerText(content, config = null) {
+  const files = Number.isInteger(Number(content.filesCount))
+    ? content.filesCount
+    : (Array.isArray(content.files) ? content.files.length : 0);
+  const link = config ? getContentPageUrl(config, content) : null;
+  const facts = [
+    categoryDetails(content.category).label,
+    Number(content.year) ? String(content.year) : null,
+    `${files} file${files === 1 ? '' : 's'}`,
+    content.published === false ? 'not published yet' : null
+  ].filter(Boolean).join(' \u00b7 ');
+  return [
+    `Post ID: ${content.adminId}`,
+    `\u201c${cleanText(content.title, 90)}\u201d \u00b7 ${facts}`,
+    link ? `Catalog page: ${link}` : null,
+    `Use it like this: /title ${content.adminId} New title \u00b7 /category ${content.adminId} tv \u00b7 /poster ${content.adminId} \u00b7 /delete ${content.adminId}`
+  ].filter(Boolean).join('\n');
+}
+
+/** Routes the app owns; anything else under the site root is a catalog card. */
+const NOT_A_CARD_ROUTE = new Set(['', 'browse', 'search', 'request', 'requests', 'new', 'help', 'top', 'calendar', 'genres', 'delivery', 'api', 'watch']);
+
+function catalogSlugFromUrl(url) {
+  const segments = String(url.pathname || '').split('/').filter(Boolean);
+  if (!segments.length || segments.length > 2) return null;
+  const slug = segments.at(-1).replace(/\.html?$/i, '');
+  if (!slug || NOT_A_CARD_ROUTE.has(segments[0]) || (segments.length === 2 && !CATEGORY_IDS.has(segments[0]))) return null;
+  return slug;
+}
+
+/**
+ * Find the Post ID behind something the publisher already has in hand.
+ *
+ * Getting at an `SB-…` id meant scrolling /posts until the right one turned up. Anything that
+ * already points at a card answers directly instead: the announcement post forwarded back to the
+ * bot, the catalog page link, or a link to the message in the storage channel. A message that is
+ * none of those is passed to the normal draft flow, so typing a title is never mistaken for a query.
+ */
+export async function handlePostIdLookupMessage(ctx, repository, config = null) {
+  const message = ctx.message;
+  if (!message) return false;
+  const origin = message.forward_origin
+    || (message.forward_from_chat ? { chat: message.forward_from_chat, message_id: message.forward_from_message_id } : null);
+  const wantedMessageId = Number(origin?.chat && origin?.message_id ? origin.message_id : 0);
+
+  if (wantedMessageId > 0) {
+    const channel = cleanText(origin.chat.id || origin.chat.username, 60);
+    const found = typeof repository.findContentByAnnouncementMessage === 'function'
+      ? await repository.findContentByAnnouncementMessage({ channelId: channel, messageId: wantedMessageId })
+      : null;
+    await ctx.reply(found
+      ? postIdAnswerText(found, config)
+      : `That forwarded post is not an announcement of mine I can match, so it has no Post ID here.\n\n/search <title> lists the cards that do, /postid finds them by the day they were uploaded, and /posts lists the newest ones.`);
+    return true;
+  }
+
+  const text = cleanText(message.text, 400);
+  const onlyLink = /^\s*https?:\/\/\S+\s*$/;
+  if (!text || !onlyLink.test(text.trim())) return false;
+  let url;
+  try {
+    url = new URL(text.trim());
+  } catch {
+    return false;
+  }
+  const host = String(url.hostname || '').toLowerCase();
+  if (host === 't.me' || host.endsWith('.t.me')) {
+    const parts = url.pathname.split('/').filter(Boolean);
+    // `/c/<internal-id>/<message-id>` or `/<channel>/<message-id>`. A bare channel link, and a
+    // `/s/…` short link, carry no message id to match on.
+    const messageId = parts[0] === 's' ? 0 : Number.parseInt(parts.at(-1), 10) || 0;
+    if (messageId <= 0 || parts.length < 2) return false;
+    const channel = parts[0] === 'c' ? `-${Number.parseInt(parts[1], 10)}` : `@${parts[0]}`;
+    const found = typeof repository.findContentByAnnouncementMessage === 'function'
+      ? await repository.findContentByAnnouncementMessage({ channelId: channel, messageId })
+      : null;
+    if (found) {
+      await ctx.reply(postIdAnswerText(found, config));
+      return true;
+    }
+    // A storage-channel message is not an announcement, but the card it fed is findable by it.
+    const viaStorage = typeof repository.findContentByStorageMessageId === 'function'
+      ? await repository.findContentByStorageMessageId(messageId, channel.replace(/^-?@?/, ''), { includeLegacy: true })
+      : null;
+    if (!viaStorage) return false;
+    const card = typeof repository.findContentByAdminId === 'function'
+      ? await repository.findContentByAdminId(viaStorage.adminId)
+      : viaStorage;
+    await ctx.reply(card ? postIdAnswerText(card, config) : `That storage message belongs to ${viaStorage.adminId}, which is no longer in the catalog.`);
+    return true;
+  }
+  const slug = catalogSlugFromUrl(url);
+  if (!slug || typeof repository.findContentBySlug !== 'function') return false;
+  const found = await repository.findContentBySlug(slug);
+  if (!found) return false;
+  await ctx.reply(postIdAnswerText(found, config));
+  return true;
+}
+
+/** Validate, mirror, and store one replacement poster for a published card. */
+export async function mirrorPosterForPublishedPost({ ctx, repository, adminId, sourceUrl, config, lookupTitle = null, inferredCategory = null }) {
+  const existing = await repository.findContentByAdminId(adminId);
+  if (!existing) {
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
+    return null;
+  }
+  const resolvedCategory = inferredCategory && CATEGORY_IDS.has(inferredCategory) && existing.category !== ADULT_CATEGORY && !(inferredCategory === 'movie' && Number(existing.episodeCount) > 1)
+    ? inferredCategory
+    : null;
+  let posterResult = null;
+  try {
+    posterResult = await mirrorPosterToImgBB({
+      sourceUrl,
+      // A manual pick must fail loudly rather than quietly falling back to a
+      // generated poster the publisher never chose.
+      sourceIsManual: true,
+      title: existing.title,
+      category: resolvedCategory || existing.category,
+      config,
+      repository
+    });
+  } catch (error) {
+    // A busy image host is the one reason an artwork change can wait: the choice is kept in the
+    // retry queue, so the operator never has to pick it again and the card keeps its old poster.
+    if (!isPosterRateLimit(error)) throw error;
+    const image = await preparePosterImage({ sourceUrl, sourceIsManual: true, title: existing.title, category: resolvedCategory || existing.category });
+    queuePosterRetry({
+      adminId,
+      title: existing.title,
+      image,
+      notifyChatId: chatId(ctx),
+      retryAfterMs: error.retryAfterMs || (error.allKeysCooling ? 3_600_000 : undefined)
+    });
+    if (error.allKeysCooling) {
+      await ctx.reply(
+        `\u25aa All ${error.poolSize || 'configured'} ImgBB API keys are rate limited right now. Checked 1st API key and it is still rate limited. The artwork you chose for ${adminId} is queued and will automatically retry in about ${shortDuration(error.retryAfterMs || 3_600_000)} once the rate limit is removed \u2014 nothing to resend, and your choice was not lost.`
+      );
+    } else {
+      await ctx.reply(
+        `\u25aa ImgBB is rate limiting right now, so ${adminId} keeps its current poster for the moment. The artwork you chose is queued and I will update this card and its channel post as soon as the host takes it \u2014 nothing to resend, and your choice was not lost.`
+      );
+    }
+    return null;
+  }
+  const updated = await repository.updateContentByAdminId(adminId, {
+    ...(resolvedCategory ? { category: resolvedCategory } : {}),
+    posterUrl: posterResult.url,
+    backdropUrl: posterResult.url,
+    // `title` is what the artwork was matched against. A later /title correction is the signal that
+    // the match is worth repeating, and a poster chosen by hand is never overwritten by one.
+    poster: {
+      provider: 'imgbb',
+      providerId: posterResult.providerId,
+      originalUrl: posterResult.originalUrl,
+      source: posterResult.source,
+      title: cleanText(existing.title, 180) || null,
+      mirroredAt: new Date().toISOString()
+    }
+  });
+  // The artwork is the announcement, so replace the photo in every channel this
+  // post was announced to. A poster nobody chose manually is still a real change.
+  const announcementSync = updated
+    ? await queueAnnouncementSync({ telegram: ctx.telegram, repository, content: updated, config, adminId: updated.adminId, notifyChatId: chatId(ctx) })
+    : null;
+  // Choosing the artwork by hand is also the moment a card gets the rest of its identity: the same
+  // provider lookup that found this poster knows its year, genres and synopsis, and a release
+  // published from a filename usually has none of them. A poster picked from a search is looked up
+  // under the name it was found as, which is the release whose details belong on the card.
+  const detailsJob = updated
+    ? queuePosterRematchForTitle({ repository, config, content: updated, adminId: updated.adminId, telegram: ctx.telegram, lookupTitle })
+    : null;
+  detailsJob?.catch(() => {});
+  return { existing, posterResult, updated, announcementSync };
+}
+
+export async function presentPosterCandidates({ ctx, repository, config, adminId, query }) {
+  const target = adminId ? await repository.findContentByAdminId(adminId) : null;
+  if (adminId && !target) {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts or /search <title> to find it, or forward me the announcement post.`);
+    return false;
+  }
+  const searchTitle = cleanText(query, 180) || target?.title || '';
+  if (!searchTitle) {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Send the release name to search artwork for. Example: /poster SB-0123ABCDEF Cocktail 2');
+    return false;
+  }
+  const category = target?.category || 'movie';
+  await ctx.reply(`Searching AniList, TMDB, and OMDb artwork for “${searchTitle}”…`);
+  let candidates = [];
+  try {
+    candidates = await searchPosterCandidates(searchTitle, category, config, { limit: 10 });
+  } catch (error) {
+    console.error('[telegram] poster candidate search failed:', error?.message || 'Unknown error');
+  }
+  if (!candidates.length) {
+    // Nothing was chosen, so the conversation is closed instead of being left
+    // waiting for another title the publisher may never send.
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await ctx.reply(
+      `No provider artwork matched “${searchTitle}”. ${adminId ? `Send a direct link instead: /poster ${adminId} https://…` : 'Send a direct link instead: /poster https://…'}`,
+      adminId ? posterCancelKeyboard() : undefined
+    );
+    return false;
+  }
+  await repository.startPosterFlow?.({
+    chatId: chatId(ctx),
+    ownerId: userId(ctx),
+    style: 'new',
+    targetAdminId: adminId || null,
+    stage: 'pick',
+    query: searchTitle,
+    candidates
+  });
+  await ctx.reply(
+    [
+      `Found ${candidates.length} match${candidates.length === 1 ? '' : 'es'} for ${adminId || 'this draft'}. Tap one to mirror it to ImgBB and use it on the card:`,
+      '',
+      posterCandidateListText(candidates)
+    ].join('\n'),
+    posterCandidateKeyboard(candidates)
+  );
+  return true;
+}
+
+/** Answers a `poster:*` button. Returns false when the payload is unknown. */
+export async function handlePosterAction(ctx, repository, config, action) {
+  if (typeof repository.findPosterFlow !== 'function') return false;
+  const key = cleanText(action, 40);
+  if (key === 'poster:cancel') {
+    await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+    await acknowledgeTap(ctx, 'Cancelled');
+    await ctx.reply('Poster selection cancelled.');
+    return true;
+  }
+  const flow = await repository.findPosterFlow(chatId(ctx), userId(ctx));
+  if (!flow) {
+    await acknowledgeTap(ctx, 'This poster menu expired. Send /poster again.', { alert: true });
+    return true;
+  }
+  if (key === 'poster:style:old' || key === 'poster:style:new') {
+    const style = key.endsWith(':old') ? 'old' : 'new';
+    await repository.updatePosterFlow?.(chatId(ctx), userId(ctx), { style, stage: 'post-id', candidates: [], query: '' });
+    await acknowledgeTap(ctx);
+    await ctx.reply(
+      style === 'old'
+        ? 'Old style: send the Post ID, for example SB-0123ABCDEF. Find it with /posts or /postid.'
+        : 'New style: send the Post ID first, for example SB-0123ABCDEF. I will then ask for the title and show you the artwork I can find.',
+      posterCancelKeyboard()
+    );
+    return true;
+  }
+  if (key === 'poster:retry') {
+    // Answer the tap first: a provider search can outlive Telegram's short
+    // callback window, and an unacknowledged tap makes the button look broken.
+    await acknowledgeTap(ctx, 'Searching artwork again\u2026');
+    await presentPosterCandidates({ ctx, repository, config, adminId: flow.targetAdminId, query: flow.query });
+    return true;
+  }
+  const pick = key.match(/^poster:pick:(\d{1,2})$/);
+  if (pick) {
+    const candidate = (flow.candidates || [])[Number.parseInt(pick[1], 10)];
+    if (!candidate?.posterUrl) {
+      await acknowledgeTap(ctx, 'That artwork is no longer available. Search again.', { alert: true });
+      return true;
+    }
+    await acknowledgeTap(ctx, `Mirroring ${cleanText(candidate.title, 60) || 'poster'}…`);
+    const candidateCategory = categoryFromHints({ hints: candidate, minimumScore: 0.3 });
+    if (!flow.targetAdminId) {
+      const session = await repository.findSession(chatId(ctx), userId(ctx));
+      if (!session) {
+        await ctx.reply('That draft is no longer active, so the artwork has nowhere to go. Start one with /panel, or edit a published post with /poster SB-… <name>.');
+        return true;
+      }
+      const draftPatch = {
+        posterOriginalUrl: candidate.posterUrl,
+        ...(candidateCategory && session.category !== ADULT_CATEGORY ? { category: candidateCategory } : {})
+      };
+      await repository.updateSession(chatId(ctx), userId(ctx), draftPatch);
+      await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+      await ctx.reply(`Draft artwork selected: ${cleanText(candidate.title, 80)}${Number.isInteger(Number(candidate.year)) ? ` (${candidate.year})` : ''}. Publish with /done to mirror it to ImgBB.`);
+      return true;
+    }
+    try {
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: candidate.posterUrl, config, lookupTitle: candidate.title, inferredCategory: candidateCategory });
+      if (!result) return true;
+      await repository.deletePosterFlow?.(chatId(ctx), userId(ctx));
+      await ctx.reply(result.updated
+        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title} using the ${posterProviderLabel(candidate.provider) || 'chosen'} artwork.`
+        : `The poster was mirrored, but ${flow.targetAdminId} is no longer available.`);
+      try {
+        await ctx.replyWithPhoto(result.posterResult.url, { caption: 'New catalog artwork preview' });
+      } catch {
+        // A preview is a convenience; the catalog card is already updated.
+      }
+    } catch (error) {
+      const message = error instanceof PosterHostingError ? error.message : 'The chosen poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+      console.error('[telegram] poster selection failed:', error?.message || 'Unknown error');
+      await ctx.reply(`Poster was not changed. ${message}`);
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Continues an armed /poster conversation: Post ID → image link (old style) or
+ * Post ID → title → artwork buttons (new style).
+ */
+export async function handlePosterFlowMessage(ctx, repository, config) {
+  if (typeof repository.findPosterFlow !== 'function') return false;
+  const flow = await repository.findPosterFlow(chatId(ctx), userId(ctx));
+  if (!flow) return false;
+  const text = cleanText(ctx.message?.text, 2_000);
+  if (!text) return false;
+
+  if (flow.stage === 'post-id') {
+    const trimmed = text.trim();
+    const target = /^SB-[A-F0-9]{10}$/i.test(trimmed)
+      ? trimmed.toUpperCase()
+      : parsePublishedPostEdit(trimmed)?.adminId || null;
+    if (!target) {
+      await ctx.reply('Send the post ID only, for example SB-0123ABCDEF. Use /posts or /postid to find it, or /poster cancel to stop.');
+      return true;
+    }
+    await repository.updatePosterFlow(chatId(ctx), userId(ctx), { targetAdminId: target, stage: flow.style === 'old' ? 'image-url' : 'search-title' });
+    await ctx.reply(
+      flow.style === 'old'
+        ? `Editing ${target}. Now send the HTTPS image link for the new poster.`
+        : `Editing ${target}. Now send the exact movie/series name (add a year if it helps) and I will show the artwork I can find.`,
+      posterCancelKeyboard()
+    );
+    return true;
+  }
+
+  if (flow.stage === 'image-url') {
+    const match = text.match(/https:\/\/\S+/i);
+    if (!match) {
+      await ctx.reply('That is not an HTTPS image link. Send a URL such as https://example.com/poster.jpg, or use /poster cancel.');
+      return true;
+    }
+    try {
+      const result = await mirrorPosterForPublishedPost({ ctx, repository, adminId: flow.targetAdminId, sourceUrl: match[0], config });
+      if (!result) return true;
+      await repository.deletePosterFlow(chatId(ctx), userId(ctx));
+      await ctx.reply(result.updated
+        ? `Poster updated for ${result.updated.adminId} · ${result.updated.title}.`
+        : `The poster was mirrored, but ${flow.targetAdminId} is no longer available.`);
+    } catch (error) {
+      const message = error instanceof PosterHostingError ? error.message : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+      console.error('[telegram] poster flow mirror failed:', error?.message || 'Unknown error');
+      await ctx.reply(`Poster was not changed. ${message}\nThe prompt is still open — send another link or use /poster cancel.`);
+    }
+    return true;
+  }
+
+  if (flow.stage === 'search-title') {
+    // A failed search closes the flow itself, so nothing has to be cleaned up here.
+    await presentPosterCandidates({ ctx, repository, config, adminId: flow.targetAdminId, query: text });
+    return true;
+  }
+
+  return false;
+}
+
+// A t.me/c link contains Telegram's private-channel internal ID, rather than
+// the normal -100… chat ID used by the Bot API. Keeping this parser narrow
+// avoids accidentally importing a public link or a link from another channel.
+export function parsePrivateStorageMessageLink(value) {
+  const match = String(value || '').match(/(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d{5,20})\/(\d{1,12})(?:[/?#][^\s)]*)?/i);
+  if (!match) return null;
+
+  const messageId = Number(match[2]);
+  if (!Number.isSafeInteger(messageId) || messageId < 1) return null;
+  return {
+    channelId: `-100${match[1]}`,
+    messageId,
+    url: `https://t.me/c/${match[1]}/${messageId}`
+  };
+}
+
+function parseBatchArgument(value) {
+  const supplied = cleanText(value, 180);
+  if (!supplied) return { title: '', category: null };
+
+  // An optional category prefix lets a publisher override automatic detection
+  // without adding a separate, more fragile batch command syntax.
+  const prefixed = supplied.match(/^(anime|cartoon|donghua|k(?:-|\s)?drama|movie|web(?:-|\s)?series|t\.?v\.?|ott|adult|18\+?)\s*(?:\||:)\s*(.+)$/i);
+  if (!prefixed) return { title: supplied, category: null };
+
+  // Spoken names are resolved through the same alias table as /category, so `/batch tv | X`,
+  // `/batch OTT | X`, and `/batch web series | X` all mean what the publisher meant by them.
+  const spoken = prefixed[1].toLowerCase().replace(/[\s._-]+/g, '');
+  const category = /^(?:adult|18\+?|18)$/.test(spoken)
+    ? ADULT_CATEGORY
+    : resolveCategoryId(spoken === 'tv' || spoken === 'ott' ? 'tv' : spoken);
+  return {
+    title: cleanText(prefixed[2], 180),
+    category: category && PUBLISH_CATEGORIES.includes(category) ? category : null
+  };
+}
+
+/**
+ * Words a release group writes around a title, and words that describe the file rather than the
+ * work. None of them ever appear in a real catalog title, which is what makes them safe to drop:
+ * the uploader's own wording is kept unless a token is only packaging.
+ */
+const RELEASE_TITLE_NOISE = new Set([
+  'mkv', 'mp4', 'avi', 'webm', 'mov', 'm4v', 'ts', 'm2ts', 'm4a', 'mp3', 'flac', 'srt', 'ass',
+  'x264', 'x265', 'h264', 'h265', 'hevc', 'avc', 'av1', 'vp9', 'aac', 'ac3', 'eac3', 'dts', 'truehd',
+  'ddp', 'ddp5', 'ddp2', 'dd', 'lpcm', 'opus', 'hi10p', 'dovi', 'dv', 'hlg',
+  'atmos', 'hdr', 'hdr10', 'sdr', '10bit', '8bit', 'remux', 'proper', 'repack', 'rerip', 'uncut', 'extended',
+  'unrated', 'remastered', 'dual', 'multi', 'audio', 'subs', 'sub', 'subbed', 'dub', 'dubbed', 'engsub', 'esub', 'esubs', 'msub', 'msubs', 'multisub', 'multisubs', 'korsub',
+  'org', 'original', 'hq', 'hc', 'hd', 'sd', 'qhd', '2k', '5k', '6k',
+  'fhd', 'uhd', '4k', '8k', 'dvdscr', 'webdl', 'webrip', 'webhd', 'web', 'bluray', 'bdrip', 'brrip', 'brip', 'hdrip', 'dvdrip',
+  'hdcam', 'cam', 'hdts', 'telesync', 'telecine', 'predvd', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'epi', 'ep', 'eps',
+  'nf', 'netflix', 'amzn', 'amazon', 'prime', 'primevideo', 'dsnp', 'dsnk', 'disney', 'hotstar', 'jiohotstar', 'jiocinema',
+  'zee5', 'sonyliv', 'sliv', 'sunnxt', 'snxt', 'aha', 'hoichoi', 'voot', 'ullu', 'chaupal', 'stage', 'hulu', 'hbomax', 'hmax',
+  'atvp', 'pcok', 'peacock', 'pmtp', 'paramount', 'lionsgate', 'lgp', 'crunchyroll', 'cr', 'bilibili', 'bglobal', 'wetv', 'iqiyi',
+  'youku', 'mgtv', 'tencent', 'viki', 'viu', 'wavve', 'tving', 'hidive', 'funimation', 'muse', 'anione',
+  'rarbg', 'yts', 'yify', 'psa', 'pahe', 'tgx', 'kayoanime', 'animekayo', 'subsplease', 'horriblesubs', 'nyaa', 'ember', 'judas', 'flux', 'ntb', 'ethel', 'playweb',
+  // Audio labels are packaging on a file, and `cleanMediaName` already drops them for the same
+  // reason; listing them here keeps a direct call to the tidy from disagreeing with the pipeline.
+  'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'bangla', 'marathi',
+  'punjabi', 'gujarati', 'urdu', 'japanese', 'korean', 'chinese', 'mandarin', 'cantonese',
+  'indonesian', 'thai', 'vietnamese', 'spanish', 'french', 'german', 'portuguese', 'arabic', 'russian'
+]);
+const RELEASE_TITLE_YEAR = /^(?:19|20)\d{2}$/;
+// A group tag is welded to its hyphen ("-KyoGo"), or it is the one short word after a spaced
+// separator at the very end ("Minions - KyoGo"). Anything longer or numbered is read as part of the
+// title, because "K.G.F – Chapter 2" and "Baahubali – The Beginning" really are the title.
+const TRAILING_GROUP_TAG = /\s[-–—|~]\s*[A-Za-z][A-Za-z0-9]{1,11}$/;
+const HYPHEN_WELDED_TAG = /\s[-–—]\S+/g;
+
+/**
+ * Reduce a caption or filename to the release title inside it.
+ *
+ * A range of files is split into one card per release, so a caption carrying "-KyoGo mkv 🔊 #" next
+ * to a caption carrying only "Minions" used to make two cards, two announcements, and two ImgBB
+ * uploads for one film — and a whole mixed range multiplied that. Cosmetic packaging is what is
+ * removed here; the words are matched against a packaging vocabulary, never guessed at.
+ */
+export function tidyReleaseTitle(value) {
+  // A pasted caption usually arrives with the upload channel's advertising still welded to it
+  // (`❤️ Join ~ [ @twg]King of Prison (2020) 720p HDRip.mkv`), and a title beginning `Join` is also
+  // how two cards for one release end up looking like different releases to the merge guard. The
+  // same scrub the file names go through runs first, so a typed title and an inferred one agree.
+  const raw = cleanText(stripTelegramAttribution(value, 320), 180).replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  const unwrapped = raw
+    .replace(/\[[^\]]{0,120}\]/g, ' ')
+    .replace(/\{[^}]{0,80}\}/g, ' ')
+    .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts|m4a|mp3|flac)$/i, ' ')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|gib|mib)\b/gi, ' ')
+    .replace(/\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const dehyphenated = unwrapped.replace(HYPHEN_WELDED_TAG, ' ').replace(/\s+/g, ' ').trim();
+  const withoutTag = dehyphenated.replace(TRAILING_GROUP_TAG, '').trim();
+  const source = withoutTag.length >= 3 ? withoutTag : dehyphenated;
+  const kept = [];
+  for (const [index, token] of source.split(/\s+/).entries()) {
+    const core = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+    // An emoji, a lone "#", or a bare separator says nothing about the release.
+    if (!core) continue;
+    const lowered = core.toLowerCase();
+    if (RELEASE_TITLE_NOISE.has(lowered)) continue;
+    if (/^\d{2,4}[pPi]$/i.test(lowered)) continue;
+    if (/^(?:ddp?|eac3|ac3|aac|dts|truehd|h\.?26[45]|x\.?26[45])[\d.]*$/i.test(lowered)) continue;
+    // A year is metadata, and `cleanMediaName` has already taken most of them. One welded to a
+    // colon or leading the title is part of the name ("2001: A Space Odyssey"), so it stays.
+    if (RELEASE_TITLE_YEAR.test(lowered) && index > 0 && !/[:.]$/.test(token)) continue;
+    if (kept.length && kept[kept.length - 1].toLowerCase().replace(/[^a-z0-9]/g, '') === lowered.replace(/[^a-z0-9]/g, '')) continue;
+    // A word is kept as written, with only the wrapping that a paste adds taken off. An inner "!"
+    // (Scooby-Doo!), a colon after a year (2001: A Space Odyssey) and a hyphen inside a name are
+    // the title, not packaging, so they are never touched.
+    kept.push(token.replace(/^[#@/>*+\-–—\[{("'`]+|[)\]},;|\\_]+$/g, '').trim());
+  }
+  while (kept.length > 1) {
+    const tail = kept[kept.length - 1].replace(/[^\p{L}\p{N}]/gu, '');
+    if (
+      /^[b-df-hj-np-tv-xz]{4,6}$/i.test(tail)
+      && new Set(tail.toLowerCase()).size >= 3
+      && !/^(?:part|ii|iii|iv|vi|vii|viii|ix|xi|xii)$/i.test(tail)
+    ) {
+      kept.pop();
+    } else {
+      break;
+    }
+  }
+  const tidied = cleanText(kept.join(' ').replace(/\s{2,}/g, ' ').trim(), 180);
+  // Never let the tidy eat a title whole: a short, unusual name beats an empty string.
+  return tidied.length >= 2 ? tidied : raw;
+}
+
+/** A card needs a name. "🔊 #", "mkv", and "2015" are not one, so that file follows the one above it. */
+export function isPlausibleReleaseTitle(value) {
+  const text = String(value || '').trim();
+  if (text.length < 3) return false;
+  const words = text.split(/\s+/).filter((token) => /[A-Za-zÀ-ÿ\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\uAC00-\uD7AF]{2,}/.test(token));
+  if (!words.length) return false;
+  if (/^(?:document|video|file|upload|movie|film)(?:\s*\d+)?$/i.test(text)) return false;
+  if (words.length === 1) {
+    const singleCore = words[0].replace(/[^\p{L}]/gu, '');
+    if (/^[b-df-hj-np-tv-xz]{4,}$/i.test(singleCore) && new Set(singleCore.toLowerCase()).size >= 3) return false;
+  }
+  return words.some((word) => {
+    const core = word.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+    // One real word, and not a packaging word dressed up as one: "mkv" and "1080p" are not names.
+    return core.length >= 2 && !RELEASE_TITLE_NOISE.has(core);
+  });
+}
+
+export function inferBatchTitle(files = []) {
+  for (const file of files) {
+    // A caption may contain only an episode label while the filename carries
+    // the actual title, so try each independently instead of treating the
+    // caption as an unconditional replacement for the filename.
+    for (const value of [file?.displayName, file?.name]) {
+      const source = cleanText(value, 180);
+      if (!source) continue;
+
+      // A title that opens with a year and a colon is the work's name, not a release date, so it is
+      // tidied directly rather than through cleanMediaName (which removes years on purpose).
+      if (/^(?:19|20)\d{2}\s*:\s*\S/.test(source)) {
+        const named = tidyReleaseTitle(source);
+        if (isPlausibleReleaseTitle(named)) return named;
+      }
+
+      const candidate = cleanMediaName(source)
+        .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\b(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
+        // Keep sequel numbers (Cocktail 2), but remove a standalone season
+        // marker because it describes packaging rather than the series title.
+        .replace(/\b(?:S(?:EASON)?\s*0*\d{1,2})\b/gi, ' ')
+        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|esubs?|msubs?|eng|indo|cc)\b/gi, ' ')
+        .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|indonesian|thai|vietnamese|spanish|french|german|portuguese|arabic|russian)\b/gi, ' ')
+        .replace(/\b(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})\s*[pPiI]\b/g, ' ')
+        .replace(/\b(?:144|240|288|360|480|540|544|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
+        .replace(/[+]+/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .replace(/^[\s\-–—|:/.]+|[\s\-–—|:/.]+$/g, '')
+        .trim();
+
+      // Tidied first, and only then judged: a caption that is nothing but packaging must not become
+      // a card of its own, and a file whose title survives the tidy is the release it names.
+      const title = tidyReleaseTitle(candidate);
+      if (isPlausibleReleaseTitle(title)) return title;
+    }
+  }
+  return '';
+}
+
+export function inferBatchCategory({ title = '', files = [], withSignal = false } = {}) {
+  const signals = [title, ...files.flatMap((file) => [file?.displayName, file?.name])]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const said = (category) => (withSignal ? { category, evidence: true } : category);
+  const guessed = (category) => (withSignal ? { category, evidence: false } : category);
+
+  // A publisher who wrote the word in the title or the caption means it, so this runs first and the
+  // providers are never consulted.
+  if (/\b(?:donghua|manhua|xianxia|cultivation|chinese\s+anime)\b/.test(signals)) return said('donghua');
+  if (/\b(?:k[\s-]?drama|korean\s+drama)\b/.test(signals)) return said('kdrama');
+  if (/\b(?:cartoon|animated\s+(?:series|show)|kids\s+animation)\b/.test(signals)) return said('cartoon');
+  if (/\b(?:anime|japanese\s+anime)\b/.test(signals)) return said('anime');
+  if (/\b(?:web[\s-]?series|webseries)\b/.test(signals)) return said('web-series');
+  // Only a labelled TV/OTT release counts as evidence: `Show (OTT)`, `Show | TV Premiere`. A bare
+  // `TV` is a release-group tag on a filename far too often to trust on its own.
+  if (/\b(?:ott|tv)\s+(?:original|premiere|show|series|special)\b/i.test(title)
+    || /[(|[{]\s*(?:ott|tv)\b/i.test(title)) return said('tv');
+
+  // Season packaging is episodic by definition: `Fullmetal Alchemist S1` has no
+  // episode numbers in the filenames, and used to be filed as a movie.
+  const hasSeasonMarkers = files.some((file) => Boolean(detectUploadSeasonForFile(file)));
+  if (summarizeEpisodes(files).count || hasSeasonMarkers) {
+    if (/\b(?:chinese|mandarin|cantonese)\b/.test(signals)) return said('donghua');
+    if (/\b(?:japanese|jpn)\b/.test(signals)) return said('anime');
+    if (/\b(?:korean|kor)\b/.test(signals)) return said('kdrama');
+    // Everything below this line is a guess from packaging alone, and `decidePublishCategory`
+    // treats it as one: that is the difference between a category and a coin toss.
+    return guessed('web-series');
+  }
+  return guessed('movie');
+}
+
+/**
+ * The category a release should be filed under.
+ *
+ * A caption that says nothing cannot tell a donghua from a web series — `Peerless Martial Spirit
+ * S01E02.mkv` is exactly as informative as a Chinese live-action show — and filing every such
+ * upload as "web series" meant publishers correcting the same field again and again. So an
+ * evidence-free guess is put to the providers before anything is written, and their answer wins
+ * when they recognised the title. No key configured, no network, or a weak match leaves the
+ * caption's own answer in place, because silence from a provider must not misfile a release.
+ */
+export async function decidePublishCategory({ title = '', files = [], chosen = null, config = null, search = searchPosterCandidates } = {}) {
+  const guess = inferBatchCategory({ title, files, withSignal: true });
+  const cleanTitle = cleanText(title, 180);
+  // A category that is not what the caption alone would produce was chosen deliberately — on the
+  // /panel keyboard, by `/batch donghua | Title`, or with /category — and a person's word outranks
+  // a provider's. Only a category nobody picked is put to the providers.
+  if (chosen && CATEGORY_IDS.has(chosen) && chosen !== guess.category) return { category: chosen, evidence: true, source: 'publisher' };
+  if (guess.evidence || !cleanTitle) return { ...guess, source: 'caption' };
+  let hints = null;
+  try {
+    hints = await searchCategoryHints(cleanTitle, config || {}, { search, category: 'movie' });
+  } catch {
+    hints = null;
+  }
+  const decided = categoryFromHints({ hints });
+  if (!decided || decided === guess.category) return { ...guess, source: 'caption' };
+  return {
+    category: decided,
+    evidence: true,
+    source: hints.provider,
+    matchedTitle: cleanText(hints.title, 80) || null,
+    was: guess.category
+  };
+}
+
+function autoPublishKeyboard(enabled) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`Auto-publish: ${enabled ? 'ON' : 'OFF'}`, 'auto:status')],
+    [Markup.button.callback('Turn ON', 'auto:on'), Markup.button.callback('Turn OFF', 'auto:off')]
+  ]);
+}
+
+function autoPublishStatusText(settings, config) {
+  const enabled = Boolean(settings?.enabled);
+  return [
+    `Storage-channel auto-publish is ${enabled ? 'ON' : 'OFF'}.`,
+    '',
+    enabled
+      ? 'New supported media posted directly in the configured database channel is collected by cleaned release name. After 90 seconds with no matching upload (or 15 minutes maximum), one combined post is classified, matched with metadata, mirrored to ImgBB, and published.'
+      : 'Nothing posted in the database channel will be published automatically while this is OFF.',
+    '',
+    config.telegram.storageChannelId
+      ? `Database channel: ${config.telegram.storageChannelId}`
+      : 'TELEGRAM_STORAGE_CHANNEL_ID is not configured. Set it before turning automation on.',
+    'Bot-originated storage copies, active-draft files, and already-published storage messages are ignored to prevent loops and duplicates.',
+    settings?.notifyChatId || settings?.updatedBy
+      ? 'Completion and error diagnostics are sent to the authorized publisher, never into the database channel.'
+      : 'Turn the setting ON from your private publisher chat to receive completion and error diagnostics.',
+    'Use /batch to publish an existing inclusive range of storage-channel files.'
+  ].join('\n');
+}
+
+function parseStartPayload(ctx) {
+  const text = ctx.message?.text || '';
+  const [, payload] = text.split(/\s+/, 2);
+  return payload || '';
+}
+
+export function parseDeliveryPayload(payload) {
+  const safePayload = String(payload || '').trim();
+  if (safePayload.startsWith('get-')) {
+    const shareCode = safePayload.slice(4);
+    return /^[A-Za-z0-9_-]{6,48}$/.test(shareCode) ? { shareCode, filePosition: null } : null;
+  }
+
+  // The final numeric segment is the 1-based file position. The share code can
+  // contain hyphens, so matching from the right avoids ambiguous split logic.
+  const singleFile = safePayload.match(/^file-([A-Za-z0-9_-]{6,48})-([1-9]\d{0,5})$/);
+  if (!singleFile) return null;
+  return { shareCode: singleFile[1], filePosition: Number.parseInt(singleFile[2], 10) };
+}
+
+function normalizeChannelId(value) {
+  const parsed = cleanText(value, 80);
+  if (/^-?\d+$/.test(parsed)) return parsed;
+  if (/^@[A-Za-z][A-Za-z0-9_]{4,}$/i.test(parsed)) return parsed;
+  return null;
+}
+
+// A metadata edit can name as many posts as fit in one Telegram message, so the
+// argument is read at nearly the full 4 096-character limit instead of the
+// default 180. `parsePublishedPostEdit` and `postIdsFromCommand` deliberately
+// impose no batch cap of their own.
+export const POST_EDIT_ARGUMENT_LIMIT = 3_800;
+
+function postIdsFromCommand(value) {
+  return [...new Set(
+    [...String(value || '').toUpperCase().matchAll(/\bSB-[A-F0-9]{10}\b/g)].map((match) => match[0])
+  )].slice(0, 1_000);
+}
+
+function episodeUploadNote(file, { episodic = false } = {}) {
+  if (file.episode?.label) return ` · ${file.episode.label} detected from ${file.episode.source}`;
+  const pack = seasonPackOf(file);
+  if (pack) {
+    // A whole season in one file is indexed by season, not by episode, so this is the
+    // correct outcome rather than something the publisher has to fix.
+    return ` · ${formatSeasonLabel(pack.season)} complete season in one file (no episode number needed)`;
+  }
+  // A file with no episode number never reaches the episode index. Saying so in
+  // the upload reply is the only moment the caption can still be fixed.
+  return episodic
+    ? ' · no episode number was found in this file’s name or caption, so it stays out of the episode index — send it again with a caption like “Ep 12”'
+    : '';
+}
+
+async function updateTitleAndMetadata({ ctx, repository, config, title }) {
+  const current = await repository.findSession(chatId(ctx), userId(ctx));
+  if (!current) return null;
+  // Adult titles remain in the publisher/private storage flow and are not sent
+  // to external metadata search providers as part of title entry.
+  const metadata = isAdultCategory(current.category)
+    ? emptyPrivateCategoryMetadata(title)
+    : await findMetadata(title, current.category, config);
+  const updated = await repository.updateSession(chatId(ctx), userId(ctx), {
+    title: cleanText(title, 180),
+    metadata
+  });
+
+  if (isAdultCategory(current.category)) {
+    await ctx.reply('Title saved. This 18+ draft stays private, uses the separate 18+ storage channel, and will never be sent to announcement channels. Upload files whenever you are ready.', uploadKeyboard());
+  } else if (metadata.matched) {
+    await ctx.reply(
+      `Title saved. ${String(metadata.provider || 'metadata').toUpperCase()} found “${metadata.title}” (${metadata.year || 'year unavailable'}). Upload files whenever you are ready.`,
+      uploadKeyboard()
+    );
+  } else {
+    await ctx.reply(
+      'Title saved. No confident metadata match was found, so a branded fallback poster will be created and mirrored to ImgBB when you publish. Upload files whenever you are ready.',
+      uploadKeyboard()
+    );
+  }
+  return updated;
+}
+
+async function beginDraft(ctx, category, suppliedTitle, repository, config) {
+  if (isAdultCategory(category) && !hasDedicatedAdultStorage(config)) {
+    await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before starting /18db.`);
+    return null;
+  }
+  await repository.startSession({
+    chatId: chatId(ctx),
+    ownerId: userId(ctx),
+    category,
+    title: ''
+  });
+
+  if (suppliedTitle) {
+    await updateTitleAndMetadata({ ctx, repository, config, title: suppliedTitle });
+    return;
+  }
+
+  await ctx.reply(
+    [
+      `New ${categoryDetails(category).shortLabel} draft created.`,
+      '',
+      'Send the title next. After that, upload files directly to this chat and finish with /done.',
+      isAdultCategory(category)
+        ? 'This 18+ draft uses the isolated private storage channel and is never announced to public Telegram channels.'
+        : 'Episode detection checks the clean caption first, strips @channel tags, then checks the filename.',
+      'Optional: /lang Hindi, English · /year 2026 · /poster https://image.example/poster.jpg'
+    ].join('\n'),
+    uploadKeyboard()
+  );
+}
+
+async function beginBatch(ctx, suppliedArgument, repository, config) {
+  if (ctx.chat?.type && ctx.chat.type !== 'private') {
+    await ctx.reply('For privacy, start /batch in your private chat with this bot. It temporarily forwards each storage file there only to inspect its caption and media details.');
+    return;
+  }
+
+  const parsed = parseBatchArgument(suppliedArgument);
+  const category = parsed.category || 'movie';
+  const storageChannelId = storageChannelForCategory(config, category);
+  if (!storageChannelId) {
+    await ctx.reply(`${storageEnvironmentName(category)} is not configured. Add the ${storageChannelDescription(category)} numeric -100… ID before importing a batch.`);
+    return;
+  }
+  if (isAdultCategory(category) && !hasDedicatedAdultStorage(config)) {
+    await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before importing an 18+ batch.`);
+    return;
+  }
+
+  await repository.startSession({
+    chatId: chatId(ctx),
+    ownerId: userId(ctx),
+    category,
+    title: parsed.title
+  });
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    workflow: 'batch',
+    batch: {
+      stage: 'awaiting-first-link',
+      sourceChannelId: null,
+      firstMessageId: null,
+      lastMessageId: null,
+      titleProvided: Boolean(parsed.title),
+      categoryOverride: parsed.category
+    }
+  });
+
+  await ctx.reply(
+    [
+      parsed.title ? `Batch import created for “${parsed.title}”.` : 'Untitled batch import created.',
+      '',
+      'Send the FIRST private database-channel link, then send the LAST link. Both links must look like:',
+      'https://t.me/c/1234567890/123',
+      '',
+      'Every supported media message in the inclusive range is imported as one release. Large episode ranges are processed patiently with progress updates; the bot briefly forwards each item only to inspect its file details, then removes that preview.',
+      isAdultCategory(category)
+        ? 'This 18+ batch reads only the separate adult storage channel and will never create a public Telegram announcement.'
+        : parsed.title
+          ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
+          : 'The title and category will be inferred from the imported file descriptions and names. Use /batch adult | Your title for the isolated 18+ storage channel.'
+    ].join('\n')
+  );
+}
+
+async function removeBatchPreview(ctx, message) {
+  if (!message?.message_id) return;
+  try {
+    await ctx.telegram.deleteMessage(chatId(ctx), message.message_id);
+  } catch (error) {
+    // Removing a just-forwarded preview is best effort. It does not affect the
+    // original storage message or the catalog record.
+    console.warn('[telegram] could not remove batch inspection preview:', error?.description || error?.message || 'Unknown error');
+  }
+}
+
+function batchReasonRecordsLine(label, records, detailFormatter) {
+  if (!records.length) return null;
+  return `${label} (${records.length}): ${records.map((record) => detailFormatter(record)).join(', ')}`;
+}
+
+function batchDiagnosticLines({ skippedByReason, failures }) {
+  return [
+    batchReasonRecordsLine('Already linked to a catalog post', skippedByReason.alreadyPublished, (record) => `${record.messageId}${record.detail ? ` (${record.detail})` : ''}`),
+    batchReasonRecordsLine('Already attached to an active draft', skippedByReason.activeDraft, (record) => `${record.messageId}${record.detail ? ` (${record.detail})` : ''}`),
+    batchReasonRecordsLine('Not supported media / text-only', skippedByReason.nonMedia, (record) => String(record.messageId)),
+    batchReasonRecordsLine('Could not inspect (inaccessible, deleted, or protected)', failures, (record) => `${record.messageId} (${record.detail})`)
+  ].filter(Boolean);
+}
+
+async function replyBatchDiagnostics(ctx, lines) {
+  const maximumLength = 3_700;
+  let chunk = '';
+  for (const originalLine of lines) {
+    let line = originalLine;
+    const next = chunk ? `${chunk}\n${line}` : line;
+    if (next.length <= maximumLength) {
+      chunk = next;
+      continue;
+    }
+    if (chunk) await ctx.reply(chunk);
+    // Details are compact, but Telegram's 4096-character limit should never
+    // hide why a long inclusive range had individual messages skipped.
+    while (line.length > maximumLength) {
+      await ctx.reply(line.slice(0, maximumLength));
+      line = line.slice(maximumLength);
+    }
+    chunk = line;
+  }
+  if (chunk) await ctx.reply(chunk);
+}
+
+function telegramRetryAfterMilliseconds(error, attempt) {
+  const retryAfter = Number(
+    error?.parameters?.retry_after
+    || error?.response?.parameters?.retry_after
+    || error?.response?.body?.parameters?.retry_after
+  );
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1_000, 10 * 60_000);
+  const details = telegramErrorText(error);
+  if (/too many requests|flood|429/.test(details)) return Math.min(1_000 * (2 ** attempt), 30_000);
+  return 0;
+}
+
+function pause(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Schedule removal of one bot-delivered media message from the recipient chat.
+ * This is intentionally best effort: Telegram may reject a deletion after a
+ * user clears a chat or changes its availability, and it cannot erase a file
+ * that has already been downloaded, forwarded, or saved outside Telegram.
+ */
+export function scheduleDeliveredFileDeletion({ telegram, recipientChatId, messageId, deleteAfterMs = DELIVERY_FILE_DELETE_AFTER_MS } = {}) {
+  const destination = recipientChatId === null || recipientChatId === undefined ? '' : String(recipientChatId).trim();
+  const numericMessageId = Number(messageId);
+  if (!telegram || typeof telegram.deleteMessage !== 'function' || !destination || !Number.isSafeInteger(numericMessageId) || numericMessageId < 1) {
+    return false;
+  }
+  const requestedDelay = Number(deleteAfterMs);
+  const delay = Number.isFinite(requestedDelay) && requestedDelay >= 0
+    ? Math.min(requestedDelay, 24 * 60 * 60_000)
+    : DELIVERY_FILE_DELETE_AFTER_MS;
+  const timer = setTimeout(() => {
+    // Large releases can contain hundreds of copied files. Serialize removal
+    // requests with a small gap so the five-minute cleanup itself does not
+    // trigger Telegram's flood limit.
+    deliveryDeletionQueue = deliveryDeletionQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await telegram.deleteMessage(destination, numericMessageId);
+          console.info(`[telegram] automatically deleted delivered message ${numericMessageId} from chat ${destination}.`);
+        } catch (error) {
+          console.warn('[telegram] automatic delivery cleanup failed:', error?.description || error?.message || 'Unknown error');
+        }
+        if (DELIVERY_FILE_DELETE_SPACING_MS) await pause(DELIVERY_FILE_DELETE_SPACING_MS);
+      });
+  }, delay);
+  // Scheduled cleanup should not keep an otherwise idle Koyeb process alive.
+  timer.unref?.();
+  return true;
+}
+
+async function forwardStorageMessageWithRetry(ctx, storageChannelId, storageMessageId) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= BATCH_MAX_FORWARD_RETRIES; attempt += 1) {
+    try {
+      return await ctx.telegram.forwardMessage(
+        chatId(ctx),
+        String(storageChannelId),
+        storageMessageId,
+        { disable_notification: true }
+      );
+    } catch (error) {
+      lastError = error;
+      const waitMilliseconds = telegramRetryAfterMilliseconds(error, attempt);
+      if (!waitMilliseconds || attempt === BATCH_MAX_FORWARD_RETRIES) throw error;
+      const waitLabel = waitMilliseconds >= 1_000 ? `${Math.ceil(waitMilliseconds / 1_000)}s` : `${waitMilliseconds}ms`;
+      console.warn(`[telegram] batch import rate limited at storage message ${storageMessageId}; retrying in ${waitLabel} (attempt ${attempt + 1}/${BATCH_MAX_FORWARD_RETRIES}).`);
+      await pause(waitMilliseconds);
+    }
+  }
+  throw lastError || new Error('Could not inspect the storage message.');
+}
+
+async function reportBatchProgress(ctx, { processed, total, imported, skipped, failed }) {
+  try {
+    await ctx.reply(
+      `Batch progress: ${processed}/${total} storage messages inspected · ${imported} media imported · ${skipped} skipped${failed ? ` · ${failed} could not be inspected` : ''}.`
+    );
+  } catch (error) {
+    // A progress update is helpful but must never interrupt a long release.
+    console.warn('[telegram] could not send batch progress:', automationDiagnostic(error));
+  }
+}
+
+export async function importStorageRange(ctx, session, lastLink, bot, repository, config, publish = publishDraft) {
+  const batch = session.batch || {};
+  const sourceStorageChannelId = batch.sourceChannelId || storageChannelForCategory(config, session.category || batch.categoryOverride);
+  const includeLegacyStorageReferences = !isAdultCategory(session.category || batch.categoryOverride);
+  const firstMessageId = Number(batch.firstMessageId);
+  const lastMessageId = Number(lastLink.messageId);
+  const imported = [];
+  const captionQueue = [];
+  const flushCaptionQueue = () => {
+    if (!captionQueue.length) return 0;
+    // splice, not a clear afterwards: the lane starts this job later, and a job handed the same
+    // array the import is still filling would find nothing to do by the time it ran.
+    const queued = captionQueue.splice(0, captionQueue.length);
+    queueStorageCaptionScrub({ telegram: ctx.telegram, targets: queued, notifyChatId: chatId(ctx) }, { detached: true });
+    return queued.length;
+  };
+  const skippedByReason = {
+    alreadyPublished: [],
+    activeDraft: [],
+    nonMedia: []
+  };
+  const failures = [];
+  const totalMessages = lastMessageId - firstMessageId + 1;
+  let processedMessages = 0;
+
+  for (let storageMessageId = firstMessageId; storageMessageId <= lastMessageId; storageMessageId += 1) {
+    processedMessages += 1;
+    let preview;
+    try {
+      const existing = await repository.findContentByStorageMessageId(
+        storageMessageId,
+        sourceStorageChannelId,
+        { includeLegacy: includeLegacyStorageReferences }
+      );
+      if (existing) {
+        skippedByReason.alreadyPublished.push({
+          messageId: storageMessageId,
+          detail: existing.adminId || cleanText(existing.title, 70) || 'published post'
+        });
+        continue;
+      }
+      const pendingDraft = await repository.findSessionByStorageMessageId(
+        storageMessageId,
+        sourceStorageChannelId,
+        { includeLegacy: includeLegacyStorageReferences }
+      );
+      if (pendingDraft) {
+        skippedByReason.activeDraft.push({
+          messageId: storageMessageId,
+          detail: pendingDraft.workflow || 'upload draft'
+        });
+        continue;
+      }
+
+      // Bot API has no getMessage endpoint. Forwarding to the logged-in
+      // publisher is the safe way to inspect an existing channel message and
+      // obtain its caption/file metadata; the preview is deleted immediately.
+      preview = await forwardStorageMessageWithRetry(
+        ctx,
+        sourceStorageChannelId,
+        storageMessageId
+      );
+      if (!isMediaMessage(preview)) {
+        skippedByReason.nonMedia.push({ messageId: storageMessageId });
+        continue;
+      }
+
+      const file = fileFromMessage(preview, storageMessageId, 'existing-storage', sourceStorageChannelId);
+      // The caption is fixed on the lane rather than inline. A flood refusal must neither slow
+      // the import nor lose the fix, and the file is usable either way: nothing is created for
+      // it, the message is only edited.
+      if (captionNeedsScrub(preview?.caption)) {
+        captionQueue.push({ channel: sourceStorageChannelId, messageId: storageMessageId, caption: preview.caption, adminId: null });
+      }
+      const updated = await repository.appendSessionFile(chatId(ctx), userId(ctx), file);
+      if (!updated?.files?.length) throw new Error('The batch session expired while importing files.');
+      imported.push(file);
+    } catch (error) {
+      const details = automationDiagnostic(error);
+      failures.push({ messageId: storageMessageId, detail: details });
+      console.error('[telegram] batch import message failed:', storageMessageId, details);
+    } finally {
+      await removeBatchPreview(ctx, preview);
+      if (processedMessages === totalMessages || processedMessages % BATCH_PROGRESS_INTERVAL === 0) {
+        const skipped = Object.values(skippedByReason).reduce((total, records) => total + records.length, 0);
+        await reportBatchProgress(ctx, {
+          processed: processedMessages,
+          total: totalMessages,
+          imported: imported.length,
+          skipped,
+          failed: failures.length
+        });
+      }
+    }
+  }
+
+  const skippedCount = Object.values(skippedByReason).reduce((total, records) => total + records.length, 0);
+  const latestSession = await repository.findSession(chatId(ctx), userId(ctx));
+  const diagnostics = batchDiagnosticLines({ skippedByReason, failures });
+  const diagnosticCounts = {
+    alreadyPublished: skippedByReason.alreadyPublished.length,
+    activeDraft: skippedByReason.activeDraft.length,
+    nonMedia: skippedByReason.nonMedia.length
+  };
+
+  if (!imported.length || !latestSession) {
+    if (latestSession) {
+      await repository.updateSession(chatId(ctx), userId(ctx), {
+        batch: {
+          ...batch,
+          stage: 'import-failed',
+          lastMessageId,
+          importedCount: 0,
+          skippedCount,
+          skipReasons: diagnosticCounts,
+          failureCount: failures.length
+        }
+      });
+    }
+    const allAlreadyPublished = skippedByReason.alreadyPublished.length > 0
+      && skippedByReason.alreadyPublished.length === lastMessageId - firstMessageId + 1;
+    const queuedBeforeFailure = flushCaptionQueue();
+    await replyBatchDiagnostics(ctx, [
+      `No supported new media could be imported from messages ${firstMessageId}–${lastMessageId}.`,
+      ...diagnostics,
+      allAlreadyPublished
+        ? 'Every selected message is already linked to an existing catalog post, so no duplicate delivery records were created. Use /posts 50 to see post IDs, remove unwanted old cards with /delete SB-…, then run /batch again to rebuild the range as one post.'
+        : failures.length
+          ? 'Check that this bot is an administrator in this exact storage channel. Protected/forward-disabled messages cannot be inspected by Telegram and must be uploaded again directly.'
+          : 'No new catalog post was created. Correct the identified messages or links, then run /batch again.',
+      batchCaptionQueueNote(queuedBeforeFailure)
+    ].filter(Boolean));
+    return { imported: 0, skippedByReason, failures };
+  }
+
+  const title = cleanText(session.title || inferBatchTitle(latestSession.files), 180) || `Storage import ${firstMessageId}–${lastMessageId}`;
+  const category = batch.categoryOverride || inferBatchCategory({ title, files: latestSession.files });
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    title,
+    category,
+    metadata: null,
+    batch: {
+      ...batch,
+      stage: 'ready',
+      lastMessageId,
+      importedCount: imported.length,
+      skippedCount,
+      skipReasons: diagnosticCounts,
+      failureCount: failures.length
+    }
+  });
+
+  const queuedCaptions = flushCaptionQueue();
+  await replyBatchDiagnostics(ctx, [
+    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.`,
+    ...diagnostics,
+    batchCaptionQueueNote(queuedCaptions),
+    'Matching metadata and publishing now…'
+  ].filter(Boolean));
+  const publication = await publish(ctx, bot, repository, config);
+  return { imported: imported.length, skippedByReason, failures, publication };
+}
+
+async function handleBatchLink(ctx, session, bot, repository, config) {
+  const link = parsePrivateStorageMessageLink(ctx.message?.text);
+  if (!link) {
+    await ctx.reply('Please send a private storage link in the form https://t.me/c/<internal-channel-id>/<message-id>. Public @channel links cannot safely identify this database channel.');
+    return;
+  }
+  const category = session.category || session.batch?.categoryOverride || 'movie';
+  const storageChannelId = storageChannelForCategory(config, category);
+  if (String(link.channelId) !== String(storageChannelId || '')) {
+    await ctx.reply(`That link is not from the configured ${isAdultCategory(category) ? '18+ ' : ''}database channel. This batch only accepts links whose internal ID maps to ${storageChannelId || `the configured ${storageEnvironmentName(category)}`}.`);
+    return;
+  }
+
+  const batch = session.batch || {};
+  if (batch.stage === 'importing') {
+    await ctx.reply('This batch is already being imported. Please wait for its publishing result before sending another link.');
+    return;
+  }
+  if (batch.stage === 'ready') {
+    await ctx.reply('This batch has already been prepared. Use /done if publishing did not finish, or begin a new /batch import.');
+    return;
+  }
+  if (!batch.firstMessageId) {
+    await repository.updateSession(chatId(ctx), userId(ctx), {
+      batch: {
+        ...batch,
+        stage: 'awaiting-last-link',
+        sourceChannelId: link.channelId,
+        firstMessageId: link.messageId
+      }
+    });
+    await ctx.reply(`First storage message saved: ${link.messageId}. Now send the LAST link (the range is inclusive).`);
+    return;
+  }
+
+  if (String(batch.sourceChannelId) !== String(link.channelId)) {
+    await ctx.reply('The last link must be from the same private storage channel as the first link.');
+    return;
+  }
+  if (link.messageId < Number(batch.firstMessageId)) {
+    await ctx.reply(`The last message ID must be ${batch.firstMessageId} or higher. Send the last link again.`);
+    return;
+  }
+  const rangeCount = link.messageId - Number(batch.firstMessageId) + 1;
+
+  await repository.updateSession(chatId(ctx), userId(ctx), {
+    batch: { ...batch, stage: 'importing', lastMessageId: link.messageId }
+  });
+  await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing the catalog post…`);
+  await importStorageRange(ctx, session, link, bot, repository, config);
+}
+
+async function requirePublisher(ctx, repository, config) {
+  if (!hasAllowedPublisherId(ctx, config)) {
+    await ctx.reply('This is a delivery bot. Open a catalog link to receive files, or use /request to send the catalog team a request.');
+    return false;
+  }
+  if (!config.adminLoginCode) {
+    await ctx.reply('Publisher login is not configured yet. Add ADMIN_LOGIN_CODE as a server secret.');
+    return false;
+  }
+  if (!(await isPublisher(ctx, repository, config))) {
+    await ctx.reply('Publisher area is locked. Use /login followed by your private passcode first.');
+    return false;
+  }
+  return true;
+}
+
+async function showDraftStatus(ctx, repository) {
+  const session = await repository.findSession(chatId(ctx), userId(ctx));
+  if (!session) {
+    await ctx.reply('There is no active draft. Use /panel or /movie Title to start one.', panelKeyboard());
+    return null;
+  }
+  await ctx.reply(displayDraft(session), uploadKeyboard());
+  return session;
+}
+
+// Exported because a caller outside this file needs to know what the channel *should* say:
+// /sync compares it with what a reference remembers being sent, and a test asserts the same.
+export function announcementCaption(content) {
+  const episodeSummary = content.episodeCount ? `${content.episodeCount} episode${content.episodeCount === 1 ? '' : 's'}` : null;
+  const facts = [
+    content.year ? `📅 <b>Year:</b> ${content.year}` : null,
+    content.languages?.length ? `🗣 <b>Audio:</b> ${escapeHtml(content.languages.join(' · '))}` : null,
+    content.subtitleLanguages?.length ? `💬 <b>Subtitles:</b> ${escapeHtml(content.subtitleLanguages.join(' · '))}` : null,
+    content.genres?.length ? `✦ <b>Genres:</b> ${escapeHtml(content.genres.join(' · '))}` : null,
+    episodeSummary ? `▣ <b>Included:</b> ${episodeSummary}` : `▣ <b>Delivery files:</b> ${content.filesCount}`
+  ].filter(Boolean);
+  const synopsis = cleanText(content.description, 420);
+
+  return [
+    `🎬 <b>NEW ${escapeHtml(String(content.categoryLabel || categoryDetails(content.category).label).toUpperCase())} DROP</b>`,
+    '',
+    `<b>${escapeHtml(content.title)}</b>`,
+    '━━━━━━━━━━━━━━━━',
+    ...facts,
+    synopsis ? '' : null,
+    synopsis ? escapeHtml(synopsis) : null,
+    '',
+    'Tap the button below for full details, episode guide, and Telegram delivery.'
+  ].filter((line) => line !== null).join('\n').slice(0, 1000);
+}
+
+function announcementKeyboard(config, content, websiteUrl = null) {
+  const link = websiteUrl || (config ? getContentPageUrl(config, content) : null);
+  return link ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', link)]]) : undefined;
+}
+
+let ANNOUNCEMENT_SYNC_SPACING_MS = configuredMilliseconds(process.env.ANNOUNCEMENT_SYNC_SPACING_MS, 1_100);
+// How many database-channel captions one sweep is allowed to touch. The work is paced, so a
+// bigger number is slower rather than riskier; 80 is a comfortable ten minutes of sending.
+const STORAGE_CAPTION_SWEEP_LIMIT = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_LIMIT);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 600 ? parsed : 80;
+})();
+const STORAGE_CAPTION_JOB_KEY = 'storage-captions';
+// A sweep is paged, not capped: 25 cards and up to 80 messages per read, then it moves to the
+// next window until the archive ends or the run ceiling is reached. Every one of these is a knob
+// because the honest number depends on how large a database the publisher keeps.
+const STORAGE_CAPTION_SWEEP_CARDS = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_CARDS);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 200 ? parsed : 25;
+})();
+const STORAGE_CAPTION_SWEEP_TOTAL = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_TOTAL);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 50_000 ? parsed : 1_500;
+})();
+const STORAGE_CAPTION_SWEEP_PAGES = (() => {
+  const parsed = Number(process.env.STORAGE_CAPTION_SWEEP_PAGES);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 5_000 ? parsed : 400;
+})();
+// The counters a sweep reports, so an aggregate over pages adds exactly what one page produced.
+const STORAGE_CAPTION_OUTCOMES = ['updated', 'unchanged', 'alreadyClean', 'knownClean', 'noCaption', 'unreadable', 'gone', 'blocked', 'failed', 'inspected'];
+
+/**
+ * Test seam (and an operator knob): the gap the lane leaves between two calls. Zero means
+ * "as fast as the API allows", which is what an automated check wants; production never
+ * uses it, because the gap is the thing that keeps a bulk refresh inside Telegram's limit.
+ */
+export function configureAnnouncementSyncSpacing(milliseconds) {
+  ANNOUNCEMENT_SYNC_SPACING_MS = configuredMilliseconds(milliseconds, ANNOUNCEMENT_SYNC_SPACING_MS);
+  return ANNOUNCEMENT_SYNC_SPACING_MS;
+}
+
+/** Resolves once everything queued on the lane so far has finished — for a caller that
+ *  wants to report or assert on a batch that was deliberately not awaited. */
+export function announcementLaneDrained() {
+  return announcementLane.tail.then(() => undefined, () => undefined);
+}
+const ANNOUNCEMENT_SYNC_REF_ATTEMPTS = 3;
+// How long a /sync preview stays valid, and how long /sync go may be answered from it. Sweeping the
+// announced archive is a read of every card, and the two commands are normally run back to back, so
+// the second one used to check everything the first had just checked. Anything that edits a card
+// drops the memo, and /sync force never uses it.
+const ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS = configuredMilliseconds(process.env.SYNC_PREVIEW_TTL_MS, 120_000);
+const ANNOUNCEMENT_SYNC_APPLY_TTL_MS = Math.min(ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS || 0, 60_000);
+let announcementSweepMemo = null;
+
+/** Test seam (and /sync force's escape hatch): forget the last sweep. */
+export function resetAnnouncementSweepMemo() {
+  const had = announcementSweepMemo;
+  announcementSweepMemo = null;
+  return Boolean(had);
+}
+const ANNOUNCEMENT_SYNC_RETRY_CEILING_MS = 5 * 60_000;
+const ANNOUNCEMENT_SYNC_ROUNDS = 3;
+
+// Telegram's hard text limit for a message. Anything longer is refused outright — the update then
+// fails with "Bad Request: message is too long", which is exactly what a 261-file release's skip
+// report or a whole-archive caption list used to do.
+const TELEGRAM_TEXT_LIMIT = 4_096;
+const TELEGRAM_REPLY_CHUNK_LIMIT = (() => {
+  const parsed = Number(process.env.TELEGRAM_REPLY_CHUNK_LIMIT);
+  return Number.isInteger(parsed) && parsed >= 500 && parsed <= TELEGRAM_TEXT_LIMIT ? parsed : 3_800;
+})();
+// Telegraf gives every update handler this many seconds and rejects the handler after it, while the
+// work carries on inside the process. A big /batch (one message forwarded, inspected and deleted
+// per file, then the catalog publish) needs minutes, so the budget is generous by default.
+const TELEGRAM_HANDLER_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.TELEGRAM_HANDLER_TIMEOUT_MS);
+  return Number.isInteger(parsed) && parsed >= 30_000 ? parsed : 20 * 60_000;
+})();
+
+/**
+ * Split a long reply into messages Telegram will accept.
+ *
+ * The reply is broken on line boundaries rather than truncated: the part a publisher needs — which
+ * ids were skipped, and why — is normally at the end, and silently cutting it off turns an honest
+ * report into "something went wrong, try again". Numbering only appears once there is more than
+ * one part, so a normal reply is untouched.
+ */
+export function splitTelegramText(text, maxLength = TELEGRAM_REPLY_CHUNK_LIMIT) {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  if (!source) return [''];
+  const budget = Math.max(200, Math.min(Number(maxLength) || TELEGRAM_REPLY_CHUNK_LIMIT, TELEGRAM_TEXT_LIMIT)) - 12;
+  const parts = [];
+  let chunk = '';
+  const push = (value) => { if (value) parts.push(value); };
+  for (const line of source.split('\n')) {
+    let rest = line;
+    while (rest.length > budget) {
+      push(chunk);
+      chunk = '';
+      parts.push(rest.slice(0, budget));
+      rest = rest.slice(budget);
+    }
+    const joined = chunk ? `${chunk}\n${rest}` : rest;
+    if (joined.length > budget) {
+      push(chunk);
+      chunk = rest;
+      continue;
+    }
+    chunk = joined;
+  }
+  push(chunk);
+  if (parts.length < 2) return parts.length ? parts : [''];
+  return parts.map((part, index) => `(${index + 1}/${parts.length}) ${part}`);
+}
+
+function withoutKeyboard(args) {
+  return args.map((arg) => (arg && typeof arg === 'object' && !Array.isArray(arg) && 'reply_markup' in arg
+    ? Object.fromEntries(Object.entries(arg).filter(([key]) => key !== 'reply_markup'))
+    : arg));
+}
+
+/**
+ * Every text reply the bot sends goes through this, so no command has to remember the limit.
+ * Inline keyboards stay attached to the first part — the buttons belong to the message the user is
+ * looking at — and a later part keeps the rest of the options (parse mode, notifications).
+ */
+export function installLongReplyPagination(bot) {
+  const replyMethods = ['reply', 'replyWithMarkdown', 'replyWithMarkdownV2', 'replyWithHTML'];
+  bot.use(async (ctx, next) => {
+    for (const method of replyMethods) {
+      const original = typeof ctx[method] === 'function' ? ctx[method].bind(ctx) : null;
+      if (!original) continue;
+      ctx[method] = async (text, ...rest) => {
+        if (typeof text !== 'string') return original(text, ...rest);
+        const parts = splitTelegramText(text);
+        let first = null;
+        for (let index = 0; index < parts.length; index += 1) {
+          const sent = await original(parts[index], ...(index === 0 ? rest : withoutKeyboard(rest)));
+          if (index === 0) first = sent;
+        }
+        return first;
+      };
+    }
+    if (typeof ctx.editMessageText === 'function') {
+      const originalEdit = ctx.editMessageText.bind(ctx);
+      // An edit has one message to work with, so it is clamped instead of split — with the overflow
+      // sent as a follow-up, because the point of an edit is to keep the panel usable, not to lose
+      // what it had to say.
+      ctx.editMessageText = async (text, ...rest) => {
+        if (typeof text !== 'string' || text.length <= TELEGRAM_REPLY_CHUNK_LIMIT) return originalEdit(text, ...rest);
+        // Reserve room for the note, so the clamped edit is still inside the limit.
+        const parts = splitTelegramText(text, TELEGRAM_REPLY_CHUNK_LIMIT - 60);
+        const edited = await originalEdit(`${parts[0]}\n▪ Continued in the message below.`, ...rest);
+        await Promise.resolve(ctx.reply(parts.slice(1).join('\n'))).catch(() => {});
+        return edited;
+      };
+    }
+    return next();
+  });
+}
+
+/**
+ * A handler that ran out of its time budget is not a failed job. Telegraf rejects the update while
+ * the import or sweep keeps going and reports in its own message, so the only honest answer is that
+ * the work is still running — "something went wrong, please try again" made a finished 261-file
+ * import look like a crash and pushed publishers to run the same range twice.
+ */
+export function isTelegramHandlerTimeout(error) {
+  const description = String(error?.description || error?.message || '');
+  return error?.name === 'TimeoutError' || /Promise timed out after/i.test(description);
+}
+
+function configuredMilliseconds(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Whether a channel post already shows exactly what this card would produce today.
+ *
+ * `announcementRefs` remember the caption and artwork they were last sent with, so a
+ * repeat edit costs nothing — and a post published before that memory existed carries
+ * none, which is what makes /sync able to find the old announcements that still show an
+ * `@channel` tag without asking Telegram about a single one of them first.
+ */
+export function announcementReferenceIsCurrent(reference, { caption = null, link = null, posterUrl = null } = {}) {
+  if (!reference || typeof reference.caption !== 'string' || !reference.caption) return false;
+  if (reference.caption !== caption) return false;
+  if ((reference.websiteUrl || null) !== (link || null)) return false;
+  if (reference.kind !== 'text') return (reference.posterUrl || null) === (posterUrl || null);
+  // A copy posted as plain text because the card had no artwork at the time is still behind once
+  // artwork exists: that message can carry a photo now. `posterUpgrade` is the note saying the
+  // attachment was tried and Telegram refused it, so the same refusal is not paid for twice.
+  if (!posterUrl) return true;
+  return reference.posterUpgrade?.signature === announcementSignature({ caption, link, posterUrl });
+}
+
+/** A fingerprint of what the channel copy would have to say, so "unchanged" survives a restart. */
+export function announcementSignature({ caption = null, link = null, posterUrl = null } = {}) {
+  return crypto.createHash('sha1').update(`${caption || ''}|${link || ''}|${posterUrl || ''}`).digest('base64url').slice(0, 16);
+}
+
+/**
+ * Whether this message was already refused for the copy it is being asked to carry now.
+ *
+ * A refusal by permission does not get milder with retries, so the reference remembers the exact
+ * caption/link/artwork it failed on and the next sweep skips it without a call. The moment the card
+ * changes, the signature changes with it and the edit is attempted again - nothing is skipped that
+ * could now succeed.
+ */
+export function announcementRefIsDeferred(reference, { caption = null, link = null, posterUrl = null } = {}) {
+  const error = reference?.syncError;
+  if (!error?.blocked || !error.signature) return false;
+  return error.signature === announcementSignature({ caption, link, posterUrl });
+}
+
+function announcementReferenceMemory(reference, { caption, link, posterUrl }) {
+  return {
+    ...reference,
+    caption,
+    posterUrl: reference.kind === 'text' ? null : (posterUrl || null),
+    ...(link ? { websiteUrl: link } : {})
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * The announcement lane
+ *
+ * A 40-ID /batch used to fire forty channel edits back to back and Telegram answered
+ * with a flood limit, so some announcements stayed stale and the only evidence was a
+ * line in the log. Every refresh and every merge deletion now runs through one lane:
+ * at most one call in flight, a gap between them, a bounded flood-wait retry per edit,
+ * and a job that still ends failing goes back for another round after the wait
+ * Telegram actually asked for. When the rounds run out, the publisher chat is told
+ * which Post IDs are left — a wait that outlives the command's own reply must not
+ * become silence.
+ * ------------------------------------------------------------------------- */
+const announcementLane = {
+  tail: Promise.resolve(),
+  pending: 0,
+  stale: new Map(),
+  totals: { jobs: 0, retried: 0, refreshed: 0, unchanged: 0, failed: 0, dropped: 0, deleted: 0, captions: 0 }
+};
+
+/**
+ * A database-channel message the bot is not allowed to edit, remembered for the life of the
+ * process. Telegram only lets a bot rewrite its own messages, so a post written by a human
+ * account or an uploader bot fails the same way forever; retrying it on every sweep would
+ * spend the lane on a refusal. Listing them once and skipping them after that is honest and
+ * free — and a restart re-checks them, in case the bot was made an editor in between.
+ */
+const storageCaptionBlockers = new Map();
+// The other half of the same idea: a message that was read and found clean, or just cleaned, is
+// not looked at again in this process, which is what makes running /sync db twice cheap. Forgetting
+// it is /sync db retry.
+const storageCaptionClean = new Set();
+// A sweep runs on the lane, after its command has already answered, so the publisher needs a way
+// to ask what it is doing. This is that answer: live counters, refreshed per page.
+const storageSweepState = {
+  running: false,
+  adminId: null,
+  startedAt: null,
+  at: null,
+  pages: 0,
+  messages: 0,
+  updated: 0,
+  blocked: 0,
+  failed: 0,
+  stoppedFor: null
+};
+
+export function listStorageCaptionBlockers() {
+  return [...storageCaptionBlockers.entries()].map(([key, reason]) => ({ key, reason }));
+}
+
+/**
+ * A command may wait for a lane job only while the lane is quick. Waiting any longer risks
+ * outliving Telegram's own request timeout on the update, which turns work that did go through
+ * into "Something went wrong while handling that request" — so past the grace period the command
+ * answers on its own and the lane reports when it finishes.
+ */
+export function settleQueuedJob(job, { graceMs = 10_000 } = {}) {
+  if (!job || typeof job.then !== 'function') return Promise.resolve({ settled: false, result: null });
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve({ settled: false, result: null });
+    }, Math.max(1, Number(graceMs) || 10_000));
+    timer.unref?.();
+    Promise.resolve(job).then(
+      (result) => { if (done) return; done = true; clearTimeout(timer); resolve({ settled: true, result: result || null }); },
+      () => { if (done) return; done = true; clearTimeout(timer); resolve({ settled: true, result: null }); }
+    );
+  });
+}
+
+export function enqueueAnnouncementJob({ run, key = null, label = null, notifyChatId = null, telegram = null, rounds = ANNOUNCEMENT_SYNC_ROUNDS, stuckNote = null, options = {} }) {
+  // Anything queued here changes what a channel post should say, so a preview of the archive is no
+  // longer trustworthy until the next command sweeps it again.
+  announcementSweepMemo = null;
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const totalRounds = Math.max(1, Number(options.rounds || rounds) || 1);
+
+  const task = async () => {
+    let result = null;
+    let retried = 0;
+    for (let round = 1; round <= totalRounds; round += 1) {
+      result = await run({ ...options, spacingMs, wait, round });
+      const stuck = Number(result?.failed) || 0;
+      announcementLane.totals.jobs += 1;
+      if (!stuck) break;
+      if (round === totalRounds) break;
+      retried += stuck;
+      announcementLane.totals.retried += stuck;
+      // Back of the lane, and no sooner than Telegram asked for: the restriction is
+      // measured in seconds, not in retries. The gap scales with the lane's own pacing, so
+      // a test that asked for zero spacing is not left waiting on a wall clock.
+      await wait(Math.max(Number(result.retryAfterMs) || 0, spacingMs * 4));
+    }
+    if (result?.failed || result?.blocked) announcementLane.stale.set(key || `job-${Date.now()}`, { key: key || null, label: label || null, failed: Number(result.failed) || 0, blocked: Number(result.blocked) || 0, reason: result.reason || null, retried });
+    else if (key) announcementLane.stale.delete(key);
+    // A job that started from a command answers in its own message when it settles, which is how
+    // the command gets to reply at once instead of holding a Telegram request open for minutes.
+    if (typeof options.onSettled === 'function') {
+      await Promise.resolve(options.onSettled(result, { retried, rounds: totalRounds })).catch(() => {});
+    }
+    // A blocked edit is not something a later round fixes, so the publisher hears about it once,
+    // in the same message that says what to change in Telegram. A copy this bot never posted is
+    // remembered instead, and only listed by /sync — no repeat notice on every edit.
+    if ((retried || Number(result?.blocked)) && notifyChatId && typeof telegram?.sendMessage === 'function') {
+      const still = Number(result?.failed) || 0;
+      const blocked = Number(result?.blocked) || 0;
+      const why = result?.reason ? ` Telegram said: ${result.reason}.` : '';
+      const lines = still
+        ? [
+          `⚠ ${label || key || 'An announcement'}: ${still} channel post${still === 1 ? '' : 's'} still refused after ${totalRounds} rounds.${why}`,
+          stuckNote || 'The catalog card is already correct — only the channel copy is behind. /sync lists what is left and /sync go sends it again.'
+        ]
+        : blocked
+          ? [
+            `⚠ ${label || key || 'An announcement'}: ${blocked} channel post${blocked === 1 ? '' : 's'} cannot be edited by this bot.${why}`,
+            'The catalog card and its website page are correct, so nothing on the site is behind — only that channel copy is. Add this bot as an administrator of the channel (it needs “Manage messages”) and /sync go fixes it, or edit the copy in the channel yourself. /sync retry makes the bot look at those messages again.'
+          ]
+        : [
+          `✓ ${label || key || 'A queued announcement'} went through once Telegram’s limit lifted (${result.updated} edited${result.unchanged ? `, ${result.unchanged} already correct` : ''}).`,
+          'Nothing needed doing — the retry finished it.'
+        ];
+      await Promise.resolve(telegram.sendMessage(String(notifyChatId), lines.join('\n'))).catch(() => {});
+    }
+    return result;
+  };
+
+  announcementLane.pending += 1;
+  const tracked = announcementLane.tail.then(task, task);
+  announcementLane.tail = tracked.then(() => undefined, () => undefined);
+  const settled = tracked.then(
+    (value) => { announcementLane.pending -= 1; return value; },
+    (error) => { announcementLane.pending -= 1; throw error; }
+  );
+  if (options.detached) {
+    settled.catch(() => {});
+    return null;
+  }
+  return settled;
+}
+
+export function queueAnnouncementSync({ telegram, repository, content, config = null, adminId = null, notifyChatId = null, label = null }, options = {}) {
+  const key = adminId || content?.adminId || null;
+  return enqueueAnnouncementJob({
+    key,
+    // The Post ID leads: a publisher reading a “still refused” message has to know which
+    // card to name, and the title alone does not identify it.
+    label: label || (key ? `${key} · ${cleanText(content?.title, 48)}` : cleanText(content?.title, 48) || null),
+    notifyChatId,
+    telegram,
+    options,
+    run: (inner) => syncPublishedAnnouncements({ telegram, repository, content, config, options: inner })
+  });
+}
+
+export function queueAnnouncementDeletion({ telegram, repository, content, references, channelId = null }, options = {}) {
+  return enqueueAnnouncementJob({
+    key: content?.adminId || null,
+    label: content?.adminId ? `${content.adminId} · ${cleanText(content.title, 48)}` : null,
+    telegram,
+    options,
+    run: (inner) => deleteAnnouncementMessages({ telegram, references, ...inner })
+      .then(async (result) => {
+        if (result.deleted && repository?.updateContentByAdminId && content?.adminId) {
+          const left = (Array.isArray(content.announcementRefs) ? content.announcementRefs : [])
+            .filter((reference) => !references.some((entry) => entry.channelId === reference.channelId && entry.messageId === reference.messageId));
+          await Promise.resolve(repository.updateContentByAdminId(content.adminId, { announcementRefs: left })).catch(() => {});
+        }
+        return result;
+      })
+  });
+}
+
+export function announcementSyncStatus() {
+  return {
+    pending: announcementLane.pending,
+    stale: [...announcementLane.stale.entries()].map(([key, entry]) => ({ key, ...entry })),
+    totals: { ...announcementLane.totals }
+  };
+}
+
+/**
+ * Channel messages this bot never sent, so no bot can rewrite them. Remembered by message, because
+ * re-asking Telegram about the same human-posted copy on every batch is how a refresh turned into a
+ * hundred guaranteed refusals. /sync names them, and /sync retry forgets the list.
+ */
+const announcementUnsyncable = new Map();
+const announcementRefKey = (reference) => `${reference?.channelId ?? '?'}:${reference?.messageId ?? '?'}`;
+
+export function listAnnouncementUnsyncable() {
+  return [...announcementUnsyncable.entries()].map(([key, entry]) => ({ key, ...entry }));
+}
+
+export function clearAnnouncementUnsyncable() {
+  const size = announcementUnsyncable.size;
+  announcementUnsyncable.clear();
+  return size;
+}
+
+/** Telegram refuses some edits for a reason that will never change; those say what to do instead. */
+export function classifyAnnouncementEditFailure(description) {
+  const reason = cleanText(description, 160);
+  if (/message[ _]author[ _]invalid|sent by (?:another|other) bots?|other bot[\u2019']?s message|can[\u2019']?t (?:be )?edit|not allowed to edit/i.test(reason)) {
+    return { kind: 'unsyncable', reason: 'the copy was posted by another account, so no bot can rewrite it' };
+  }
+  if (/not enough rights|administrator|kicked|removed from the chat|bot was blocked|unauthorized|forbidden|chat_id can access this bot/i.test(reason)) {
+    return { kind: 'rights', reason: 'this bot is not an administrator of that channel, or was removed from it' };
+  }
+  return { kind: 'retry', reason: null };
+}
+
+/** Test seam: forget the queue's bookkeeping between cases. */
+export function resetAnnouncementLane() {
+  announcementSweepMemo = null;
+  announcementLane.pending = 0;
+  announcementLane.stale.clear();
+  announcementUnsyncable.clear();
+  announcementLane.totals = { jobs: 0, retried: 0, refreshed: 0, unchanged: 0, failed: 0, dropped: 0, deleted: 0, captions: 0 };
+  announcementLane.tail = Promise.resolve();
+  // A test that resets the lane also forgets which captions were refused, so each case starts
+  // from the same place a freshly deployed process would.
+  storageCaptionBlockers.clear();
+  storageCaptionClean.clear();
+  storageSweepState.running = false;
+  storageSweepState.adminId = null;
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
+}
+
+/**
+ * Read every announced card once and split them into what needs a channel edit and what does not.
+ *
+ * This is the whole cost of /sync, so it is one function that can be counted and reused rather than
+ * inlined in the command: a card whose stored reference already carries this caption, link, and
+ * artwork is a string compare, and a copy this bot provably cannot rewrite is counted as left alone
+ * instead of being asked about again. Nothing here calls Telegram.
+ */
+export async function sweepAnnouncedCards({ repository, config = null, adminId = null, list = null } = {}) {
+  const startedAt = Date.now();
+  const contents = Array.isArray(list) ? list : await Promise.resolve(repository.listAnnouncedContent({ adminId })).catch(() => []);
+  const cards = Array.isArray(contents) ? contents : [];
+  const stale = [];
+  let refs = 0;
+  let matching = 0;
+  let leftAlone = 0;
+  let deferred = 0;
+  for (const content of cards) {
+    const link = config ? getContentPageUrl(config, content) : null;
+    const caption = announcementCaption(content);
+    const posterUrl = content.posterUrl || null;
+    const references = Array.isArray(content.announcementRefs) ? content.announcementRefs : [];
+    const behind = [];
+    let remembered = 0;
+    let reason = null;
+    for (const reference of references) {
+      if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) continue;
+      const key = announcementRefKey(reference);
+      if (announcementUnsyncable.has(key)) {
+        remembered += 1;
+        reason = reason || announcementUnsyncable.get(key)?.reason || null;
+        continue;
+      }
+      if (announcementRefIsDeferred(reference, { caption, link, posterUrl })) {
+        remembered += 1;
+        reason = reason || reference?.syncError?.reason || null;
+        continue;
+      }
+      behind.push(reference);
+    }
+    if (!behind.length) {
+      if (remembered) { leftAlone += 1; deferred += remembered; }
+      else matching += 1;
+      continue;
+    }
+    stale.push({ content, refs: behind.length, reason, remembered });
+    refs += behind.length;
+  }
+  return { checked: cards.length, matching, leftAlone, deferred, stale, refs, elapsedMs: Math.max(0, Date.now() - startedAt) };
+}
+
+/**
+ * Re-check the artwork after a title correction, and put whatever is found everywhere the card is
+ * shown: the catalog card, its backdrop, and the posted channel copy.
+ *
+ * A wrong title used to leave a card with a generated placeholder forever, because the poster was
+ * matched once, before the correction. This runs on the announcement lane — paced, retried against
+ * Telegram's own waits, and never awaited by the command that queued it — and a poster ImgBB will
+ * not take right now goes to the poster retry queue rather than being lost.
+ */
+export function queuePosterRematchForTitle({ ctx = null, repository, config = null, content, adminId = null, telegram = null, notify = null, lookupTitle = null, find = findMetadata, prepare = preparePosterImage, host = hostPosterImage } = {}) {
+  const target = adminId || content?.adminId || null;
+  if (!target || !content || typeof repository?.updateContentByAdminId !== 'function') return null;
+  const poster = content.poster || {};
+  const wantsMatch = !content.posterUrl
+    || poster.source === 'generated-fallback'
+    || (poster.title && poster.title !== content.title);
+  // A title that was corrected (or a poster that was just chosen by hand) is also the moment the
+  // rest of the card is worth asking about: a release published from a filename usually has no
+  // synopsis, no year, and no genres. Fields the publisher never filled are filled; anything they
+  // typed is left alone.
+  const needsDetails = !cleanText(content.description, 2_000)
+    || !Number(content.year)
+    || !(Array.isArray(content.genres) && content.genres.length);
+  if (!wantsMatch && !needsDetails) return null;
+  const title = cleanText(content.title, 180);
+  // The name to ask the providers about. A poster picked out of a search that used a different
+  // spelling, or a title corrected in the same breath, is the release whose synopsis, year, and
+  // genres belong on this card — while `poster.title` below keeps the card's own name, so a
+  // hand-picked poster is never treated as stale the next time this runs.
+  const query = cleanText(lookupTitle, 180) || title;
+  const tell = notify || (ctx ? (chat, text) => ctx.reply(text).catch(() => {}) : null);
+  return enqueueAnnouncementJob({
+    key: `poster:${target}`,
+    label: `${target} · poster re-check`,
+    notifyChatId: null,
+    telegram: telegram || ctx?.telegram || null,
+    run: async () => {
+      const outcome = { updated: 0, unchanged: 0, failed: 0, skipped: 0, channels: 0, reason: null };
+      let metadata = null;
+      try {
+        metadata = await find(query, content.category, config);
+      } catch (error) {
+        outcome.reason = automationDiagnostic(error);
+        return outcome;
+      }
+      const sourceUrl = metadata?.posterOriginalUrl || null;
+      // Only ever artwork the card was missing: a poster chosen by hand is that way on purpose and
+      // is never searched away, even when the same lookup turns up details worth adding.
+      const hasArtwork = wantsMatch && Boolean(sourceUrl) && metadata?.matched !== false;
+      const details = {};
+      if (metadata && metadata.matched !== false) {
+        const synopsis = cleanText(metadata.description, 2_000);
+        const providerGenres = Array.isArray(metadata.genres) ? metadata.genres.filter(Boolean).slice(0, 8) : [];
+        if (synopsis && !cleanText(content.description, 2_000)) details.description = synopsis;
+        if (Number.isInteger(Number(metadata.year)) && !Number(content.year)) details.year = Number(metadata.year);
+        if (providerGenres.length && !(Array.isArray(content.genres) && content.genres.length)) details.genres = providerGenres;
+        const providerStatus = cleanText(metadata.status, 40);
+        if (providerStatus && !cleanText(content.status, 40)) details.status = providerStatus;
+        if (metadata.provider && metadata.provider !== 'fallback' && !content.metadataProvider) {
+          details.metadataProvider = metadata.provider;
+          details.tmdbId = metadata.tmdbId || content.tmdbId || null;
+          details.metadataKey = metadata.metadataKey || content.metadataKey || null;
+        }
+        const hasCategoryEvidence = Boolean(
+          metadata.inferredCategory
+          || metadata.provider
+          || metadata.type
+          || (Array.isArray(metadata.originCountry) && metadata.originCountry.length)
+          || (Array.isArray(metadata.genreIds) && metadata.genreIds.length)
+          || providerGenres.some((genre) => /animation|animated|cartoon|anime|donghua/i.test(String(genre)))
+        );
+        const inferredCategory = metadata.inferredCategory
+          || (hasCategoryEvidence ? categoryFromHints({ hints: metadata, minimumScore: 0.3 }) : null);
+        if (
+          inferredCategory
+          && CATEGORY_IDS.has(inferredCategory)
+          && inferredCategory !== content.category
+          && content.category !== ADULT_CATEGORY
+          && !(inferredCategory === 'movie' && Number(content.episodeCount) > 1)
+        ) {
+          details.category = inferredCategory;
+        }
+      }
+      if (!hasArtwork && !Object.keys(details).length) {
+        outcome.skipped = 1;
+        outcome.reason = 'no provider artwork or details were found for the corrected title';
+        return outcome;
+      }
+      let hosted = null;
+      if (hasArtwork) {
+        const image = await prepare({ sourceUrl, title, category: details.category || content.category });
+        try {
+          hosted = await host({ image, title, config });
+        } catch (error) {
+          if (!isPosterRateLimit(error)) throw error;
+          queuePosterRetry({ adminId: target, title, image, notifyChatId: ctx ? chatId(ctx) : null });
+          // A synopsis the provider already gave is worth writing even while the image host cools,
+          // so the card is not left blank because ImgBB was busy. A store that refuses the write
+          // loses nothing: the retry lane carries the artwork and the details with it.
+          if (Object.keys(details).length) {
+            const partial = await repository.updateContentByAdminId(target, details).catch(() => null);
+            outcome.updated = partial ? 1 : 0;
+          }
+          outcome.skipped = 1;
+          outcome.reason = 'ImgBB is rate limiting; the artwork is hosted on the poster queue';
+          return outcome;
+        }
+      }
+      const saved = await repository.updateContentByAdminId(target, {
+        ...(hosted
+          ? {
+            posterUrl: hosted.url,
+            backdropUrl: hosted.url,
+            poster: {
+              provider: 'imgbb',
+              providerId: hosted.providerId || null,
+              originalUrl: hosted.originalUrl || sourceUrl,
+              source: hosted.source || 'remote-mirror',
+              title,
+              mirroredAt: new Date().toISOString()
+            }
+          }
+          : {}),
+        ...details
+      });
+      outcome.details = Object.keys(details).length;
+      outcome.updated = saved ? 1 : 0;
+      outcome.artwork = Boolean(hosted);
+      if (!saved) outcome.reason = 'that card is no longer in the catalog';
+      // The channel copy is refreshed here rather than queued, because this job is already on the
+      // lane: a queued follow-up goes to the back and arrives after the very edit this card's title
+      // change is making from an older snapshot, which is how a new poster could be overwritten by
+      // the old one. Doing it inline also lets the reply say what actually happened to the post.
+      const references = Array.isArray(saved?.announcementRefs) ? saved.announcementRefs : [];
+      let sync = null;
+      if (saved && references.length && telegram) {
+        sync = await syncPublishedAnnouncements({ telegram, repository, content: saved, config, options: {} });
+        outcome.channels = references.length;
+        outcome.promoted = Number(sync?.promoted) || 0;
+        outcome.announcementSync = sync;
+      }
+      if (saved && typeof tell === 'function') {
+        const channel = !references.length
+          ? 'No channel copy is attached to that card, so the website page is what changed.'
+          : !telegram
+            ? 'Its channel copy was not touched because this job has no bot attached; /sync sends it.'
+            : sync && (sync.promoted || sync.updated)
+              ? `Its channel copy was updated with it. ${announcementSyncNote(sync)}`
+              : sync && sync.unchanged && !sync.failed && !sync.blocked && !sync.skipped && !sync.upgradeFailed
+                ? 'Its channel copy was already showing that artwork.'
+                : `Its channel copy could not be finished by this run. ${announcementSyncNote(sync)} /sync lists it.`;
+        Promise.resolve(tell(target, `✓ Poster for ${target} · ${title} was matched and hosted from the corrected title. ${channel}`)).catch(() => {});
+      }
+      return outcome;
+    }
+  });
+}
+
+/**
+ * Keep the Telegram announcement of a published post visually identical to the
+ * catalog card. Every edit path (title, languages, genres, synopsis, status,
+ * release label, category, and poster) funnels through here, so an announcement
+ * never keeps showing an old image or old information after /poster or /title.
+ *
+ * Only the messages this bot sent are touched, and only when they are actually
+ * behind: a ref that already carries this caption, link, and artwork is not sent at
+ * all, which is what keeps a large batch inside the flood limit instead of testing it.
+ * An announcement the publisher deleted manually is forgotten rather than retried, and
+ * a refused edit keeps its ref so the lane can try again later.
+ */
+export async function editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download = downloadPosterImage }) {
+  const edit = (media) => telegram.editMessageMedia(
+    reference.channelId, reference.messageId, null,
+    { type: 'photo', media, caption, parse_mode: 'HTML' },
+    replyMarkup ? { reply_markup: replyMarkup } : {}
+  );
+  try {
+    return await edit(posterUrl);
+  } catch (error) {
+    if (!/failed to get HTTP URL|wrong file identifier\/HTTP URL specified|WEBPAGE_CURL_FAILED|WEBPAGE_MEDIA_EMPTY|IMAGE_PROCESS_FAILED|PHOTO_INVALID_DIMENSIONS|PHOTO_SAVE_FILE_INVALID|FILE_PARTS_INVALID|wrong type of the web page content/i.test(error?.description || error?.message || '')) throw error;
+    // Download with the poster service's URL, redirect, size and timeout protections.
+    // Never substitute generated artwork: a failure must stay pending for /sync.
+    let image;
+    try {
+      image = await download(posterUrl);
+    } catch (downloadError) {
+      throw new Error(`${error.description || error.message}; direct poster download failed: ${downloadError.message}`, { cause: downloadError });
+    }
+    return edit({ source: image.buffer, filename: image.contentType === 'image/png' ? 'poster.png' : 'poster.jpg' });
+  }
+}
+
+export async function syncPublishedAnnouncements({ telegram, repository, content, config = null, options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
+  const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
+  // The card is read again as this job runs. A queued refresh carries the content it was asked
+  // about, which on a 48-card batch is a minute old by the time the lane reaches it — long enough
+  // for a poster re-match to have landed in between, and an edit built from that snapshot would
+  // quietly put the previous artwork back in the channel.
+  let source = content;
+  if (content?.adminId && typeof repository?.findContentByAdminId === 'function') {
+    const fresh = await Promise.resolve(repository.findContentByAdminId(content.adminId)).catch(() => null);
+    if (fresh) source = { ...content, ...fresh };
+  }
+  const refs = Array.isArray(source?.announcementRefs) ? source.announcementRefs : [];
+  const result = { updated: 0, unchanged: 0, failed: 0, blocked: 0, dropped: 0, unsyncable: 0, skipped: 0, promoted: 0, upgradeFailed: 0, reason: null, channels: refs.length, retryAfterMs: 0 };
+  if (!refs.length || !telegram || isAdultCategory(source?.category)) return result;
+  const caption = announcementCaption(source);
+  const posterUrl = source.posterUrl || null;
+  let downloadedPoster;
+  const download = (url) => (downloadedPoster ||= downloadPosterImage(url).catch((error) => { downloadedPoster = null; throw error; }));
+  const kept = [];
+  let dirty = false;
+
+  for (const reference of refs) {
+    // Only rewrite the button row when the destination link is actually known;
+    // omitting reply_markup leaves the publisher's existing buttons untouched.
+    const link = (config ? getContentPageUrl(config, source) : null) || reference.websiteUrl || null;
+    if (announcementUnsyncable.has(announcementRefKey(reference))) {
+      // Known to be unfixable by this bot: the card is right, the copy is not, and that is said in
+      // /sync rather than re-attempted every time anything on the card changes.
+      kept.push(reference);
+      result.skipped += 1;
+      result.reason = result.reason || announcementUnsyncable.get(announcementRefKey(reference))?.reason || null;
+      continue;
+    }
+    if (announcementRefIsDeferred(reference, { caption, link, posterUrl })) {
+      // Already refused for exactly this copy. Counted, reported by /sync, and never re-attempted
+      // until the card says something different - that is what keeps a repeat /sync go cheap.
+      kept.push(reference);
+      result.skipped += 1;
+      result.reason = result.reason || reference.syncError.reason || null;
+      continue;
+    }
+    if (announcementReferenceIsCurrent(reference, { caption, link, posterUrl })) {
+      if (reference.syncError) {
+        // A ref that once failed and now matches has its stale complaint cleared, or /sync keeps
+        // listing a card that is actually fine.
+        kept.push({ ...reference, syncError: null });
+        dirty = true;
+      } else {
+        kept.push(reference);
+      }
+      result.unchanged += 1;
+      continue;
+    }
+    const wantsArt = reference.kind === 'text' && Boolean(posterUrl)
+      && reference.posterUpgrade?.signature !== announcementSignature({ caption, link, posterUrl });
+    const keyboard = link ? announcementKeyboard(config, source, link) : undefined;
+    const replyMarkup = keyboard ? keyboard.reply_markup : undefined;
+    const extra = replyMarkup ? { reply_markup: replyMarkup } : {};
+    let applied = null;
+    // The last thing Telegram said about this message, kept for the report: "still refused" means
+    // nothing to a publisher, "the copy was posted by another account" tells them what to do.
+    let lastRefusal = null;
+    let upgradeFailure = null;
+
+    if (wantsArt) {
+      // Telegram lets a text message be replaced with a photo, and that is the only way an
+      // announcement posted while the card had no artwork ever gets one. A refusal here does not
+      // end the edit: the caption is still worth fixing, and the artwork failure is remembered on
+      // the reference so the next sweep does not spend a call learning it again.
+      let attached = false;
+      try {
+        await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
+        if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
+        attached = true;
+      } catch (error) {
+        upgradeFailure = cleanText(error?.description || error?.message, 160);
+        if (/message is not modified/i.test(upgradeFailure)) attached = true;
+      }
+      if (attached) {
+        // The reference becomes a photo one, remembering the artwork it now carries: that is what
+        // makes the next edit of this card see it as a poster post instead of a text post again.
+        kept.push({
+          ...announcementReferenceMemory(reference, { caption, link, posterUrl }),
+          kind: 'photo',
+          posterUrl,
+          posterUpgrade: null,
+          syncError: null
+        });
+        dirty = true;
+        result.promoted += 1;
+        result.updated += 1;
+        announcementUnsyncable.delete(announcementRefKey(reference));
+        if (spacingMs) await wait(spacingMs);
+        continue;
+      }
+    }
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        if (reference.kind !== 'text' && posterUrl) {
+          try {
+            await editAnnouncementPhoto({ telegram, reference, posterUrl, caption, replyMarkup, download });
+          } catch (photoError) {
+            const photoDesc = cleanText(photoError?.description || photoError?.message, 200);
+            const canFallbackToCaption = typeof telegram.editMessageCaption === 'function'
+              && !/message is not modified|not found|chat not found|deleted|message to edit|too many requests|flood|retry after/i.test(photoDesc)
+              && classifyAnnouncementEditFailure(photoDesc).kind === 'retry';
+            if (!canFallbackToCaption) throw photoError;
+            await telegram.editMessageCaption(reference.channelId, reference.messageId, null, caption, {
+              parse_mode: 'HTML',
+              ...extra
+            });
+          }
+          // Some Bot API versions ignore reply_markup on editMessageMedia; a
+          // second call is idempotent and keeps the website button present.
+          if (replyMarkup) await telegram.editMessageReplyMarkup(reference.channelId, reference.messageId, null, replyMarkup).catch(() => {});
+        } else {
+          await telegram.editMessageText(reference.channelId, reference.messageId, null, caption, {
+            parse_mode: 'HTML',
+            ...extra
+          });
+        }
+        applied = 'updated';
+        break;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 200);
+        lastRefusal = description;
+        // Telegram says this when the post already reads exactly as we would write
+        // it, which is a success for a card that has not really changed.
+        if (/message is not modified/i.test(description)) { applied = 'unchanged'; break; }
+        if (/not found|chat not found|deleted|message to edit/i.test(description)) { applied = 'dropped'; break; }
+        const refusal = classifyAnnouncementEditFailure(description);
+        if (refusal.kind === 'unsyncable') {
+          announcementUnsyncable.set(announcementRefKey(reference), { reason: refusal.reason, at: new Date().toISOString(), adminId: content?.adminId || null });
+          result.reason = result.reason || refusal.reason;
+          applied = 'unsyncable';
+          break;
+        }
+        if (refusal.kind === 'rights') {
+          // The ref is kept and the round stops: nothing about this card needs re-editing, and the
+          // publisher has one thing to fix in Telegram rather than a command to repeat.
+          result.reason = result.reason || refusal.reason;
+          applied = 'blocked';
+          break;
+        }
+        const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
+        if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
+        const backoff = Math.min(retryAfterMs, ceilingMs);
+        result.retryAfterMs = Math.max(result.retryAfterMs, backoff);
+        if (spacingMs) await wait(backoff);
+      }
+    }
+
+    if (applied === 'updated' || applied === 'unchanged') {
+      const memory = announcementReferenceMemory(reference, { caption, link, posterUrl });
+      if (memory.syncError) { delete memory.syncError; dirty = true; }
+      if (upgradeFailure && !/too many requests|flood|retry after|not found|deleted|message to edit/i.test(upgradeFailure)) {
+        memory.posterUpgrade = { reason: upgradeFailure, at: new Date().toISOString(), signature: announcementSignature({ caption, link, posterUrl }) };
+        result.upgradeFailed += 1;
+        dirty = true;
+      } else if (memory.posterUpgrade) {
+        delete memory.posterUpgrade;
+        dirty = true;
+      }
+      if (memory !== reference) dirty = true;
+      kept.push(memory);
+      announcementUnsyncable.delete(announcementRefKey(reference));
+      result[applied === 'updated' ? 'updated' : 'unchanged'] += 1;
+    } else if (applied === 'unsyncable' || applied === 'dropped') {
+      // Both shrink the reference list: one because the copy belongs to another account, the other
+      // because it no longer exists. Keeping either would refuse the same message on every future edit.
+      result[applied === 'unsyncable' ? 'unsyncable' : 'dropped'] += 1;
+      dirty = true;
+    } else {
+      // Not dropped: the ref stays in the list so the lane's next round can finish it — and it now
+      // carries why Telegram refused, which is what makes a report actionable instead of alarming.
+      const detail = cleanText(lastRefusal, 160);
+      kept.push({
+        ...reference,
+        syncError: {
+          reason: detail,
+          at: new Date().toISOString(),
+          blocked: applied === 'blocked',
+          // What the copy was supposed to say, so the next sweep recognises "the same request" and
+          // leaves it alone without spending a call on a refusal that will repeat itself.
+          signature: announcementSignature({ caption, link, posterUrl })
+        }
+      });
+      dirty = true;
+      result[applied === 'blocked' ? 'blocked' : 'failed'] += 1;
+      result.reason = result.reason || (applied === 'blocked' ? classifyAnnouncementEditFailure(detail).reason : detail) || null;
+    }
+    if (spacingMs) await wait(spacingMs);
+  }
+
+  // The reference list is written back when it shrank or a ref learned what the channel
+  // now shows, so the next edit of this card can answer "already correct" without calling.
+  if ((kept.length !== refs.length || dirty) && source?.adminId && typeof repository?.updateContentByAdminId === 'function') {
+    await Promise.resolve(repository.updateContentByAdminId(source.adminId, { announcementRefs: kept })).catch(() => {});
+  }
+  announcementLane.totals.refreshed += result.updated;
+  announcementLane.totals.unchanged += result.unchanged;
+  announcementLane.totals.failed += result.failed;
+  announcementLane.totals.dropped += result.dropped;
+  return result;
+}
+
+/**
+ * Remove the announcement copies of a card that no longer deserves them (a merged-away
+ * post). Deletions flood-limit exactly like edits, so this shares the retry policy and
+ * keeps an undeleted reference rather than losing the trail of where the post still is.
+ */
+export async function deleteAnnouncementMessages({ telegram, references, options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
+  const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
+  const list = Array.isArray(references) ? references : [];
+  const result = { deleted: 0, failed: 0, gone: 0, channels: list.length, retryAfterMs: 0 };
+  if (!list.length || !telegram || typeof telegram.deleteMessage !== 'function') return result;
+
+  for (const reference of list) {
+    let applied = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await telegram.deleteMessage(reference.channelId, reference.messageId);
+        applied = 'deleted';
+        break;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 200);
+        if (/message to delete not found|message can't be deleted|not found|already deleted/i.test(description)) { applied = 'gone'; break; }
+        const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
+        if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
+        const backoff = Math.min(retryAfterMs, ceilingMs);
+        result.retryAfterMs = Math.max(result.retryAfterMs, backoff);
+        await wait(backoff);
+      }
+    }
+    if (applied === 'deleted') { result.deleted += 1; announcementLane.totals.deleted += 1; }
+    else if (applied === 'gone') result.gone += 1;
+    else result.failed += 1;
+    if (spacingMs) await wait(spacingMs);
+  }
+  announcementLane.totals.failed += result.failed;
+  return result;
+}
+
+/**
+ * Whether a caption carries anything the sanitizer would remove.
+ *
+ * This is the test `/batch` applies while it inspects a message, and it is what keeps a sweep
+ * from forwarding and re-editing a caption that is already clean.
+ */
+export function captionNeedsScrub(value) {
+  const original = typeof value === 'string' ? cleanText(value, 1_024) : '';
+  if (!original) return false;
+  return cleanStorageCaption(value) !== original;
+}
+
+/**
+ * Clean the caption on a message in the database channel, reading it from Telegram.
+ *
+ * The catalog's own label is deliberately not the source of truth: a file record may have kept
+ * the file name instead of a caption, and a caption edited by hand since would look unchanged
+ * forever. So each message is read the way `/batch` reads it — forwarded once into the
+ * publisher's chat, inspected, deleted again — and only then edited, to exactly the cleaned form
+ * of what Telegram reported. Nothing is composed, no post is created, and a caption that is
+ * already clean costs no edit at all.
+ *
+ * A target may arrive with its `caption` already known, which is what /batch has in hand while
+ * it inspects a file; then the read step is skipped and the edit is the only work.
+ */
+export async function scrubStorageCaptions({ telegram, targets = [], options = {} }) {
+  const spacingMs = Number.isFinite(Number(options.spacingMs)) ? Number(options.spacingMs) : ANNOUNCEMENT_SYNC_SPACING_MS;
+  const wait = typeof options.wait === 'function' ? options.wait : pause;
+  const attempts = Math.max(1, Number(options.attempts) || ANNOUNCEMENT_SYNC_REF_ATTEMPTS);
+  const ceilingMs = configuredMilliseconds(options.ceilingMs, ANNOUNCEMENT_SYNC_RETRY_CEILING_MS);
+  // Never forward to look at a message inside the very channel being cleaned: an automation
+  // context is the storage channel itself, and a "preview" there would be another channel post.
+  const inspectChatId = options.inspectChatId === null || options.inspectChatId === undefined
+    ? null
+    : String(options.inspectChatId);
+  const list = Array.isArray(targets) ? targets : [];
+  const result = {
+    updated: 0,
+    unchanged: 0,
+    alreadyClean: 0,
+    knownClean: 0,
+    noCaption: 0,
+    unreadable: 0,
+    gone: 0,
+    blocked: 0,
+    failed: 0,
+    inspected: 0,
+    messages: list.length,
+    retryAfterMs: 0,
+    blockedCards: []
+  };
+  if (!list.length || !telegram || typeof telegram.editMessageCaption !== 'function') return result;
+
+  for (const target of list) {
+    const channel = String(target.channel);
+    const messageId = Number(target.messageId);
+    const key = `${channel}:${messageId}`;
+    if (storageCaptionBlockers.has(key)) {
+      result.blocked += 1;
+      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId });
+      continue;
+    }
+    if (storageCaptionClean.has(key)) { result.knownClean += 1; continue; }
+
+    let original = typeof target.caption === 'string' ? target.caption : null;
+    if (original === null) {
+      if (!inspectChatId || inspectChatId === channel || typeof telegram.forwardMessage !== 'function') {
+        // No safe chat to read through. Reported rather than guessed at from the record.
+        result.unreadable += 1;
+        continue;
+      }
+      let preview = null;
+      try {
+        preview = await telegram.forwardMessage(inspectChatId, channel, messageId, { disable_notification: true });
+        result.inspected += 1;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 160);
+        if (/not found|deleted|can'?t be forwarded|protected/i.test(description)) result.unreadable += 1;
+        else result.failed += 1;
+        continue;
+      } finally {
+        // The preview exists only to be read: it is deleted again per message, so the publisher's
+        // chat never accumulates copies of the file post.
+        if (preview?.message_id && typeof telegram.deleteMessage === 'function') {
+          await Promise.resolve(telegram.deleteMessage(inspectChatId, preview.message_id)).catch(() => {});
+        }
+      }
+      original = typeof preview?.caption === 'string' ? preview.caption : '';
+    }
+
+    if (!original) {
+      // A file post with no caption has nothing to sanitize, and is not given one.
+      result.noCaption += 1;
+      storageCaptionClean.add(key);
+      if (spacingMs) await wait(spacingMs);
+      continue;
+    }
+    const caption = cleanStorageCaption(original);
+    if (!caption || caption === cleanText(original, 1_024)) {
+      result.alreadyClean += 1;
+      storageCaptionClean.add(key);
+      if (spacingMs) await wait(spacingMs);
+      continue;
+    }
+
+    let applied = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        // telegraf takes (chat_id, message_id, inline_message_id, caption, extra): a storage
+        // post is a channel message, so there is no inline id to pass.
+        await telegram.editMessageCaption(channel, messageId, undefined, caption);
+        applied = 'updated';
+        break;
+      } catch (error) {
+        const description = cleanText(error?.description || error?.message, 200);
+        if (/message is not modified/i.test(description)) { applied = 'unchanged'; break; }
+        if (/no caption|message to edit not found|not found|already deleted|message to edit/i.test(description)) { applied = 'gone'; break; }
+        // Only "this is not your message" is permanent: a missing admin right or a channel the
+        // bot was removed from is a configuration problem the publisher can fix, so it stays a
+        // failure the lane retries and reports instead of being quietly remembered.
+        if (/own messages|can'?t edit|cannot edit|not allowed to edit|only edit its own|edit messages sent/i.test(description)
+          && !/too many requests|flood/i.test(description)) {
+          applied = 'blocked';
+          storageCaptionBlockers.set(key, description || 'Telegram refused the edit');
+          break;
+        }
+        const retryAfterMs = telegramRetryAfterMilliseconds(error, attempt - 1);
+        if (!retryAfterMs || attempt === attempts) { applied = 'failed'; break; }
+        const backoff = Math.min(retryAfterMs, ceilingMs);
+        result.retryAfterMs = Math.max(result.retryAfterMs, backoff);
+        if (spacingMs) await wait(backoff);
+      }
+    }
+    if (applied === 'updated' || applied === 'unchanged') {
+      result[applied] += 1;
+      // Whatever Telegram shows now is the cleaned form, so this process will not look again.
+      storageCaptionClean.add(key);
+    } else if (applied === 'gone') result.gone += 1;
+    else if (applied === 'blocked') {
+      result.blocked += 1;
+      result.blockedCards.push({ adminId: target.adminId || null, title: target.title || null, messageId });
+    } else result.failed += 1;
+    if (spacingMs) await wait(spacingMs);
+  }
+  announcementLane.totals.captions += result.updated;
+  announcementLane.totals.refreshed += result.updated;
+  announcementLane.totals.unchanged += result.unchanged + result.alreadyClean;
+  announcementLane.totals.failed += result.failed;
+  return result;
+}
+
+/**
+ * Queue a caption sweep on the announcement lane. Targets are read first so a reply can say how
+ * many there are; the work then happens at the lane's own pace, and a refusal that outlives the
+ * reply is reported to the publisher instead of being dropped.
+ */
+export function queueStorageCaptionScrub({ telegram, targets = [], notifyChatId = null, inspectChatId = null }, options = {}) {
+  // Copied, because the caller's list belongs to a loop that is still running: a queued sweep
+  // must see the messages as they were when it was handed over.
+  const list = Array.isArray(targets) ? targets.slice() : [];
+  return enqueueAnnouncementJob({
+    key: STORAGE_CAPTION_JOB_KEY,
+    label: `Database channel captions (${list.length})`,
+    notifyChatId,
+    telegram,
+    stuckNote: 'The website labels were already clean — only the messages in the database channel are behind. /sync db lists them again and /sync db go retries the edit.',
+    options,
+    run: (inner) => scrubStorageCaptions({ telegram, targets: list, options: { ...inner, inspectChatId } })
+  });
+}
+
+/**
+ * The sweep's inputs. A file post is a candidate because the catalog knows its message ID; what
+ * its caption says is read from Telegram, so nothing depends on which label the record kept.
+ */
+export async function listStorageCaptionTargets(repository, { adminId = null, limit = STORAGE_CAPTION_SWEEP_LIMIT, skip = 0, cards = null, config = null } = {}) {
+  if (typeof repository?.listStorageCaptionTargets !== 'function') {
+    return { targets: [], available: false, stats: null, blocked: 0, clean: 0, more: false };
+  }
+  const listed = await repository.listStorageCaptionTargets({
+    adminId,
+    limit,
+    skip,
+    cards,
+    storageChannelId: cleanText(config?.telegram?.storageChannelId, 80) || null,
+    adultStorageChannelId: cleanText(config?.telegram?.adultStorageChannelId, 80) || null
+  });
+  const targets = Array.isArray(listed?.targets) ? listed.targets : (Array.isArray(listed) ? listed : []);
+  return {
+    targets,
+    available: true,
+    stats: listed?.stats || null,
+    // `more` is what lets a sweep page through an archive without a count query: the store fetched
+    // one card past its window and is saying whether anything followed it.
+    more: Boolean(listed?.more ?? listed?.stats?.more),
+    blocked: storageCaptionBlockers.size,
+    clean: storageCaptionClean.size
+  };
+}
+
+/**
+ * Forget what the sweep decided: which messages Telegram refused to edit, and which it read and
+ * found clean. A refusal is remembered so a sweep does not spend the lane on a post this bot will
+ * never own, and a clean message so that re-running the command is cheap — but after the bot's
+ * rights change, or a file is re-uploaded with a new caption, both answers are stale.
+ */
+export function clearStorageCaptionMemory() {
+  const cleared = { blocked: storageCaptionBlockers.size, clean: storageCaptionClean.size };
+  storageCaptionBlockers.clear();
+  storageCaptionClean.clear();
+  return cleared;
+}
+
+/**
+ * How a sweep reports itself: what it changed, what it read and found already right, and what it
+ * is not allowed to touch. Every outcome is named, because "nothing to clean" and "I could not
+ * read it" must not sound the same to the publisher.
+ */
+export function storageScrubNote(result, { blocked = 0 } = {}) {
+  // The caller usually knows how many messages are uneditable from an earlier run, so the
+  // count may arrive either on the result or beside it — the report has to say the same thing.
+  const blockedTotal = Number(result?.blocked) || Number(blocked) || 0;
+  if (!result?.messages) {
+    return blockedTotal
+      ? `Nothing left to rewrite: the remaining ${blockedTotal} message${blockedTotal === 1 ? '' : 's'} in the database channel ${blockedTotal === 1 ? 'is' : 'are'} not posts this bot sent, and Telegram only lets a bot edit its own messages.`
+      : 'Nothing to rewrite: every database-channel message this catalog knows about was read and already carries a clean caption.';
+  }
+  const parts = [];
+  if (result.updated) parts.push(`${result.updated} caption${result.updated === 1 ? '' : 's'} rewritten`);
+  if (result.unchanged) parts.push(`${result.unchanged} already carrying it`);
+  if (result.alreadyClean) parts.push(`${result.alreadyClean} read from Telegram and already clean, so nothing was sent`);
+  if (result.noCaption) parts.push(`${result.noCaption} file post${result.noCaption === 1 ? '' : 's'} with no caption at all, left without one`);
+  if (result.unreadable) parts.push(`${result.unreadable} message${result.unreadable === 1 ? '' : 's'} this bot could not read (protected or deleted)`);
+  if (result.inspected) parts.push(`${result.inspected} read through a one-time preview`);
+  if (result.knownClean) parts.push(`${result.knownClean} already checked in this process`);
+  if (result.gone) parts.push(`${result.gone} deleted or captionless message${result.gone === 1 ? '' : 's'} left alone`);
+  if (blockedTotal) parts.push(`${blockedTotal} not editable by a bot (sent by another account)`);
+  if (result.failed) parts.push(`${result.failed} refused by Telegram, still queued for a later round`);
+  return `Database channel: ${parts.length ? parts.join(', ') : 'nothing changed'}.`;
+}
+
+/**
+ * What a bulk import says when it hands its caption fixes to the lane instead of applying them
+ * inline: the release never waits on a channel edit, and a Telegram limit never loses the edit.
+ */
+export function batchCaptionQueueNote(count) {
+  if (!count) return null;
+  const bullet = String.fromCharCode(9642);
+  const dash = String.fromCharCode(8212);
+  return `${bullet} ${count} storage post${count === 1 ? '' : 's'} arrived with an @channel prefix in its caption. The files were imported as usual and nothing new was created for it ${dash} the caption fix is queued on the channel lane, so a Telegram limit delays the edit and never the release. /sync db lists what is left.`;
+}
+
+/**
+ * One sweep, walked a page at a time.
+ *
+ * A single command has to finish the job it was asked for, so this does not stop at the first
+ * page: it lists a window of cards, reads and cleans those messages, and moves to the next window
+ * until the archive runs out or the run ceiling is reached. `STORAGE_CAPTION_SWEEP_LIMIT` sizes a
+ * page, not the whole run — answering "capped at 80, run it again" turned cleaning a database into
+ * a chore instead of a command.
+ *
+ * Nothing here is awaited by the command that started it. A sweep that outlives Telegram's own
+ * request timeout used to surface as "Something went wrong while handling that request" while the
+ * work had in fact gone through, which is the worst possible answer for a bulk command.
+ */
+export async function runStorageCaptionSweep({ telegram, repository, config = null, adminId = null, inspectChatId = null, options = {} } = {}) {
+  const pageSize = Math.max(1, Math.min(Number(options.limit) || STORAGE_CAPTION_SWEEP_LIMIT, 600));
+  const totalCeiling = Math.max(pageSize, Number(options.totalCeiling) || STORAGE_CAPTION_SWEEP_TOTAL);
+  const cardWindow = Math.max(1, Number(options.cards) || STORAGE_CAPTION_SWEEP_CARDS);
+  const aggregate = {
+    updated: 0, unchanged: 0, alreadyClean: 0, knownClean: 0, noCaption: 0, unreadable: 0,
+    gone: 0, blocked: 0, failed: 0, inspected: 0, messages: 0, cards: 0, pages: 0,
+    retryAfterMs: 0, blockedCards: [], stoppedFor: null, available: true
+  };
+  if (typeof repository?.listStorageCaptionTargets !== 'function') {
+    aggregate.available = false;
+    aggregate.stoppedFor = 'unavailable';
+    return aggregate;
+  }
+  storageSweepState.running = true;
+  storageSweepState.adminId = adminId || null;
+  storageSweepState.startedAt = new Date().toISOString();
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
+  let skip = 0;
+  try {
+    // The page count is a hard stop of its own, so a store that keeps reporting "more" because of
+    // a bug cannot keep a lane busy forever.
+    for (let page = 0; page < STORAGE_CAPTION_SWEEP_PAGES; page += 1) {
+      let pageLimit = pageSize;
+      let listed = await listStorageCaptionTargets(repository, { adminId, limit: pageLimit, cards: cardWindow, skip, config });
+      // A card holding more files than a page allows (a season pack) would be cut off mid-list, so
+      // the same window is re-read with a wider ceiling rather than silently skipping its files.
+      while (listed.stats?.capped && pageLimit < 600) {
+        pageLimit = Math.min(600, pageLimit * 3);
+        listed = await listStorageCaptionTargets(repository, { adminId, limit: pageLimit, cards: cardWindow, skip, config });
+      }
+      aggregate.pages += 1;
+      aggregate.cards += Number(listed.stats?.scanned) || listed.targets.length;
+      storageSweepState.pages = aggregate.pages;
+      if (listed.targets.length) {
+        const result = await scrubStorageCaptions({ telegram, targets: listed.targets, options: { ...options, inspectChatId } });
+        for (const key of STORAGE_CAPTION_OUTCOMES) aggregate[key] += Number(result[key]) || 0;
+        aggregate.messages += listed.targets.length;
+        aggregate.retryAfterMs = Math.max(aggregate.retryAfterMs, Number(result.retryAfterMs) || 0);
+        if (Array.isArray(result.blockedCards)) aggregate.blockedCards.push(...result.blockedCards);
+        storageSweepState.messages = aggregate.messages;
+        storageSweepState.updated = aggregate.updated;
+        storageSweepState.blocked = aggregate.blocked;
+        storageSweepState.failed = aggregate.failed;
+        // A channel that refuses to let its posts be forwarded cannot be read at all, and no
+        // number of pages will change that. Stop and say so instead of spending the archive.
+        if (result.unreadable === listed.targets.length && !result.updated && !result.failed) {
+          aggregate.stoppedFor = 'unreadable';
+          break;
+        }
+      }
+      if (!listed.more) break;
+      if (aggregate.messages >= totalCeiling) {
+        aggregate.stoppedFor = 'total';
+        break;
+      }
+      skip += Math.max(1, Number(listed.stats?.scanned) || 1);
+    }
+  } finally {
+    storageSweepState.running = false;
+    storageSweepState.at = new Date().toISOString();
+    storageSweepState.stoppedFor = aggregate.stoppedFor;
+  }
+  return aggregate;
+}
+
+/**
+ * What a finished sweep says, in the publisher's chat. It repeats the numbers rather than
+ * promising that everything is clean, because a page that was unreadable and a message another
+ * sender owns are different follow-ups.
+ */
+export function storageSweepReport(result, { adminId = null } = {}) {
+  if (!result?.pages) return null;
+  const scope = adminId ? ` for ${adminId}` : '';
+  const lines = [
+    `Database channel sweep${scope}: ${result.pages} page${result.pages === 1 ? '' : 's'}, ${result.messages} message${result.messages === 1 ? '' : 's'} read from Telegram.`
+  ];
+  lines.push(storageScrubNote(result, { blocked: result.blocked }));
+  if (result.stoppedFor === 'unreadable') {
+    lines.push('Stopped early: the whole page refused the preview, which means this database channel does not allow its posts to be forwarded. A caption that cannot be read cannot be cleaned from the bot — either allow forwarding in the channel or edit the posts there yourself.');
+  }
+  if (result.stoppedFor === 'total') {
+    lines.push('Stopped at the run ceiling, with the archive still going: /sync db go picks up with the next set.');
+  }
+  if (result.blockedCards?.length) {
+    lines.push(`Not editable: ${result.blockedCards.slice(0, 8).map((entry) => `${entry.adminId || entry.title || 'card'} → message ${entry.messageId}`).join(', ')}${result.blockedCards.length > 8 ? ` · +${result.blockedCards.length - 8} more` : ''}. A bot can only edit the messages it sent.`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * How far the running (or last finished) sweep got, without touching Telegram. A publisher who
+ * sees "queued on the lane" needs a way to ask what the lane is doing.
+ */
+export function storageSweepStatusText() {
+  const plural = (value, word) => `${value} ${word}${value === 1 ? '' : 's'}`;
+  if (storageSweepState.running) {
+    const ahead = Math.max(0, (announcementSyncStatus().pending || 0) - 1);
+    const stage = storageSweepState.pages
+      ? 'running'
+      : `queued on the lane${ahead ? ` behind ${plural(ahead, 'job')}` : ''}`;
+    return `A database-channel sweep is ${stage}${storageSweepState.adminId ? ` for ${storageSweepState.adminId}` : ''}: ${plural(storageSweepState.pages, 'page')} read, ${plural(storageSweepState.messages, 'message')} looked at, ${plural(storageSweepState.updated, 'caption')} rewritten so far. It keeps going on its own; /sync db answers immediately and never waits for it.`;
+  }
+  if (!storageSweepState.at) return 'No database-channel sweep has run since this process started. /sync db shows what it would read, /sync db go runs it.';
+  const finishedAt = cleanText(storageSweepState.at, 20).slice(11, 16);
+  const tail = storageSweepState.stoppedFor === 'total'
+    ? 'It stopped at the run ceiling with the archive still going — /sync db go continues with the next set.'
+    : 'Run /sync db go again any time: a message already read and found clean is not touched twice, and a refusal is retried only after /sync db retry.';
+  return [
+    `Last sweep finished at ${finishedAt} UTC: ${plural(storageSweepState.pages, 'page')}, ${plural(storageSweepState.messages, 'message')} read, ${plural(storageSweepState.updated, 'caption')} rewritten, ${plural(storageSweepState.blocked, 'message')} a bot may not edit, ${plural(storageSweepState.failed, 'refusal')} still outstanding.`,
+    tail
+  ].join('\n');
+}
+
+/**
+ * Start a whole-archive sweep on the lane and answer at once. The completion note is sent when the
+ * job settles, and a refusal that outlives the retries is reported by the lane itself.
+ */
+export function queueStorageCaptionSweep({ telegram, repository, config = null, adminId = null, notifyChatId = null, inspectChatId = null }, options = {}) {
+  // Claimed here rather than inside the runner, so a second /sync db go while the lane is still
+  // working cannot queue a duplicate, and `/sync db status` can answer immediately.
+  if (storageSweepState.running) return null;
+  storageSweepState.running = true;
+  storageSweepState.adminId = adminId || null;
+  storageSweepState.startedAt = new Date().toISOString();
+  storageSweepState.at = null;
+  storageSweepState.pages = 0;
+  storageSweepState.messages = 0;
+  storageSweepState.updated = 0;
+  storageSweepState.blocked = 0;
+  storageSweepState.failed = 0;
+  storageSweepState.stoppedFor = null;
+  const releaseClaim = () => { storageSweepState.running = false; };
+  const report = (result) => {
+    const text = storageSweepReport(result, { adminId });
+    if (!text || !notifyChatId || typeof telegram?.sendMessage !== 'function') return null;
+    return Promise.resolve(telegram.sendMessage(String(notifyChatId), text)).catch(() => {});
+  };
+  return enqueueAnnouncementJob({
+    key: STORAGE_CAPTION_JOB_KEY,
+    label: adminId ? `Database channel captions (${adminId})` : 'Database channel captions',
+    notifyChatId,
+    telegram,
+    stuckNote: 'The website labels were already clean — only the messages in the database channel are behind. /sync db lists them again and /sync db go retries the edit.',
+    options: { ...options, onSettled: report },
+    run: (inner) => runStorageCaptionSweep({ telegram, repository, config, adminId, inspectChatId, options: inner })
+  }).finally(releaseClaim);
+}
+
+/**
+ * What a database-caption sweep would do, in the publisher's own words. Kept apart from the
+ * command so the preview and the applied run say the same thing about the same numbers.
+ */
+export function storageScrubPreviewText({
+  targets = [],
+  cards = 0,
+  blocked = 0,
+  stats = null,
+  apply = false,
+  single = false,
+  listed = 25,
+  spacingMs = ANNOUNCEMENT_SYNC_SPACING_MS
+} = {}) {
+  const count = targets.length;
+  const plural = (value, word) => `${value} ${word}${value === 1 ? '' : 's'}`;
+  const lines = [
+    `▸ ${apply ? '' : 'Preview · '}${plural(count, 'database-channel message')} on ${plural(cards || new Set(targets.map((entry) => entry.adminId).filter(Boolean)).size, 'card')} ${apply ? 'queued for rewriting' : 'listed for a caption check'}.`
+  ];
+  // A page is 80 messages, and the publisher has to be able to check which ones — a long list is
+  // paginated now instead of being cut at three lines, so the whole page is named.
+  const listedCount = Math.max(8, Number(listed) || 25);
+  for (const target of targets.slice(0, listedCount)) {
+    lines.push(`▪ ${target.adminId || 'unlisted card'} · ${cleanText(target.title, 40) || 'untitled'} — message ${Number(target.messageId)}`);
+  }
+  if (count > listedCount) lines.push(`▪ +${count - listedCount} more not listed here.`);
+  if (blocked) {
+    lines.push(`▪ ${plural(blocked, 'message')} ${blocked === 1 ? 'was' : 'were'} refused before because this bot did not send ${blocked === 1 ? 'it' : 'them'}. Telegram only lets a bot edit its own messages, so those captions stay as their sender wrote them — the website label is already clean either way.`);
+  }
+  if (stats?.legacyChannel) {
+    lines.push(`▪ ${stats.legacyChannel} of them ${stats.legacyChannel === 1 ? 'is' : 'are'} a file post saved before the catalog tracked which channel it went to — resolved through the configured database channel, the same way /batch reaches them.`);
+  }
+  if (count) {
+    lines.push('▪ Each one is read from Telegram first — the same one-time preview /batch uses — so a file whose record kept no caption is still checked, and a caption that is already clean is never sent. Nothing is composed from the catalog: a message is set to the cleaned form of its own caption.');
+  }
+  if (stats?.noChannel) {
+    lines.push(`▪ ${stats.noChannel} file post${stats.noChannel === 1 ? '' : 's'} name no database channel and TELEGRAM_STORAGE_CHANNEL_ID is not configured for ${stats.noChannel === 1 ? 'it' : 'them'}, so there is nothing to address.`);
+  }
+  if (stats?.files) {
+    const cardNote = stats.cards ? ` — ${plural(stats.cards, 'card')} with something to check` : '';
+    lines.push(`▪ ${plural(stats.files, 'file record')} in this catalog point at a database message${cardNote}.`);
+  }
+  if (!count) {
+    lines.push(blocked
+      ? 'Nothing else can be done from here: the captions that remain are posts a bot is not allowed to edit. Delete or edit those in the channel yourself, or upload through this bot so the copy it stores is clean from the start. /sync db retry forgets them if that changes.'
+      : 'Every database-channel message this catalog knows about was checked and already reads cleanly, so there is nothing to send.');
+  } else if (apply) {
+    const minutes = Math.max(1, Math.ceil((count * spacingMs) / 60_000));
+    lines.push(`▪ One read and, if needed, one edit per ${(spacingMs / 1000).toFixed(1)}s on the announcement lane — about ${plural(minutes, 'minute')} for this page. No file is re-uploaded and no caption is invented: a message is set to the cleaned form of its own text, so a sweep is safe to run twice and the second run is cheap.`);
+    if (stats?.capped) {
+      lines.push(`▪ That is one page. The run continues past it — a page at a time, up to ${plural(STORAGE_CAPTION_SWEEP_TOTAL, 'message')} in total (STORAGE_CAPTION_SWEEP_LIMIT, STORAGE_CAPTION_SWEEP_CARDS and STORAGE_CAPTION_SWEEP_TOTAL change the shape of a page). /sync db status asks how far it has got.`);
+    }
+  } else {
+    if (stats?.capped) {
+      // A preview that quietly stops at the cap would read like the whole archive, which is
+      // how a sweep ends up looking like "it only did some of them".
+      lines.push(`▪ This preview shows one page of ${plural(count, 'message')}; /sync db go walks the whole archive a page at a time, so nothing needs running twice.`);
+    }
+    lines.push(`To apply it: /sync db go${single ? '' : `, or /sync db SB-0123ABCDEF for one card`}.`);
+  }
+  // Not sliced: a caption sweep's list is exactly what a publisher wants whole, and a long reply
+  // is paginated now instead of being cut off.
+  return lines.join('\n');
+}
+
+export function announcementSyncNote(sync) {
+  if (!sync?.channels) return 'No Telegram announcement is attached to this post, so nothing else needed updating.';
+  const parts = [];
+  if (sync.updated) parts.push(`${sync.updated} announcement${sync.updated === 1 ? '' : 's'} updated`);
+  if (sync.unchanged) parts.push(`${sync.unchanged} already showing this information`);
+  if (sync.failed) parts.push(`${sync.failed} waiting on Telegram’s limit and queued for a later round`);
+  if (sync.blocked) parts.push(`${sync.blocked} refused because ${sync.reason || 'this bot cannot edit that channel'}`);
+  if (sync.promoted) parts.push(`${sync.promoted} text-only ${sync.promoted === 1 ? 'copy was' : 'copies were'} given their artwork for the first time`);
+  if (sync.upgradeFailed) parts.push(`${sync.upgradeFailed} ${sync.upgradeFailed === 1 ? 'post would not' : 'posts would not'} take the photo, so its caption was corrected without it (remembered, not re-attempted)`);
+  if (sync.dropped) parts.push(`${sync.dropped} deleted announcement${sync.dropped === 1 ? '' : 's'} forgotten`);
+  if (sync.unsyncable) parts.push(`${sync.unsyncable} announcement${sync.unsyncable === 1 ? '' : 's'} ${sync.unsyncable === 1 ? 'is' : 'are'} a copy this bot did not post, so no bot can edit ${sync.unsyncable === 1 ? 'it' : 'them'} \u2014 remembered, so nothing is ever re-sent for ${sync.unsyncable === 1 ? 'it' : 'them'}`);
+  if (sync.skipped) parts.push(`${sync.skipped} ${sync.skipped === 1 ? 'copy is' : 'copies are'} left for you to edit in the channel${sync.reason ? ` because ${sync.reason}` : ''} - remembered, so nothing is re-sent for ${sync.skipped === 1 ? 'it' : 'them'}, and re-checked the moment the card changes`);
+  if (parts.length) return `Telegram announcements: ${parts.join(', ')}.`;
+  return 'The Telegram announcement could not be edited; it stays on the list, so /sync will send it again.';
+}
+
+export async function announcePublishedContent({ bot, repository, content, websiteUrl, storageChannelId = null }) {
+  // 18+ releases are intentionally never broadcast, even when normal
+  // announcement destinations are configured. Their access route is the
+  // age-confirmed category page only.
+  if (isAdultCategory(content?.category)) return { sent: 0, failed: 0, skipped: 0, suppressed: true };
+  const channels = await repository.listAnnouncementChannels();
+  if (!channels.length) return { sent: 0, failed: 0, skipped: 0 };
+
+  // A database channel is deliberately not an announcement destination. Apart
+  // from keeping storage clean, this prevents an auto-published announcement
+  // photo from becoming another storage-channel automation event.
+  const normalizedStorageChannelId = storageChannelId === null || storageChannelId === undefined ? null : String(storageChannelId);
+
+  // Announcement channels deliberately send users to the catalog page first.
+  // The public page is where the user can review details and choose Telegram delivery.
+  const keyboard = websiteUrl ? Markup.inlineKeyboard([[Markup.button.url('✨ VIEW ON WEBSITE', websiteUrl)]]) : undefined;
+  const caption = announcementCaption(content);
+  const posts = [];
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (const channel of channels) {
+    if (normalizedStorageChannelId && String(channel.channelId) === normalizedStorageChannelId) {
+      skipped += 1;
+      console.warn('[telegram] skipped an announcement to the database storage channel to prevent an automation loop.');
+      continue;
+    }
+    try {
+      const posted = await bot.telegram.sendPhoto(channel.channelId, content.posterUrl, {
+        caption,
+        parse_mode: 'HTML',
+        ...keyboard
+      });
+      // The caption and artwork are remembered on the reference so a later edit can answer
+      // "already correct" without calling Telegram at all — the difference between a big
+      // batch clearing the flood limit and one edit per post per channel hitting it.
+      posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'photo', websiteUrl, postedAt: new Date().toISOString(), caption, posterUrl: content.posterUrl || null });
+      sent += 1;
+    } catch (photoError) {
+      try {
+        const posted = await bot.telegram.sendMessage(channel.channelId, caption, {
+          parse_mode: 'HTML',
+          ...keyboard
+        });
+        posts.push({ channelId: String(channel.channelId), messageId: posted?.message_id, kind: 'text', websiteUrl, postedAt: new Date().toISOString(), caption, posterUrl: null });
+        sent += 1;
+      } catch (messageError) {
+        failed += 1;
+        console.error('[telegram] announcement failed:', channel.channelId, messageError?.description || messageError?.message || photoError?.message || 'Unknown error');
+      }
+    }
+  }
+
+  return { sent, failed, skipped, posts: posts.filter((post) => Number(post.messageId) > 0) };
+}
+
+export async function inspectSessionMediaTracks({ session, bot, repository, config } = {}) {
+  if (!session?.files?.length) return { session, inspection: { scanned: 0, skipped: 0, unavailable: 0, failed: 0 } };
+  try {
+    const inspection = await inspectDeferredMediaTracks({
+      files: session.files,
+      telegram: bot?.telegram,
+      mediaInfo: config?.mediaInfo || {}
+    });
+    const changed = inspection.files.some((file, index) => file !== session.files[index]);
+    if (!changed) return { session, inspection };
+    let saved = null;
+    if (typeof repository?.replaceSessionFiles === 'function') {
+      saved = await repository.replaceSessionFiles(session.chatId, session.ownerId, inspection.files);
+    }
+    return { session: saved || { ...session, files: inspection.files }, inspection };
+  } catch (error) {
+    // Track labels are an enhancement. A failed download, timeout, or missing
+    // MediaInfo binary must never prevent a publisher from releasing files.
+    console.warn('[telegram] deferred media-track inspection failed:', automationDiagnostic(error));
+    return { session, inspection: { scanned: 0, skipped: 0, unavailable: 0, failed: 1 } };
+  }
+}
+
+/** A usable season number only: `null`, `0`, and text never count as Season 0. */
+export function readSeason(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 && number <= 99 ? number : null;
+}
+
+export function detectUploadSeasonForFile(file) {
+  const stored = Number(file?.season);
+  if (Number.isInteger(stored) && stored >= 1) return stored;
+  return detectUploadSeason({
+    caption: file?.displayName || file?.sourceLabel,
+    filename: file?.name
+  }).season;
+}
+
+/**
+ * The season a whole release belongs to, or null when the batch is ambiguous.
+ * A mixed batch deliberately returns null: existing posts stay addressable by
+ * their title key, while a freshly split upload always knows its own season.
+ */
+export function dominantReleaseSeason(files = [], { requireEveryFile = false } = {}) {
+  const list = Array.isArray(files) ? files : [];
+  const seasons = new Set();
+  let marked = 0;
+  for (const file of list) {
+    const season = detectUploadSeasonForFile(file);
+    if (!season) continue;
+    marked += 1;
+    seasons.add(season);
+  }
+  // One agreement is a season. A mixed or unreadable batch deliberately stays
+  // null so an older catalog card can never be reinterpreted by accident.
+  if (seasons.size !== 1) return null;
+  // A single stray "S1" file must not rename a whole release: when the label is
+  // being invented rather than handed over by the split planner, every file in
+  // the group has to carry the same season marker.
+  if (requireEveryFile && list.length > 0 && marked !== list.length) return null;
+  return [...seasons][0];
+}
+
+/**
+ * A catalog card must be readable at a glance, so a season release gets its
+ * season in the title. An explicit publisher title that already names a season
+ * is never rewritten unless `replace` is requested by the multi-season split.
+ */
+export function withSeasonLabel(value, season, { replace = false } = {}) {
+  const title = cleanText(value, 180);
+  const number = readSeason(season);
+  if (!title || !number) return title;
+  const label = formatSeasonLabel(number);
+  if (!label) return title;
+  if (!replace && /\b(?:season|s)\s*0*\d{1,2}\b/i.test(title)) return title;
+  const cleaned = replace
+    ? cleanText(
+      title
+        // Keep an attached episode marker such as S01E03 intact while removing
+        // the standalone season package label.
+        .replace(/\b(?:SEASON|S)\s*0*\d{1,2}\b(?!\s*[- ]?E(?:P(?:ISODE)?)?\s*\d{1,3})/gi, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim(),
+      180
+    )
+    : title;
+  return cleanText(`${cleaned || title} ${label}`, 180);
+}
+
+/**
+ * Group one upload batch by the release each file actually belongs to. Files
+ * are keyed by their cleaned title so a range that holds `RRR`, `Robot 2`, and
+ * 24 `Fullmetal Alchemist` episodes becomes three posts instead of one card
+ * named after whichever file happened to come first. A file whose caption is
+ * unusable follows the file above it, because uploaders send a release together.
+ */
+export function groupFilesByReleaseTitle(files = []) {
+  const entries = (Array.isArray(files) ? files : []).map((file) => {
+    // Keyed on the tidied title, so one film captioned three ways by one uploader is one card, not
+    // three cards with three announcements and three poster uploads behind them.
+    const title = cleanText(inferBatchTitle([file]), 180);
+    return { file, title, key: title ? slugify(title).replace(/[^a-z0-9]/g, '') : '' };
+  });
+  const groups = new Map();
+  let previousKey = null;
+  for (const entry of entries) {
+    const key = entry.key || previousKey;
+    if (!key) {
+      groups.set(slugify(entry.title || 'untitled'), { title: entry.title, files: [entry.file] });
+      previousKey = key;
+      continue;
+    }
+    // The group keeps the shortest title that tidied to this key: "Minions" reads better on a card
+    // than the caption it merged in from, "Minions DUAL -KyoGo mkv 🔊 #".
+    const current = groups.get(key) || { title: entry.title, files: [] };
+    if (entry.title && entry.title.length < current.title.length) current.title = entry.title;
+    current.files.push(entry.file);
+    groups.set(key, current);
+    previousKey = key;
+  }
+  if (groups.size < 2) return [];
+  return [...groups.values()]
+    .filter((group) => group.title && group.files.length)
+    .map((group) => ({
+      title: group.title,
+      category: inferBatchCategory({ title: group.title, files: group.files }),
+      files: group.files
+    }));
+}
+
+/**
+ * Decide what one draft should become. Returns [] when the draft is already a
+ * single coherent post, so nothing about the ordinary flow changes.
+ */
+export function planDraftPublicationGroups(session) {
+  const files = Array.isArray(session?.files) ? session.files : [];
+  if (files.length < 2) return [];
+  const seasonGroups = groupFilesBySeason(files);
+  const batchWithoutTitle = session?.workflow === 'batch' && !session?.batch?.titleProvided && !session?.batch?.categoryOverride;
+  const releaseGroups = batchWithoutTitle ? groupFilesByReleaseTitle(files) : [];
+
+  if (!releaseGroups.length) {
+    if (seasonGroups.length < 2) return [];
+    return seasonGroups.map((group) => ({
+      title: withSeasonLabel(session.title, group.season, { replace: true }),
+      category: session.category,
+      season: group.season,
+      files: group.files,
+      reason: 'season'
+    }));
+  }
+
+  const planned = [];
+  for (const group of releaseGroups) {
+    const groupSeasons = groupFilesBySeason(group.files);
+    if (groupSeasons.length > 1) {
+      for (const season of groupSeasons) {
+        planned.push({
+          title: withSeasonLabel(group.title, season.season, { replace: true }),
+          category: group.category,
+          season: season.season,
+          files: season.files,
+          reason: 'season'
+        });
+      }
+      continue;
+    }
+    planned.push({
+      title: withSeasonLabel(group.title, groupSeasons[0]?.season ?? null),
+      category: group.category,
+      season: groupSeasons[0]?.season ?? null,
+      files: group.files,
+      reason: 'release'
+    });
+  }
+  return planned.length > 1 ? planned : [];
+}
+
+export async function publishDraft(ctx, bot, repository, config) {
+  let session = await repository.findSession(chatId(ctx), userId(ctx));
+  if (!session) {
+    const error = 'There is no active draft. Start one from /panel first.';
+    await ctx.reply(error);
+    return { content: null, error };
+  }
+  if (!session.title) {
+    const error = 'Please send a title before publishing.';
+    await ctx.reply(error);
+    return { content: null, error };
+  }
+  if (!session.files?.length) {
+    const error = 'Add at least one document, video, audio file, animation, or image before using /done.';
+    await ctx.reply(error);
+    return { content: null, error };
+  }
+  if (isAdultCategory(session.category) && !hasDedicatedAdultStorage(config)) {
+    const error = adultStorageConfigurationHint(config);
+    await ctx.reply(error);
+    return { content: null, error };
+  }
+  if (!config.telegram.botUsername) {
+    const error = 'TELEGRAM_BOT_USERNAME is not configured on the server, so I cannot create a shareable delivery link yet.';
+    await ctx.reply(error);
+    return { content: null, error };
+  }
+
+  // MediaInfo is deliberately deferred until all manual or batch files have
+  // arrived. It processes only ambiguous candidates sequentially, rather than
+  // opening a download/process for every incoming Telegram upload.
+  const mediaTrackWork = await inspectSessionMediaTracks({ session, bot, repository, config });
+  session = mediaTrackWork.session || session;
+  const inspectionNote = mediaTrackWork.inspection?.scanned
+    ? ` I verified tracks for ${mediaTrackWork.inspection.scanned} eligible file${mediaTrackWork.inspection.scanned === 1 ? '' : 's'} before publication.`
+    : '';
+  await ctx.reply(`Preparing your draft for publication…${inspectionNote}`);
+
+  // One draft can legitimately contain several posts: an untitled /batch range
+  // usually holds different releases, and a mixed-season upload must never share
+  // one card. Splitting first keeps every episode list, category, and quality
+  // ladder coherent, and lets a later upload merge into the right post.
+  const plan = planDraftPublicationGroups(session);
+  if (plan.length > 1) {
+    const summary = plan
+      .map((group) => `${group.title} (${group.files.length} file${group.files.length === 1 ? '' : 's'})`)
+      .join(', ');
+    const seasonOnly = plan.every((group) => group.reason === 'season');
+    await ctx.reply(seasonOnly
+      ? `${plan.length} seasons were detected in this upload: ${summary}. Each season is published as its own catalog post so their episode lists never collide.`
+      : `${plan.length} separate releases were detected in this upload: ${summary}. Each one becomes its own catalog post with its own category, episode list, and delivery link. Send /title before /done when you really want them combined.`);
+
+    const published = [];
+    // /cancel has to actually stop a long run. A hundred-card publish used to keep going after the
+    // draft was discarded, because the loop worked from a plan built before the first post.
+    let draftSession = session;
+    let cancelledAt = null;
+    for (const group of plan) {
+      // Each post is a separate publishing event with its own announcement and
+      // metadata lookup, so sequential work is intentional here.
+      // eslint-disable-next-line no-await-in-loop
+      if (published.length) {
+        // Reading the draft again is also how a change made between two cards is honoured.
+        const open = await repository.findSession(chatId(ctx), userId(ctx));
+        if (!open) {
+          cancelledAt = group;
+          break;
+        }
+        draftSession = open;
+      }
+      const result = await publishDraftSession({
+        ctx,
+        bot,
+        repository,
+        config,
+        session: { ...draftSession, title: group.title, category: group.category, files: group.files, metadata: null },
+        season: group.season,
+        deleteSessionOnSuccess: false
+      });
+      published.push({ ...result, season: group.season, title: group.title, reason: group.reason });
+    }
+    const failedGroups = published.filter((entry) => !entry.content);
+    // Deleting the draft while a group is still unpublished is how one transient error turned into
+    // "re-upload the whole range". A retained draft is republished into the same cards, not new ones.
+    if (!failedGroups.length && !cancelledAt) await repository.deleteSession(chatId(ctx), userId(ctx));
+    const notPublished = cancelledAt ? plan.length - published.length : failedGroups.length;
+    const cancelledGroup = cancelledAt ? `${cancelledAt.title}` : null;
+
+    const succeeded = published.filter((entry) => entry.content);
+    if (!succeeded.length) {
+      const error = published.find((entry) => entry.error)?.error || 'Nothing could be published.';
+      await ctx.reply(`Nothing was published. ${error}`);
+      return { content: null, error, published, seasons: published };
+    }
+    const last = succeeded.at(-1).content;
+    const deferredPosters = published.filter((entry) => entry.content && entry.posterResult?.deferred).length;
+    const cooling = published.filter((entry) => entry.posterResult?.allKeysCooling);
+    const freeInMs = cooling.length ? Math.max(...cooling.map((entry) => Number(entry.posterResult.retryAfterMs) || 0)) : 0;
+    const posterTimerNote = cooling.length
+      ? ` Every configured key is cooling; the next one frees in about ${freeInMs > 0 ? shortDuration(freeInMs) : 'a few minutes'} and the queue runs on that timer.`
+      : '';
+    await ctx.reply([
+      `Published ${succeeded.length} catalog post${succeeded.length === 1 ? '' : 's'} from this upload.`,
+      '',
+      ...published.map((entry) => (entry.content
+        ? `\u2713 ${entry.content.title} \u00b7 ${entry.content.filesCount} file${entry.content.filesCount === 1 ? '' : 's'} \u00b7 Post ID ${entry.content.adminId}`
+        : `\u2717 ${entry.title} \u2014 ${entry.error || 'not published'}`)),
+      deferredPosters
+        ? `\u25aa ${deferredPosters} poster${deferredPosters === 1 ? '' : 's'} could not be hosted because ImgBB is rate limiting. Those cards are live with their source artwork and the mirror is retried in the background — nothing needs re-sending.${posterTimerNote}`
+        : null,
+      cancelledAt
+        ? `\u25aa Stopped at ${cancelledGroup}: the draft was cancelled, so ${notPublished} of ${plan.length} releases were not published. Nothing else was touched, and the ${notPublished === 1 ? 'card' : 'cards'} above stand${notPublished === 1 ? 's' : ''} as they are.`
+        : null,
+      failedGroups.length
+        ? `\u25aa ${failedGroups.length} release${failedGroups.length === 1 ? '' : 's'} stayed in your draft instead of being lost. /done again publishes only those, and they merge into the cards above rather than making second ones.`
+        : 'Use /done again only if a post still needs its own files.'
+    ].filter((line) => line !== null).join('\n'), publicationKeyboard(getContentPageUrl(config, last), getTelegramDeliveryUrl(config, last.shareCode)));
+    return {
+      content: last,
+      published,
+      seasons: published,
+      multiPost: true,
+      multiSeason: seasonOnly,
+      websiteUrl: getContentPageUrl(config, last),
+      deliveryUrl: getTelegramDeliveryUrl(config, last.shareCode)
+    };
+  }
+
+  return publishDraftSession({ ctx, bot, repository, config, session });
+}
+
+/**
+ * Publish exactly one prepared draft. Manual uploads, /batch imports, storage
+ * automation, and each split season group all share this path so identity,
+ * poster mirroring, announcements, and replies stay identical everywhere.
+ */
+// How long a poster waits for ImgBB to stop rate limiting before the publisher is told. Each
+// attempt grows the gap (5, 10, 15 … minutes), so a burst of uploads is walked back rather than
+// hammered, and a card is never left without artwork because the image host had a busy hour.
+const POSTER_RETRY_INTERVAL_MS = (() => {
+  const parsed = Number(process.env.POSTER_RETRY_INTERVAL_MS);
+  return Number.isInteger(parsed) && parsed >= 15_000 && parsed <= 30 * 60_000 ? parsed : 5 * 60_000;
+})();
+const POSTER_RETRY_ROUNDS = (() => {
+  const parsed = Number(process.env.POSTER_RETRY_ROUNDS);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 100 ? parsed : 8;
+})();
+const POSTER_RETRY_TICK_MS = 30_000;
+
+let activePosterRetryQueue = null;
+
+/** `42_000` reads as "about 40 s" to a publisher, which is what a wait has to be to be useful. */
+export function shortDuration(value) {
+  const ms = Math.max(0, Number(value) || 0);
+  if (ms < 1_000) return 'a moment';
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+/**
+ * What the poster host said, in the one sentence the publisher can act on (or ignore).
+ *
+ * "Every key in the pool is full" is a different report from "this one upload was refused": the
+ * first is a wait with a number attached, and saying so is what stops a bulk publish from reading
+ * like a failure while the mirror is quietly being retried on that timer.
+ */
+export function posterDeferralNote(deferred) {
+  if (!deferred?.deferred) return null;
+  if (deferred.allKeysCooling) {
+    const pool = Number(deferred.poolSize) > 1 ? `all ${deferred.poolSize} configured ImgBB keys are` : 'the ImgBB key is';
+    const when = deferred.retryAfterMs ? ` The next one is free in about ${shortDuration(deferred.retryAfterMs)},` : '';
+    return `\u25aa Rate limit note: ${pool} rate limited right now, so no key would take another upload.${when} the mirror runs on that timer instead of the usual wait. Nothing needs resending, and /poster can force one card whenever you like.`;
+  }
+  return '\u25aa ImgBB is rate limiting, so this card uses the poster from its source for now. The mirror is retried on its own queue and updates the card and its channel post when it goes through \u2014 nothing was created, and you do not need to publish this again.';
+}
+
+/**
+ * Posters ImgBB would not take because it was busy — not because anything is wrong with them.
+ *
+ * A publish is never held up by an image host: the card goes live with the artwork it already has,
+ * and the mirror is retried on this queue until the host accepts it, then updates that card and the
+ * channel post it belongs to. Nothing is created for a deferred poster and no upload is repeated,
+ * which is the same rule the database-caption sweep follows.
+ */
+export function createPosterRetryQueue({
+  repository = null,
+  config = null,
+  host = hostPosterImage,
+  announce = null,
+  notify = async () => {},
+  now = () => Date.now(),
+  intervalMs = POSTER_RETRY_INTERVAL_MS,
+  rounds = POSTER_RETRY_ROUNDS,
+  batchSize = 4
+} = {}) {
+  const pending = new Map();
+  const counters = { hosted: 0, givenUp: 0, lastRunAt: null };
+  const tell = (targetChatId, text) => (targetChatId
+    ? Promise.resolve(notify(targetChatId, text)).catch(() => {})
+    : Promise.resolve());
+  // One report per chat per tick. A hundred-card publish must not turn into a hundred "it is
+  // hosted now" messages any more than it should turn into a hundred failures: the publisher reads
+  // a list naming the cards, once.
+  const reported = new Map();
+  const report = (targetChatId, bucket, line) => {
+    if (!targetChatId) return;
+    if (!reported.has(targetChatId)) reported.set(targetChatId, { hosted: [], gaveUp: [], errored: [] });
+    reported.get(targetChatId)[bucket].push(line);
+  };
+  const flushReports = async () => {
+    const chats = [...reported.entries()];
+    reported.clear();
+    for (const [targetChatId, sections] of chats) {
+      const parts = [];
+      if (sections.hosted.length) {
+        parts.push(`\u2713 ${sections.hosted.length} poster${sections.hosted.length === 1 ? '' : 's'} ImgBB had refused ${sections.hosted.length === 1 ? 'is' : 'are'} hosted now. ${sections.hosted.length === 1 ? 'The card' : 'The cards'} and ${sections.hosted.length === 1 ? 'its' : 'their'} channel post${sections.hosted.length === 1 ? '' : 's'} were updated in place \u2014 nothing to resend:`);
+        parts.push(sections.hosted.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (sections.gaveUp.length) {
+        parts.push(`\u2717 ImgBB kept refusing ${sections.gaveUp.length} poster${sections.gaveUp.length === 1 ? '' : 's'} after ${rounds} attempts, so ${sections.gaveUp.length === 1 ? 'it still uses' : 'they still use'} the source image. ${sections.gaveUp.length === 1 ? 'The card is' : 'The cards are'} published and correct \u2014 /poster can re-host any of them later, and no new post is needed:`);
+        parts.push(sections.gaveUp.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (sections.errored.length) {
+        parts.push(`\u2717 ${sections.errored.length} poster${sections.errored.length === 1 ? '' : 's'} could not be hosted at all. ${sections.errored.length === 1 ? 'That card keeps' : 'Those cards keep'} the artwork it already has, and nothing was created for this:`);
+        parts.push(sections.errored.map((line) => `\u25aa ${line}`).join('\n'));
+      }
+      if (parts.length) await tell(targetChatId, parts.join('\n'));
+    }
+  };
+  return {
+    enqueue(item = {}) {
+      if (!item.adminId || !item.image) return null;
+      const key = String(item.adminId);
+      const previous = pending.get(key);
+      const waitMs = Number(item.retryAfterMs) > 0 ? Number(item.retryAfterMs) : intervalMs;
+      pending.set(key, {
+        title: item.title || null,
+        image: item.image,
+        notifyChatId: item.notifyChatId || null,
+        attempts: previous?.attempts || 0,
+        nextAt: previous?.nextAt || now() + waitMs
+      });
+      return pending.get(key);
+    },
+    get size() { return pending.size; },
+    list() {
+      return [...pending.entries()].map(([adminId, entry]) => ({
+        adminId, title: entry.title, attempts: entry.attempts, nextAt: entry.nextAt
+      }));
+    },
+    clear() { pending.clear(); },
+    status() { return { ...counters, waiting: pending.size, rounds, intervalMs, attached: true }; },
+    async runDue(at = now()) {
+      counters.lastRunAt = at;
+      const outcome = { hosted: 0, givenUp: 0, deferred: 0, waiting: 0 };
+      let handled = 0;
+      for (const [adminId, entry] of [...pending.entries()]) {
+        if (handled >= Math.max(1, Number(batchSize) || 4)) break;
+        if (entry.nextAt > at) {
+          outcome.deferred += 1;
+          continue;
+        }
+        handled += 1;
+        const named = `${adminId}${entry.title ? ` \u00b7 ${cleanText(entry.title, 48)}` : ''}`;
+        try {
+          const result = await host({ image: entry.image, title: entry.title, config, repository });
+          const saved = typeof repository?.updateContentByAdminId === 'function'
+            ? await repository.updateContentByAdminId(adminId, {
+              posterUrl: result.url,
+              backdropUrl: result.url,
+              poster: {
+                provider: 'imgbb',
+                providerId: result.providerId || null,
+                originalUrl: result.originalUrl || entry.image.sourceUrl || null,
+                source: result.source || 'remote-mirror',
+                title: cleanText(entry.title, 180) || null,
+                mirroredAt: new Date(at).toISOString()
+              }
+            })
+            : null;
+          pending.delete(adminId);
+          counters.hosted += 1;
+          outcome.hosted += 1;
+          // The channel post is still showing the source artwork, so the same lane that handles
+          // /poster refreshes that message — an edit, never a second post.
+          if (saved && typeof announce === 'function') await Promise.resolve(announce(saved, adminId)).catch(() => {});
+          report(entry.notifyChatId, 'hosted', `Poster for ${named} is hosted`);
+        } catch (error) {
+          const diagnostic = automationDiagnostic(error);
+          if (!isPosterRateLimit(error)) {
+            pending.delete(adminId);
+            counters.givenUp += 1;
+            outcome.givenUp += 1;
+            report(entry.notifyChatId, 'errored', `${named} \u2014 ${diagnostic}`);
+            continue;
+          }
+          entry.attempts += 1;
+          // The host's own number wins: a quota that says "30 seconds" is retried in 30 seconds,
+          // not five minutes later, and one that says "an hour" is never sat through.
+          const askedMs = Number(error.retryAfterMs) || 0;
+          entry.nextAt = at + (askedMs > 0
+            ? Math.min(intervalMs * rounds, Math.max(30_000, askedMs))
+            : intervalMs * Math.min(rounds, entry.attempts + 1));
+          if (entry.attempts >= rounds) {
+            pending.delete(adminId);
+            counters.givenUp += 1;
+            outcome.givenUp += 1;
+            report(entry.notifyChatId, 'gaveUp', named);
+          }
+        }
+      }
+      await flushReports();
+      outcome.waiting = pending.size;
+      return outcome;
+    }
+  };
+}
+
+function queuePosterRetry(item) {
+  if (!activePosterRetryQueue) return null;
+  return activePosterRetryQueue.enqueue(item);
+}
+
+/** The bot wires its queue here, so any publishing path can defer into it without threading it. */
+export function attachPosterRetryQueue(queue) {
+  activePosterRetryQueue = queue || null;
+  return activePosterRetryQueue;
+}
+
+async function publishDraftSession({
+  ctx,
+  bot,
+  repository,
+  config,
+  session,
+  season = null,
+  deleteSessionOnSuccess = true
+}) {
+  // A season release is keyed and titled by season. The split orchestrator hands
+  // each group its own season; a plain upload is settled by
+  // `dominantReleaseSeason`, which deliberately returns null for a movie or an
+  // ambiguous batch so those keep their established merge behaviour.
+  const draftTitle = withSeasonLabel(session.title, readSeason(season) ?? (session?.category === 'movie' ? null : dominantReleaseSeason(session?.files || [], { requireEveryFile: true })));
+  const categoryDecision = await decidePublishCategory({ title: draftTitle, files: session.files, chosen: session.category, config });
+  const category = categoryDecision.category;
+  const isMovieRelease = category === 'movie';
+  const releaseSeason = readSeason(season) ?? (isMovieRelease ? null : dominantReleaseSeason(session?.files || [], { requireEveryFile: true }));
+
+  try {
+    const metadata = session.metadata || (isAdultCategory(category)
+      ? emptyPrivateCategoryMetadata(draftTitle)
+      : await findMetadata(draftTitle, category, config));
+    const mergeKeys = releaseMergeKeys(session, metadata, { season: releaseSeason });
+    // This final guard applies to manual uploads, /batch imports, and storage
+    // automation. A later upload for the same category/title or verified
+    // provider identity extends the existing post instead of making a second
+    // catalog card and second delivery link.
+    if (mergeKeys.length && typeof repository.appendFilesToContentByMergeKey === 'function') {
+      const existingMatch = await findContentByMergeKeys(repository, mergeKeys, category, { season: releaseSeason });
+      if (existingMatch) {
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, mergeKeys, category);
+        if (!content) throw new Error('The existing same-title post could not be updated.');
+        if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
+        const websiteUrl = getContentPageUrl(config, content);
+        const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
+        // The channel post lists how many episodes/files a release carries, so
+        // an append has to refresh it as well.
+        const sync = await queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: content.adminId, notifyChatId: chatId(ctx) });
+        await ctx.reply(
+          [
+            `Added ${session.files.length} new file${session.files.length === 1 ? '' : 's'} to the existing catalog post “${content.title}”. It now has ${content.filesCount} file${content.filesCount === 1 ? '' : 's'} and keeps Post ID ${content.adminId}.`,
+            announcementSyncNote(sync)
+          ].join('\n'),
+          publicationKeyboard(websiteUrl, deliveryUrl)
+        );
+        return { content, metadata, merged: true, websiteUrl, deliveryUrl };
+      }
+    }
+    await ctx.reply([
+      'Creating a new catalog post and mirroring its poster to ImgBB now…',
+      categoryDecision.was
+        ? `Filed under ${categoryDetails(category).label}, not ${categoryDetails(categoryDecision.was).label}: the caption said nothing either way, so this is what ${categoryDecision.source} calls “${categoryDecision.matchedTitle || draftTitle}”. /category <Post ID> ${category} or another name changes it.`
+        : null
+    ].filter(Boolean).join('\n'));
+    const overrides = session.overrides || {};
+    const episodeSummary = summarizeEpisodes(session.files);
+    const uploadedLanguages = summarizeUploadLanguages(session.files);
+    const uploadedSubtitleLanguages = summarizeSubtitleLanguages(session.files);
+    const metadataLanguages = (metadata.languages || []).filter((language) => !/^multi(?:\s+language)?$/i.test(String(language || '')));
+    const releaseLanguages = overrides.languages?.length ? overrides.languages : uploadedLanguages.length ? uploadedLanguages : metadataLanguages;
+    const releaseSubtitleLanguages = overrides.subtitleLanguages?.length ? overrides.subtitleLanguages : uploadedSubtitleLanguages;
+    const posterTitle = withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason);
+    const posterImage = await preparePosterImage({
+      sourceUrl: session.posterOriginalUrl || metadata.posterOriginalUrl,
+      sourceIsManual: Boolean(session.posterOriginalUrl),
+      title: posterTitle,
+      category
+    });
+    let posterResult = null;
+    try {
+      posterResult = await hostPosterImage({ image: posterImage, title: posterTitle, config, repository });
+    } catch (error) {
+      // A rate limit at the image host must not decide whether this release exists. The card is
+      // published with the artwork it already has and the mirror is retried on its own queue, so a
+      // busy ImgBB neither loses a draft nor forces the whole upload to be sent again.
+      if (!isPosterRateLimit(error)) throw error;
+      posterResult = {
+        url: posterImage.sourceUrl || null,
+        providerId: null,
+        originalUrl: posterImage.sourceUrl || null,
+        source: 'pending-host-rate-limit',
+        contentType: posterImage.contentType,
+        deferred: true,
+        allKeysCooling: Boolean(error.allKeysCooling),
+        poolSize: Number(error.poolSize) || null,
+        retryAfterMs: Number(error.nextFreeMs) || Number(error.retryAfterMs) || null
+      };
+      console.warn(`[telegram] ImgBB is rate limiting; the poster for ${posterTitle} is served from its source and re-hosted on the retry queue${posterResult.allKeysCooling ? ` (every key in the pool is cooling; next free in ~${posterResult.retryAfterMs || 0} ms)` : ''}.`);
+    }
+
+    // The provider's canonical name wins, but a season boundary is never lost:
+    // AniList and TMDB return the same series title for every season.
+    const title = withSeasonLabel(metadata.matched ? metadata.title : draftTitle, releaseSeason);
+    const releaseLabel = overrides.releaseLabel || episodeSummary.releaseLabel || metadata.releaseLabel || `${session.files.length} files`;
+    const content = await repository.createContent({
+      title,
+      category,
+      year: overrides.year || metadata.year,
+      // Explicit /lang settings win. Otherwise the file caption/filename is
+      // the source of truth for release audio labels (e.g. Multi Hindi + Malayalam).
+      languages: releaseLanguages,
+      subtitleLanguages: releaseSubtitleLanguages,
+      subtitleLanguageSource: overrides.subtitleLanguages?.length ? 'manual' : uploadedSubtitleLanguages.length ? 'upload' : null,
+      languageSource: overrides.languages?.length ? 'manual' : uploadedLanguages.length ? 'upload' : 'metadata',
+      genres: overrides.genres || metadata.genres || [],
+      description: overrides.description || metadata.description || '',
+      status: overrides.status || metadata.status || 'New release',
+      releaseLabel,
+      posterUrl: posterResult.url,
+      backdropUrl: posterResult.url,
+      poster: {
+        provider: 'imgbb',
+        providerId: posterResult.providerId,
+        originalUrl: posterResult.originalUrl,
+        source: posterResult.source,
+        // The title this artwork was matched against, so a later rename can tell whether the match
+        // is still the right one. A manual pick is never re-matched away.
+        title: cleanText(title, 180) || null,
+        mirroredAt: new Date().toISOString()
+      },
+      metadataProvider: metadata.provider,
+      tmdbId: metadata.tmdbId,
+      // Store a verified provider identity for every publishing workflow, not
+      // just automatic storage posts, so an authorized later upload can find
+      // and extend this exact release without relying only on a loose title.
+      metadataKey: metadata.metadataKey || null,
+      art: { tone: categoryDetails(session.category).tone },
+      // A persistent normalized source title plus internet-verified aliases
+      // lets later manual, batch, or automatic uploads append without another
+      // catalog card.
+      automationKey: session.workflow === 'automation' ? session.auto?.groupKey : null,
+      automationKeys: mergeKeys,
+      files: session.files
+    });
+    if (deleteSessionOnSuccess) await repository.deleteSession(chatId(ctx), userId(ctx));
+    if (posterResult.deferred) {
+      queuePosterRetry({
+        adminId: content.adminId,
+        title: content.title,
+        image: posterImage,
+        notifyChatId: chatId(ctx),
+        retryAfterMs: posterResult.retryAfterMs || (posterResult.allKeysCooling ? 3_600_000 : undefined)
+      });
+      if (posterResult.allKeysCooling) {
+        try {
+          await ctx.reply(
+            `⚠️ Rate limit note: All ${posterResult.poolSize || 'configured'} ImgBB API keys are currently rate limited.\n` +
+            `Checked 1st API key and it is still rate limited.\n` +
+            `The artwork for “${content.title}” is queued and will retry automatically in about ${shortDuration(posterResult.retryAfterMs || 3_600_000)} once the rate limit is removed.`
+          );
+        } catch {}
+      }
+    }
+
+    const url = getTelegramDeliveryUrl(config, content.shareCode);
+    const websiteUrl = getContentPageUrl(config, content);
+    const privateAdultPost = isAdultCategory(content.category);
+    let announcements = { sent: 0, failed: 0, skipped: 0, configured: false, suppressed: privateAdultPost };
+    // Do not even resolve public announcement destinations for an 18+ post.
+    // This keeps the isolated publishing path independent of public channels.
+    if (!privateAdultPost) {
+      try {
+        const configuredChannels = await repository.listAnnouncementChannels();
+        announcements = {
+          ...(await announcePublishedContent({
+            bot,
+            repository,
+            content,
+            websiteUrl,
+            storageChannelId: storageChannelForCategory(config, session.category)
+          })),
+          configured: configuredChannels.length > 0
+        };
+      } catch (error) {
+        console.error('[telegram] announcement dispatch failed:', error?.message || 'Unknown error');
+        announcements = { sent: 0, failed: 1, skipped: 0, configured: true };
+      }
+    }
+    // Remember where the announcement landed so a later /poster, /title, /lang,
+    // or a new file can edit that same channel message instead of leaving it stale.
+    if (announcements.posts?.length && typeof repository.updateContentByAdminId === 'function') {
+      try {
+        const saved = await repository.updateContentByAdminId(content.adminId, { announcementRefs: announcements.posts });
+        if (saved) {
+          content.announcementRefs = saved.announcementRefs || announcements.posts;
+          announcements.refs = content.announcementRefs;
+        }
+      } catch (error) {
+        console.warn('[telegram] could not remember announcement message IDs for later edits:', error?.message || 'Unknown error');
+      }
+    }
+    const posterNote = posterResult.deferred
+      ? posterDeferralNote(posterResult)
+      : posterResult.source === 'generated-fallback'
+        ? 'A permanent fallback poster was generated and mirrored to ImgBB.'
+        : `The ${String(metadata.provider || 'matched').toUpperCase()} poster was mirrored to ImgBB.`;
+    const episodeNote = episodeSummary.releaseLabel ? `Episode index: ${episodeSummary.releaseLabel}.` : 'No episode labels were found; the post lists delivery files instead.';
+    const channelNote = privateAdultPost
+      ? 'This 18+ post was not announced to any Telegram channel.'
+      : announcements.sent
+        ? `Posted to ${announcements.sent} announcement channel${announcements.sent === 1 ? '' : 's'}${announcements.failed ? ` (${announcements.failed} failed)` : ''}${announcements.skipped ? ' (database channel skipped)' : ''}.`
+        : announcements.skipped
+          ? 'The database channel was skipped for announcements to prevent an auto-publish loop. Add a separate announcement channel if you want release posts there.'
+          : announcements.configured
+            ? 'The catalog post is live, but the announcement channel delivery failed. Check that the bot is an admin in each configured channel.'
+            : 'No announcement channels are configured yet. Add one with /addchannel <channel_id>.';
+    const websiteNote = privateAdultPost
+      ? (websiteUrl ? `Private 18+ catalog page: ${websiteUrl}` : 'PUBLIC_SITE_URL is not configured, so the age-confirmed catalog page cannot be shared yet.')
+      : websiteUrl
+        ? `Announcement website link: ${websiteUrl}`
+        : 'PUBLIC_SITE_URL is not configured, so announcement posts were sent without a button. Add your Koyeb website URL and publish the next post.';
+
+    await ctx.reply(
+      [
+        'Published successfully.',
+        '',
+        `${content.title} is now live with ${content.filesCount} file${content.filesCount === 1 ? '' : 's'}.`,
+        `Post ID: ${content.adminId} — delete later with /delete ${content.adminId}`,
+        episodeNote,
+        posterNote,
+        channelNote,
+        websiteNote,
+        '',
+        websiteUrl ? 'Share this stable catalog page (recommended):' : 'Share this delivery link:',
+        websiteUrl || url,
+        websiteUrl ? 'It will always generate Telegram links for the active delivery bot.' : null
+      ].filter((line) => line !== null).join('\n'),
+      publicationKeyboard(websiteUrl, url)
+    );
+    return { content, metadata, posterResult, announcements, websiteUrl, deliveryUrl: url };
+  } catch (error) {
+    const message = error instanceof PosterHostingError
+      ? error.message
+      : 'Publishing could not be completed. Your draft is still safe; please try /done again.';
+    console.error('[telegram] publish failed:', error?.name || 'Error', error?.message || 'Unknown error');
+    await ctx.reply(`Could not publish this draft. ${message}`);
+    return { content: null, error: message, cause: error };
+  }
+}
+
+function isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds) {
+  const messageId = String(message?.message_id || '');
+  if (messageId && ignoredStorageMessageIds?.delete(messageId)) return true;
+  if (message?.from?.is_bot) return true;
+  return Boolean(bot?.botInfo?.id && String(message?.from?.id || '') === String(bot.botInfo.id));
+}
+
+export function automationGroupKey(title, storageMessageId) {
+  const key = slugify(title);
+  // inferBatchTitle normally prevents a generic file name from becoming a title.
+  // Keep unidentified uploads isolated so unrelated files can never merge.
+  return key && key !== 'untitled-release' ? key : `storage-media-${storageMessageId}`;
+}
+
+function standaloneReleaseMergeAlias(value) {
+  const raw = cleanText(value, 180);
+  // Series seasons and individual episodes must retain their own release key.
+  // This deliberately covers compact upload names such as S01E01 too, not
+  // only spaced "Season 1" or "Episode 1" labels.
+  if (!raw || /\b(?:s(?:eason)?\s*\d{1,2}(?:\s*e(?:p(?:isode)?)?\s*\d{1,3})?|e(?:p(?:isode)?)?\s*\d{1,3}|\d{1,2}\s*x\s*\d{1,3})\b/i.test(raw)) return null;
+  const inferred = inferBatchTitle([{ displayName: raw, name: '' }]);
+  const key = slugify(cleanText(inferred, 180));
+  return key && key !== 'untitled-release' ? key : null;
+}
+
+/**
+ * Save both the upload-derived and provider-verified identities. A channel may
+ * label the same show as "Raakh S01" on one day and "Raakh" on another; the
+ * metadata identity is the durable bridge that prevents a second card.
+ *
+ * The same keys are also used for a later manual or /batch upload. Once a
+ * publisher has created a post, sending more files for that same release
+ * should extend its existing delivery page—not create a duplicate card.
+ */
+export function releaseMergeKeys(session, metadata = {}, { season = null } = {}) {
+  const rawValues = [
+    // Prefer the verified provider identity over a collision-prone upload name.
+    metadata?.metadataKey,
+    metadata?.title,
+    session?.auto?.groupKey,
+    session?.title
+  ];
+  const baseKeys = [...new Set([
+    ...rawValues.map((value) => slugify(cleanText(value, 180))),
+    // Preserve a title-only alias for noisy standalone movie/release labels
+    // such as "RRR (2022) Hindi 1080p". This is deliberately not generated
+    // for explicit season/episode labels.
+    standaloneReleaseMergeAlias(metadata?.title),
+    standaloneReleaseMergeAlias(session?.title)
+  ].filter((key) => key && key !== 'untitled-release'))];
+
+  // A season upload is looked up by its own season-scoped identity first, so
+  // Season 2 of a show cannot be appended onto the Season 1 card merely
+  // because both share one provider ID. The plain keys stay behind it so an
+  // older single-card release still merges rather than duplicating.
+  const number = Number(season);
+  if (!Number.isInteger(number) || number < 1) return baseKeys;
+  return [...new Set([...baseKeys.map((key) => `${key}-season-${number}`), ...baseKeys])];
+}
+
+// Kept as the public name used by existing automation tests/integrations.
+export function automationMergeKeys(session, metadata = {}, options = {}) {
+  return releaseMergeKeys(session, metadata, options);
+}
+
+async function findContentByMergeKeys(repository, keys, category = null, { season = null } = {}) {
+  if (typeof repository?.findContentByMergeKey !== 'function') return null;
+  const wantedSeason = readSeason(season);
+  for (const key of keys) {
+    const content = await repository.findContentByMergeKey(key, category);
+    // A title such as "Avatar" can legitimately exist in multiple categories.
+    // Do not append a movie upload to an anime or series card merely because a
+    // loose title happened to match.
+    if (!content || (category && content.category !== category)) continue;
+    // A season-specific upload must not land on a card whose own files clearly
+    // belong to another season. An older card with no readable season stays
+    // mergeable, so an established catalog keeps receiving its next episodes.
+    if (wantedSeason) {
+      const contentSeason = dominantReleaseSeason(content.files || []);
+      if (contentSeason && contentSeason !== wantedSeason) continue;
+    }
+    return { content, key };
+  }
+  return null;
+}
+
+async function findAutomationContentByKeys(repository, keys, category = null) {
+  return findContentByMergeKeys(repository, keys, category);
+}
+
+function automationTiming(options = {}) {
+  const idleMs = Number(options?.idleMs);
+  const maxWaitMs = Number(options?.maxWaitMs);
+  return {
+    idleMs: Number.isFinite(idleMs) && idleMs >= 1_000 ? idleMs : AUTO_COLLECTION_IDLE_MS,
+    maxWaitMs: Number.isFinite(maxWaitMs) && maxWaitMs >= 5_000 ? maxWaitMs : AUTO_COLLECTION_MAX_WAIT_MS
+  };
+}
+
+function earlierAutomationDeadline(first, second) {
+  return String(first) <= String(second) ? String(first) : String(second);
+}
+
+function automationReplyContext(session) {
+  const label = cleanText(session?.title, 100) || session?.auto?.groupKey || 'storage group';
+  return {
+    chat: { id: session.chatId },
+    from: { id: session.ownerId },
+    // Never reply in the storage channel. publishDraft can retain its normal
+    // success/error path while the worker sends a separate admin notification.
+    reply: async (text) => {
+      console.info(`[telegram] automation ${label}: ${cleanText(text, 360)}`);
+    }
+  };
+}
+
+function automationDiagnostic(error) {
+  return cleanText(error?.description || error?.message || error || 'Unknown automation error', 300);
+}
+
+async function notifyAutomationPublisher(bot, settings, { state, content, session, websiteUrl, deliveryUrl, error }) {
+  const destination = settings?.notifyChatId || settings?.updatedBy;
+  if (!destination || !bot?.telegram?.sendMessage) return false;
+
+  const fileCount = content?.filesCount || session?.files?.length || 0;
+  const title = content?.title || session?.title || 'Untitled storage release';
+  const message = state === 'published'
+    ? [
+      '✅ <b>Storage automation published</b>',
+      '',
+      `<b>${escapeHtml(title)}</b>`,
+      `Files collected: ${fileCount}`,
+      `Post ID: <code>${escapeHtml(content.adminId)}</code>`,
+      `Delete if needed: <code>/delete ${escapeHtml(content.adminId)}</code>`,
+      websiteUrl ? `Catalog page: ${escapeHtml(websiteUrl)}` : null
+    ].filter(Boolean).join('\n')
+    : state === 'merged'
+      ? [
+        '✅ <b>Storage automation updated an existing post</b>',
+        '',
+        `<b>${escapeHtml(title)}</b>`,
+        `Added ${session?.files?.length || 0} collected file${session?.files?.length === 1 ? '' : 's'} · total ${fileCount}.`,
+        `Post ID: <code>${escapeHtml(content.adminId)}</code>`,
+        'No second announcement was sent.'
+      ].join('\n')
+      : [
+        '⚠️ <b>Storage automation needs attention</b>',
+        '',
+        `<b>${escapeHtml(title)}</b>`,
+        `Collected files: ${fileCount}`,
+        `Reason: ${escapeHtml(error || 'Unknown automation error')}`,
+        'The database channel was left clean. The retained group can be retried by uploading another matching file after fixing the issue.'
+      ].join('\n');
+
+  try {
+    await bot.telegram.sendMessage(destination, message, {
+      parse_mode: 'HTML',
+      ...(state === 'published' ? publicationKeyboard(websiteUrl, deliveryUrl) : {})
+    });
+    return true;
+  } catch (notificationError) {
+    console.error('[telegram] could not notify the automation publisher:', automationDiagnostic(notificationError));
+    return false;
+  }
+}
+
+/**
+ * Persist a direct-storage upload in a normalized release group. It deliberately
+ * does not publish: the queue worker flushes after a quiet period, surviving
+ * Koyeb restarts because its deadline and files live in MongoDB.
+ */
+export async function autoPublishStoragePost(ctx, bot, repository, config, ignoredStorageMessageIds, inFlightStorageMessageIds, options = {}) {
+  const message = ctx.channelPost || ctx.update?.channel_post;
+  if (!message || String(message.chat?.id) !== String(config.telegram.storageChannelId || '')) return { queued: false, reason: 'not-storage-media' };
+  if (!isMediaMessage(message)) return { queued: false, reason: 'not-supported-media' };
+  if (isBotGeneratedStoragePost(message, bot, ignoredStorageMessageIds)) return { queued: false, reason: 'bot-generated' };
+
+  const storageMessageId = message.message_id;
+  const inFlightKey = String(storageMessageId);
+  if (inFlightStorageMessageIds?.has(inFlightKey)) return { queued: false, reason: 'already-processing' };
+
+  const settings = await repository.getAutoPublishSettings();
+  if (!settings?.enabled) return { queued: false, reason: 'disabled' };
+
+  const enabledAt = Date.parse(settings.enabledAt || '');
+  const messageTimestamp = Number(message.date) * 1000;
+  if (Number.isFinite(enabledAt) && Number.isFinite(messageTimestamp) && messageTimestamp < enabledAt - 5_000) {
+    console.info(`[telegram] ignored storage message ${storageMessageId}; it predates the current auto-publish activation.`);
+    return { queued: false, reason: 'predates-enable' };
+  }
+
+  const pendingDraft = await repository.findSessionByStorageMessageId(
+    storageMessageId,
+    config.telegram.storageChannelId,
+    { includeLegacy: true }
+  );
+  if (pendingDraft) {
+    console.info(`[telegram] ignored storage message ${storageMessageId}; it is already attached to an active ${pendingDraft.workflow || 'upload'} draft.`);
+    return { queued: false, reason: 'active-draft' };
+  }
+
+  const existing = await repository.findContentByStorageMessageId(
+    storageMessageId,
+    config.telegram.storageChannelId,
+    { includeLegacy: true }
+  );
+  if (existing) {
+    console.info(`[telegram] ignored already-published auto storage message ${storageMessageId} (${existing.adminId || existing.title || 'existing post'}).`);
+    return { queued: false, reason: 'already-published' };
+  }
+
+  inFlightStorageMessageIds?.add(inFlightKey);
+  try {
+    if (typeof repository.queueAutomationSession !== 'function') {
+      throw new Error('The catalog repository does not support persistent automation groups.');
+    }
+    const file = fileFromMessage(message, storageMessageId, 'direct-storage', config.telegram.storageChannelId);
+    // The same rule as /batch: the group is collected and published regardless, and the caption
+    // edit waits its turn on the lane. No inspection here — this context is the channel itself,
+    // so a "preview" would be another post in it.
+    if (captionNeedsScrub(message?.caption)) {
+      queueStorageCaptionScrub({
+        telegram: ctx.telegram,
+        targets: [{ channel: config.telegram.storageChannelId, messageId: storageMessageId, caption: message.caption, adminId: null }],
+        notifyChatId: settings?.notifyChatId || settings?.updatedBy || null
+      }, { detached: true });
+    }
+    const title = inferBatchTitle([file]) || `Storage media ${storageMessageId}`;
+    const category = inferBatchCategory({ title, files: [file] });
+    const groupKey = automationGroupKey(title, storageMessageId);
+    const timing = automationTiming(typeof options === 'function' ? {} : options);
+    const receivedAt = new Date().toISOString();
+    const primaryOwnerId = `${AUTO_PUBLISH_OWNER_PREFIX}${groupKey}`;
+    const primarySession = await repository.findSession(message.chat.id, primaryOwnerId);
+    const isPublishing = primarySession?.workflow === 'automation' && primarySession.auto?.status === 'publishing';
+    const ownerId = isPublishing
+      ? `${AUTO_PUBLISH_LATE_OWNER_PREFIX}${groupKey}-${storageMessageId}`
+      : primaryOwnerId;
+    const activeSession = isPublishing ? null : primarySession;
+    const restartingFailedGroup = activeSession?.auto?.status === 'failed';
+    const firstReceivedAt = restartingFailedGroup
+      ? receivedAt
+      : activeSession?.auto?.firstReceivedAt || receivedAt;
+    const maxWaitAt = restartingFailedGroup
+      ? new Date(Date.parse(receivedAt) + timing.maxWaitMs).toISOString()
+      : activeSession?.auto?.maxWaitAt || new Date(Date.parse(firstReceivedAt) + timing.maxWaitMs).toISOString();
+    const quietDeadline = new Date(Date.parse(receivedAt) + timing.idleMs).toISOString();
+    const scheduledAt = earlierAutomationDeadline(quietDeadline, maxWaitAt);
+
+    let queued = await repository.queueAutomationSession({
+      chatId: message.chat.id,
+      ownerId,
+      category: activeSession?.category || category,
+      title: activeSession?.title || title,
+      file,
+      groupKey,
+      scheduledAt,
+      maxWaitAt,
+      firstReceivedAt,
+      receivedAt
+    });
+
+    // In the tiny race between findSession and the atomic queue update, a worker
+    // may claim the primary group. Preserve the upload in a late group instead
+    // of mutating/deleting a snapshot that is being published.
+    if (queued?.auto?.status === 'publishing' && ownerId === primaryOwnerId) {
+      const lateOwnerId = `${AUTO_PUBLISH_LATE_OWNER_PREFIX}${groupKey}-${storageMessageId}`;
+      const lateMaxWaitAt = new Date(Date.parse(receivedAt) + timing.maxWaitMs).toISOString();
+      queued = await repository.queueAutomationSession({
+        chatId: message.chat.id,
+        ownerId: lateOwnerId,
+        category,
+        title,
+        file,
+        groupKey,
+        scheduledAt: earlierAutomationDeadline(quietDeadline, lateMaxWaitAt),
+        maxWaitAt: lateMaxWaitAt,
+        firstReceivedAt: receivedAt,
+        receivedAt
+      });
+    }
+    if (!queued?.files?.length) throw new Error('The persistent automation group could not retain the storage file.');
+
+    console.info(`[telegram] queued storage message ${storageMessageId} in ${groupKey} (${queued.files.length} file${queued.files.length === 1 ? '' : 's'}; flush ${queued.auto?.scheduledAt || 'pending'}).`);
+    return { queued: true, groupKey, ownerId: queued.ownerId || ownerId, session: queued };
+  } catch (error) {
+    console.error('[telegram] auto-publish queue failed:', storageMessageId, automationDiagnostic(error));
+    // The global channel handler and bot.catch also suppress replies here; the
+    // storage database should never receive a generic error message.
+    return { queued: false, reason: 'queue-error', error: automationDiagnostic(error) };
+  } finally {
+    inFlightStorageMessageIds?.delete(inFlightKey);
+  }
+}
+
+/** Flush due persistent auto-upload groups. Exported for deterministic tests. */
+export async function processQueuedAutomationSessions({ bot, repository, config, publish = publishDraft, now = new Date().toISOString(), limit = 20 } = {}) {
+  const settings = await repository.getAutoPublishSettings();
+  if (!settings?.enabled || typeof repository.listDueAutomationSessions !== 'function') return [];
+
+  const dueSessions = await repository.listDueAutomationSessions({ limit, now });
+  const results = [];
+  for (const dueSession of dueSessions) {
+    let session;
+    try {
+      session = await repository.claimAutomationSession(dueSession.chatId, dueSession.ownerId, { now });
+    } catch (error) {
+      console.error('[telegram] could not claim automation group:', dueSession.ownerId, automationDiagnostic(error));
+      continue;
+    }
+    if (!session?.files?.length) continue;
+
+    const groupKey = session.auto?.groupKey || automationGroupKey(session.title, session.files[0]?.storageMessageId || session.ownerId);
+    try {
+      // Just like manual and /batch publishing, do this after the group has
+      // fully collected and before any merge/create decision is persisted.
+      const mediaTrackWork = await inspectSessionMediaTracks({ session, bot, repository, config });
+      session = mediaTrackWork.session || session;
+      // Resolve a canonical provider identity before looking for an existing
+      // release. This makes aliases/noisy filenames converge instead of
+      // producing a fresh post just because their raw group keys differ.
+      const metadata = session.metadata || (await findMetadata(session.title, session.category, config));
+      const automationKeys = automationMergeKeys(session, metadata);
+      const existingMatch = await findAutomationContentByKeys(repository, automationKeys.length ? automationKeys : [groupKey], session.category);
+      if (existingMatch) {
+        const content = await repository.appendFilesToContentByMergeKey(existingMatch.key, session.files, automationKeys, session.category);
+        if (!content) throw new Error('The existing same-title post could not be updated.');
+        await repository.deleteSession(session.chatId, session.ownerId);
+        const websiteUrl = getContentPageUrl(config, content);
+        const deliveryUrl = getTelegramDeliveryUrl(config, content.shareCode);
+        await notifyAutomationPublisher(bot, settings, {
+          state: 'merged',
+          content,
+          session,
+          websiteUrl,
+          deliveryUrl
+        });
+        console.info(`[telegram] merged ${session.files.length} auto file(s) into ${content.adminId || content.title}.`);
+        results.push({ state: 'merged', content, session });
+        continue;
+      }
+
+      // Store the preflight result so publishDraft uses the same verified
+      // canonical title/poster rather than performing a potentially different
+      // provider search a moment later.
+      session = await repository.updateSession(session.chatId, session.ownerId, { metadata }) || { ...session, metadata };
+      console.info(`[telegram] publishing queued storage group ${groupKey} as ${session.category}: ${session.title} (${session.files.length} file(s)).`);
+      const result = await publish(automationReplyContext(session), bot, repository, config);
+      if (!result?.content) {
+        // publishDraft keeps manual-chat wording friendly, but the authorized
+        // publisher needs the concrete underlying failure in the private
+        // automation report (for example an ImgBB or MongoDB configuration error).
+        throw result?.cause instanceof Error
+          ? result.cause
+          : new Error(result?.error || 'The automation publisher returned no catalog post.');
+      }
+      // publishDraft deletes its own session; custom publishers in tests and
+      // future workers may not, so make the successful cleanup idempotent.
+      await repository.deleteSession(session.chatId, session.ownerId);
+      const state = result.merged ? 'merged' : 'published';
+      await notifyAutomationPublisher(bot, settings, {
+        state,
+        content: result.content,
+        session,
+        websiteUrl: result.websiteUrl || getContentPageUrl(config, result.content),
+        deliveryUrl: result.deliveryUrl || getTelegramDeliveryUrl(config, result.content.shareCode)
+      });
+      results.push({ state, content: result.content, session });
+    } catch (error) {
+      const diagnostic = automationDiagnostic(error);
+      console.error('[telegram] queued auto-publish failed:', session.ownerId, diagnostic);
+      try {
+        await repository.markAutomationSessionFailed(session.chatId, session.ownerId, { error: diagnostic });
+      } catch (saveError) {
+        console.error('[telegram] could not save automation failure state:', automationDiagnostic(saveError));
+      }
+      await notifyAutomationPublisher(bot, settings, { state: 'failed', session, error: diagnostic });
+      results.push({ state: 'failed', error: diagnostic, session });
+    }
+  }
+  return results;
+}
+
+export async function deliverContent(ctx, delivery, repository, config, { scheduleDeletion = scheduleDeliveredFileDeletion } = {}) {
+  if (!delivery?.shareCode || delivery.shareCode.length > 48) {
+    await ctx.reply('That delivery link is invalid.');
+    return;
+  }
+
+  const content = await repository.findContentByShareCode(delivery.shareCode);
+  if (!content) {
+    await ctx.reply('This release is unavailable or the link has expired.');
+    return;
+  }
+  const defaultStorageChannelId = storageChannelForCategory(config, content.category);
+  if (!defaultStorageChannelId || (isAdultCategory(content.category) && !hasDedicatedAdultStorage(config))) {
+    await ctx.reply(isAdultCategory(content.category)
+      ? '18+ file delivery is being configured with its separate private storage. Please try again later.'
+      : 'File delivery is being configured. Please try again later.');
+    return;
+  }
+  if (!content.files?.length) {
+    await ctx.reply('This release does not have any delivery files yet.');
+    return;
+  }
+
+  const files = delivery.filePosition
+    ? [content.files[delivery.filePosition - 1]].filter(Boolean)
+    : content.files;
+  if (!files.length) {
+    await ctx.reply('That file choice is no longer available for this release. Return to the website and choose another option.');
+    return;
+  }
+
+  await ctx.reply(
+    delivery.filePosition
+      ? `Preparing your selected file for “${content.title}”…`
+      : `Preparing ${files.length} item${files.length === 1 ? '' : 's'} for “${content.title}”…`
+  );
+  let delivered = 0;
+  let cleanupScheduled = 0;
+  for (const file of files) {
+    try {
+      // New records retain their source channel; old normal records fall back
+      // to TELEGRAM_STORAGE_CHANNEL_ID for backwards-compatible delivery.
+      const sourceChannelId = isAdultCategory(content.category)
+        ? defaultStorageChannelId
+        : cleanText(file?.storageChannelId, 80) || defaultStorageChannelId;
+      const copied = await ctx.telegram.copyMessage(chatId(ctx), sourceChannelId, file.storageMessageId);
+      delivered += 1;
+      try {
+        if (scheduleDeletion({
+          telegram: ctx.telegram,
+          recipientChatId: chatId(ctx),
+          messageId: copied?.message_id,
+          deleteAfterMs: DELIVERY_FILE_DELETE_AFTER_MS
+        })) cleanupScheduled += 1;
+      } catch (cleanupError) {
+        // Delivery succeeded; a local scheduling problem must not be reported
+        // as though Telegram failed to copy the file.
+        console.warn('[telegram] could not schedule delivery cleanup:', cleanupError?.message || 'Unknown error');
+      }
+    } catch (error) {
+      console.error('[telegram] delivery copy failed:', error?.description || error?.message || 'Unknown error');
+    }
+  }
+
+  if (delivered) {
+    await repository.incrementDelivery(delivery.shareCode);
+    const cleanupNote = cleanupScheduled
+      ? ` The bot will remove ${cleanupScheduled === 1 ? 'this delivered file' : `${cleanupScheduled} delivered files`} from this chat in about 5 minutes.`
+      : '';
+    await ctx.reply(
+      delivery.filePosition
+        ? `Your selected file has been delivered. Enjoy responsibly.${cleanupNote}`
+        : `Delivered ${delivered} of ${files.length} item${files.length === 1 ? '' : 's'}. Enjoy responsibly.${cleanupNote}`
+    );
+  } else {
+    await ctx.reply('I could not retrieve these files from the storage channel. Please let the catalog administrator know.');
+  }
+}
+
+async function logRequestToChannel(ctx, request, config) {
+  const channelId = config.telegram.requestChannelId || config.telegram.storageChannelId;
+  if (!channelId) return false;
+  const requester = request.requester?.username
+    ? `@${escapeHtml(request.requester.username)}`
+    : escapeHtml(request.requester?.name || 'Telegram user');
+  const caption = [
+    '📨 <b>NEW CATALOG REQUEST</b>',
+    '',
+    `<b>Request:</b> ${escapeHtml(request.requestText)}`,
+    `<b>Request ID:</b> ${escapeHtml(request.id)}`,
+    `<b>From:</b> ${requester}`,
+    `<b>User ID:</b> <code>${escapeHtml(request.requester?.id)}</code>`,
+    '',
+    'Use this private channel entry to review or fulfill the request.'
+  ].join('\n');
+  try {
+    await ctx.telegram.sendMessage(channelId, caption, { parse_mode: 'HTML' });
+    return true;
+  } catch (error) {
+    console.error('[telegram] request channel log failed:', error?.description || error?.message || 'Unknown error');
+    return false;
+  }
+}
+
+const REQUEST_SELECTION_PAGE_SIZE = 8;
+const INDIA_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+export function requestManagerKeyboard() {
+  // Keep the entry screen intentionally simple: publishers first choose to
+  // select open requests or leave the management workflow.
+  return Markup.inlineKeyboard([[
+    Markup.button.callback('Select requests', 'requests:select'),
+    Markup.button.callback('Back', 'requests:back')
+  ]]);
+}
+
+function requesterLabel(request) {
+  return request?.requester?.username
+    ? `@${request.requester.username}`
+    : cleanText(request?.requester?.name || '', 60) || 'Telegram user';
+}
+
+function requestManagerText(openRequestCount = 0) {
+  return [
+    'Request management',
+    '',
+    openRequestCount
+      ? `${openRequestCount} open request${openRequestCount === 1 ? '' : 's'} ready for review.`
+      : 'There are no open catalog requests right now.',
+    'Choose Select requests to mark one or several requests Completed or Rejected.'
+  ].join('\n');
+}
+
+async function replaceInteractiveMessage(ctx, text, keyboard) {
+  if (ctx.callbackQuery?.message && typeof ctx.editMessageText === 'function') {
+    try {
+      return await ctx.editMessageText(text, keyboard);
+    } catch (error) {
+      const details = telegramErrorText(error);
+      if (/message is not modified/.test(details)) return null;
+      console.warn('[telegram] could not update interactive publisher view:', automationDiagnostic(error));
+    }
+  }
+  return ctx.reply(text, keyboard);
+}
+
+function requestSelectionText(requests, selectedIds, page, totalPages) {
+  const start = page * REQUEST_SELECTION_PAGE_SIZE;
+  const visible = requests.slice(start, start + REQUEST_SELECTION_PAGE_SIZE);
+  return [
+    'Select open requests',
+    '',
+    `${selectedIds.size} selected · showing ${visible.length ? `${start + 1}–${start + visible.length}` : '0'} of ${requests.length} open request${requests.length === 1 ? '' : 's'} · page ${page + 1}/${totalPages}.`,
+    '',
+    ...visible.map((request, index) => {
+      const selected = selectedIds.has(request.id) ? '☑' : '☐';
+      return `${selected} ${start + index + 1}. ${cleanText(request.requestText, 180)}\n   ${request.id} · ${requesterLabel(request)}`;
+    }),
+    '',
+    'Tap requests to toggle them, then choose Completed or Rejected. Statuses update immediately.'
+  ].join('\n');
+}
+
+function requestSelectionKeyboard(requests, selectedIds, page, totalPages) {
+  const start = page * REQUEST_SELECTION_PAGE_SIZE;
+  const visible = requests.slice(start, start + REQUEST_SELECTION_PAGE_SIZE);
+  const rows = visible.map((request) => [Markup.button.callback(
+    `${selectedIds.has(request.id) ? '☑' : '☐'} ${request.id} · ${cleanText(request.requestText, 28)}`,
+    `requests:toggle:${request.id}:${page}`
+  )]);
+  if (totalPages > 1) {
+    const navigation = [];
+    if (page > 0) navigation.push(Markup.button.callback('‹ Previous', `requests:page:${page - 1}`));
+    if (page < totalPages - 1) navigation.push(Markup.button.callback('Next ›', `requests:page:${page + 1}`));
+    if (navigation.length) rows.push(navigation);
+  }
+  rows.push([
+    Markup.button.callback(`Completed (${selectedIds.size})`, 'requests:resolve:completed'),
+    Markup.button.callback(`Rejected (${selectedIds.size})`, 'requests:resolve:rejected')
+  ]);
+  rows.push([Markup.button.callback('Back', 'requests:back')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function renderRequestSelection(ctx, repository, page = 0) {
+  const requests = await repository.listRequests({ status: 'open', limit: 200 });
+  const selection = await repository.findRequestSelection(chatId(ctx), userId(ctx));
+  if (!selection) {
+    return replaceInteractiveMessage(ctx, 'Your request selection expired. Start it again when you are ready.', requestManagerKeyboard());
+  }
+  if (!requests.length) {
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    return replaceInteractiveMessage(ctx, requestManagerText(0), requestManagerKeyboard());
+  }
+  const openIds = new Set(requests.map((request) => request.id));
+  const selectedIds = new Set((selection.requestIds || []).filter((requestId) => openIds.has(requestId)));
+  const totalPages = Math.max(1, Math.ceil(requests.length / REQUEST_SELECTION_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  return replaceInteractiveMessage(
+    ctx,
+    requestSelectionText(requests, selectedIds, safePage, totalPages),
+    requestSelectionKeyboard(requests, selectedIds, safePage, totalPages)
+  );
+}
+
+export function requestResolutionNotificationText(request, status) {
+  return status === 'completed'
+    ? `✅ Your catalog request “${cleanText(request?.requestText, 180)}” has been completed. Please kindly check the site.`
+    : `⚠️ Your catalog request “${cleanText(request?.requestText, 180)}” was rejected due to issues.`;
+}
+
+async function notifyResolvedRequesters(bot, requests, status) {
+  let notified = 0;
+  let failed = 0;
+  for (const request of requests) {
+    const destination = String(request?.requester?.id || '');
+    if (!destination) {
+      failed += 1;
+      continue;
+    }
+    const text = requestResolutionNotificationText(request, status);
+    try {
+      await bot.telegram.sendMessage(destination, text);
+      notified += 1;
+    } catch (error) {
+      failed += 1;
+      console.warn('[telegram] could not notify request user:', destination, automationDiagnostic(error));
+    }
+  }
+  return { notified, failed };
+}
+
+function indiaDayStart(value = new Date(), daysAgo = 0) {
+  const instant = value instanceof Date ? value : new Date(value);
+  const shifted = new Date(instant.getTime() + INDIA_OFFSET_MS);
+  return new Date(Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate() - daysAgo
+  ) - INDIA_OFFSET_MS);
+}
+
+export function postIdTimeWindow(period, now = new Date()) {
+  const today = indiaDayStart(now);
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+  if (period === 'today') return { label: 'Today (IST)', startAt: today, endAt: tomorrow };
+  if (period === 'yesterday') return { label: 'Yesterday (IST)', startAt: indiaDayStart(now, 1), endAt: today };
+  if (period === 'week') return { label: 'Last 7 days (IST)', startAt: indiaDayStart(now, 6), endAt: tomorrow };
+  if (period === 'month') return { label: 'Last 30 days (IST)', startAt: indiaDayStart(now, 29), endAt: tomorrow };
+  return null;
+}
+
+export function postIdKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Today', 'postid:today'), Markup.button.callback('Yesterday', 'postid:yesterday')],
+    [Markup.button.callback('Week', 'postid:week'), Markup.button.callback('Month', 'postid:month')],
+    [Markup.button.callback('Back', 'postid:back')]
+  ]);
+}
+
+function formatPostIdResults(window, posts) {
+  if (!posts.length) return `No uploaded post IDs were found for ${window.label}.`;
+  return [
+    `Uploaded post IDs · ${window.label} (${posts.length}${posts.length === 100 ? '+' : ''})`,
+    '',
+    ...posts.map((post, index) => `${index + 1}. ${post.adminId} · ${cleanText(post.title, 130)} — ${categoryDetails(post.category).shortLabel}`),
+    '',
+    'Copy an ID into /delete if you need to remove a post.'
+  ].join('\n');
+}
+
+function formatAnalyticsTime(value) {
+  if (!value) return 'No activity recorded';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'No activity recorded';
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short'
+  }).format(date);
+}
+
+function formatPublisherStats(stats) {
+  const categories = Object.entries(stats.catalog?.byCategory || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([category, count]) => `${categoryDetails(category).shortLabel}: ${count}`)
+    .join(' · ') || 'No posts yet';
+  return [
+    'Publisher statistics',
+    '',
+    'Anonymous site activity',
+    `Visitors: ${stats.site?.visitors || 0} unique · Visits: ${stats.site?.visits || 0}`,
+    `Active: ${stats.site?.activeVisitors24h || 0} visitors / ${stats.site?.visits24h || 0} visits (24h) · ${stats.site?.activeVisitors7d || 0} visitors / ${stats.site?.visits7d || 0} visits (7d)`,
+    `Last site activity: ${formatAnalyticsTime(stats.site?.latestActivityAt)}`,
+    '',
+    'Private bot activity',
+    `Bot users: ${stats.bot?.users || 0} · Interactions: ${stats.bot?.interactions || 0}`,
+    `Active bot users: ${stats.bot?.activeUsers24h || 0} (24h) · ${stats.bot?.activeUsers7d || 0} (7d)`,
+    `Last bot activity: ${formatAnalyticsTime(stats.bot?.latestActivityAt)}`,
+    '',
+    'Catalog',
+    `Posts: ${stats.catalog?.posts || 0} · Files: ${stats.catalog?.files || 0} · Episodes: ${stats.catalog?.episodes || 0} · Telegram deliveries: ${stats.catalog?.deliveries || 0}`,
+    categories,
+    '',
+    'Requests',
+    `Total: ${stats.requests?.total || 0} · Open: ${stats.requests?.open || 0} · Completed: ${stats.requests?.completed || 0} · Rejected: ${stats.requests?.rejected || 0}`
+  ].join('\n');
+}
+
+function backupOptionsFromConfig(config) {
+  return config?.backup || {};
+}
+
+function backupCreatedAt(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function formatBackupCounts(counts = {}) {
+  const content = Number(counts.content || 0);
+  const sessions = Number(counts.upload_sessions || 0);
+  const requests = Number(counts.requests || 0);
+  const visitors = Number(counts.site_visitors || 0);
+  return `${content} post${content === 1 ? '' : 's'} · ${sessions} upload session${sessions === 1 ? '' : 's'} · ${requests} request${requests === 1 ? '' : 's'} · ${visitors} anonymous visitor record${visitors === 1 ? '' : 's'}`;
+}
+
+export async function sendStorageBackup({ repository, telegram, config, createdAt = new Date().toISOString() } = {}) {
+  return createAndSendBackup({
+    repository,
+    telegram,
+    storageChannelId: config?.telegram?.storageChannelId,
+    signingSecret: config?.backup?.signingSecret,
+    options: backupOptionsFromConfig(config),
+    createdAt
+  });
+}
+
+/** Run once per India calendar month, with a durable repository claim. */
+export async function runMonthlyBackup({ bot, repository, config, now = new Date() } = {}) {
+  if (!config?.backup?.monthlyEnabled || !config?.telegram?.storageChannelId) {
+    return { sent: false, reason: 'disabled-or-no-storage-channel' };
+  }
+  if (!config?.backup?.signingSecret) return { sent: false, reason: 'no-signing-secret' };
+  if (typeof repository?.claimMonthlyBackup !== 'function') {
+    return { sent: false, reason: 'repository-does-not-support-monthly-backups' };
+  }
+  const createdAt = backupCreatedAt(now);
+  const month = indiaMonthKey(createdAt);
+  if (!month) return { sent: false, reason: 'invalid-date' };
+  const claimed = await repository.claimMonthlyBackup({ month, now: createdAt });
+  if (!claimed) return { sent: false, reason: 'already-sent-or-claimed', month };
+  try {
+    const backup = await sendStorageBackup({ repository, telegram: bot?.telegram, config, createdAt });
+    if (typeof repository.markMonthlyBackupCreated === 'function') {
+      await repository.markMonthlyBackupCreated({ month, createdAt });
+    }
+    return { sent: true, month, backup };
+  } catch (error) {
+    if (typeof repository.releaseMonthlyBackupClaim === 'function') {
+      await repository.releaseMonthlyBackupClaim({ month }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+function streamingOptionsFromConfig(config) {
+  return { allowedHosts: config?.streaming?.allowedHosts || [] };
+}
+
+function streamingDownloadOptionsFromConfig(config) {
+  const maxBytes = Number(config?.streaming?.manifestMaxBytes) || 512 * 1024;
+  return {
+    maxBytes,
+    // This importer reads plain JSON/CSV only, but the shared Telegram download
+    // helper has an uncompressed bound as well. Keep both bounds tiny so a
+    // malformed document cannot consume a free Koyeb instance.
+    maxUncompressedBytes: maxBytes,
+    timeoutMs: Number(config?.streaming?.downloadTimeoutMs) || 15_000
+  };
+}
+
+function episodePathRange(episode) {
+  const start = Number(episode?.start);
+  const end = Number(episode?.end ?? episode?.start);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) return null;
+  return start === end ? String(start) : `${start}-${end}`;
+}
+
+function directEpisodeLabel(start, end) {
+  return start === end
+    ? `Episode ${String(start).padStart(2, '0')}`
+    : `Episodes ${String(start).padStart(2, '0')}–${String(end).padStart(2, '0')}`;
+}
+
+/**
+ * Accept one clearly scoped player link without making publishers build a
+ * manifest. Bare URLs remain intentional release-level players; adding
+ * `ep`/`episode` (or a leading number) ties the link to that delivery episode.
+ */
+/**
+ * Split one message into separate player links. A publisher commonly pastes a
+ * list ("ep 2 url1 url2" or one link per line, sometimes as Markdown links), and
+ * each pasted link is a player the publisher wants to keep.
+ */
+export function splitPlayerLinks(value, { allowedHosts = [] } = {}) {
+  const candidates = cleanText(value, 4_000)
+    .split(/\r?\n|\s{2,}|[,;]+|\s+(?=https?:\/\/|\[|<iframe)/i)
+    .map((entry) => entry.replace(/^\s*(?:[-*•]\s*|\d{1,3}[.)]\s*)/, '').trim())
+    .filter(Boolean);
+  const urls = [];
+  const rejected = [];
+  for (const candidate of candidates) {
+    if (!/https?:\/\//i.test(candidate) && !/iframe/i.test(candidate)) continue;
+    const link = safeStreamingLink(candidate, { allowedHosts });
+    if (link?.embedUrl || link?.watchUrl) {
+      urls.push(link);
+      continue;
+    }
+    rejected.push(extractStreamingUrl(candidate).slice(0, 80) || cleanText(candidate, 80));
+  }
+  return { urls, rejected };
+}
+
+/**
+ * Parse the removal grammar of /cmd: `del 3`, `del 2, 4`, `del ep 5`,
+ * `del ep 2-7`, or `del all`. Episode ranges remove every player of those
+ * episodes at once, which is how a wrong bulk import is undone.
+ */
+export function parseStreamRemoval(value) {
+  const text = cleanText(value, 120).replace(/^#/, '').trim();
+  if (!text) return { error: 'Say what to remove: /cmd SB-0123ABCDEF del 3, del ep 5, del ep 2-7, or del all.' };
+  if (/^(?:all|everything|every|everythang|the whole list)$/i.test(text)) return { mode: 'all' };
+  const episode = text.match(/^(?:ep|episode|eps)\.?\s*(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?$/i);
+  if (episode) {
+    const start = Number(episode[1]);
+    const end = Number(episode[2] || episode[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+      return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+    }
+    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) } };
+  }
+  if (/^(?:ep|episode|eps)\b/i.test(text)) return { error: 'Use a range such as del ep 5 or del ep 2-7.' };
+  const indexes = [...text.matchAll(/\d{1,4}/g)].map((match) => Number(match[0])).filter((number) => number >= 1);
+  if (!indexes.length) return { error: 'Say which player number to remove, for example /cmd SB-0123ABCDEF del 3.' };
+  return { mode: 'index', indexes: [...new Set(indexes)] };
+}
+
+/**
+ * One manual player paste can name the episode in front of every link:
+ *
+ *   Ep 176 https://www.dailymotion.com/embed/video/one
+ *   Ep 177 https://www.dailymotion.com/embed/video/two
+ *
+ * Lines without their own label continue the episode above them, so several
+ * sources for one episode are still pasted as plain lines, and labels packed onto
+ * a single line are read as separate episodes too — otherwise every link after
+ * the first label would land on that one episode and the rest stay empty.
+ */
+export function manualPlayerGroups(value) {
+  const groups = [];
+  let current = null;
+  for (const line of String(value || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    for (const part of trimmed.split(/\s+(?=(?:ep|eps|episode|e)\.?\s*0*\d{1,3}\b)/i)) {
+      const labeled = part.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?\b[:\-]?\s*([\s\S]*)$/i);
+      if (labeled) {
+        const start = Number(labeled[1]);
+        const end = Number(labeled[2] || labeled[1]);
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+          if (current) {
+            current.text = `${current.text}\n${part}`.trim();
+            continue;
+          }
+          return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+        }
+        current = { episode: { start, end, label: directEpisodeLabel(start, end) }, text: String(labeled[3] || '').trim() };
+        groups.push(current);
+        continue;
+      }
+      if (!current) {
+        current = { episode: null, text: '' };
+        groups.push(current);
+      }
+      current.text = `${current.text}\n${part}`.trim();
+    }
+  }
+  return { groups: groups.filter((group) => group.text) };
+}
+
+/**
+ * Turn one manual player paste into manifest rows, honouring an episode label in
+ * front of every link. `/cmd SB-… <links>` and a follow-up message in an armed
+ * import chat go through this, so the same paste behaves the same way in both.
+ */
+export function buildManualPlayerManifest(targetAdminId, value, config) {
+  const directInput = parseDirectStreamingInput(value);
+  if (directInput.error) return { error: directInput.error };
+  // A removal instruction is never a link list; the caller handles it separately.
+  if (directInput.action === 'delete') {
+    return { delete: directInput.delete, manifest: { entries: [], rejected: [] }, links: 0, rejected: [], episodes: [] };
+  }
+  const manual = manualPlayerGroups(value);
+  if (manual.error) return { error: manual.error };
+  const options = streamingOptionsFromConfig(config);
+  const groups = manual.groups.length
+    ? manual.groups
+    : [{ episode: directInput.episode, text: directInput.playerValue }];
+  const entries = [];
+  const rejected = [];
+  for (const group of groups) {
+    const found = splitPlayerLinks(group.text, options);
+    rejected.push(...found.rejected);
+    entries.push(...directStreamingManifest(targetAdminId, found.urls, group.episode).entries);
+  }
+  entries.forEach((entry, index) => { entry.row = index + 1; });
+  return {
+    manifest: { entries, rejected },
+    links: entries.length,
+    rejected,
+    episodes: [...new Set(entries.map((entry) => entry.entry?.episode?.label).filter(Boolean))]
+  };
+}
+
+function episodeCoverageNote(episodes, groupCount) {
+  if (!episodes.length || (groupCount <= 1 && episodes.length === 1)) return '';
+  return `\nEpisodes covered: ${episodes.slice(0, 12).join(', ')}${episodes.length > 12 ? ` … (+${episodes.length - 12} more)` : ''}`;
+}
+
+export function parseDirectStreamingInput(value) {
+  const supplied = cleanText(value, 4_000);
+  const removal = supplied.match(/^(?:del|delete|remove|unlink)\b[\s:]*([\s\S]*)$/i);
+  if (removal) {
+    const deletePlan = parseStreamRemoval(removal[1]);
+    return { playerValue: '', urls: [], episode: null, action: 'delete', delete: deletePlan, error: deletePlan.error || null };
+  }
+  const match = supplied.match(/^(?:(?:episode|ep)\.?\s*)?(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?\s+([\s\S]+)$/i);
+  if (!match) return { playerValue: supplied, urls: [], episode: null, action: 'add', delete: null, error: null };
+  const start = Number(match[1]);
+  const end = Number(match[2] || match[1]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+    return { playerValue: '', urls: [], episode: null, action: 'add', delete: null, error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+  }
+  return {
+    playerValue: cleanText(match[3], 3_800),
+    urls: [],
+    episode: { start, end, label: directEpisodeLabel(start, end) },
+    action: 'add',
+    delete: null,
+    error: null
+  };
+}
+
+function watchPageUrl(config, content, episode = null) {
+  const detailUrl = getContentPageUrl(config, content);
+  if (!detailUrl) return null;
+  const range = episodePathRange(episode);
+  return `${detailUrl}/watch${range ? `/episode/${range}` : ''}`;
+}
+
+function streamImportInstructions(targetAdminId = null) {
+  const target = targetAdminId
+    ? `Every valid row in the next manifest will be attached to ${targetAdminId}.`
+    : 'Each row needs a Post ID, or a Title that exactly matches one existing SoraBox release.';
+  const armedEpisodeExample = targetAdminId
+    ? `In this armed chat, you can also send: ep 1 https://soraboxs.embedseek.com/#your-video`
+    : 'For one episode now: /cmd SB-0123ABCDEF ep 1 https://soraboxs.embedseek.com/#your-video';
+  return [
+    'Manual Watch-link import is armed for 15 minutes.',
+    target,
+    '',
+    'For several episodes in one message, put the episode in front of each link on its own line: ep 176 https://… then ep 177 https://… Every link is attached to the episode named beside it, and a line with no label continues the episode above it.',
+    'For many episodes at once, send one small .json or .csv document exported from SeekStreaming, Dailymotion, Rumble, or another approved host. I only save player URLs—no media is uploaded, downloaded, transcoded, or announced from Koyeb.',
+    'SeekStreaming exports work directly with its Title, Embed Link, or Embed Code fields. An iframe snippet is reduced safely to its src URL, and a pasted Markdown link such as [https://rumble.com/v….html](…) is read like plain text.',
+    'Page links are converted automatically to the URL the site can actually frame, so https://www.dailymotion.com/video/x… and https://rumble.com/v…-title.html work as sent. Each player is named after its provider (Dailymotion server, Rumble server), and a second link for an episode you already filled stays beside the first one instead of replacing it.',
+    '',
+    'Recommended CSV columns: postId, episode, label, embedUrl, watchUrl',
+    armedEpisodeExample,
+    'Several links in one message are all saved: ep 2 <url1> <url2>, one per line, or a bullet list. For a whole range use ep 2-7 <URL>, which is what a multi-episode release needs.',
+    'For a release-wide player, omit ep: /cmd SB-0123ABCDEF https://soraboxs.embedseek.com/#your-video',
+    `To undo: del 2 removes one numbered player, del ep 2-7 removes an episode range, del all clears the post. ${targetAdminId ? `Current players and their numbers: /players ${targetAdminId}.` : `Players and their numbers: /players SB-0123ABCDEF.`}`,
+    'Use /cmd cancel to stop this import.'
+  ].join('\n');
+}
+
+function streamImportIssueText(rejected = []) {
+  if (!rejected.length) return '';
+  const examples = rejected.slice(0, 5)
+    .map((issue) => `Entry ${issue.row || '?'}: ${cleanText(issue.error, 180)}`)
+    .join('\n');
+  return `\nSkipped ${rejected.length} invalid or unresolved entr${rejected.length === 1 ? 'y' : 'ies'}:\n${examples}${rejected.length > 5 ? '\n…' : ''}`;
+}
+
+async function resolveStreamImportContent(repository, entry, targetAdminId = null) {
+  if (targetAdminId) {
+    if (entry.postId && entry.postId !== targetAdminId) {
+      return { error: `belongs to ${entry.postId}, but this import was armed for ${targetAdminId}` };
+    }
+    const content = await repository.findContentByAdminId?.(targetAdminId);
+    if (!content) return { error: `could not find target post ${targetAdminId}` };
+    if (entry.category && entry.category !== content.category) {
+      return { error: `uses category ${entry.category}, but ${targetAdminId} is in ${content.category}` };
+    }
+    return { content };
+  }
+
+  if (entry.postId) {
+    const content = await repository.findContentByAdminId?.(entry.postId);
+    return content ? { content } : { error: `could not find published post ${entry.postId}` };
+  }
+  if (!entry.sourceTitle || typeof repository.findContentByTitle !== 'function') {
+    return { error: 'needs a Post ID or an exact existing catalog Title' };
+  }
+  const candidates = await repository.findContentByTitle(entry.sourceTitle, { category: entry.category, limit: 3 });
+  if (candidates.length === 1) return { content: candidates[0] };
+  if (candidates.length > 1) {
+    return { error: `Title “${entry.sourceTitle}” matches multiple catalog posts; use /cmd SB-… to select one` };
+  }
+  return { error: `could not find one existing catalog post with Title “${entry.sourceTitle}”` };
+}
+
+/**
+ * Attach validated provider links to existing posts only. This deliberately
+ * does not call publication/announcement functions: importing a player link
+ * must preserve the post and never create a Telegram announcement.
+ */
+export async function applyStreamingManifest({ repository, manifest, targetAdminId = null, config = {}, granularity = 'provider' } = {}) {
+  if (!repository?.updateContentStreamByAdminId || !repository?.findContentByAdminId) {
+    throw new Error('This catalog store cannot attach manual Watch links.');
+  }
+  const rejected = [...(manifest?.rejected || [])];
+  const groups = new Map();
+  for (const item of manifest?.entries || []) {
+    const resolved = await resolveStreamImportContent(repository, item, targetAdminId);
+    if (!resolved.content) {
+      rejected.push({ row: item.row, error: resolved.error || 'could not resolve a catalog post' });
+      continue;
+    }
+    const key = resolved.content.adminId;
+    const group = groups.get(key) || { content: resolved.content, entries: [], rows: 0 };
+    group.entries.push(item.entry);
+    group.rows += 1;
+    groups.set(key, group);
+  }
+
+  const updated = [];
+  for (const group of groups.values()) {
+    const stream = mergeStreamingEntries(group.content.stream, group.entries, { ...streamingOptionsFromConfig(config), granularity });
+    if (!stream) {
+      rejected.push({ row: '?', error: `could not create a safe player entry for ${group.content.adminId}` });
+      continue;
+    }
+    const saved = await repository.updateContentStreamByAdminId(group.content.adminId, stream);
+    if (!saved) {
+      rejected.push({ row: '?', error: `could not update ${group.content.adminId}; it may have been removed` });
+      continue;
+    }
+    updated.push({ content: saved, rows: group.rows, stream, entries: group.entries });
+  }
+  return {
+    updated,
+    attachedRows: updated.reduce((total, item) => total + item.rows, 0),
+    rejected
+  };
+}
+
+/**
+ * Turn one or more pasted player links into manifest entries. Each link keeps
+ * the provider's own name, so the site shows "Dailymotion server" and
+ * "Rumble server" instead of an anonymous "Player 1 / Player 2".
+ */
+function directStreamingManifest(targetAdminId, playerLinks, episode = null) {
+  const links = (Array.isArray(playerLinks) ? playerLinks : [playerLinks]).filter(Boolean);
+  return {
+    entries: links.map((link, index) => {
+      const embedUrl = typeof link === 'string' ? link : link?.embedUrl || null;
+      const watchUrl = typeof link === 'string' ? link : link?.watchUrl || null;
+      const server = streamServerName(embedUrl || watchUrl);
+      const shortName = server.replace(/\s+server$/i, '');
+      return {
+        row: index + 1,
+        postId: targetAdminId,
+        sourceTitle: null,
+        category: null,
+        entry: {
+          label: `${shortName}${episode?.label ? ` · ${episode.label}` : ''}`,
+          episode: episode || null,
+          provider: shortName,
+          server,
+          embedUrl,
+          watchUrl
+        }
+      };
+    }),
+    rejected: []
+  };
+}
+
+/**
+ * Remove the players a publisher selects by list number, by episode (including
+ * a range), or all of them. Only the existing post is touched — like every
+ * other /cmd action it never publishes, deletes files, or announces.
+ */
+export async function removeAttachedPlayers({ repository, targetAdminId, removal = {}, config = {} } = {}) {
+  const content = await repository.findContentByAdminId?.(String(targetAdminId).toUpperCase());
+  if (!content) return { error: `No published catalog post was found for ${targetAdminId}.` };
+  const entries = Array.isArray(content.stream?.entries) ? content.stream.entries : [];
+  if (!entries.length) return { error: `${content.title} has no player links attached, so nothing was removed.`, removed: 0, remaining: 0 };
+  const total = publicStreamingData(content.stream, streamingOptionsFromConfig(config)).entries.length;
+  const indexes = removal.mode === 'index'
+    ? removal.indexes.filter((index) => index >= 1 && index <= total)
+    : null;
+  if (indexes && !indexes.length) {
+    return { error: `This post has ${total} player${total === 1 ? '' : 's'}. Use a number between 1 and ${total}, or del ep 5 for an episode.`, removed: 0, remaining: total };
+  }
+  const outcome = removeStreamingEntries(content.stream, {
+    indexes,
+    episode: removal.mode === 'episode' ? removal.episode : null,
+    all: removal.mode === 'all'
+  }, streamingOptionsFromConfig(config));
+  if (!outcome.removed) {
+    return { error: 'No attached player matched that episode range, so nothing was removed.', removed: 0, remaining: total };
+  }
+  const saved = await repository.updateContentStreamByAdminId(content.adminId, outcome.stream || null);
+  if (!saved) return { error: 'The player list could not be saved. Nothing was removed.', removed: 0, remaining: total };
+  return {
+    content: saved,
+    removed: outcome.removed,
+    remaining: outcome.remaining,
+    scope: removal.mode === 'episode'
+      ? `${removal.episode.label}`
+      : removal.mode === 'all'
+        ? 'every attached player'
+        : `player${indexes.length === 1 ? '' : 's'} ${indexes.join(', ')}`
+  };
+}
+
+/**
+ * The publisher-facing list of attached players. Numbers shown here are exactly
+ * what `del <number>` and the Remove buttons address, so a mistaken bulk import
+ * can be cleaned up without remembering provider URLs.
+ */
+export function playersList(content, config = {}) {
+  const data = publicStreamingData(content?.stream, streamingOptionsFromConfig(config));
+  return data.entries.map((entry, index) => ({
+    ...entry,
+    number: index + 1,
+    title: entry.label || entry.episode?.label || 'Main player',
+    server: entry.server || streamServerName(entry.embedUrl || entry.watchUrl),
+    url: entry.embedUrl || entry.watchUrl || null
+  }));
+}
+
+/**
+ * A release can hold hundreds of players, so the list is a window and not a dump:
+ * the publisher narrows it to one episode or range, jumps to the episodes that have
+ * no player yet, or pages through everything. Numbers always come from the stored
+ * order, so a number printed here is the number `/cmd SB-… del <n>` addresses, and
+ * the Remove buttons carry the card they belong to.
+ */
+export const PLAYERS_PAGE_SIZE = 8;
+
+function playersEpisodeGroups(content) {
+  return (Array.isArray(content?.episodeGroups) ? content.episodeGroups : [])
+    .map((group) => ({ start: Number(group?.start), end: Number(group?.end ?? group?.start) }))
+    .filter((group) => Number.isInteger(group.start) && group.start >= 1);
+}
+
+function playersCoversEpisodeNumber(content, number) {
+  return playersEpisodeGroups(content).some((group) => number >= group.start && number <= (Number.isInteger(group.end) ? group.end : group.start));
+}
+
+/**
+ * The view a publisher asked for. `content` lets a bare number mean what they
+ * meant by it: on a card that has an Episode 176, `/players SB-… 176` opens that
+ * episode; on any other card the same number pages through the list.
+ */
+/**
+ * Read the tail of `/players SB-… [view]` into a view: nothing (the paged list), an
+ * episode or episode range, `missing`, a `#row`, or a page number. A bare number is the
+ * episode when the card actually has that episode and a page otherwise, because a
+ * publisher reads `176` as "the one I am looking for". A page may follow the view it
+ * narrows, so `ep 176 2` and `missing 3` work the way a scrolled list is re-asked.
+ */
+export function parsePlayersView(value, content = null) {
+  const flat = { mode: 'all', episode: null, page: 1, focus: null };
+  const text = cleanText(value, 80).trim().replace(/[.,;:!?]+$/, '');
+  if (!text) return flat;
+  let tokens = text.toLowerCase().replace(/\s+/g, ' ').split(' ').filter(Boolean);
+  const words = 'all|everything|every|full|list|miss|missing|gaps|uncovered';
+  const episodeShape = '(?:ep|eps|episode|e)\\.?\\s*0*\\d{1,3}(?:\\s*(?:-|\\u2013|to)\\s*0*\\d{1,3})?';
+  const rowShape = '(?:#|row\\s+|n\\s+)?\\.?\\s*0*\\d{1,4}(?:-0*\\d{1,4})?';
+  let page = 1;
+  if (tokens.length > 1) {
+    const tail = tokens[tokens.length - 1].match(/^(?:p|page)?0*(\d{1,4})$/);
+    const head = tokens.slice(0, -1).join(' ');
+    if (tail && new RegExp(`^(?:${words}|${episodeShape}|${rowShape})$`).test(head)) {
+      tokens = tokens.slice(0, -1);
+      page = Math.max(1, Number(tail[1]));
+    }
+  }
+  // A row number already says which page holds it, so an added page is ignored there.
+  const withPage = (view) => (view.error || view.focus || page === 1 ? view : { ...view, page });
+
+  const lowered = tokens.join(' ');
+  if (/^(?:all|everything|every|full|list)$/.test(lowered)) return withPage({ ...flat });
+  if (/^(?:miss|missing|gaps|uncovered)$/.test(lowered)) return withPage({ mode: 'missing', episode: null, page: 1, focus: null });
+
+  const bare = lowered.match(/^(#|row|n)?\.?\s*0*(\d{1,4})$/);
+  if (bare) {
+    const number = Number(bare[2]);
+    const explicitRow = Boolean(bare[1]);
+    if (!explicitRow && playersCoversEpisodeNumber(content, number)) {
+      return withPage({
+        mode: 'episode',
+        episode: { start: number, end: number, label: directEpisodeLabel(number, number) },
+        page: 1,
+        focus: null
+      });
+    }
+    if (explicitRow) {
+      // `#12` is the row they are reading, so it opens the page holding it.
+      return withPage({
+        mode: 'all',
+        episode: null,
+        page: Math.floor((Math.max(1, number) - 1) / PLAYERS_PAGE_SIZE) + 1,
+        focus: number || null
+      });
+    }
+    if (page > 1) {
+      return {
+        error: `${content && content.title ? content.title : 'This release'} has no Episode ${number} to page through. Use /players ${content ? content.adminId : 'SB-0123ABCDEF'} ${number} for page ${number} of the list, or ep 1-<end> with a page after it.`
+      };
+    }
+    return { ...flat, page: Math.max(1, number || 1) };
+  }
+
+  // A range needs no `ep` to be understood: two numbers joined are episodes, never pages.
+  const bareRange = lowered.match(/^0*(\d{1,3})\s*(?:-|\u2013|to)\s*0*(\d{1,3})$/);
+  if (bareRange) return withPage(parsePlayersView(`ep ${Number(bareRange[1])}-${Number(bareRange[2])}`, content));
+
+  const pageOnly = lowered.match(/^(?:page|p)\s*0*(\d{1,4})$/);
+  if (pageOnly) return { ...flat, page: Math.max(1, Number(pageOnly[1])) };
+
+  const episode = lowered.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?$/);
+  if (episode) {
+    const start = Number(episode[1]);
+    const end = Number(episode[2] || episode[1]);
+    if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < start || end > 999) {
+      return { error: 'Episode numbers run from 1 to 999, with the end no earlier than the start. Example: /players SB-0123ABCDEF ep 176' };
+    }
+    return withPage({ mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null });
+  }
+  return {
+    error: 'Use /players SB-0123ABCDEF ep 176 for one episode, ep 170-180 for a range, missing for the episodes with no player, #12 for a row, or a page number — and a page may follow any of them, as in ep 176 2.'
+  };
+}
+
+/** The view travels inside the button data, so an older message stays usable. */
+export function playersViewKey(view = {}) {
+  if (view.mode === 'episode' && view.episode) return `${view.episode.start}-${view.episode.end}`;
+  return view.mode === 'missing' ? 'miss' : 'all';
+}
+
+export function playersViewFromKey(key) {
+  const range = String(key || '').match(/^(\d{1,3})-(\d{1,3})$/);
+  if (range) {
+    const start = Number(range[1]);
+    const end = Number(range[2]);
+    return { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1, focus: null };
+  }
+  return { mode: key === 'miss' ? 'missing' : 'all', episode: null, page: 1, focus: null };
+}
+
+function playersRangesOverlap(first, second) {
+  const leftStart = Number(first?.start);
+  const leftEnd = Number(first?.end ?? first?.start);
+  const rightStart = Number(second?.start);
+  const rightEnd = Number(second?.end ?? second?.start);
+  if (!Number.isInteger(leftStart) || !Number.isInteger(rightStart)) return false;
+  return leftStart <= (Number.isInteger(rightEnd) ? rightEnd : rightStart)
+    && (Number.isInteger(leftEnd) ? leftEnd : leftStart) >= rightStart;
+}
+
+/**
+ * Which episodes the card actually has a player for. A release-wide link is
+ * deliberately not counted: the site offers a player on an episode page only when
+ * a link covers that episode, so counting it would hide a real gap.
+ */
+export function playersCoverage(content, entries = []) {
+  const groups = playersEpisodeGroups(content);
+  const list = Array.isArray(entries) ? entries : [];
+  const episodic = list.filter((entry) => Number.isInteger(Number(entry?.episode?.start)));
+  const missing = [];
+  let covered = 0;
+  for (const group of groups) {
+    const end = Number.isInteger(group.end) && group.end >= group.start ? group.end : group.start;
+    const span = Math.min(400, end - group.start + 1);
+    let hit = 0;
+    for (let offset = 0; offset < span; offset += 1) {
+      const number = group.start + offset;
+      if (episodic.some((entry) => playersRangesOverlap(entry.episode, { start: number, end: number }))) hit += 1;
+    }
+    if (!hit) {
+      const last = missing[missing.length - 1];
+      if (last && group.start === last.end + 1) last.end = end;
+      else missing.push({ start: group.start, end });
+    }
+    covered += hit;
+  }
+  const total = groups.reduce((sum, group) => sum + Math.min(400, (Number.isInteger(group.end) ? group.end : group.start) - group.start + 1), 0);
+  return { total, covered, missing, releaseWide: list.length - episodic.length };
+}
+
+function playersGapLabel(range) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return range.start === range.end ? `Ep ${pad(range.start)}` : `Ep ${pad(range.start)}\u2013${pad(range.end)}`;
+}
+
+function playersGapCommand(adminId, range) {
+  if (!range) return `/cmd ${adminId} ep 1 <player URL>`;
+  return `/cmd ${adminId} ep ${range.start === range.end ? range.start : `${range.start}-${range.end}`} <player URL>`;
+}
+
+function selectPlayersEntries(entries, view) {
+  if (view.mode !== 'episode') return entries;
+  return entries.filter((entry) => playersRangesOverlap(entry?.episode, view.episode));
+}
+
+export function playersListText(content, entries = [], config = {}, view = { mode: 'all', page: 1 }) {
+  const watchUrl = watchPageUrl(config, content, null);
+  const all = Array.isArray(entries) ? entries : [];
+  if (!all.length) {
+    return [
+      `\u25b8 ${content.title} (${content.adminId})`,
+      '',
+      'No player is attached to this release yet.',
+      'Add one: /cmd ' + content.adminId + ' ep 1 https://rumble.com/vxxxx-title.html',
+      'Many at once: /cmd ' + content.adminId + ' then send the provider .json or .csv export.',
+      'Several episodes in one message: put "ep 176 <link>" and "ep 177 <link>" on their own lines.'
+    ].join('\n');
+  }
+
+  const coverage = playersCoverage(content, all);
+  const selected = selectPlayersEntries(all, view);
+  const pages = Math.max(1, Math.ceil(selected.length / PLAYERS_PAGE_SIZE));
+  const wanted = Math.max(1, Number(view.page) || 1);
+  const page = Math.min(wanted, pages);
+  const shown = selected.slice((page - 1) * PLAYERS_PAGE_SIZE, page * PLAYERS_PAGE_SIZE);
+
+  const header = [`\u25b8 ${content.title} (${content.adminId}) \u2014 ${all.length} player${all.length === 1 ? '' : 's'}`];
+  if (view.mode === 'episode') {
+    header.push(`\u25aa ${view.episode.label}: ${selected.length} of ${all.length} players${selected.length ? ` \u00b7 page ${page} of ${pages}` : ''}`);
+  } else if (coverage.total) {
+    const episodeWord = coverage.total === 1 ? 'episode has' : 'episodes have';
+    header.push(`\u25aa ${coverage.covered} of ${coverage.total} ${episodeWord} a player \u00b7 page ${page} of ${pages}`);
+  } else {
+    header.push(`\u25aa page ${page} of ${pages}`);
+  }
+  if (page !== wanted) {
+    // A number that is neither an episode of this card nor a real page is a typo,
+    // and silently landing somewhere else would be worse than saying so.
+    header.push(`\u25aa There ${pages === 1 ? 'is only 1 page' : `are only ${pages} pages`} of ${all.length} players${coverage.total && wanted > coverage.total ? `, and this release runs to ${directEpisodeLabel(1, coverage.total)}` : ''} \u2014 showing page ${page}.`);
+  }
+
+  const lines = shown.map((entry) => [
+    `${view.focus && entry.number === view.focus ? '\u25b6' : '\u25aa'} ${entry.number}. ${entry.episode?.label || 'Release-wide'} \u00b7 ${entry.server}`,
+    `   \u2192 ${entry.url}`
+  ].join('\n'));
+
+  const tail = [];
+  if (view.mode === 'episode' && !selected.length) {
+    const beyond = coverage.total > 0 && view.episode.start > coverage.total;
+    tail.push(beyond
+      ? `This release runs to ${directEpisodeLabel(1, coverage.total)}, so ${view.episode.label} does not exist on it. Nothing was changed.`
+      : `No player is attached to ${view.episode.label} yet. Add one: ${playersGapCommand(content.adminId, view.episode)}`);
+    tail.push(beyond
+      ? `\u25aa /players ${content.adminId} missing lists the episodes that still need a player.`
+      : 'After that this same page shows it, with its Remove button.');
+  }
+  if (view.mode !== 'episode' && coverage.missing.length) {
+    tail.push(`\u25aa With no player yet: ${coverage.missing.slice(0, 8).map(playersGapLabel).join(', ')}${coverage.missing.length > 8 ? ` \u00b7 +${coverage.missing.length - 8} more` : ''}`);
+    tail.push(`   Fill the first gap: ${playersGapCommand(content.adminId, coverage.missing[0])}`);
+  }
+  if (view.mode === 'episode') {
+    tail.push(`\u25aa Back to every player: /players ${content.adminId} all`);
+  } else if (all.length > PLAYERS_PAGE_SIZE && view.mode !== 'missing') {
+    tail.push(`\u25aa Narrow it: /players ${content.adminId} ep 176 for one episode, ep 170-180 for a range, missing for the gaps, #12 for row twelve, 3 for page three \u2014 or use the buttons below.`);
+  }
+  const episodeHint = view.episode?.start ?? shown[0]?.episode?.start ?? 1;
+  tail.push([
+    `\u25aa Remove: /cmd ${content.adminId} del ${shown[0]?.number ?? 1} for that line`,
+    `/cmd ${content.adminId} del ep ${episodeHint} for that whole episode`,
+    `/cmd ${content.adminId} del ep ${episodeHint}-${episodeHint + 5} for a range`
+  ].join(' \u00b7 '));
+  if (coverage.releaseWide) {
+    tail.push(`\u25aa ${coverage.releaseWide} release-wide link${coverage.releaseWide === 1 ? '' : 's'} sit${coverage.releaseWide === 1 ? 's' : ''} on the release page only, not on an episode page.`);
+  }
+  if (watchUrl) tail.push(`Watch page: ${watchUrl}`);
+
+  return [...header, '', ...lines, '', ...tail.filter(Boolean)].join('\n').slice(0, 3_600);
+}
+
+export function playersMissingText(content, entries = [], config = {}, view = { mode: 'missing', page: 1 }) {
+  const coverage = playersCoverage(content, entries);
+  if (!coverage.total) {
+    return `\u25b8 ${content.title} (${content.adminId})\n\nThis card numbers no episodes, so there is nothing to check. It has ${entries.length} player${entries.length === 1 ? '' : 's'} attached.`;
+  }
+  if (!coverage.missing.length) {
+    return `\u25b8 ${content.title} (${content.adminId})\n\nAll ${coverage.total} of its episodes have a player${coverage.releaseWide ? ` (${coverage.releaseWide} release-wide link${coverage.releaseWide === 1 ? '' : 's'} as well)` : ''}. Nothing is missing.`;
+  }
+  const gapPages = Math.max(1, Math.ceil(coverage.missing.length / PLAYERS_PAGE_SIZE));
+  const gapPage = Math.min(Math.max(1, Number(view.page) || 1), gapPages);
+  const gaps = coverage.missing.slice((gapPage - 1) * PLAYERS_PAGE_SIZE, gapPage * PLAYERS_PAGE_SIZE);
+  return [
+    `\u25b8 ${content.title} (${content.adminId}) \u2014 ${coverage.covered} of ${coverage.total} episodes covered`,
+    '',
+    ...gaps.map((gap) => `\u25aa ${playersGapLabel(gap)} \u00b7 ${gap.end - gap.start + 1} episode${gap.end === gap.start ? '' : 's'} with no player`),
+    gapPages > 1 ? `\u25aa Gap page ${gapPage} of ${gapPages}` : null,
+    coverage.missing.length > gapPage * PLAYERS_PAGE_SIZE ? `\u2026 ${coverage.missing.length - gapPage * PLAYERS_PAGE_SIZE} more gap${coverage.missing.length - gapPage * PLAYERS_PAGE_SIZE === 1 ? '' : 's'} on the next page` : null,
+    '',
+    `Fill one: ${playersGapCommand(content.adminId, gaps[0])}`,
+    '\u25aa Tap a gap below to open the view that prints the command filling it.'
+  ].filter(Boolean).join('\n').slice(0, 3_600);
+}
+
+/**
+ * Re-render a `/players` message in place after a button tap.
+ *
+ * The context has to come from the caller: a callback handler owns the update, and a
+ * helper declared beside them that reaches for a `ctx` of its own compiles happily and
+ * throws `ctx is not defined` at runtime, which Telegram reports as a generic failure.
+ * An edit that changes nothing (Telegram answers 400 "message is not modified") and a
+ * message that no longer exists are both normal here, so they are folded into the
+ * return value instead of the error path.
+ */
+export async function renderPlayersMessage(ctx, repository, config, adminId, view = { mode: 'all', page: 1 }, fallbackNote = null) {
+  const content = await repository.findContentByAdminId?.(adminId);
+  if (!content) {
+    if (fallbackNote) await ctx.reply(fallbackNote).catch(() => {});
+    return 'gone';
+  }
+  const entries = playersList(content, config);
+  const text = view.mode === 'missing'
+    ? playersMissingText(content, entries, config, view)
+    : playersListText(content, entries, config, view);
+  const keyboard = playersKeyboard(content, entries, view);
+  try {
+    await ctx.editMessageText(text, keyboard);
+    return 'edited';
+  } catch (error) {
+    const description = String(error?.description || error?.message || '');
+    if (/message is not modified|no change/i.test(description)) return 'unchanged';
+    await ctx.reply(text, keyboard).catch(() => {});
+    return 'replied';
+  }
+}
+
+export function playersKeyboard(content, entries = [], view = { mode: 'all', page: 1 }) {
+  const adminId = String(content?.adminId || '').toUpperCase();
+  const all = (Array.isArray(entries) ? entries : []).filter((entry) => Number.isInteger(entry?.number));
+  if (!all.length) {
+    // Nothing to remove yet, so the only useful action is to add the first link.
+    return Markup.inlineKeyboard([[Markup.button.callback('Add players', `ply:add:${adminId}`)]]);
+  }
+  const selected = selectPlayersEntries(all, view);
+  const pages = Math.max(1, Math.ceil(selected.length / PLAYERS_PAGE_SIZE));
+  const page = Math.min(Math.max(1, Number(view.page) || 1), pages);
+  const shown = selected.slice((page - 1) * PLAYERS_PAGE_SIZE, page * PLAYERS_PAGE_SIZE);
+  const key = playersViewKey(view);
+  const shortName = (entry) => String(entry.server || 'player').replace(/\s+server$/i, '');
+
+  if (view.mode === 'missing') {
+    const gaps = playersCoverage(content, all).missing;
+    const gapPages = Math.max(1, Math.ceil(gaps.length / PLAYERS_PAGE_SIZE));
+    const gapPage = Math.min(Math.max(1, Number(view.page) || 1), gapPages);
+    const shownGaps = gaps.slice((gapPage - 1) * PLAYERS_PAGE_SIZE, gapPage * PLAYERS_PAGE_SIZE);
+    const gapRows = [];
+    for (let index = 0; index < shownGaps.length; index += 2) {
+      gapRows.push(shownGaps.slice(index, index + 2).map((gap) => Markup.button.callback(
+        telegramButtonText(`\u2192 ${playersGapLabel(gap)} \u00b7 ${gap.end - gap.start + 1} missing`),
+        `ply:pag:${adminId}:${gap.start === gap.end ? gap.start : `${gap.start}-${gap.end}`}:1`
+      )));
+    }
+    const gapNav = [];
+    if (gapPage > 1) gapNav.push(Markup.button.callback(`\u25c0 ${gapPage - 1}`, `ply:pag:${adminId}:miss:${gapPage - 1}`));
+    if (gapPage < gapPages) gapNav.push(Markup.button.callback(`${gapPage + 1} \u25b6`, `ply:pag:${adminId}:miss:${gapPage + 1}`));
+    if (gapNav.length) gapRows.push(gapNav);
+    gapRows.push([
+      Markup.button.callback('All players', `ply:pag:${adminId}:all:1`),
+      Markup.button.callback('Add players', `ply:add:${adminId}`)
+    ]);
+    return Markup.inlineKeyboard(gapRows);
+  }
+  const rows = [];
+  for (let index = 0; index < shown.length; index += 2) {
+    rows.push(shown.slice(index, index + 2).map((entry) => Markup.button.callback(
+      telegramButtonText(`\u2715 ${entry.episode?.label || 'Release'} \u00b7 ${shortName(entry)}`),
+      `ply:rem:${adminId}:${entry.number}:${key}:${page}`
+    )));
+  }
+  if (view.mode === 'episode' && selected.length) {
+    rows.push([Markup.button.callback(
+      telegramButtonText(`\u2715 Remove all ${selected.length} for ${view.episode.label}`),
+      `ply:remep:${adminId}:${view.episode.start}-${view.episode.end}`
+    )]);
+  }
+  const navigation = [];
+  if (page > 1) navigation.push(Markup.button.callback(`\u25c0 ${page - 1}`, `ply:pag:${adminId}:${key}:${page - 1}`));
+  if (page < pages) navigation.push(Markup.button.callback(`${page + 1} \u25b6`, `ply:pag:${adminId}:${key}:${page + 1}`));
+  navigation.push(Markup.button.callback(
+    view.mode === 'missing' ? 'All players' : 'Missing episodes',
+    `ply:pag:${adminId}:${view.mode === 'missing' ? 'all' : 'miss'}:1`
+  ));
+  if (view.mode === 'episode') navigation.push(Markup.button.callback('All players', `ply:pag:${adminId}:all:1`));
+  rows.push(navigation);
+  const footer = [Markup.button.callback('Add players', `ply:add:${adminId}`)];
+  if (view.mode === 'all') {
+    footer.push(Markup.button.callback(`Remove all ${all.length}`, `ply:rem:${adminId}:all:${key}:${page}`));
+  }
+  rows.push(footer);
+  // Telegram caps an inline keyboard at 100 buttons and a wall of them is
+  // unreadable anyway, which is why the list pages instead of growing.
+  return Markup.inlineKeyboard(rows);
+}
+
+/* ---------------------------------------------------------------------------
+ * Post merging (/merge)
+ *
+ * A multi-season upload is intentionally published as one card per season, and
+ * providers sometimes export the same show as several cards. /merge puts those
+ * cards back together: the target keeps its own ID, slug, poster, and delivery
+ * identity, absorbs every file and player of the listed cards, rebuilds its
+ * season blocks, and the cards it absorbed are removed from the website and from
+ * the announcement channels. Private storage messages are never touched, so a
+ * merge can be undone by re-adding files with /batch.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Parse a /merge line. The first Post ID is always the card that receives the
+ * files; a title in front of it is a safety check, not a search. `drop` trims
+ * files back off one card, by season or by episode range.
+ */
+export function parseMergeCommand(value) {
+  const text = cleanText(value, 1_200);
+  const lowered = text.trim().toLowerCase();
+  if (!text || /^(?:help|example|\?)$/.test(lowered)) return { action: 'help' };
+  if (/^(?:confirm|yes|do it|go ahead|merge it)$/.test(lowered)) return { action: 'confirm' };
+  if (/^(?:cancel|never mind|stop|no)$/.test(lowered)) return { action: 'cancel' };
+
+  const adminIds = postIdsFromCommand(text);
+  // Everything that is not a Post ID, so a mistyped ID can never be read as a
+  // title: "Sb -29292" is reported instead of silently ignored.
+  const words = cleanText(text.replace(/SB-[A-F0-9]{10}/gi, ' ').replace(/\s+/g, ' ').trim(), 140);
+  // Anything shaped like a Post ID that is not one: a wrong length or stray
+  // letters is reported instead of being read as a title or dropped silently.
+  const malformed = [...text.matchAll(/\bs\s*b\s*[-]?\s*[a-f0-9]{1,14}\b/gi)]
+    .filter((match) => !adminIds.includes(cleanText(match[0], 40).toUpperCase().replace(/\s+/g, '').replace(/^(SB)[^A-F0-9]/, 'SB-')));
+  if (adminIds.length < 2 && malformed.length) {
+    return { error: `“${malformed.map((match) => cleanText(match[0], 24)).join('”, “')}” ${malformed.length === 1 ? 'is' : 'are'} not a SoraBox Post ID. A Post ID is SB- plus ten hexadecimal characters — copy the exact IDs from /posts 50.` };
+  }
+
+  if (/^drop\b/i.test(words)) {
+    const instruction = cleanText(words.replace(/^drop\b/i, '').trim(), 120);
+    const drop = parseMergeDropInstruction(instruction);
+    if (drop.error) return { error: drop.error };
+    if (!adminIds.length) return { error: 'Say which card to trim: /merge drop SB-0123ABCDEF season 2' };
+    return { action: 'drop', targetAdminId: adminIds[0], drop };
+  }
+
+  if (adminIds.length === 0) {
+    return { error: 'Usage: /merge Bleach SB-0123ABCDEF SB-1111222233 SB-4444555566 — the first Post ID keeps its card and receives every file of the others. Use /merge help for removing a season or episodes.' };
+  }
+  if (adminIds.length < 2) {
+    return { error: `Add at least one Post ID to absorb after the target: /merge ${adminIds[0]} SB-SECONDID${words ? ` (or /merge ${words.split(' ')[0]} ${adminIds[0]} SB-SECONDID)` : ''}` };
+  }
+  return {
+    action: 'plan',
+    label: adminIds.length > 1 ? cleanText(words, 140) : '',
+    targetAdminId: adminIds[0],
+    sourceAdminIds: adminIds.slice(1)
+  };
+}
+
+/**
+ * `season 2`, `s2`, `ep 5`, `episodes 5-7`, or `season 2 ep 5-7`. Episode
+ * numbers restart in every season, so a bare `ep 5` on a merged card removes
+ * Episode 5 of every season and a season-qualified one removes only that block.
+ */
+export function parseMergeDropInstruction(value) {
+  const text = cleanText(value, 120);
+  if (!text) return { error: 'Say what to remove: /merge drop SB-0123ABCDEF season 2, ep 5, ep 2-7, or season 2 ep 5.' };
+  const season = text.match(/^(?:all\s+of\s+)?s(?:eason)?\.?\s*0*(\d{1,2})\b(.*)$/i);
+  const seasonNumber = season ? Number(season[1]) : null;
+  // `Season 0` is not a block anyone can read back off a card, and a bare word
+  // like `season two` must be reported rather than dropped.
+  if (season && !(Number.isInteger(seasonNumber) && seasonNumber >= 1)) {
+    return { error: 'Season numbers must be digits from 1 to 99, for example season 2.' };
+  }
+  const remainder = cleanText(season ? season[2] : text, 60);
+  const episodes = remainder.match(/^(?:ep|eps|episode|e)\.?\s*0*(\d{1,3})(?:\s*(?:-|\u2013|to)\s*0*(\d{1,3}))?$/i);
+  if (episodes) {
+    const start = Number(episodes[1]);
+    const end = Number(episodes[2] || episodes[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) {
+      return { error: 'Episode numbers must be between 1 and 999, with the end no earlier than the start.' };
+    }
+    return { mode: 'episodes', season: seasonNumber, start, end };
+  }
+  if (remainder) {
+    // "season two" names a season but not in digits, which is the mistake worth
+    // calling out rather than a generic format complaint.
+    const words = /^(?:all\s+of\s+)?s(?:eason)?\.?\b/i.test(remainder);
+    return { error: words
+      ? 'Season numbers must be digits from 1 to 99, for example season 2.'
+      : 'Use a form such as season 2, ep 5, ep 2-7, or season 2 ep 5-7.' };
+  }
+  if (!season) {
+    const bareSeason = text.match(/^s(?:eason)?\.?\s*0*(\d{1,2})$/i);
+    if (bareSeason) return { mode: 'season', season: Number(bareSeason[1]) };
+    return { error: 'Use a form such as season 2, ep 5, ep 2-7, or season 2 ep 5-7.' };
+  }
+  return { mode: 'season', season: seasonNumber };
+}
+
+function titleIdentityKey(value) {
+  return cleanText(value, 180).toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Read every card the publisher named and turn it into an explicit plan. Nothing
+ * is changed here: a merge deletes catalog posts, so the plan is shown first and
+ * applied by the confirmation button.
+ */
+export async function resolveMergePlan({ repository, parsed = {} }) {
+  if (typeof repository.findContentByAdminId !== 'function' || typeof repository.deleteContentByAdminId !== 'function') {
+    return { error: 'Post merging is not available in this catalog store.' };
+  }
+  const target = await repository.findContentByAdminId(parsed.targetAdminId);
+  if (!target) return { error: `No published catalog post was found for ${parsed.targetAdminId}. Use /posts 50 to copy the exact target ID.` };
+  // The named title is a safety check, not a search: it has to agree with the
+  // card the publisher pointed at, but a shorter form of the same name ("bleach
+  // movie" under "Bleach Movie 2024") must not refuse an intended merge.
+  if (parsed.label) {
+    const wanted = titleIdentityKey(parsed.label);
+    const actual = titleIdentityKey(target.title);
+    const agrees = wanted && (wanted === actual || actual.includes(wanted) || wanted.includes(actual));
+    if (!agrees) {
+      return { error: `“${cleanText(parsed.label, 60)}” is not the name of ${target.adminId} (“${target.title}”). I stopped so the files cannot land on the wrong card — check the target ID with /posts 50, or drop the name and rely on the ID alone.` };
+    }
+  }
+
+  const sources = [];
+  const missing = [];
+  const blocked = [];
+  const sourceFiles = [];
+  const seasons = new Set();
+  let movedFiles = 0;
+  let movedPlayers = 0;
+  let movedAnnouncements = 0;
+  for (const adminId of parsed.sourceAdminIds) {
+    if (adminId === target.adminId) continue;
+    const source = await repository.findContentByAdminId(adminId);
+    if (!source) {
+      missing.push(adminId);
+      continue;
+    }
+    if (isAdultCategory(source.category) !== isAdultCategory(target.category)) {
+      blocked.push({ adminId, title: cleanText(source.title, 70), reason: '18+ storage and age gate stay separate' });
+      continue;
+    }
+    const files = Array.isArray(source.files) ? source.files : [];
+    const summary = summarizeEpisodes(files);
+    // Per-file detection, not the split planner: a source carrying one marked
+    // season is still worth naming in the preview even though it needs no split.
+    const sourceSeasons = [...new Set(files.map((file) => detectUploadSeasonForFile(file)).filter(Boolean))].sort((first, second) => first - second);
+    for (const season of sourceSeasons) seasons.add(season);
+    sourceFiles.push(...files);
+    movedFiles += files.length;
+    movedPlayers += (Array.isArray(source.stream?.entries) ? source.stream.entries : []).length;
+    movedAnnouncements += (Array.isArray(source.announcementRefs) ? source.announcementRefs : []).length;
+    sources.push({
+      adminId: source.adminId,
+      title: cleanText(source.title, 70),
+      category: source.category,
+      files: files.length,
+      episodes: summary.count,
+      seasons: sourceSeasons,
+      players: (Array.isArray(source.stream?.entries) ? source.stream.entries : []).length,
+      announcements: (Array.isArray(source.announcementRefs) ? source.announcementRefs : []).length
+    });
+  }
+  if (!sources.length) {
+    if (blocked.length) return { error: `None of the listed posts can be merged into ${target.adminId}: ${blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}.` };
+    return { error: `There is no other post to absorb${missing.length ? ` (${missing.join(', ')} was not found)` : ''}.` };
+  }
+
+  const targetFiles = Array.isArray(target.files) ? target.files : [];
+  const targetSummary = summarizeEpisodes(targetFiles);
+  for (const season of targetFiles.map((file) => detectUploadSeasonForFile(file)).filter(Boolean)) seasons.add(season);
+
+  return {
+    plan: {
+      targetAdminId: target.adminId,
+      targetTitle: cleanText(target.title, 90),
+      targetCategory: target.category,
+      label: cleanText(parsed.label, 140) || null,
+      targetFiles: targetFiles.length,
+      targetPlayers: (Array.isArray(target.stream?.entries) ? target.stream.entries : []).length,
+      sources,
+      missing,
+      blocked,
+      movedFiles,
+      movedPlayers,
+      movedAnnouncements,
+      // The blocks the card will actually show: season attribution runs over the
+      // combined list the same way the merged card itself computes it.
+      seasons: attributeUploadSeasons([...targetFiles, ...sourceFiles]).seasons,
+      targetSeasons: [...seasons].sort((first, second) => first - second),
+      resultingFiles: targetFiles.length + movedFiles,
+      resultingEpisodes: targetSummary.count + sources.reduce((total, source) => total + (source.episodes || 0), 0)
+    }
+  };
+}
+
+export function mergePlanText(plan, config = {}) {
+  const lines = [
+    `Merge into ${plan.targetAdminId} · ${plan.targetTitle}`,
+    '',
+    `▪ Absorbing ${plan.sources.length} post${plan.sources.length === 1 ? '' : 's'} — ${plan.movedFiles} file${plan.movedFiles === 1 ? '' : 's'} move to ${plan.targetAdminId}:`,
+    ...plan.sources.map((source) => `   • ${source.adminId} · ${source.title} — ${source.files} file${source.files === 1 ? '' : 's'}${source.episodes ? `, ${source.episodes} episode${source.episodes === 1 ? '' : 's'}` : ''}${source.seasons.length ? `, S${source.seasons.join('/S')}` : ''}${source.players ? `, ${source.players} player${source.players === 1 ? '' : 's'}` : ''}`),
+    '',
+    `▪ The target keeps its own ID, slug, poster, and delivery links, then shows ${plan.resultingFiles} file${plan.resultingFiles === 1 ? '' : 's'} and ${plan.resultingEpisodes} episode${plan.resultingEpisodes === 1 ? '' : 's'}${plan.seasons.length > 1 ? ` across ${plan.seasons.length} season blocks (${plan.seasons.map((season) => `S${season}`).join(', ')})` : ''}.`,
+    plan.movedAnnouncements ? `▪ ${plan.movedAnnouncements} announcement message${plan.movedAnnouncements === 1 ? '' : 's'} for the absorbed posts will be deleted from the announcement channel${plan.movedAnnouncements === 1 ? '' : 's'}.` : '▪ None of the absorbed posts has a recorded announcement message.',
+    '▪ The files themselves stay in the private storage channel, so this can be undone with /batch and /merge drop.',
+    plan.missing.length ? `▪ Not found and skipped: ${plan.missing.join(', ')}.` : null,
+    plan.blocked.length ? `▪ Left alone: ${plan.blocked.map((entry) => `${entry.adminId} (${entry.reason})`).join('; ')}.` : null,
+    '',
+    'Confirm to apply. Nothing changes until then.'
+  ].filter((line) => line !== null);
+  return lines.join('\n').slice(0, 3_700);
+}
+
+export function mergeConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Confirm merge', 'mrg:go'), Markup.button.callback('Cancel', 'mrg:no')],
+    [Markup.button.callback('Show the cards again', 'mrg:peek')]
+  ]);
+}
+
+export function mergeInstructions() {
+  return [
+    'Merge cards so one show lives in one post.',
+    '',
+    'Put the target first, then every card to absorb:',
+    '/merge Bleach SB-0123ABCDEF SB-1111222233 SB-4444555566',
+    '/merge SB-0123ABCDEF SB-1111222233',
+    '',
+    'The title in front is only a check: I stop if that Post ID carries a different name. The target keeps its ID, slug, poster, and delivery links; every file and player of the other cards moves into it; season blocks are rebuilt (S1 with its episodes, then S2 …); and the absorbed cards are deleted from the website and their announcement messages deleted from the announcement channels.',
+    '',
+    'I show the plan first and change nothing until you tap Confirm merge (or /merge confirm). /merge cancel drops the plan.',
+    '',
+    'To trim a card instead — a whole season, or an episode added to it by mistake:',
+    '/merge drop SB-0123ABCDEF season 2',
+    '/merge drop SB-0123ABCDEF ep 5',
+    '/merge drop SB-0123ABCDEF season 2 ep 5-7',
+    'A drop only removes files from that card; the storage messages stay, so you can re-add them with /batch. Players attached to removed episodes stay until you remove them: /players SB-0123ABCDEF, then /cmd SB-0123ABCDEF del ep 5.'
+  ].join('\n');
+}
+
+/** A file name the publisher recognises, kept from its tail where the number is. */
+function shortFileName(file) {
+  const raw = cleanText(file?.name || file?.displayName || file?.sourceLabel || 'unnamed file', 160).replace(/\.[a-z0-9]{2,4}$/i, '');
+  return raw.length > 42 ? `…${raw.slice(-41)}` : raw;
+}
+
+export function mergeResultText(outcome, config = {}) {
+  if (outcome.error) return outcome.error;
+  if (outcome.plan?.groups?.length > 1) {
+    const moved = Array.isArray(outcome.moved) ? outcome.moved : [];
+    return [
+      `Merged ${moved.length || outcome.plan?.sources?.length || 0} post${(moved.length || 0) === 1 ? '' : 's'} across ${outcome.plan.groups.length} titles.`,
+      `▪ ${outcome.filesMoved || 0} file${outcome.filesMoved === 1 ? '' : 's'} moved into their target cards.`,
+      moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
+      outcome.announcementMessages?.queued
+        ? `▪ Announcement messages: ${outcome.announcementMessages.queued} copy${outcome.announcementMessages.queued === 1 ? '' : 's'} of the absorbed posts queued for deletion on the channel lane, so a Telegram limit cannot fail the merge. /sync lists what is still there.`
+        : null,
+      outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
+        ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
+        : null,
+      '▪ The private storage files were not touched, so nothing was uploaded again.'
+    ].filter(Boolean).join('\n').slice(0, 3_700);
+  }
+  const content = outcome.content || {};
+  const moved = Array.isArray(outcome.moved) ? outcome.moved : [];
+  const totalFiles = (Array.isArray(content?.files) ? content.files : []).length;
+  // One line per season block the website now shows, so the publisher can read
+  // the same structure a visitor sees without opening the page.
+  const cardFiles = Array.isArray(content?.files) ? content.files : [];
+  const isEpisodicMerge = String(content?.category || '').trim().toLowerCase() !== 'movie';
+  // A file naming a season with no episode number is that whole season in one
+  // upload, and the card files it by season. Only a file with neither belongs in a
+  // warning, so a complete-season pack is never told to come back with "Ep 12".
+  const unnumberedAll = isEpisodicMerge ? cardFiles.filter((file) => !hasEpisodeRange(file)) : [];
+  const classified = unnumberedAll.map((file) => ({ file, pack: seasonPackOf(file) }));
+  const seasonPacks = classified.map((entry) => entry.pack).filter(Boolean);
+  const unnumbered = classified.filter((entry) => !entry.pack).map((entry) => entry.file);
+  const perSeason = new Map();
+  for (const group of Array.isArray(content?.episodeGroups) ? content.episodeGroups : []) {
+    if (!group.seasonLabel) continue;
+    const current = perSeason.get(group.seasonLabel) || 0;
+    perSeason.set(group.seasonLabel, current + (group.count || 1));
+  }
+  const episodeSeasonLines = [...perSeason.entries()].map(([label, count]) => `   • ${label}: ${count} episode${count === 1 ? '' : 's'}`);
+  const packSeasons = new Map();
+  for (const pack of seasonPacks) packSeasons.set(pack.season, (packSeasons.get(pack.season) || 0) + 1);
+  const packOrder = [...packSeasons.entries()].sort((first, second) => first[0] - second[0]);
+  // A card made only of season packs says so in one summary line; repeating
+  // "complete season in 1 file" twenty times would push the real news off screen.
+  const packSeasonLines = perSeason.size
+    ? packOrder.map(([season, count]) => `   • ${formatSeasonLabel(season)}: complete season in ${count} file${count === 1 ? '' : 's'}`)
+    : [];
+  const seasonLines = [...episodeSeasonLines, ...packSeasonLines];
+  const shownSeasonLines = seasonLines.length > 8
+    ? [...seasonLines.slice(0, 7), `   • +${seasonLines.length - 7} more season${seasonLines.length - 7 === 1 ? '' : 's'}`]
+    : seasonLines;
+  const multiSeason = perSeason.size + packSeasons.size > 1;
+  const packSummary = packOrder.length
+    ? `▪ Filed as ${packOrder.length} complete season${packOrder.length === 1 ? '' : 's'} (${packOrder.slice(0, 6).map(([season, count]) => `S${season}${count > 1 ? ` ×${count}` : ''}`).join(', ')}${packOrder.length > 6 ? `, +${packOrder.length - 6} more` : ''}) — each of those files is a whole season, so it gets its own season block on the card instead of an episode number.${perSeason.size ? ' The rest of the card keeps its episode index.' : ''}`
+    : null;
+  return [
+    `Merged ${moved.length || outcome.plan?.sources?.length || 0} post${(moved.length || 0) === 1 ? '' : 's'} into ${content.adminId || outcome.plan?.targetAdminId} · ${content.title || outcome.plan?.targetTitle}.`,
+    `▪ ${totalFiles} file${totalFiles === 1 ? '' : 's'} on this card · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'}.`,
+    shownSeasonLines.length ? `▪ Season blocks on the website:\n${shownSeasonLines.join('\n')}` : null,
+    packSummary,
+    outcome.playersMerged ? `▪ ${outcome.playersMerged} player${outcome.playersMerged === 1 ? '' : 's'} moved to /players ${content.adminId}.${multiSeason ? ' Players are matched by episode number only, so check each season keeps its own link.' : ''}` : null,
+    // Files whose episode number cannot be read at all are listed rather than
+    // left invisible, because "the merge lost my episodes" is otherwise the only
+    // thing a publisher can conclude.
+    unnumbered.length
+      ? `▪ ${unnumbered.length} moved file${unnumbered.length === 1 ? '' : 's'} ${unnumbered.length === 1 ? 'has' : 'have'} no episode number and ${unnumbered.length === 1 ? 'stays' : 'stay'} outside the episode index (${unnumbered.slice(0, 3).map((file) => shortFileName(file)).join(', ')}${unnumbered.length > 3 ? `, +${unnumbered.length - 3} more` : ''}). ${unnumbered.length === 1 ? 'It' : 'They'} ${unnumbered.length === 1 ? 'is' : 'are'} still on the card and delivered as ${unnumbered.length === 1 ? 'a file' : 'files'} — re-send ${unnumbered.length === 1 ? 'it' : 'them'} with a caption like “Ep 12” to place ${unnumbered.length === 1 ? 'it' : 'them'} in the index.`
+      : null,
+    moved.length ? `▪ Deleted from the website: ${moved.map((entry) => entry.adminId).join(', ')}.` : null,
+    outcome.announcementMessages?.queued
+      ? `▪ Announcement messages: ${outcome.announcementMessages.queued} copy${outcome.announcementMessages.queued === 1 ? '' : 's'} of the absorbed posts queued for deletion on the channel lane, so a Telegram limit cannot fail the merge. /sync lists what is still there.`
+      : null,
+    outcome.announcementMessages?.deleted || outcome.announcementMessages?.failed
+      ? `▪ Announcement messages: ${outcome.announcementMessages.deleted} deleted${outcome.announcementMessages.failed ? `, ${outcome.announcementMessages.failed} could not be deleted (is the bot an admin in that channel?)` : ''}.`
+      : null,
+    outcome.plan.missing?.length ? `▪ Already gone: ${outcome.plan.missing.join(', ')}.` : null,
+    '▪ The private storage files were not touched, so nothing was uploaded again.',
+    getContentPageUrl(config, content) ? `Card: ${getContentPageUrl(config, content)}` : null
+  ].filter((line) => line !== null).join('\n').slice(0, 3_700);
+}
+
+export function mergeDropResultText(outcome, config = {}) {
+  if (outcome.error) return outcome.error;
+  const { content, removed, remaining } = outcome;
+  return [
+    `Removed ${removed.length} file${removed.length === 1 ? '' : 's'} (${outcome.description}) from ${content.adminId} · ${content.title}.`,
+    `▪ ${remaining} file${remaining === 1 ? '' : 's'} · ${content.episodeCount || 0} episode${content.episodeCount === 1 ? '' : 's'} left on the card${content.episodeCount === 0 ? ' — it is empty now, so use /delete ' + content.adminId + ' to drop the card or /batch to re-add the files' : ''}.`,
+    outcome.playersLeft ? `▪ ${outcome.playersLeft} player${outcome.playersLeft === 1 ? '' : 's'} for the removed ${outcome.playersLeft === 1 ? 'episode is' : 'episodes are'} still attached: /cmd ${content.adminId} del ep ${outcome.playerRange || 'all'}.` : null,
+    '▪ The storage messages were not deleted, so these files can be added back with /batch later.'
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Move every absorbed card's files and players onto the target, then delete the
+ * absorbed cards and their announcement messages. The plan is re-read here, so a
+ * catalog change between preview and confirmation is applied as it stands rather
+ * than from a stale snapshot.
+ */
+export async function applyMergePlan({ bot, repository, config = {}, plan = {} }) {
+  if (Array.isArray(plan.groups) && plan.groups.length > 0) {
+    const allOutcomes = [];
+    for (const group of plan.groups) {
+      const outcome = await applyMergePlan({ bot, repository, config, plan: group });
+      allOutcomes.push(outcome);
+    }
+    const successful = allOutcomes.filter((o) => !o.error);
+    if (!successful.length) {
+      return { error: allOutcomes[0]?.error || 'Nothing was merged.' };
+    }
+    const combinedMoved = successful.flatMap((o) => o.moved || []);
+    const combinedFiles = successful.reduce((sum, o) => sum + (o.filesMoved || 0), 0);
+    const combinedPlayers = successful.reduce((sum, o) => sum + (o.playersMerged || 0), 0);
+    const lastContent = successful[successful.length - 1]?.content;
+    return {
+      plan,
+      content: lastContent,
+      moved: combinedMoved,
+      missing: successful.flatMap((o) => o.missing || []),
+      blocked: successful.flatMap((o) => o.blocked || []),
+      filesMoved: combinedFiles,
+      playersMerged: combinedPlayers,
+      announcementMessages: {
+        deleted: successful.reduce((sum, o) => sum + (o.announcementMessages?.deleted || 0), 0),
+        failed: successful.reduce((sum, o) => sum + (o.announcementMessages?.failed || 0), 0),
+        queued: successful.reduce((sum, o) => sum + (o.announcementMessages?.queued || 0), 0)
+      },
+      announcementSync: successful[successful.length - 1]?.announcementSync
+    };
+  }
+  const target = await repository.findContentByAdminId(plan.targetAdminId);
+  if (!target) return { error: `${plan.targetAdminId} no longer exists, so nothing was merged.` };
+  const movedFiles = [];
+  const movedPlayers = [];
+  const aliases = [];
+  const moved = [];
+  const missing = [];
+  const blocked = [];
+  const announcementMessages = { deleted: 0, failed: 0, queued: 0 };
+  const telegram = bot?.telegram;
+
+  for (const entry of plan.sources || []) {
+    const source = await repository.findContentByAdminId(entry.adminId);
+    if (!source) {
+      missing.push(entry.adminId);
+      continue;
+    }
+    if (isAdultCategory(source.category) !== isAdultCategory(target.category)) {
+      blocked.push({ adminId: source.adminId, reason: '18+ storage and age gate stay separate' });
+      continue;
+    }
+    movedFiles.push(...(Array.isArray(source.files) ? source.files : []));
+    movedPlayers.push(...(Array.isArray(source.stream?.entries) ? source.stream.entries : []));
+    aliases.push(...[source.titleKey, source.automationKey, ...(Array.isArray(source.automationKeys) ? source.automationKeys : [])].filter(Boolean));
+    // Telegram refuses a burst of deletions the same way it refuses a burst of edits, so
+    // removing the absorbed posts' announcements runs on the lane: the merge completes
+    // whether or not the channel is willing, and /sync reports anything left behind.
+    const staleReferences = Array.isArray(source.announcementRefs) ? source.announcementRefs : [];
+    if (staleReferences.length) {
+      queueAnnouncementDeletion({ telegram, repository, content: source, references: staleReferences }, { detached: true });
+      announcementMessages.queued += staleReferences.length;
+    }
+    moved.push({
+      adminId: source.adminId,
+      title: cleanText(source.title, 70),
+      files: (Array.isArray(source.files) ? source.files : []).length
+    });
+    await repository.deleteContentByAdminId(source.adminId);
+  }
+
+  if (!moved.length) {
+    return {
+      error: missing.length
+        ? `None of the listed posts still exist (${missing.join(', ')}), so nothing was merged.`
+        : 'Every listed post was refused, so nothing was merged.'
+    };
+  }
+
+  // supersede: false — a Season 2 Episode 1 must land beside the Season 1
+  // Episode 1, unlike a re-upload of the same delivery slot, which replaces it.
+  const appended = await repository.appendFilesToContentByAdminId(target.adminId, movedFiles, aliases, { supersede: false });
+  if (!appended) return { error: `The absorbed files could not be saved on ${target.adminId}. No card was deleted.` };
+
+  let playersMerged = 0;
+  if (movedPlayers.length && typeof repository.updateContentStreamByAdminId === 'function') {
+    const stream = mergeStreamingEntries(appended.stream, movedPlayers.map((entry) => ({ entry })), { ...streamingOptionsFromConfig(config), granularity: 'exact' });
+    if (stream) {
+      await repository.updateContentStreamByAdminId(target.adminId, stream);
+      playersMerged = movedPlayers.length;
+    }
+  }
+
+  const content = await repository.findContentByAdminId(target.adminId);
+  if (content && typeof repository.updateContentStreamByAdminId === 'function' && content.stream) {
+    const refreshed = mergeContentStreamWithTelegramFiles(content.stream, content, config);
+    if (refreshed) {
+      await repository.updateContentStreamByAdminId(target.adminId, refreshed);
+    }
+  }
+  // The merged card shows a new episode summary, so its own announcement must
+  // say the same thing.
+  const sync = await queueAnnouncementSync({ telegram, repository, content, config, adminId: content?.adminId });
+  return {
+    plan,
+    content,
+    moved,
+    missing,
+    blocked,
+    filesMoved: movedFiles.length,
+    playersMerged,
+    announcementMessages,
+    announcementSync: sync
+  };
+}
+
+/**
+ * Trim files off one card: a whole season block, or specific episodes. Season
+ * attribution matches how the card was grouped, so "season 2" removes exactly
+ * what the card shows under Season 2.
+ */
+export async function applyMergeDrop({ repository, bot, config = {}, adminId, drop = {} }) {
+  const existing = await repository.findContentByAdminId(adminId);
+  if (!existing) return { error: `No published catalog post was found for ${adminId}.` };
+  const files = Array.isArray(existing.files) ? existing.files : [];
+  if (!files.length) return { error: `${existing.title} has no files attached, so there is nothing to remove.` };
+  const { entries, seasons } = attributeUploadSeasons(files);
+  if (drop.mode === 'season' && !seasons.includes(drop.season)) {
+    // A single-season card reports no blocks at all, so the season numbers that
+    // are really present are read file by file to make the refusal useful.
+    const present = [...new Set(files.map((file) => detectUploadSeasonForFile(file)).filter(Boolean))].sort((first, second) => first - second);
+    const listing = present.length ? ` (${present.map((season) => `S${season}`).join(', ')})` : '';
+    return { error: `${existing.adminId} has no Season ${drop.season} block${listing}. Nothing was removed.` };
+  }
+
+  const kept = [];
+  const removed = [];
+  for (const entry of entries) {
+    if (drop.mode === 'season') {
+      (entry.season === drop.season ? removed : kept).push(entry.file);
+      continue;
+    }
+    const start = Number(entry.file?.episode?.start);
+    const end = Number(entry.file?.episode?.end ?? entry.file?.episode?.start);
+    const overlaps = Number.isInteger(start) && Number.isInteger(end) && start <= drop.end && end >= drop.start;
+    const seasonOk = !drop.season || entry.season === drop.season;
+    (overlaps && seasonOk ? removed : kept).push(entry.file);
+  }
+  if (!removed.length) {
+    return { error: `Nothing on ${existing.adminId} matches ${describeMergeDrop(drop)}, so nothing was removed.` };
+  }
+  const content = await repository.replaceContentFilesByAdminId(existing.adminId, kept);
+  if (!content) return { error: 'The card could not be saved. Nothing was removed.' };
+
+  const players = publicStreamingData(content.stream, streamingOptionsFromConfig(config)).entries;
+  const droppedEpisodes = removed.map((file) => Number(file?.episode?.start)).filter(Number.isInteger);
+  const playersLeft = players.filter((entry) => {
+    const entryStart = Number(entry.episode?.start);
+    return Number.isInteger(entryStart) && droppedEpisodes.includes(entryStart);
+  }).length;
+  const sync = await queueAnnouncementSync({ telegram: bot?.telegram, repository, content, config, adminId: content?.adminId });
+  return {
+    content,
+    removed,
+    remaining: kept.length,
+    description: describeMergeDrop(drop),
+    playersLeft,
+    // The advice has to name the episodes that actually lost their files, not
+    // the season number, because players are matched by episode number only.
+    playerRange: droppedEpisodes.length
+      ? (() => {
+        const lowest = Math.min(...droppedEpisodes);
+        const highest = Math.max(...droppedEpisodes);
+        return lowest === highest ? `${lowest}` : `${lowest}-${highest}`;
+      })()
+      : null,
+    announcementSync: sync
+  };
+}
+
+function describeMergeDrop(drop = {}) {
+  const seasonPart = drop.season ? `Season ${drop.season} ` : '';
+  if (drop.mode === 'season') return `${seasonPart.trim()}`;
+  return drop.end && drop.end !== drop.start
+    ? `${seasonPart}Episodes ${String(drop.start).padStart(2, '0')}\u2013${String(drop.end).padStart(2, '0')}`
+    : `${seasonPart}Episode ${String(drop.start).padStart(2, '0')}`;
+}
+
+function streamImportResultText(result, config) {
+  const pages = [...new Set(result.updated
+    .flatMap(({ content, entries }) => (entries || []).map((entry) => watchPageUrl(config, content, entry?.episode)))
+    .filter(Boolean))]
+    .slice(0, 4);
+  const hasEpisodePlayers = result.updated.some(({ entries }) => (entries || []).some((entry) => episodePathRange(entry?.episode)));
+  const success = result.updated.length
+    ? `✅ Saved ${result.attachedRows} manual player link${result.attachedRows === 1 ? '' : 's'} on ${result.updated.length} existing catalog post${result.updated.length === 1 ? '' : 's'}. No Telegram announcement was sent.`
+    : 'No Watch links were saved.';
+  const availability = hasEpisodePlayers
+    ? 'Matching episode delivery pages now show Watch beside their Telegram file action. Set PUBLIC_SITE_URL on Koyeb if you also want direct episode Watch URLs here.'
+    : 'The Watch button is now available on the existing release page. Set PUBLIC_SITE_URL on Koyeb if you also want the bot to return its direct Watch URL.';
+  return [
+    success,
+    pages.length ? `Watch page${pages.length === 1 ? '' : 's'}:\n${pages.join('\n')}` : result.updated.length ? availability : null,
+    result.rejected.length ? streamImportIssueText(result.rejected).trimStart() : null
+  ].filter(Boolean).join('\n\n');
+}
+
+async function handleStreamImportUpload(ctx, repository, config) {
+  if (typeof repository?.findStreamImport !== 'function') return false;
+  const pending = await repository.findStreamImport(chatId(ctx), userId(ctx));
+  if (!pending) return false;
+  const document = ctx.message?.document;
+  if (!document) {
+    const directInput = pending.targetAdminId && ctx.message?.text
+      ? parseDirectStreamingInput(ctx.message.text)
+      : null;
+    if (directInput?.error) {
+      await ctx.reply(directInput.error);
+      return true;
+    }
+    if (directInput?.action === 'delete') {
+      const outcome = await removeAttachedPlayers({ repository, targetAdminId: pending.targetAdminId, removal: directInput.delete, config });
+      if (outcome.error) {
+        await ctx.reply(`${outcome.error} Use /players ${pending.targetAdminId} to list the current players with their numbers.`);
+        return true;
+      }
+      await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      await ctx.reply(
+        `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
+        playersKeyboard(outcome.content, playersList(outcome.content, config))
+      );
+      return true;
+    }
+    // A follow-up message may name the episode on every line, exactly like the
+    // /cmd form, so one paste fills a whole run of episodes.
+    const manual = pending.targetAdminId && ctx.message?.text
+      ? buildManualPlayerManifest(pending.targetAdminId, ctx.message.text, config)
+      : null;
+    if (manual?.error) {
+      await ctx.reply(manual.error);
+      return true;
+    }
+    if (manual?.links) {
+      const result = await applyStreamingManifest({
+        repository,
+        targetAdminId: pending.targetAdminId,
+        config,
+        granularity: 'exact',
+        manifest: manual.manifest
+      });
+      if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      const rejectedNote = manual.rejected.length
+        ? `\nSkipped ${manual.rejected.length} link${manual.rejected.length === 1 ? '' : 's'} from an unapproved host: ${manual.rejected.slice(0, 3).join(', ')}${manual.rejected.length > 3 ? '…' : ''}`
+        : '';
+      await ctx.reply(`${streamImportResultText(result, config)}${episodeCoverageNote(manual.episodes, manual.links)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${pending.targetAdminId}` : ''}`);
+      return true;
+    }
+    await ctx.reply(pending.targetAdminId
+      ? 'Watch-link import is waiting for a .json/.csv document or approved player URLs. For one episode, send “ep 1 <player URL or iframe>”; several links in one message are all saved, and each line can carry its own “ep 176 …” label. To remove players, send “del ep 2-7” or “del 3”. Or use /cmd cancel.'
+      : 'Watch-link import is waiting for one .json or .csv document. To paste one episode player directly, start with /cmd SB-0123ABCDEF ep 1 <player URL>.');
+    return true;
+  }
+  const format = inferStreamManifestFormat(document);
+  if (!format) {
+    await ctx.reply('This does not look like a .json or .csv Watch-link export. Send the provider export as a document, or use /cmd cancel.');
+    return true;
+  }
+  try {
+    await ctx.reply('Checking the manual player-link manifest…');
+    const archive = await downloadTelegramDocument({
+      document,
+      telegram: ctx.telegram,
+      options: streamingDownloadOptionsFromConfig(config),
+      label: 'streaming manifest'
+    });
+    const manifest = parseStreamingManifest(archive, {
+      format,
+      ...streamingOptionsFromConfig(config),
+      allowMissingTarget: Boolean(pending.targetAdminId)
+    });
+    const result = await applyStreamingManifest({
+      repository,
+      manifest,
+      targetAdminId: pending.targetAdminId || null,
+      config
+    });
+    if (result.updated.length) await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+    await ctx.reply(streamImportResultText(result, config));
+    if (!result.updated.length) {
+      await ctx.reply('The import remains armed so you can correct the file and send it again, or use /cmd cancel.');
+    }
+  } catch (error) {
+    const message = cleanText(error?.message || 'The streaming manifest could not be imported.', 500);
+    console.error('[telegram] streaming manifest import failed:', message);
+    await ctx.reply(`No Watch links were changed. ${message}\nThe import remains armed; correct the export and try again, or use /cmd cancel.`);
+  }
+  return true;
+}
+
+async function handleBackupRecoveryUpload(ctx, repository, config) {
+  if (typeof repository?.findBackupRecovery !== 'function') return false;
+  const recovery = await repository.findBackupRecovery(chatId(ctx), userId(ctx));
+  if (!recovery) return false;
+  const document = ctx.message?.document;
+  if (!document) {
+    await ctx.reply('Recovery is waiting for a signed SoraBox backup document. Send the .json.gz backup file as a document, not as a photo/video.');
+    return true;
+  }
+  if (typeof repository.restoreBackupData !== 'function') {
+    await ctx.reply('This catalog store cannot restore backup data.');
+    return true;
+  }
+  try {
+    await ctx.reply('Verifying the signed backup before replacing application data…');
+    const archive = await downloadTelegramDocument({
+      document,
+      telegram: ctx.telegram,
+      options: backupOptionsFromConfig(config)
+    });
+    const backup = readSignedBackupArchive({
+      archive,
+      signingSecret: config?.backup?.signingSecret,
+      options: backupOptionsFromConfig(config)
+    });
+    const counts = await repository.restoreBackupData(backup.data);
+    await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
+    await ctx.reply([
+      '✅ Backup recovery completed.',
+      `Restored signed snapshot: ${backup.createdAt || 'unknown timestamp'}.`,
+      `Application data restored: ${formatBackupCounts(counts)}.`,
+      'Your current Telegram publisher login remains active; open /posts or /stats to verify the restored catalog.'
+    ].join('\n'));
+  } catch (error) {
+    const message = cleanText(error?.message || 'The backup could not be restored.', 500);
+    console.error('[telegram] backup recovery failed:', message);
+    await ctx.reply(`Recovery was not applied. ${message}\nThe existing application data was left unchanged.`);
+  }
+  return true;
+}
+
+export { maskApiKey };
+
+export function maintenanceStatusText(active) {
+  return [
+    '🛠 Website Maintenance Mode',
+    '',
+    `Current Status: ${active ? '🔴 ON (Maintenance Active)' : '🟢 OFF (Site Online)'}`,
+    '',
+    active
+      ? 'When active: The website returns HTTP 404 with message:\n“site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box”'
+      : 'When inactive: The website is live and fully accessible.',
+    '',
+    'Click a button below to turn maintenance mode ON or OFF:'
+  ].join('\n');
+}
+
+export function maintenanceInlineKeyboard(active) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(active ? '🔴 ON (Active)' : 'Turn ON', 'maint:on'),
+      Markup.button.callback(!active ? '🟢 OFF (Online)' : 'Turn OFF', 'maint:off')
+    ],
+    [
+      Markup.button.callback('🔄 Refresh Status', 'maint:status')
+    ]
+  ]);
+}
+
+export async function handleImgApisCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const poolStatus = posterKeyPoolStatus();
+  const statsList = getAllPosterKeyStats();
+  const queueStatus = activePosterRetryQueue?.status?.() || { waiting: 0 };
+  const fallbackUrl = (typeof repository?.getFallbackPosterUrl === 'function' ? await repository.getFallbackPosterUrl() : null) || getSharedFallbackPosterUrl();
+
+  if (!statsList.length) {
+    await ctx.reply(
+      'No ImgBB API keys configured.\n\nUse /addimgapi <api_key> to add your first key.'
+    );
+    return;
+  }
+
+  const lines = [
+    '📸 ImgBB API Keys & Rotation Pool',
+    '',
+    `• Total keys: ${statsList.length} (limit: ${poolStatus.limit})`,
+    `• Active / sticky key: ${poolStatus.sticky ? maskApiKey(poolStatus.sticky) : 'None (rotates next upload)'}`,
+    `• Pool status: ${poolStatus.ready} ready, ${poolStatus.cooling} cooling, ${poolStatus.invalid} invalid`,
+    `• Retry queue: ${queueStatus.waiting || 0} poster${queueStatus.waiting === 1 ? '' : 's'} waiting`,
+    fallbackUrl ? `• Shared fallback poster: ${fallbackUrl}` : '• Shared fallback poster: Not hosted yet',
+    '',
+    'Keys Detail:'
+  ];
+
+  statsList.forEach((item, index) => {
+    let statusIcon = '🟢 Ready';
+    if (item.isInvalid) {
+      statusIcon = `🔴 Invalid (${item.invalidReason || 'Rejected by ImgBB'})`;
+    } else if (item.isCooling) {
+      statusIcon = `🟡 Rate Limited (free in ${shortDuration(item.remainingCooldownMs)})`;
+    }
+    const stickyNote = item.isSticky ? ' [ACTIVE]' : '';
+    lines.push(
+      `#${index + 1} ${maskApiKey(item.key)}${stickyNote}`,
+      `  Status: ${statusIcon}`,
+      `  Uploads: ${item.uploads || 0} picture${item.uploads === 1 ? '' : 's'}`,
+      `  Rate limit hits: ${item.refusals || 0}`
+    );
+  });
+
+  lines.push('', '💡 To add more keys: /addimgapi <api_key>');
+  lines.push('🗑️ To remove an invalid key: /removeimgapi <number>');
+  await ctx.reply(lines.join('\n'));
+}
+
+export async function handleAddImgApiCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const argument = parseCommandArgument(ctx.message?.text, 1000);
+  if (!argument) {
+    await ctx.reply(
+      'Usage: /addimgapi <api_key>\n\nExample: /addimgapi 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\n\nYou can pass one or more comma-separated ImgBB API keys. The keys will be verified, added to the rotation pool, and saved to the database so they survive server restarts.'
+    );
+    return;
+  }
+
+  const rawKeys = argument.split(/[\s,;]+/).map((k) => k.trim()).filter(Boolean);
+  if (!rawKeys.length) {
+    await ctx.reply('Please provide at least one valid ImgBB API key.');
+    return;
+  }
+
+  const added = [];
+  const rejected = [];
+  const alreadyPresent = [];
+  for (const key of rawKeys) {
+    if (key.length < 8) {
+      rejected.push(`${maskApiKey(key)} (too short)`);
+      continue;
+    }
+    const existing = typeof repository?.getPosterApiKeys === 'function' ? await repository.getPosterApiKeys() : [];
+    if (existing.includes(key)) {
+      alreadyPresent.push(maskApiKey(key));
+      continue;
+    }
+
+    const testResult = await testPosterApiKey(key);
+    if (testResult.invalid) {
+      rejected.push(`${maskApiKey(key)} (${testResult.detail})`);
+      continue;
+    }
+
+    if (typeof repository?.addPosterApiKey === 'function') {
+      await repository.addPosterApiKey(key, userId(ctx));
+    }
+    addPosterApiKey(key);
+    if (config) {
+      config.imgbbApiKeys = parseImgBBKeys([...(config.imgbbApiKeys || []), key]);
+      if (!config.imgbbApiKey) config.imgbbApiKey = key;
+    }
+    const note = testResult.verified ? ' [verified]' : testResult.rateLimited ? ' [cooling]' : '';
+    added.push(`${maskApiKey(key)}${note}`);
+  }
+
+  const total = posterKeyPoolStatus().configured;
+  const responseLines = [];
+  if (added.length) {
+    responseLines.push(`✓ Added ${added.length} ImgBB API key${added.length === 1 ? '' : 's'}: ${added.join(', ')}`);
+    responseLines.push(`Total active keys in pool: ${total}.`);
+    responseLines.push('These keys are saved in the database and will survive restarts. Uploads will rotate automatically if one is rate limited.');
+  }
+  if (alreadyPresent.length) {
+    responseLines.push(`Already in pool: ${alreadyPresent.join(', ')}`);
+  }
+  if (rejected.length) {
+    responseLines.push(`⚠️ Rejected keys: ${rejected.join(', ')}`);
+  }
+  if (!added.length && !alreadyPresent.length && !rejected.length) {
+    responseLines.push('No valid API keys were found in your command. ImgBB API keys are usually 32 characters long.');
+  }
+  await ctx.reply(responseLines.join('\n'));
+}
+
+export async function handleRemoveImgApiCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const argument = parseCommandArgument(ctx.message?.text, 500);
+  if (!argument) {
+    await ctx.reply('Usage: /removeimgapi <api_key_or_number>\nExample: /removeimgapi 1 or /removeimgapi <key>');
+    return;
+  }
+  const pool = getAllPosterKeyStats();
+  let targetKey = null;
+  const indexNum = Number.parseInt(argument, 10);
+  if (Number.isInteger(indexNum) && indexNum >= 1 && indexNum <= pool.length) {
+    targetKey = pool[indexNum - 1].key;
+  } else {
+    const match = pool.find((entry) => entry.key === argument || entry.key.includes(argument));
+    if (match) targetKey = match.key;
+  }
+  if (!targetKey) {
+    await ctx.reply(`Key not found: "${argument}". Use /imgapis to view active keys.`);
+    return;
+  }
+  if (typeof repository?.removePosterApiKey === 'function') {
+    await repository.removePosterApiKey(targetKey);
+  }
+  removePosterApiKey(targetKey);
+  if (config) {
+    config.imgbbApiKeys = (config.imgbbApiKeys || []).filter((k) => k !== targetKey);
+    if (config.imgbbApiKey === targetKey) {
+      config.imgbbApiKey = config.imgbbApiKeys[0] || '';
+    }
+  }
+  await ctx.reply(`✓ Removed ImgBB API key: ${maskApiKey(targetKey)}. Remaining keys: ${posterKeyPoolStatus().configured}`);
+}
+
+export async function handleMaintenanceCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const active = typeof repository?.isMaintenanceActive === 'function' ? await repository.isMaintenanceActive() : false;
+  await ctx.reply(maintenanceStatusText(active), maintenanceInlineKeyboard(active));
+}
+
+export async function handleMaintenanceAction(ctx, repository, config, action = null) {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await acknowledgeTap(ctx, 'Publisher access required.', { alert: true });
+    return;
+  }
+  const act = action || ctx.match?.[0] || ctx.match?.[1];
+  let active = typeof repository?.isMaintenanceActive === 'function' ? await repository.isMaintenanceActive() : false;
+
+  if (act === 'maint:on') {
+    if (typeof repository?.setMaintenanceSettings === 'function') {
+      await repository.setMaintenanceSettings({ enabled: true, updatedBy: userId(ctx) });
+    }
+    active = true;
+    await acknowledgeTap(ctx, 'Maintenance mode turned ON');
+  } else if (act === 'maint:off') {
+    if (typeof repository?.setMaintenanceSettings === 'function') {
+      await repository.setMaintenanceSettings({ enabled: false, updatedBy: userId(ctx) });
+    }
+    active = false;
+    await acknowledgeTap(ctx, 'Maintenance mode turned OFF');
+  } else {
+    await acknowledgeTap(ctx, 'Status refreshed');
+  }
+
+  try {
+    await ctx.editMessageText(maintenanceStatusText(active), maintenanceInlineKeyboard(active));
+  } catch {
+    // Message text may be identical
+  }
+}
+
+let botInstanceStartedAt = Date.now();
+
+export async function handleRestartCommand(ctx, repository, config, onRestart = null, { delayMs = 2000 } = {}) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const messageDateMs = (ctx.message?.date || 0) * 1000;
+  if (messageDateMs > 0 && typeof botInstanceStartedAt === 'number' && messageDateMs < botInstanceStartedAt - 5000) {
+    console.warn('[telegram] Ignoring stale /restart command received from before bot startup.');
+    return;
+  }
+  await ctx.reply('🔄 Restarting SoraBox service now... The bot and website will be back up in a few seconds.');
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+  const doRestart = async () => {
+    if (typeof onRestart === 'function') {
+      try {
+        await onRestart();
+      } catch (err) {
+        console.error('[telegram] onRestart failed:', err);
+      }
+    } else {
+      console.info('[server] Restart command received; exiting process for container restart.');
+      process.exit(0);
+    }
+  };
+  if (waitMs > 0) {
+    setTimeout(doRestart, waitMs).unref?.();
+  } else {
+    await doRestart();
+  }
+}
+
+export async function handleScrapeCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return { handled: false, error: 'Unauthorized' };
+
+  const parsed = parseScrapeArguments(ctx.message?.text);
+  if (parsed.empty || !parsed.url) {
+    await ctx.reply([
+      'Usage: /scrape <Post ID> <URL>',
+      'Example: /scrape SB-0123ABCDEF https://www.imdb.com/title/tt43056433/',
+      '',
+      'You can also use /scrape <URL> while editing an active draft.',
+      '',
+      'Supported sites: IMDb, Netflix, MyAnimeList, AniList, Wikipedia, and any web page with movie/series info and artwork.'
+    ].join('\n'));
+    return { handled: true, error: 'Usage prompt displayed' };
+  }
+
+  let adminId = parsed.adminId;
+  let isDraft = false;
+  let session = null;
+
+  if (!adminId) {
+    session = await repository.findSession?.(chatId(ctx), userId(ctx));
+    if (session) {
+      isDraft = true;
+    } else {
+      await ctx.reply(`Provide a Post ID or start an active draft first.\nExample: /scrape SB-0123ABCDEF ${parsed.url}`);
+      return { handled: true, error: 'No Post ID or active draft' };
+    }
+  }
+
+  let existing = null;
+  if (!isDraft) {
+    existing = await repository.findContentByAdminId(adminId);
+    if (!existing) {
+      await ctx.reply(`No published catalog post was found for ${adminId}. Use /posts, /postid, or /search <title> to find an ID.`);
+      return { handled: true, error: 'Post not found' };
+    }
+  }
+
+  let domain = 'web page';
+  try {
+    domain = new URL(parsed.url).hostname.replace(/^www\./, '');
+  } catch {}
+
+  await ctx.reply(`Scraping info and artwork from ${domain}…`);
+
+  const scraped = await scrapeMetadataFromUrl(parsed.url, { config });
+  if (scraped.error || (!scraped.title && !scraped.description && !scraped.posterUrl)) {
+    await ctx.reply(`Could not scrape metadata: ${scraped.error || 'No media information found on that page.'}`);
+    return { handled: true, error: scraped.error || 'No metadata' };
+  }
+
+  const inferredCategory = scraped.category || categoryFromHints({ hints: scraped, minimumScore: 0.3 }) || null;
+  let mirroredPosterUrl = null;
+  if (scraped.posterUrl) {
+    const titleForArt = scraped.title || (isDraft ? session?.title : existing?.title) || 'Scraped Artwork';
+    const categoryForArt = inferredCategory || (isDraft ? session?.category : existing?.category) || 'movie';
+    try {
+      const mirrorResult = await mirrorPosterToImgBB({
+        sourceUrl: scraped.posterUrl,
+        fallbackUrls: scraped.posterFallbackUrls || [],
+        sourceIsManual: true,
+        title: titleForArt,
+        category: categoryForArt,
+        config: config || {},
+        repository
+      });
+      mirroredPosterUrl = mirrorResult?.url || null;
+    } catch (err) {
+      if (isPosterRateLimit(err) && !isDraft && existing) {
+        try {
+          const image = await preparePosterImage({
+            sourceUrl: scraped.posterUrl,
+            fallbackUrls: scraped.posterFallbackUrls || [],
+            sourceIsManual: true,
+            title: titleForArt,
+            category: categoryForArt
+          });
+          queuePosterRetry({
+            adminId,
+            title: titleForArt,
+            image,
+            notifyChatId: chatId(ctx),
+            retryAfterMs: err.retryAfterMs || (err.allKeysCooling ? 3_600_000 : undefined)
+          });
+        } catch {}
+      }
+      mirroredPosterUrl = scraped.posterUrl;
+    }
+  }
+
+  if (isDraft) {
+    const draftUpdates = {};
+    if (scraped.title) draftUpdates.title = scraped.title;
+    if (scraped.year) draftUpdates.year = scraped.year;
+    if (scraped.description) draftUpdates.description = scraped.description;
+    if (Array.isArray(scraped.genres) && scraped.genres.length) draftUpdates.genres = scraped.genres;
+    // Never overwrite audio/subtitle languages from scraped websites; only use what the draft files actually have.
+    const draftFiles = Array.isArray(session?.files) ? session.files : [];
+    const draftFileAudio = summarizeUploadLanguages(draftFiles);
+    const draftFileSubs = summarizeSubtitleLanguages(draftFiles);
+    if (draftFileAudio.length) draftUpdates.languages = draftFileAudio;
+    if (draftFileSubs.length && session?.subtitleLanguageSource !== 'manual') draftUpdates.subtitleLanguages = draftFileSubs;
+    if (scraped.releaseLabel) draftUpdates.releaseLabel = scraped.releaseLabel;
+    if (inferredCategory && CATEGORY_IDS.has(inferredCategory) && session?.category !== ADULT_CATEGORY) {
+      draftUpdates.category = inferredCategory;
+    }
+    if (mirroredPosterUrl) {
+      draftUpdates.posterOriginalUrl = mirroredPosterUrl;
+      draftUpdates.posterUrl = mirroredPosterUrl;
+    }
+    await repository.updateSession(chatId(ctx), userId(ctx), draftUpdates);
+
+    const lines = [
+      `Scraped from ${domain} and updated active draft:`,
+      draftUpdates.title ? `▪ Title: ${draftUpdates.title}` : null,
+      draftUpdates.category ? `▪ Category: ${draftUpdates.category}` : null,
+      draftUpdates.year ? `▪ Year: ${draftUpdates.year}` : null,
+      draftUpdates.genres?.length ? `▪ Genres: ${draftUpdates.genres.join(', ')}` : null,
+      draftUpdates.languages?.length ? `▪ Languages (from files): ${draftUpdates.languages.join(', ')}` : null,
+      draftUpdates.releaseLabel ? `▪ Type: ${draftUpdates.releaseLabel}` : null,
+      draftUpdates.description ? `▪ Synopsis: ${cleanText(draftUpdates.description, 140)}` : null,
+      mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : '▪ Artwork: None found',
+      '',
+      'Use /status to inspect the draft or /done to publish.'
+    ].filter(Boolean);
+    await ctx.reply(lines.join('\n'));
+    return { handled: true, isDraft: true, scraped, updates: draftUpdates };
+  }
+
+  // Published post
+  const patch = {};
+  if (scraped.title) patch.title = scraped.title;
+  if (scraped.year) patch.year = scraped.year;
+  if (scraped.description) patch.description = scraped.description;
+  if (Array.isArray(scraped.genres) && scraped.genres.length) patch.genres = scraped.genres;
+  // Never overwrite audio/subtitle languages from scraped websites; only use what the stored files actually have.
+  const existingFiles = Array.isArray(existing?.files) ? existing.files : [];
+  if (existingFiles.length) {
+    const fileAudio = summarizeUploadLanguages(existingFiles);
+    const fileSubs = summarizeSubtitleLanguages(existingFiles);
+    if (fileAudio.length && existing.languageSource !== 'manual') {
+      patch.languages = fileAudio;
+      patch.languageSource = 'upload';
+    }
+    if (fileSubs.length && existing.subtitleLanguageSource !== 'manual') {
+      patch.subtitleLanguages = fileSubs;
+      patch.subtitleLanguageSource = 'upload';
+    }
+  }
+  if (
+    inferredCategory
+    && CATEGORY_IDS.has(inferredCategory)
+    && existing.category !== ADULT_CATEGORY
+    && !(inferredCategory === 'movie' && Number(existing.episodeCount) > 1)
+  ) {
+    patch.category = inferredCategory;
+  }
+  if (scraped.releaseLabel) patch.releaseLabel = scraped.releaseLabel;
+  if (mirroredPosterUrl) {
+    patch.posterUrl = mirroredPosterUrl;
+    patch.backdropUrl = mirroredPosterUrl;
+    patch.poster = {
+      provider: 'imgbb',
+      originalUrl: scraped.posterUrl,
+      source: scraped.provider || domain,
+      title: scraped.title || existing.title,
+      mirroredAt: new Date().toISOString()
+    };
+  }
+  if (Array.isArray(existing?.announcementRefs) && existing.announcementRefs.length) {
+    patch.announcementRefs = existing.announcementRefs.map((ref) => {
+      if (!ref || (!ref.syncError && !ref.posterUpgrade)) return ref;
+      const cleanedRef = { ...ref };
+      delete cleanedRef.syncError;
+      delete cleanedRef.posterUpgrade;
+      return cleanedRef;
+    });
+  }
+
+  let updated = await repository.updateContentByAdminId(adminId, patch);
+  if (typeof repository.reindexContent === 'function') {
+    await repository.reindexContent({ adminId }).catch(() => {});
+    updated = (await repository.findContentByAdminId?.(adminId)) || updated;
+  } else if (patch.title && updated) {
+    const rebuiltIndex = reindexContentRecord(updated);
+    if (rebuiltIndex.changed) {
+      updated = (await repository.updateContentByAdminId(adminId, rebuiltIndex.patch)) || updated;
+    }
+  }
+  const syncJob = queueAnnouncementSync({
+    telegram: ctx.telegram,
+    repository,
+    content: updated || existing,
+    config,
+    adminId: (updated || existing).adminId,
+    notifyChatId: chatId(ctx)
+  });
+  const syncOutcome = await settleQueuedJob(syncJob);
+
+  const pageUrl = updated ? getContentPageUrl(config || {}, updated) : null;
+  const syncLine = syncOutcome?.settled && syncOutcome.result
+    ? `▪ Channel announcement: ${announcementSyncNote(syncOutcome.result)}`
+    : '▪ Channel announcement: Queued for update';
+  const lines = [
+    `Scraped from ${domain} and updated ${(updated || existing).adminId} · ${(updated || existing).title}:`,
+    patch.title ? `▪ Title: ${patch.title}` : null,
+    patch.category ? `▪ Category: ${patch.category}` : null,
+    patch.year ? `▪ Year: ${patch.year}` : null,
+    patch.genres?.length ? `▪ Genres: ${patch.genres.join(', ')}` : null,
+    patch.languages?.length ? `▪ Languages (from files): ${patch.languages.join(', ')}` : null,
+    patch.releaseLabel ? `▪ Type: ${patch.releaseLabel}` : null,
+    patch.description ? `▪ Synopsis: ${cleanText(patch.description, 140)}` : null,
+    mirroredPosterUrl ? `▪ Artwork: ${mirroredPosterUrl.includes('ibb.co') ? 'Mirrored to ImgBB and saved' : 'Image link saved'}` : null,
+    syncLine,
+    pageUrl ? `Card: ${pageUrl}` : null
+  ].filter(Boolean);
+  await ctx.reply(lines.join('\n'));
+  return { handled: true, isDraft: false, scraped, updated, patch };
+}
+
+export { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
+
+const REMOVE_FILE_POSTS_PAGE_SIZE = 8;
+const REMOVE_FILE_ITEMS_PAGE_SIZE = 8;
+
+export function formatRemoveFileButtonLabel(file, index = 0) {
+  const quality = cleanText(file?.quality || detectMediaQuality({
+    caption: file?.sourceLabel || file?.displayName,
+    filename: file?.name,
+    height: file?.height,
+    width: file?.width
+  }), 24);
+  const episodeLabel = cleanText(
+    file?.episodeLabel
+    || (Number.isInteger(Number(file?.episode?.start))
+      ? (Number.isInteger(Number(file?.seasonNumber))
+        ? `S${file.seasonNumber} E${file.episode.start}`
+        : `Episode ${file.episode.start}`)
+      : ''),
+    32
+  );
+  const cleanedName = cleanText(
+    cleanDeliveryFileName(file?.displayName || file?.name || file?.sourceLabel || '')
+    || file?.displayName
+    || file?.name
+    || `File ${index + 1}`,
+    48
+  );
+  const parts = [];
+  if (episodeLabel) {
+    parts.push(episodeLabel);
+    if (cleanedName && cleanedName.toLowerCase() !== episodeLabel.toLowerCase()) {
+      parts.push(cleanedName);
+    }
+  } else {
+    parts.push(cleanedName || `File ${index + 1}`);
+  }
+  const base = parts.join(' · ');
+  return telegramButtonText(quality ? `${base} [${quality}]` : base);
+}
+
+async function listPostsForFileRemoval(repository, query = '') {
+  let posts = [];
+  if (typeof repository?.listRecentContentForAdmin === 'function') {
+    posts = await repository.listRecentContentForAdmin(100, { includeAdult: true });
+  } else if (typeof repository?.listAdminContent === 'function') {
+    posts = await repository.listAdminContent({ limit: 100 });
+  }
+  const list = Array.isArray(posts) ? posts : [];
+  const trimmed = cleanText(query, 120).toLowerCase();
+  if (!trimmed) return list;
+  return list.filter((post) => {
+    const title = cleanText(post?.title, 180).toLowerCase();
+    const adminId = cleanText(post?.adminId, 40).toLowerCase();
+    const slug = cleanText(post?.slug, 180).toLowerCase();
+    return title.includes(trimmed) || adminId.includes(trimmed) || slug.includes(trimmed);
+  });
+}
+
+async function renderRemoveFilePostsPicker(ctx, repository, { page = 0, query = '', edit = false } = {}) {
+  const posts = await listPostsForFileRemoval(repository, query);
+  if (!posts.length) {
+    const text = query
+      ? `No published posts matched "${cleanText(query, 80)}". Try /removefile with a Post ID (e.g. /removefile SB-0123ABCDEF) or /removefile with no arguments to browse recent posts.`
+      : 'No published posts were found in the catalog.';
+    if (edit) await replaceInteractiveMessage(ctx, text);
+    else await ctx.reply(text);
+    return { handled: true, mode: 'empty-posts' };
+  }
+  const totalPages = Math.max(1, Math.ceil(posts.length / REMOVE_FILE_POSTS_PAGE_SIZE));
+  const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const slice = posts.slice(clampedPage * REMOVE_FILE_POSTS_PAGE_SIZE, (clampedPage + 1) * REMOVE_FILE_POSTS_PAGE_SIZE);
+  const rows = slice.map((post) => {
+    const fileCount = Array.isArray(post?.files) ? post.files.length : (Number(post?.fileCount) || 0);
+    const label = telegramButtonText(`🎬 ${cleanText(post.title, 30)} (${post.adminId} · ${fileCount} file${fileCount === 1 ? '' : 's'})`);
+    return [Markup.button.callback(label, `rmfile:post:${post.adminId}:0`)];
+  });
+  if (totalPages > 1) {
+    const nav = [];
+    if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:posts:${clampedPage - 1}`));
+    nav.push(Markup.button.callback(`Page ${clampedPage + 1}/${totalPages}`, 'rmfile:noop'));
+    if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:posts:${clampedPage + 1}`));
+    rows.push(nav);
+  }
+  const text = [
+    'Select a post below to inspect or remove its episodes, movie files, or series files:',
+    query ? `Filter: "${cleanText(query, 60)}" (${posts.length} matching post${posts.length === 1 ? '' : 's'})` : `Showing ${slice.length} of ${posts.length} recent post${posts.length === 1 ? '' : 's'}.`,
+    'You can also jump directly with: /removefile SB-0123ABCDEF'
+  ].join('\n');
+  const keyboard = Markup.inlineKeyboard(rows);
+  if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+  else await ctx.reply(text, keyboard);
+  return { handled: true, mode: 'posts', page: clampedPage, total: posts.length };
+}
+
+export async function renderRemoveFileListForPost(ctx, repository, adminId, { page = 0, edit = false, notice = null } = {}) {
+  const content = await repository.findContentByAdminId?.(adminId);
+  if (!content) {
+    const text = `No published catalog post was found for ${adminId}. Use /removefile to choose from recent posts.`;
+    const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Choose a post', 'rmfile:posts:0')]]);
+    if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+    else await ctx.reply(text, keyboard);
+    return { handled: true, mode: 'missing-post' };
+  }
+  const files = Array.isArray(content.files) ? content.files : [];
+  if (!files.length) {
+    const text = [
+      notice,
+      `${content.adminId} · ${content.title} has no remaining files attached.`,
+      'You can delete the empty post or go back to choose another post.'
+    ].filter(Boolean).join('\n\n');
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(`🗑 Delete empty post ${content.adminId}`, `rmfile:delpost:${content.adminId}`)],
+      [Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0')]
+    ]);
+    if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+    else await ctx.reply(text, keyboard);
+    return { handled: true, mode: 'empty-files', content };
+  }
+  const totalPages = Math.max(1, Math.ceil(files.length / REMOVE_FILE_ITEMS_PAGE_SIZE));
+  const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const startIdx = clampedPage * REMOVE_FILE_ITEMS_PAGE_SIZE;
+  const slice = files.slice(startIdx, startIdx + REMOVE_FILE_ITEMS_PAGE_SIZE);
+  const rows = slice.map((file, offset) => {
+    const fileIndex = startIdx + offset;
+    return [Markup.button.callback(
+      formatRemoveFileButtonLabel(file, fileIndex),
+      `rmfile:pick:${content.adminId}:${fileIndex}:${clampedPage}`
+    )];
+  });
+  if (totalPages > 1) {
+    const nav = [];
+    if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:post:${content.adminId}:${clampedPage - 1}`));
+    nav.push(Markup.button.callback(`Page ${clampedPage + 1}/${totalPages}`, 'rmfile:noop'));
+    if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:post:${content.adminId}:${clampedPage + 1}`));
+    rows.push(nav);
+  }
+  rows.push([Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0')]);
+  const text = [
+    notice,
+    `▸ ${content.adminId} · ${content.title} (${files.length} file${files.length === 1 ? '' : 's'})`,
+    'Tap any episode, movie file, or series file below to remove it:'
+  ].filter(Boolean).join('\n\n');
+  const keyboard = Markup.inlineKeyboard(rows);
+  if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+  else await ctx.reply(text, keyboard);
+  return { handled: true, mode: 'files', content, page: clampedPage, count: files.length };
+}
+
+export async function handleRemoveFileCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return { handled: false, error: 'Unauthorized' };
+  const argument = parseCommandArgument(ctx.message?.text, 300).trim();
+  const explicitIds = postIdsFromCommand(argument);
+  if (explicitIds.length) {
+    return renderRemoveFileListForPost(ctx, repository, explicitIds[0], { page: 0, edit: false });
+  }
+  if (argument) {
+    const matched = await listPostsForFileRemoval(repository, argument);
+    if (matched.length === 1) {
+      return renderRemoveFileListForPost(ctx, repository, matched[0].adminId, { page: 0, edit: false });
+    }
+    return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: argument, edit: false });
+  }
+  return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: '', edit: false });
+}
+
+export async function handleRemoveFileAction(ctx, repository, config, actionData = '') {
+  if (!(await isPublisher(ctx, repository, config))) return false;
+  const key = String(actionData || ctx.callbackQuery?.data || '');
+  if (!key.startsWith('rmfile:')) return false;
+
+  if (key === 'rmfile:noop') {
+    await acknowledgeTap(ctx);
+    return true;
+  }
+
+  const postsPageMatch = key.match(/^rmfile:posts:(\d{1,3})$/);
+  if (postsPageMatch) {
+    await acknowledgeTap(ctx);
+    await renderRemoveFilePostsPicker(ctx, repository, { page: Number(postsPageMatch[1]), edit: true });
+    return true;
+  }
+
+  const postMatch = key.match(/^rmfile:post:(SB-[A-F0-9]{10}):(\d{1,3})$/i);
+  if (postMatch) {
+    await acknowledgeTap(ctx);
+    await renderRemoveFileListForPost(ctx, repository, postMatch[1].toUpperCase(), { page: Number(postMatch[2]), edit: true });
+    return true;
+  }
+
+  const pickMatch = key.match(/^rmfile:pick:(SB-[A-F0-9]{10}):(\d{1,4}):(\d{1,3})$/i);
+  if (pickMatch) {
+    const adminId = pickMatch[1].toUpperCase();
+    const fileIndex = Number(pickMatch[2]);
+    const page = Number(pickMatch[3]) || 0;
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    const file = files[fileIndex];
+    if (!content || !file) {
+      await acknowledgeTap(ctx, 'That file is no longer in this post.', { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page, edit: true, notice: '⚠ That file was already removed.' });
+      return true;
+    }
+    await acknowledgeTap(ctx);
+    const label = formatRemoveFileButtonLabel(file, fileIndex);
+    const quality = cleanText(file.quality || detectMediaQuality({
+      caption: file.sourceLabel || file.displayName,
+      filename: file.name,
+      height: file.height,
+      width: file.width
+    }), 24);
+    const audio = (Array.isArray(file.audioLanguages) && file.audioLanguages.length ? file.audioLanguages : (file.languages || [])).join(', ');
+    const text = [
+      `Selected file in ${content.adminId} · ${content.title}:`,
+      `▪ Name: ${label}`,
+      file.name ? `▪ Filename: ${cleanText(file.name, 120)}` : null,
+      file.episodeLabel ? `▪ Episode: ${file.episodeLabel}` : null,
+      quality ? `▪ Quality: ${quality}` : null,
+      audio ? `▪ Audio: ${audio}` : null,
+      file.storageMessageId ? `▪ Storage ID: ${file.storageMessageId}` : null,
+      '',
+      'Would you like to remove this file from the post, or go back?'
+    ].filter(Boolean).join('\n');
+    const msgToken = file.storageMessageId != null ? String(file.storageMessageId) : 'idx';
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('⬅️ Go back', `rmfile:post:${content.adminId}:${page}`),
+        Markup.button.callback('🗑 Remove', `rmfile:do:${content.adminId}:${fileIndex}:${msgToken}:${page}`)
+      ]
+    ]);
+    await replaceInteractiveMessage(ctx, text, keyboard);
+    return true;
+  }
+
+  const doMatch = key.match(/^rmfile:do:(SB-[A-F0-9]{10}):(\d{1,4}):([A-Za-z0-9_-]+):(\d{1,3})$/i);
+  if (doMatch) {
+    const adminId = doMatch[1].toUpperCase();
+    const fileIndex = Number(doMatch[2]);
+    const storageToken = doMatch[3];
+    const page = Number(doMatch[4]) || 0;
+    if (typeof repository.removeFileFromContentByAdminId !== 'function') {
+      await acknowledgeTap(ctx, 'File removal is not supported by this repository.', { alert: true });
+      return true;
+    }
+    const outcome = await repository.removeFileFromContentByAdminId(adminId, {
+      fileIndex,
+      storageMessageId: storageToken === 'idx' ? null : storageToken
+    });
+    if (!outcome || !outcome.removed) {
+      await acknowledgeTap(ctx, 'That file was already removed.', { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page, edit: true, notice: '⚠ That file was already removed.' });
+      return true;
+    }
+    const removedLabel = formatRemoveFileButtonLabel(outcome.removed, fileIndex);
+    await acknowledgeTap(ctx, `Removed ${removedLabel}`);
+    if (outcome.content && outcome.remainingCount > 0) {
+      queueAnnouncementSync({
+        telegram: ctx.telegram,
+        repository,
+        content: outcome.content,
+        config,
+        adminId: outcome.content.adminId,
+        notifyChatId: chatId(ctx)
+      }, { detached: true });
+    }
+    await renderRemoveFileListForPost(ctx, repository, adminId, {
+      page,
+      edit: true,
+      notice: `✓ Removed "${removedLabel}" from ${adminId} (${outcome.remainingCount} file${outcome.remainingCount === 1 ? '' : 's'} remaining).`
+    });
+    return true;
+  }
+
+  const delPostMatch = key.match(/^rmfile:delpost:(SB-[A-F0-9]{10})$/i);
+  if (delPostMatch) {
+    const adminId = delPostMatch[1].toUpperCase();
+    const deleted = await repository.deleteContentByAdminId?.(adminId);
+    if (deleted) {
+      const references = Array.isArray(deleted.announcementRefs) ? deleted.announcementRefs : [];
+      if (references.length) {
+        queueAnnouncementDeletion({ telegram: ctx.telegram, repository: null, content: deleted, references }, { detached: true });
+      }
+      await acknowledgeTap(ctx, `Deleted ${adminId}`);
+      await renderRemoveFilePostsPicker(ctx, repository, { page: 0, edit: true });
+    } else {
+      await acknowledgeTap(ctx, `${adminId} was already deleted.`, { alert: true });
+      await renderRemoveFilePostsPicker(ctx, repository, { page: 0, edit: true });
+    }
+    return true;
+  }
+
+  return false;
+}
+
+export const HELP_TOPICS = {
+  publish: {
+    id: 'publish',
+    button: '📤 Publish & Drafts',
+    title: '📤 Publish & Manual Drafts — What It Is For & How It Works',
+    text: [
+      '📤 PUBLISH & MANUAL DRAFTS',
+      'What this is for: Creating a new movie, series, anime, cartoon, donghua, K-Drama, TV/OTT, or private 18+ release by uploading files directly to the bot.',
+      '',
+      'Commands (What each is for):',
+      '• /panel — Opens category buttons to start a new draft.',
+      '• /movie <Title> — Starts a Movie draft.',
+      '• /anime <Title> — Starts an Anime draft.',
+      '• /cartoon <Title> — Starts a Cartoon draft.',
+      '• /donghua <Title> — Starts a Donghua (Chinese animation) draft.',
+      '• /kdrama <Title> — Starts a K-Drama draft.',
+      '• /series <Title> — Starts a Web Series draft.',
+      '• /tv <Title> (or /ott <Title>) — Starts a TV & OTT show draft.',
+      '• /18db <Title> (or /adultdb <Title>) — Starts a private 18+ draft (stored in TELEGRAM_ADULT_STORAGE_CHANNEL_ID, never announced publicly, protected by age gate).',
+      '• /status — Shows your active draft, its metadata, and how many files are attached.',
+      '• /done — Publishes the draft: fetches metadata, mirrors poster to ImgBB, creates website card + delivery link + player qualities, and posts to announcement channels.',
+      '• /cancel — Discards the current draft without publishing.',
+      '',
+      'How it works step-by-step:',
+      '1. Start a draft with a category command (e.g. /anime Solo Leveling) or tap a category on /panel.',
+      '2. Upload your video/document files to this private chat. Episode numbers, seasons, qualities (144p, 240p, 288p, 480p, 544p, 720p, 1080p, 4K, etc.), and audio/subtitle languages are detected from captions and filenames automatically.',
+      '3. Optional: Override draft details before publishing (/lang, /subtitles, /year, /genres, /description, /poster, or /scrape <URL>).',
+      '4. Send /done (or tap Publish now) to publish.'
+    ].join('\n')
+  },
+  batch: {
+    id: 'batch',
+    button: '📦 Batch & Auto-Publish',
+    title: '📦 Batch Import & Storage Auto-Publish — What It Is For & How It Works',
+    text: [
+      '📦 BATCH IMPORT & AUTO-PUBLISH',
+      'What this is for: Publishing files that are already inside your private Telegram database channel — either by message range (/batch) or automatically as you upload (/auto).',
+      '',
+      'Commands (What each is for):',
+      '• /batch [Optional Title] — Starts a range import from your private database channel.',
+      '• /batch <category> | <Optional Title> — Forces a specific category for the batch (e.g. /batch anime | Demon Slayer or /batch adult | Private Title).',
+      '• /auto — Opens ON/OFF controls for automatic storage-channel publishing.',
+      '• /teststorage — Verifies the bot has admin access to your private database channel(s).',
+      '',
+      'How /batch works:',
+      '1. Send /batch (leave title blank to auto-detect from filenames/captions, or provide a title).',
+      '2. Copy and send the FIRST and LAST message links from your private database channel (https://t.me/c/<channel-id>/<msg-id>).',
+      '3. The bot scans every message in that inclusive range, strips release/platform noise (dsnk, dsnp, 4k, 544p, DDP5.1, file sizes, @handles), groups separate titles or seasons automatically, matches metadata/category/poster, and publishes.',
+      '',
+      'How /auto works:',
+      '1. Turn automation ON via /auto.',
+      '2. Whenever files are posted to your private database channel, the bot groups matching titles and waits 90 seconds of quiet (up to 15 minutes max) so all episodes/qualities land in one post.',
+      '3. Later uploads of the same title automatically append to the existing catalog post.'
+    ].join('\n')
+  },
+  edit: {
+    id: 'edit',
+    button: '✏️ Edit Posts & Titles',
+    title: '✏️ Edit Published Posts & Titles — What It Is For & How It Works',
+    text: [
+      '✏️ EDIT PUBLISHED POSTS & TITLES',
+      'What this is for: Renaming or updating metadata on an active draft, a single published post (by Post ID), or many published posts at once.',
+      '',
+      'Commands (What each is for):',
+      '• /title SB-ID <New Title> — Renames a published post, re-matches its poster & category (e.g. cartoon/anime/movie), and updates its Telegram channel announcement.',
+      '• /titlebatch — Renames multiple posts in one message (one "SB-ID New Title" per line, or separated by " , "). Add --merge to auto-merge duplicate titles.',
+      '• /category SB-ID[, SB-ID2] <category> — Changes category (movie, anime, cartoon, donghua, kdrama, series, tv, adult) and updates announcements.',
+      '• /lang SB-ID[, SB-ID2] <Languages> (aliases: /lan, /lam) — Sets audio languages (e.g. /lang SB-0123ABCDEF Hindi, English).',
+      '• /subtitles SB-ID[, SB-ID2] <Languages> (alias: /subs) — Sets manual subtitle languages (or "none" to clear).',
+      '• /year SB-ID[, SB-ID2] <YYYY> — Updates release year.',
+      '• /genres SB-ID[, SB-ID2] <Genre1, Genre2> — Updates genres.',
+      '• /description SB-ID <Synopsis text> — Updates story synopsis.',
+      '• /release SB-ID[, SB-ID2] <Label> — Sets custom release label (e.g. Season 1, Feature Film).',
+      '• /status SB-ID[, SB-ID2] <Status> — Sets status badge (e.g. Completed, Ongoing).',
+      '',
+      'How it works:',
+      '• Use without a Post ID while a draft is open to edit the draft.',
+      '• Include one or more Post IDs (SB-XXXXXXXXXX) to update live catalog posts and automatically refresh their Telegram announcement posts.'
+    ].join('\n')
+  },
+  scrape: {
+    id: 'scrape',
+    button: '🖼 Poster & Web Scrape',
+    title: '🖼 Artwork (/poster), Web Scraper (/scrape) & ImgBB Pool — What It Is For & How It Works',
+    text: [
+      '🖼 POSTER ARTWORK, WEB SCRAPER & IMGBB KEYS',
+      'What this is for: Pulling accurate metadata and high-res posters from any website (IMDb, TMDB, AniList, MyAnimeList, etc.) or choosing artwork interactively.',
+      '',
+      'Commands (What each is for):',
+      '• /scrape SB-ID <URL> — Scrapes title, year, genres, synopsis, category, and poster from a web link and updates the post + Telegram channel announcement.',
+      '• /scrape <URL> — Scrapes metadata & poster into your currently open draft.',
+      '• /poster (aliases: /p, /imgdd) — Opens artwork updater with two modes: Old style (paste direct image URL) or New style (search AniList/TMDB/OMDb by title and tap a poster button).',
+      '• /imgapis — Shows all configured ImgBB API keys, upload/failure stats, and fallback poster.',
+      '• /addimgapi <KEY> — Adds one or more ImgBB API keys to the rotation pool.',
+      '• /removeimgapi <KEY> — Removes an ImgBB API key from the pool.',
+      '',
+      'How /scrape & /poster work:',
+      '• /scrape supports IMDb (with automatic fallback APIs when WAF blocks HTML), TMDB, AniList, MyAnimeList, and general media pages.',
+      '• Audio & Subtitles protection: /scrape NEVER overwrites your post’s audio or subtitle languages with website languages — it keeps what your uploaded files actually have (or your manual subtitles).',
+      '• Category & Announcement sync: Updating title/poster/scrape automatically updates the category (e.g. animated movie -> cartoon/anime/donghua) and edits the Telegram channel post.'
+    ].join('\n')
+  },
+  files: {
+    id: 'files',
+    button: '🗂 Remove File & Merge',
+    title: '🗂 Remove Specific Files (/removefile), Merge (/merge) & Delete (/delete)',
+    text: [
+      '🗂 REMOVE SPECIFIC EPISODES/FILES, MERGE & DELETE',
+      'What this is for: Removing an unwanted episode, movie quality, or series file from a post without deleting the whole post, combining duplicate posts, or deleting posts.',
+      '',
+      'Commands (What each is for):',
+      '• /removefile [SB-ID or search text] (aliases: /rmfile, /delfile, /deletefile, /files) — Interactive button menu to pick a post and remove a specific episode, movie file, or series file.',
+      '• /merge <Exact Title> <Target SB-ID> <Source SB-ID> [More SB-IDs...] — Combines multiple posts into the target post (moves all files & players, rebuilds seasons, deletes absorbed posts).',
+      '• /merge drop <SB-ID> season <N> (or ep <N>, or season <N> ep <A-B>) — Removes a whole season block or episode range from a post by command.',
+      '• /delete <SB-ID[, SB-ID2...]> — Permanently deletes entire catalog post(s) and their channel announcements.',
+      '',
+      'How /removefile works step-by-step:',
+      '1. Send /removefile (to browse recent posts as buttons), /removefile <title> (to filter posts), or /removefile SB-0123ABCDEF (to open that post directly).',
+      '2. Tap the post button to view buttons for every episode, movie file, or series file inside it (with episode number, name, and quality like [144P], [544P], [720P], [1080P]).',
+      '3. Tap the file/episode you want to remove — the bot shows the file details with two buttons: "⬅️ Go back" and "🗑 Remove".',
+      '4. Tap "🗑 Remove" to delete only that file/episode. The post’s episode counts, player qualities, audio/sub languages, and Telegram announcement post update automatically!'
+    ].join('\n')
+  },
+  players: {
+    id: 'players',
+    button: '▶️ Watch Players & Quality',
+    title: '▶️ Watch Page Quality Selector & External Players (/cmd, /players)',
+    text: [
+      '▶️ WATCH PLAYERS, QUALITY SWITCHING & MAGNETS',
+      'What this is for: Streaming episodes/movies on the website Watch page with multi-quality switching, manual subtitles, and optional external embed links.',
+      '',
+      'Commands (What each is for):',
+      '• /cmd SB-ID ep <N> <Player URL> — Attaches an external player link (e.g. Rumble, Dailymotion, iframe/embed URL) to Episode N (or ep <A-B> for a range).',
+      '• /cmd [SB-ID] — Starts JSON/CSV manifest upload or multi-line paste to attach many player links at once.',
+      '• /cmd SB-ID del ep <A-B> (or del <index>) — Removes attached external players for an episode range or index.',
+      '• /players SB-ID — Lists all players attached to a post with interactive Remove buttons and pagination.',
+      '• /searchm <SB-ID> [Optional Title] — Searches SubsPlease magnets for an anime post.',
+      '',
+      'How Watch Page Quality & Controls work automatically:',
+      '• Every uploaded video quality (including 144p, 240p, 288p, 360p, 480p, 544p, 720p, 1080p, 4K) is grouped per movie or episode.',
+      '• On the Watch page, playback defaults to the lowest quality for fast startup, and visitors can click any available quality button (e.g. 144P, 544P, 1080P) to switch the active Telegram post link (https://t.me/c/<channel>/<msgId>) in the player.',
+      '• Audio selector is disabled in the player UI, and visitors can load custom/manual subtitles (.srt/.vtt) directly in the player.'
+    ].join('\n')
+  },
+  sync: {
+    id: 'sync',
+    button: '🔄 Sync, Repair & Channels',
+    title: '🔄 Channel Sync (/sync), Catalog Repair (/repair) & Announcement Channels',
+    text: [
+      '🔄 SYNC ANNOUNCEMENTS, REPAIR CATALOG & MANAGE CHANNELS',
+      'What this is for: Keeping Telegram announcement posts, database captions, and catalog indexes in sync without re-uploading files.',
+      '',
+      'Commands (What each is for):',
+      '• /repair — Previews which catalog posts need re-indexing or audio/subtitle/quality reconciliation from their files.',
+      '• /repair go — Applies the repair across the catalog and queues announcement updates for changed cards.',
+      '• /sync — Previews which Telegram announcement posts differ from their current catalog card.',
+      '• /sync go — Edits every outdated channel announcement post (one paced edit at a time, obeying Telegram flood limits).',
+      '• /sync SB-ID — Immediately refreshes that single post’s Telegram announcement.',
+      '• /sync retry — Clears remembered edit errors (e.g. after granting the bot admin rights) so /sync go retries them.',
+      '• /sync force — Forces a fresh scan of all announced cards.',
+      '• /sync db (and /sync db go) — Scans and cleans @channel handles from captions inside the private database channel.',
+      '• /addchannel <@username or -100... ID> — Adds a Telegram announcement channel.',
+      '• /channels — Lists all connected announcement channels.',
+      '• /removechannel <@username or -100... ID> — Removes an announcement channel.',
+      '',
+      'How Startup Auto-Fix works:',
+      '• On every deploy/startup, SoraBox automatically checks stored posts and updates their file qualities, audio languages, and subtitles from what their files actually have (if files do not mention languages, no change is made).'
+    ].join('\n')
+  },
+  admin: {
+    id: 'admin',
+    button: '🔍 Search, IDs & System',
+    title: '🔍 Find Post IDs, Requests, Backups, Maintenance & System Controls',
+    text: [
+      '🔍 FIND POST IDS, REQUESTS, BACKUPS & SYSTEM ADMIN',
+      'What this is for: Finding Post IDs quickly, managing user title requests, creating/restoring backups, and controlling site maintenance.',
+      '',
+      'Commands (What each is for):',
+      '• /search <text> — Finds Post IDs matching a title, filename, or ID.',
+      '• /posts [limit] — Lists the newest published posts (up to 50) with their Post IDs.',
+      '• /postid — Interactive date/time lookup to find Post IDs by the day they were uploaded.',
+      '• Forward an announcement or paste a site URL — Send any channel announcement or catalog link to the bot and it replies with that post’s SB-ID.',
+      '• /requests — Opens the interactive viewer to review, select, and resolve user /request submissions.',
+      '• /stats — Shows catalog counts, bot user activity, and website visitor analytics.',
+      '• /backup — Creates a signed, compressed backup archive and sends it to the private storage channel.',
+      '• /recover — Arms backup recovery; upload a signed backup archive to restore catalog data.',
+      '• /maintanence [on|off] — Toggles website maintenance mode ON or OFF.',
+      '• /restart — Gracefully restarts the SoraBox bot and web server.',
+      '• /login <passcode> / /logout — Unlocks or locks publisher controls in this chat.'
+    ].join('\n')
+  },
+  all: {
+    id: 'all',
+    button: '📋 All Commands A–Z',
+    title: '📋 Complete Command Reference (What Every Command Is For)',
+    text: [
+      '📋 ALL COMMANDS QUICK REFERENCE',
+      '',
+      '▸ Draft & Publishing:',
+      '/panel · /movie · /anime · /cartoon · /donghua · /kdrama · /series · /tv (/ott) · /18db (/adultdb) · /done · /status · /cancel',
+      '',
+      '▸ Batch & Automation:',
+      '/batch [cat |] [Title] · /auto · /teststorage',
+      '',
+      '▸ Edit Metadata & Artwork:',
+      '/title · /titlebatch · /category · /lang (/lan, /lam) · /subtitles (/subs) · /year · /genres · /description · /release · /status · /poster (/p, /imgdd) · /scrape',
+      '',
+      '▸ Files, Merge & Delete:',
+      '/removefile (/rmfile, /delfile, /deletefile, /files) — Pick a post & remove specific episode/movie/series file with Go back / Remove buttons',
+      '/merge — Merge posts or drop seasons/episodes (/merge drop)',
+      '/delete — Delete whole post(s) by SB-ID',
+      '',
+      '▸ Watch Players & Magnets:',
+      '/cmd · /players · /searchm',
+      '',
+      '▸ Sync, Repair & Channels:',
+      '/repair · /repair go · /sync · /sync go · /sync retry · /sync force · /sync db · /addchannel · /channels · /removechannel',
+      '',
+      '▸ Search, Requests, Backups & System:',
+      '/search · /posts · /postid · /requests · /stats · /backup · /recover · /imgapis · /addimgapi · /removeimgapi · /maintanence · /restart · /login · /logout · /request · /help'
+    ].join('\n')
+  }
+};
+
+const HELP_TOPIC_ORDER = ['publish', 'batch', 'edit', 'scrape', 'files', 'players', 'sync', 'admin', 'all'];
+
+export function publisherHelpOverviewText() {
+  return [
+    '📚 SoraBox Publisher Help Center',
+    'Tap any button below to view full details on what each feature is for, every command name, and step-by-step how it works:',
+    '',
+    '• 📤 Publish & Drafts — /panel, /movie, /anime, /cartoon, /donghua, /kdrama, /series, /tv (/ott), /18db, /done, /cancel',
+    '• 📦 Batch & Auto-Publish — /batch range imports (FIRST & LAST links), /auto 90s quiet-window storage automation, /teststorage',
+    '• ✏️ Edit Posts & Titles — /title, /titlebatch, /category, /lang, /subtitles, /year, /genres, /description, /release, /status',
+    '• 🖼 Poster & Web Scrape — /scrape [SB-ID] <URL> (keeps file audio/subs, auto-updates category & announcement), /poster (/p, /imgdd), /imgapis',
+    '• 🗂 Remove File & Merge — /removefile (select post -> tap episode/file -> Go back or Remove), /merge, /merge drop, /delete',
+    '• ▶️ Watch Players & Quality — Watch page quality selector (144p/288p/544p/720p/1080p/4K Telegram link switching), /cmd, /players, /searchm',
+    '• 🔄 Sync, Repair & Channels — /repair, /repair go, /sync, /sync go, /sync db, /addchannel, /channels, /removechannel',
+    '• 🔍 Search, IDs & System — /search, /posts, /postid, /requests, /stats, /backup, /recover, /maintanence, /restart',
+    '• 📋 All Commands A–Z — Complete command checklist in one view',
+    '',
+    'Tip: You can also type /help <topic> (e.g. /help scrape, /help removefile, /help batch) or tap any button below:'
+  ].join('\n');
+}
+
+export function helpMenuKeyboard(activeTopicId = null) {
+  const rows = [];
+  for (let i = 0; i < HELP_TOPIC_ORDER.length; i += 2) {
+    const leftId = HELP_TOPIC_ORDER[i];
+    const rightId = HELP_TOPIC_ORDER[i + 1];
+    const row = [];
+    if (leftId && HELP_TOPICS[leftId]) {
+      const prefix = activeTopicId === leftId ? '✓ ' : '';
+      row.push(Markup.button.callback(`${prefix}${HELP_TOPICS[leftId].button}`, `help:topic:${leftId}`));
+    }
+    if (rightId && HELP_TOPICS[rightId]) {
+      const prefix = activeTopicId === rightId ? '✓ ' : '';
+      row.push(Markup.button.callback(`${prefix}${HELP_TOPICS[rightId].button}`, `help:topic:${rightId}`));
+    }
+    if (row.length) rows.push(row);
+  }
+  const bottomRow = [];
+  if (activeTopicId) {
+    bottomRow.push(Markup.button.callback('⬅️ Help Main Menu', 'help:menu'));
+  }
+  bottomRow.push(Markup.button.callback('🎛 Open Draft Panel', 'help:panel'));
+  rows.push(bottomRow);
+  return Markup.inlineKeyboard(rows);
+}
+
+function resolveHelpTopicFromQuery(rawQuery = '') {
+  const q = cleanText(rawQuery, 60).toLowerCase().replace(/^\/+/, '');
+  if (!q) return null;
+  if (HELP_TOPICS[q]) return HELP_TOPICS[q];
+  if (/^(?:movie|anime|cartoon|donghua|kdrama|series|tv|ott|18db|adultdb|done|cancel|draft|drafts|panel)$/.test(q)) return HELP_TOPICS.publish;
+  if (/^(?:batch|auto|teststorage|automation)$/.test(q)) return HELP_TOPICS.batch;
+  if (/^(?:title|titlebatch|lang|lan|lam|subtitles|subs|year|genres|description|release|category|edit)$/.test(q)) return HELP_TOPICS.edit;
+  if (/^(?:scrape|poster|p|imgdd|imgapis|addimgapi|removeimgapi|artwork)$/.test(q)) return HELP_TOPICS.scrape;
+  if (/^(?:removefile|rmfile|delfile|deletefile|files|merge|delete|remove)$/.test(q)) return HELP_TOPICS.files;
+  if (/^(?:cmd|players|player|watch|quality|searchm|magnet)$/.test(q)) return HELP_TOPICS.players;
+  if (/^(?:sync|repair|addchannel|channels|removechannel|channel)$/.test(q)) return HELP_TOPICS.sync;
+  if (/^(?:search|posts|postid|requests|stats|backup|recover|maintanence|maintenance|restart|login|logout|admin)$/.test(q)) return HELP_TOPICS.admin;
+  if (/^(?:all|commands|list)$/.test(q)) return HELP_TOPICS.all;
+  return null;
+}
+
+export async function handleHelpCommand(ctx, repository, config) {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await ctx.reply(visitorWelcomeText(hasAllowedPublisherId(ctx, config)));
+    return { handled: true, mode: 'visitor' };
+  }
+  const arg = parseCommandArgument(ctx.message?.text, 80);
+  const matchedTopic = resolveHelpTopicFromQuery(arg);
+  if (matchedTopic) {
+    await ctx.reply(matchedTopic.text, helpMenuKeyboard(matchedTopic.id));
+    return { handled: true, mode: 'topic', topic: matchedTopic.id };
+  }
+  await ctx.reply(publisherHelpOverviewText(), helpMenuKeyboard(null));
+  return { handled: true, mode: 'menu' };
+}
+
+export async function handleHelpAction(ctx, repository, config, actionData = '') {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await acknowledgeTap(ctx, 'Publisher login required. Use /login first.', { alert: true });
+    return false;
+  }
+  const key = String(actionData || ctx.callbackQuery?.data || '');
+  if (!key.startsWith('help:')) return false;
+
+  if (key === 'help:menu') {
+    await acknowledgeTap(ctx, 'Help Main Menu');
+    await replaceInteractiveMessage(ctx, publisherHelpOverviewText(), helpMenuKeyboard(null));
+    return true;
+  }
+
+  if (key === 'help:panel') {
+    await acknowledgeTap(ctx, 'Publisher Draft Panel');
+    await replaceInteractiveMessage(ctx, 'Choose a category for a new draft, or use /help to return to the Help Center.', panelKeyboard());
+    return true;
+  }
+
+  const topicMatch = key.match(/^help:topic:([a-z0-9_-]+)$/i);
+  if (topicMatch) {
+    const topicId = topicMatch[1].toLowerCase();
+    const topic = HELP_TOPICS[topicId];
+    if (!topic) {
+      await acknowledgeTap(ctx, 'Unknown help section');
+      return true;
+    }
+    await acknowledgeTap(ctx, topic.button);
+    await replaceInteractiveMessage(ctx, topic.text, helpMenuKeyboard(topic.id));
+    return true;
+  }
+
+  return false;
+}
+
+export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null, onRestart = null }) {
+  if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
+    console.info('[telegram] Bot polling is disabled; web catalog remains available.');
+    return null;
+  }
+
+  botInstanceStartedAt = Date.now();
+
+  // Load persisted ImgBB API keys from repository and config into the active pool
+  const initialKeys = [...(config?.imgbbApiKeys || []), ...(config?.imgbbApiKey ? [config.imgbbApiKey] : [])];
+  if (typeof repository?.getPosterApiKeys === 'function') {
+    try {
+      const persistedKeys = await repository.getPosterApiKeys();
+      if (persistedKeys?.length) {
+        initialKeys.push(...persistedKeys);
+      }
+    } catch (error) {
+      console.warn('[telegram] Could not load persisted ImgBB keys:', automationDiagnostic(error));
+    }
+  }
+  syncPosterKeysFromRepository(repository, initialKeys);
+  if (config) {
+    config.imgbbApiKeys = parseImgBBKeys(initialKeys);
+    if (!config.imgbbApiKey && config.imgbbApiKeys[0]) config.imgbbApiKey = config.imgbbApiKeys[0];
+  }
+  if (typeof repository?.getFallbackPosterUrl === 'function') {
+    try {
+      const fallbackUrl = await repository.getFallbackPosterUrl();
+      if (fallbackUrl) setSharedFallbackPosterUrl(fallbackUrl);
+    } catch {}
+  }
+
+  const bot = new Telegraf(config.telegram.botToken, { handlerTimeout: TELEGRAM_HANDLER_TIMEOUT_MS });
+  // Posters ImgBB refused for being in a hurry live here until the host catches up; a publish is
+  // never failed by the image host, and nothing is re-uploaded or duplicated to fix one.
+  const posterRetries = attachPosterRetryQueue(createPosterRetryQueue({
+    repository,
+    config,
+    notify: async (targetChatId, text) => {
+      try {
+        await bot.telegram.sendMessage(String(targetChatId), text);
+      } catch (error) {
+        console.warn('[telegram] could not report a deferred poster:', automationDiagnostic(error));
+      }
+    },
+    announce: (content, adminId) => queueAnnouncementSync({ telegram: bot.telegram, repository, content, config, adminId })
+  }));
+  setInterval(() => {
+    posterRetries.runDue().catch((error) => console.warn('[telegram] poster retry tick failed:', automationDiagnostic(error)));
+  }, POSTER_RETRY_TICK_MS).unref?.();
+  // Long publisher reports are split rather than truncated, and every reply goes through that
+  // wrapper, so no command has to remember Telegram's 4096-character ceiling.
+  installLongReplyPagination(bot);
+  // Private Telegram activity is tracked only in the publisher-side repository
+  // for aggregate analytics; it is never exposed from the public site API.
+  // Handled non-blocking in background so bot commands and interactions are immediate.
+  bot.use((ctx, next) => {
+    if (ctx.from && !ctx.from.is_bot && typeof repository.recordBotUser === 'function') {
+      repository.recordBotUser(ctx.from).catch((error) => {
+        console.warn('[telegram] could not record bot activity:', automationDiagnostic(error));
+      });
+    }
+    return next();
+  });
+  const ignoredAutoStorageMessageIds = new Set();
+  const autoPublishInFlightMessageIds = new Set();
+  let automationQueuePromise = null;
+  const runAutomationQueue = () => {
+    if (automationQueuePromise) return automationQueuePromise;
+    automationQueuePromise = processQueuedAutomationSessions({ bot, repository, config })
+      .catch((error) => {
+        console.error('[telegram] persistent automation worker failed:', automationDiagnostic(error));
+        return [];
+      })
+      .finally(() => {
+        automationQueuePromise = null;
+      });
+    return automationQueuePromise;
+  };
+  const ignoreAutoStorageMessage = (messageId) => {
+    const key = String(messageId);
+    ignoredAutoStorageMessageIds.add(key);
+    const timer = setTimeout(() => ignoredAutoStorageMessageIds.delete(key), 10 * 60 * 1000);
+    timer.unref?.();
+  };
+
+  bot.on('channel_post', async (ctx) => {
+    try {
+      const queued = await autoPublishStoragePost(ctx, bot, repository, config, ignoredAutoStorageMessageIds, autoPublishInFlightMessageIds);
+      // Also inspect an overdue group on incoming traffic; the interval below is
+      // still the durable primary scheduler after quiet uploads and restarts.
+      if (queued?.queued) void runAutomationQueue();
+    } catch (error) {
+      // This handler must never reply into the private database channel.
+      console.error('[telegram] storage-channel automation handler failed:', error?.message || 'Unknown error');
+    }
+  });
+
+  bot.start(async (ctx) => {
+    const payload = parseStartPayload(ctx);
+    const delivery = parseDeliveryPayload(payload);
+    if (delivery) {
+      await deliverContent(ctx, delivery, repository, config);
+      return;
+    }
+    // Install the owner/admin scope as soon as an authorized person opens the
+    // bot, not only after a later successful /login. This avoids Telegram's
+    // command-menu cache leaving /posts or /postid absent for the owner.
+    if (hasAllowedPublisherId(ctx, config) && config.adminLoginCode) await setPublisherCommands(bot, ctx);
+    const publisher = await isPublisher(ctx, repository, config);
+    await ctx.reply(publisher ? publisherWelcomeText() : visitorWelcomeText(hasAllowedPublisherId(ctx, config)), publisher ? panelKeyboard() : undefined);
+  });
+
+  bot.command('login', async (ctx) => {
+    if (!hasAllowedPublisherId(ctx, config) || !config.adminLoginCode) {
+      await ctx.reply(visitorWelcomeText(false));
+      return;
+    }
+    const passcode = parseCommandArgument(ctx.message.text);
+    if (!sameSecret(passcode, config.adminLoginCode)) {
+      await ctx.reply('Login failed. Check the passcode and try again.');
+      return;
+    }
+    const expiresAt = new Date(Date.now() + config.adminSessionHours * 60 * 60 * 1000);
+    await repository.createAdminSession({ chatId: chatId(ctx), ownerId: userId(ctx), expiresAt });
+    clearPublisherSessionCache(chatId(ctx), userId(ctx));
+    await setPublisherCommands(bot, ctx);
+    await ctx.reply(`Publisher session unlocked for ${config.adminSessionHours} hour${config.adminSessionHours === 1 ? '' : 's'}.`, panelKeyboard());
+  });
+
+  bot.command('logout', async (ctx) => {
+    await repository.deleteAdminSession(chatId(ctx), userId(ctx));
+    clearPublisherSessionCache(chatId(ctx), userId(ctx));
+    // Keep the owner scope registered: visible command names never grant
+    // access, while deleting the scope made Telegram intermittently hide
+    // /posts and /postid until its command-menu cache refreshed.
+    await ctx.reply('Publisher session locked. Publisher commands remain visible but are locked until /login; you can still open delivery links or use /request.');
+  });
+
+  bot.command('request', async (ctx) => {
+    const requestText = parseCommandArgument(ctx.message.text);
+    if (!requestText || requestText.length < 2) {
+      await ctx.reply('Tell us what you are looking for. Example: /request Perfect World season 1 Hindi');
+      return;
+    }
+    const request = await repository.createRequest({ requestText, requester: ctx.from });
+    const logged = await logRequestToChannel(ctx, request, config);
+    await ctx.reply(
+      logged
+        ? `Request received. Your reference is ${request.id}; the catalog team can review it now.`
+        : `Request received. Your reference is ${request.id}. It was saved for the catalog team.`
+    );
+  });
+
+  bot.command('help', async (ctx) => {
+    await handleHelpCommand(ctx, repository, config);
+  });
+
+  bot.action(/^help:(?:menu|panel|topic:[a-z0-9_-]+)$/i, async (ctx) => {
+    await handleHelpAction(ctx, repository, config, ctx.match[0]);
+  });
+
+  bot.command('panel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await ctx.reply('Choose a category for a new draft.', panelKeyboard());
+  });
+
+  for (const category of PUBLISH_CATEGORIES) {
+    const command = categoryCommandLabel(category);
+    bot.command(command, async (ctx) => {
+      if (!(await requirePublisher(ctx, repository, config))) return;
+      await beginDraft(ctx, category, parseCommandArgument(ctx.message.text), repository, config);
+    });
+  }
+
+  // The letter-first /adultdb name is listed in Telegram's command menu, while
+  // /18db is the short publisher alias requested for the isolated category.
+  bot.command('18db', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginDraft(ctx, ADULT_CATEGORY, parseCommandArgument(ctx.message.text), repository, config);
+  });
+
+  // Publishers of this shelf call it OTT as often as TV, so both words open the same draft.
+  bot.command('ott', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginDraft(ctx, 'tv', parseCommandArgument(ctx.message.text), repository, config);
+  });
+
+  bot.command('batch', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config);
+  });
+
+  bot.command('auto', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const settings = await repository.getAutoPublishSettings();
+    await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
+  });
+
+  bot.command('titlebatch', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await applyBulkTitleEdits({ ctx, repository, config, text: ctx.message.text, commands: ['titlebatch', 'title'], force: true });
+  });
+
+  bot.command('title', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    // A block of one-line renames is the shape this command takes most, so it is read as a batch
+    // first: pasted straight out of a notes app, with `/title` on every line or only on the first.
+    if (await applyBulkTitleEdits({ ctx, repository, config, text: ctx.message.text })) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const postTarget = parsePublishedPostEdit(argument);
+    if (postTarget) {
+      if (!postTarget.value) {
+        await ctx.reply(`Usage: /title ${postTarget.adminId} Your corrected title`);
+        return;
+      }
+      await updatePublishedPost({ ctx, repository, argument, config, field: 'title', fieldLabel: 'Title', rematchPoster: true });
+      return;
+    }
+    if (!argument) {
+      await ctx.reply([
+        'Usage: /title Your release title',
+        'Edit an existing post: /title SB-0123ABCDEF Corrected title',
+        'Rename a whole list at once \u2014 one line per post in a single message, with or without /title on each line:',
+        '/title SB-0123ABCDEF Vampires Of The Velvet Lounge',
+        'SB-E47CB05E36 Gold',
+        'SB-B65405F26C Oculus'
+      ].join('\n'));
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    await updateTitleAndMetadata({ ctx, repository, config, title: argument });
+  });
+
+  const handleLanguageCommand = async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const postTarget = parsePublishedPostEdit(argument);
+    if (postTarget) {
+      const languages = parseDelimitedList(postTarget.value);
+      if (!languages.length) {
+        await ctx.reply(`Usage: /lang ${postTarget.adminIds.join(', ')} Hindi, English\nSeveral posts at once: /lang SB-0123ABCDEF, SB-1122334455 Hindi, English`);
+        return;
+      }
+      await updatePublishedPost({
+        ctx,
+        repository,
+        argument,
+        field: 'languages',
+        value: languages,
+        fieldLabel: 'Audio languages'
+      });
+      return;
+    }
+    const languages = parseDelimitedList(argument);
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session || !languages.length) {
+      await ctx.reply('Usage: /lang Hindi, English\nEdit an existing post: /lang SB-0123ABCDEF Hindi, English\nSeveral posts at once: /lang SB-0123ABCDEF, SB-1122334455 Hindi, English');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), languages };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply(`Languages saved: ${languages.join(', ')}`);
+  };
+  for (const command of ['lang', 'lan', 'lam']) bot.command(command, handleLanguageCommand);
+
+  const handleSubtitleCommand = async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const postTarget = parsePublishedPostEdit(argument);
+    const languages = parseDelimitedList(postTarget ? postTarget.value : argument);
+    if (!languages.length) {
+      await ctx.reply(postTarget
+        ? `Usage: /subtitles ${postTarget.adminIds.join(', ')} English, Hindi\nSeveral posts at once: /subtitles SB-0123ABCDEF, SB-1122334455 English, Hindi`
+        : 'Usage: /subtitles English, Hindi\nEdit an existing post: /subtitles SB-0123ABCDEF English, Hindi\nSeveral posts at once: /subtitles SB-0123ABCDEF, SB-1122334455 English, Hindi');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'subtitleLanguages', value: languages, fieldLabel: 'Subtitle languages' });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), subtitleLanguages: languages };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply(`Subtitle languages saved: ${languages.join(', ')}`);
+  };
+  for (const command of ['subtitles', 'subs']) bot.command(command, handleSubtitleCommand);
+
+  bot.command('year', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const postTarget = parsePublishedPostEdit(argument);
+    const suppliedYear = Number.parseInt(postTarget ? postTarget.value : argument, 10);
+    if (!Number.isInteger(suppliedYear) || suppliedYear < 1888 || suppliedYear > new Date().getFullYear() + 5) {
+      await ctx.reply(postTarget
+        ? `Usage: /year ${postTarget.adminIds.join(', ')} 2026\nSeveral posts at once: /year SB-0123ABCDEF, SB-1122334455 2026`
+        : 'Usage: /year 2026\nEdit an existing post: /year SB-0123ABCDEF 2026\nSeveral posts at once: /year SB-0123ABCDEF, SB-1122334455 2026');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({
+        ctx,
+        repository,
+        argument,
+        field: 'year',
+        value: suppliedYear,
+        fieldLabel: 'Year'
+      });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), year: suppliedYear };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply(`Year saved: ${suppliedYear}`);
+  });
+
+  bot.command('genres', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const postTarget = parsePublishedPostEdit(argument);
+    const genres = parseDelimitedList(postTarget ? postTarget.value : argument);
+    if (!genres.length) {
+      await ctx.reply(postTarget
+        ? `Usage: /genres ${postTarget.adminIds.join(', ')} Action, Fantasy\nSeveral posts at once: /genres SB-0123ABCDEF, SB-1122334455 Action, Fantasy`
+        : 'Usage: /genres Action, Fantasy\nEdit an existing post: /genres SB-0123ABCDEF Action, Fantasy\nSeveral posts at once: /genres SB-0123ABCDEF, SB-1122334455 Action, Fantasy');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'genres', value: genres, fieldLabel: 'Genres' });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), genres };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply(`Genres saved: ${genres.join(', ')}`);
+  });
+
+  bot.command('description', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, 1_500);
+    const postTarget = parsePublishedPostEdit(argument);
+    const description = cleanText(postTarget ? postTarget.value : argument, 1400);
+    if (!description) {
+      await ctx.reply(postTarget ? `Usage: /description ${postTarget.adminId} A short, readable synopsis` : 'Usage: /description A short, readable synopsis\nEdit an existing post: /description SB-0123ABCDEF New synopsis');
+      return;
+    }
+    if (postTarget) {
+      await updatePublishedPost({ ctx, repository, argument, field: 'description', value: description, fieldLabel: 'Description' });
+      return;
+    }
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (!session) {
+      await ctx.reply('Start a draft first using /panel.');
+      return;
+    }
+    const overrides = { ...(session.overrides || {}), description };
+    await repository.updateSession(chatId(ctx), userId(ctx), { overrides });
+    await ctx.reply('Description saved.');
+  });
+
+  const handlePosterCommand = async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, 2_000);
+    if (!argument || /^(help|style|menu|\?)$/i.test(argument)) {
+      if (typeof repository.startPosterFlow === 'function') {
+        await repository.startPosterFlow({
+          chatId: chatId(ctx),
+          ownerId: userId(ctx),
+          stage: 'style',
+          targetAdminId: null,
+          query: '',
+          candidates: []
+        });
+        await ctx.reply('How should I set this poster?', posterStyleKeyboard());
+        return;
+      }
+      await ctx.reply(POSTER_COMMAND_USAGE);
+      return;
+    }
+
+    const postTarget = parsePublishedPostEdit(argument);
+    const posterValue = postTarget ? postTarget.value : argument;
+
+    // Artwork is per-release identity, so a list of post IDs is refused here
+    // instead of quietly changing only the first one.
+    if (postTarget && postTarget.adminIds.length > 1) {
+      await ctx.reply(`Poster artwork is set one post at a time, because every release keeps its own image. Send /poster ${postTarget.adminIds[0]} <image link or title>${postTarget.adminIds.length > 2 ? ` (and repeat it for ${postTarget.adminIds.slice(1).join(', ')})` : ''}. Category, languages, subtitles, genres, year, release, and status do accept a list.`);
+      return;
+    }
+
+    // Old style: an explicit image link is validated, mirrored, and saved.
+    if (posterValue.startsWith('https://')) {
+      if (postTarget) {
+        try {
+          await ctx.reply(`Mirroring the new poster for ${postTarget.adminId} to ImgBB…`);
+          const result = await mirrorPosterForPublishedPost({
+            ctx,
+            repository,
+            adminId: postTarget.adminId,
+            sourceUrl: posterValue,
+            config
+          });
+          if (!result) return;
+          await ctx.reply(result.updated
+            ? `Poster updated for ${result.updated.adminId} · ${result.updated.title}.`
+            : `The poster was mirrored, but ${postTarget.adminId} is no longer available.`);
+        } catch (error) {
+          const message = error instanceof PosterHostingError
+            ? error.message
+            : 'The new poster could not be mirrored to ImgBB. The existing poster is unchanged.';
+          console.error('[telegram] published-poster edit failed:', error?.message || 'Unknown error');
+          await ctx.reply(`Poster was not changed. ${message}`);
+        }
+        return;
+      }
+      const session = await repository.findSession(chatId(ctx), userId(ctx));
+      if (!session) {
+        await ctx.reply('Start a draft first using /panel.');
+        return;
+      }
+      await repository.updateSession(chatId(ctx), userId(ctx), { posterOriginalUrl: posterValue });
+      await ctx.reply('Manual poster saved. It will be validated, downloaded once, and mirrored to ImgBB during publishing.');
+      return;
+    }
+
+    // New style: search provider artwork for the supplied title and let the
+    // publisher tap the exact poster they want.
+    if (postTarget && !posterValue) {
+      await ctx.reply(`Usage: /poster ${postTarget.adminId} Exact Title — I will show the artwork I can find, or send a direct HTTPS image link instead.`);
+      return;
+    }
+    await presentPosterCandidates({
+      ctx,
+      repository,
+      config,
+      adminId: postTarget?.adminId || null,
+      query: posterValue
+    });
+  };
+  // /p is the short form publishers asked for, and /imgdd follows the identical
+  // old/new flow so artwork handling has exactly one behaviour to learn.
+  for (const command of ['poster', 'p', 'imgdd']) bot.command(command, handlePosterCommand);
+  bot.command('scrape', async (ctx) => handleScrapeCommand(ctx, repository, config));
+  for (const command of ['removefile', 'rmfile', 'delfile', 'deletefile', 'files']) {
+    bot.command(command, async (ctx) => handleRemoveFileCommand(ctx, repository, config));
+  }
+  bot.action(/^rmfile:/, async (ctx) => {
+    const handled = await handleRemoveFileAction(ctx, repository, config, ctx.callbackQuery?.data || '');
+    if (!handled) await acknowledgeTap(ctx, 'That file action is no longer active.');
+  });
+
+  bot.action(/^poster:(?:style:(?:old|new)|cancel|retry|pick:\d{1,2})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const handled = await handlePosterAction(ctx, repository, config, ctx.match?.[0] || '');
+    if (!handled) await acknowledgeTap(ctx, 'That poster button is no longer active.');
+  });
+
+  bot.command('category', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const target = parsePublishedPostEdit(argument);
+    const rawCategory = String(target?.value || '').trim().toLowerCase().replace(/[\s._-]+/g, '');
+    const category = /^(?:adult|18\+?|18)$/.test(rawCategory)
+      ? ADULT_CATEGORY
+      : resolveCategoryId(rawCategory);
+    if (!target || !category || !PUBLISH_CATEGORIES.includes(category)) {
+      await ctx.reply('Usage: /category SB-0123ABCDEF anime\nSeveral posts at once: /category SB-0123ABCDEF, SB-1122334455 anime\nCategories: anime, cartoon, donghua, kdrama, movie, web-series, tv (also accepted: ott), adult');
+      return;
+    }
+    // The 18+ storage boundary is decided per post: one restricted card in a
+    // list must not cancel the rest of the batch, and it must not be moved.
+    await updatePublishedPost({
+      ctx,
+      repository,
+      argument,
+      field: 'category',
+      value: category,
+      fieldLabel: 'Category',
+      guard: (content) => (isAdultCategory(content.category) !== isAdultCategory(category)
+        ? '18+ boundary: use /18db for that release'
+        : null)
+    });
+  });
+
+  bot.command('release', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const target = parsePublishedPostEdit(argument);
+    if (!target?.value) {
+      await ctx.reply('Usage: /release SB-0123ABCDEF Season 2 · 12 episodes\nSeveral posts at once: /release SB-0123ABCDEF, SB-1122334455 Season 2 · 12 episodes');
+      return;
+    }
+    await updatePublishedPost({ ctx, repository, argument, field: 'releaseLabel', fieldLabel: 'Release label' });
+  });
+
+  bot.command('status', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const argument = parseCommandArgument(ctx.message.text, POST_EDIT_ARGUMENT_LIMIT);
+    const target = parsePublishedPostEdit(argument);
+    if (target) {
+      if (!target.value) {
+        await ctx.reply(`Usage: /status ${target.adminIds.join(', ')} New release\nSeveral posts at once: /status SB-0123ABCDEF, SB-1122334455 Ongoing`);
+        return;
+      }
+      await updatePublishedPost({ ctx, repository, argument, field: 'status', fieldLabel: 'Status' });
+      return;
+    }
+    await showDraftStatus(ctx, repository);
+  });
+
+  bot.command('teststorage', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (!config.telegram.storageChannelId) {
+      await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is not configured. Add the private channel’s numeric -100… ID and restart the service.');
+      return;
+    }
+    try {
+      await ctx.telegram.sendMessage(
+        config.telegram.storageChannelId,
+        `SoraBox storage check · ${new Date().toISOString()}`,
+        { disable_notification: true }
+      );
+      await ctx.reply('Storage channel connection is working. If a particular upload still fails, it is likely protected/forwarded content; upload the original file directly to this bot so the file-ID fallback can store it.');
+    } catch (error) {
+      console.error('[telegram] storage check failed:', error?.description || error?.message || 'Unknown error');
+      await ctx.reply(`Storage channel test failed. ${storageErrorHint(error)}`);
+    }
+  });
+
+  bot.command('cancel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.deleteSession(chatId(ctx), userId(ctx));
+    await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
+    await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+    await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+    await ctx.reply('Draft, pending backup recovery, manual Watch-link import, or merge plan discarded. No catalog record was created or deleted.', panelKeyboard());
+  });
+
+  bot.command('done', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await publishDraft(ctx, bot, repository, config);
+  });
+
+  bot.command('delete', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const adminIds = postIdsFromCommand(ctx.message.text);
+    if (!adminIds.length) {
+      await ctx.reply('Usage: /delete SB-0123ABCDEF\nYou can remove several unwanted cards at once: /delete SB-0123ABCDEF, SB-FEDCBA3210\nUse /posts 50 to list recent post IDs.');
+      return;
+    }
+
+    const removed = [];
+    const missing = [];
+    for (const adminId of adminIds) {
+      const content = await repository.deleteContentByAdminId(adminId);
+      if (content) removed.push(content);
+      else missing.push(adminId);
+    }
+    if (!removed.length) {
+      await ctx.reply(`No published post was found for ${missing.join(', ')}.`);
+      return;
+    }
+    // A card that no longer exists must not leave its announcement behind as a live offer for a
+    // release the site no longer has. Deletion runs on the same paced lane as every other channel
+    // edit, so removing 30 cards at once cannot trip a flood limit, and a refusal is retried rather
+    // than dropped — the posted copy is remembered until it is gone.
+    let announcementsQueued = 0;
+    let unannounced = 0;
+    for (const content of removed) {
+      const references = Array.isArray(content.announcementRefs) ? content.announcementRefs : [];
+      if (!references.length) {
+        unannounced += 1;
+        continue;
+      }
+      queueAnnouncementDeletion({ telegram: ctx.telegram, repository: null, content, references }, { detached: true });
+      announcementsQueued += references.length;
+    }
+    await ctx.reply([
+      `Deleted ${removed.length} catalog post${removed.length === 1 ? '' : 's'}: ${removed.map((content) => content.adminId).join(', ')}.`,
+      announcementsQueued
+        ? `${announcementsQueued} channel announcement${announcementsQueued === 1 ? ' copy was' : ' copies were'} deleted with ${announcementsQueued === 1 ? 'it' : 'them'}, one message at a time on the lane. If Telegram is limiting, the removal is retried and /sync lists anything still there.`
+        : null,
+      unannounced && announcementsQueued
+        ? `${unannounced} ${unannounced === 1 ? 'card was' : 'cards were'} never announced, so there was nothing to remove from a channel.`
+        : null,
+      'Their delivery links no longer resolve. The original files remain in the private storage channel so you can manage them separately.',
+      missing.length ? `Not found: ${missing.join(', ')}.` : null
+    ].filter(Boolean).join('\n'));
+  });
+
+  // ── /merge: absorb other cards into one, then delete them and their
+  //    announcements. Destructive, so the plan is always shown first.
+  bot.command('merge', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /merge in your private publisher chat — it deletes catalog posts.');
+      return;
+    }
+    if (typeof repository.startMergePlan !== 'function' || typeof repository.findMergePlan !== 'function') {
+      await ctx.reply('This catalog store cannot hold a pending merge plan, so /merge is unavailable here.');
+      return;
+    }
+    const parsed = parseMergeCommand(parseCommandArgument(ctx.message.text, 1_200));
+    if (parsed.action === 'help') {
+      await ctx.reply(mergeInstructions());
+      return;
+    }
+    if (parsed.error) {
+      await ctx.reply(`${parsed.error}\nSend /merge help for the full form, including how to drop one season or a few episodes.`);
+      return;
+    }
+    if (parsed.action === 'cancel') {
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await ctx.reply('Merge cancelled. No post was merged or deleted.', panelKeyboard());
+      return;
+    }
+    if (parsed.action === 'confirm') {
+      const pending = await repository.findMergePlan?.(chatId(ctx), userId(ctx));
+      if (!pending?.plan) {
+        await ctx.reply('There is no merge waiting for confirmation. Start one with /merge Title SB-TARGET SB-SOURCE.');
+        return;
+      }
+      const outcome = await applyMergePlan({ bot, repository, config, plan: pending.plan });
+      if (outcome.error) {
+        await ctx.reply(outcome.error);
+        return;
+      }
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await replyBatchDiagnostics(ctx, [mergeResultText(outcome, config)]);
+      return;
+    }
+    if (parsed.action === 'drop') {
+      const outcome = await applyMergeDrop({ repository, bot, config, adminId: parsed.targetAdminId, drop: parsed.drop });
+      if (outcome.error) {
+        await ctx.reply(outcome.error);
+        return;
+      }
+      await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+      await ctx.reply(mergeDropResultText(outcome, config));
+      return;
+    }
+
+    const resolved = await resolveMergePlan({ repository, parsed });
+    if (resolved.error) {
+      await ctx.reply(resolved.error);
+      return;
+    }
+    await repository.startMergePlan({ chatId: chatId(ctx), ownerId: userId(ctx), plan: resolved.plan });
+    await ctx.reply(mergePlanText(resolved.plan, config), mergeConfirmKeyboard());
+  });
+
+  bot.action(/^mrg:(go|no|peek)$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const pending = await repository.findMergePlan?.(chatId(ctx), userId(ctx));
+    if (ctx.match[0] === 'peek') {
+      await acknowledgeTap(ctx, pending?.plan ? 'The plan is in the message above.' : 'That merge plan expired.');
+      return;
+    }
+    if (!pending?.plan) {
+      await acknowledgeTap(ctx, 'That merge plan expired. Run /merge again.', { alert: true });
+      await ctx.editMessageReplyMarkup?.(null)?.catch?.(() => {});
+      return;
+    }
+    await repository.deleteMergePlan?.(chatId(ctx), userId(ctx));
+    if (ctx.match[0] === 'no') {
+      await acknowledgeTap(ctx, 'Merge cancelled');
+      await ctx.editMessageText(`${ctx.message?.text || ''}\n\nCancelled — nothing was merged.`).catch(() => {});
+      return;
+    }
+    const outcome = await applyMergePlan({ bot, repository, config, plan: pending.plan });
+    await acknowledgeTap(ctx, outcome.error ? 'This merge could not be applied' : `Merged ${outcome.moved?.length || 0} post(s)`);
+    if (outcome.error) {
+      await ctx.reply(`${outcome.error}\nNothing else was changed.`);
+      return;
+    }
+    await ctx.editMessageReplyMarkup?.(null)?.catch?.(() => {});
+    await replyBatchDiagnostics(ctx, [mergeResultText(outcome, config)]);
+  });
+
+  // /search <text> — the Post ID list a publisher asked for. Titles, filenames, and IDs all match,
+  // and a long answer is split across messages rather than cut off, because a truncated ID is useless.
+  const magnetFlow = createTelegramMagnetFlow({ repository, subsPlease, serialize: serializeMagnetContent });
+  bot.command('searchm', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await magnetFlow.open(ctx, parseCommandArgument(ctx.message.text, 240));
+  });
+  bot.action(/^mg:(ep|page):[a-f0-9]{12}:\d{1,5}$/, async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await magnetFlow.action(ctx);
+  });
+
+  bot.command('search', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const query = parseCommandArgument(ctx.message.text, 140);
+    if (!query) {
+      await ctx.reply([
+        'Usage: /search Our Sticky Love',
+        'It answers with the Post ID of every card whose title, filename, or ID matches \u2014 no more scrolling through /posts.',
+        'You can also forward me the announcement post, or paste the catalog page link, and I reply with that card\u2019s Post ID.'
+      ].join('\n'));
+      return;
+    }
+    const listed = typeof repository.listContent === 'function'
+      ? await repository.listContent({ query, limit: 24, includeAdminId: true })
+      : [];
+    if (!listed.length) {
+      await ctx.reply(`No catalog card matches \u201c${query}\u201d. /posts lists the newest posts and /postid finds them by the day they were uploaded.`);
+      return;
+    }
+    const lines = listed.map((entry) => {
+      const files = Number.isInteger(Number(entry.filesCount)) ? entry.filesCount : (Array.isArray(entry.files) ? entry.files.length : 0);
+      const link = config ? getContentPageUrl(config, entry) : null;
+      const facts = [
+        categoryDetails(entry.category).label,
+        Number(entry.year) ? String(entry.year) : null,
+        `${files} file${files === 1 ? '' : 's'}`,
+        entry.published === false ? 'draft' : null
+      ].filter(Boolean).join(' \u00b7 ');
+      return [`\u25aa ${entry.adminId} \u00b7 ${cleanText(entry.title, 80)}`, `   ${facts}`, link ? `   ${link}` : null]
+        .filter(Boolean)
+        .join('\n');
+    });
+    // Split rather than truncated: an ID cut in half cannot be pasted into the next command.
+    await replyBatchDiagnostics(ctx, [`${listed.length} card${listed.length === 1 ? '' : 's'} match \u201c${query}\u201d:`, '', ...lines]);
+  });
+
+  bot.command('posts', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedLimit = Number.parseInt(parseCommandArgument(ctx.message.text), 10);
+    const limit = Number.isInteger(suppliedLimit) ? Math.max(1, Math.min(suppliedLimit, 50)) : 25;
+    const posts = await repository.listAdminContent(limit);
+    if (!posts.length) {
+      await ctx.reply('There are no catalog posts yet.');
+      return;
+    }
+    await replyBatchDiagnostics(ctx, [
+      `Recent catalog posts (${posts.length}) — copy an ID into /delete.`,
+      ...posts.map((post, index) => {
+        const episodes = post.episodeCount ? ` · ${post.episodeCount} episode${post.episodeCount === 1 ? '' : 's'}` : '';
+        return `${index + 1}. ${post.adminId} · ${cleanText(post.title, 74)} — ${categoryDetails(post.category).shortLabel} · ${post.filesCount || 0} file${post.filesCount === 1 ? '' : 's'}${episodes}`;
+      }),
+      '',
+      'Tip: /delete accepts multiple IDs in one message.'
+    ]);
+  });
+
+  bot.command('postid', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await ctx.reply('Choose an upload period. I will return the post IDs and names uploaded in that time window.', postIdKeyboard());
+  });
+
+  bot.command('stats', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.getPublisherStats !== 'function') {
+      await ctx.reply('Publisher statistics are not available in this catalog store.');
+      return;
+    }
+    const stats = await repository.getPublisherStats();
+    await ctx.reply(formatPublisherStats(stats));
+  });
+
+  bot.command('cmd', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /cmd in your private publisher chat, then send the small JSON/CSV player-link export there.');
+      return;
+    }
+    if (typeof repository.startStreamImport !== 'function' || typeof repository.findContentByAdminId !== 'function') {
+      await ctx.reply('Manual Watch-link import is not available in this catalog store.');
+      return;
+    }
+    const argument = parseMultilineCommandArgument(ctx.message.text, 6_000);
+    if (/^(?:cancel|stop)$/i.test(argument)) {
+      await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+      await ctx.reply('Manual Watch-link import cancelled. No player links were changed.', panelKeyboard());
+      return;
+    }
+    if (/^(?:help|example)$/i.test(argument)) {
+      await ctx.reply(streamImportInstructions());
+      return;
+    }
+    if (await repository.findBackupRecovery?.(chatId(ctx), userId(ctx))) {
+      await ctx.reply('A backup recovery is waiting for a document. Finish it or use /cancel first, then start /cmd.');
+      return;
+    }
+
+    const target = argument.match(/^(SB-[A-F0-9]{10})(?:\s+([\s\S]+))?$/i);
+    if (argument && !target) {
+      await ctx.reply('Usage: /cmd SB-0123ABCDEF ep 1 <player URL or iframe> for one episode (several links in one message are all saved), /cmd SB-0123ABCDEF ep 2-7 <URL> for a range, /cmd SB-0123ABCDEF with \u201cep 176 <URL>\u201d and \u201cep 177 <URL>\u201d on separate lines for several episodes at once, /cmd SB-0123ABCDEF <player URL or iframe> for a release-wide player, /cmd SB-0123ABCDEF del ep 2-7 to remove players, or /cmd SB-0123ABCDEF followed by a JSON/CSV export. Use /cmd help for the manifest fields, or /players SB-0123ABCDEF to see what is attached.');
+      return;
+    }
+    const targetAdminId = target?.[1]?.toUpperCase() || null;
+    const directValue = cleanMultilineText(target?.[2] || '', 4_800);
+    if (targetAdminId) {
+      const content = await repository.findContentByAdminId(targetAdminId);
+      if (!content) {
+        await ctx.reply(`No published catalog post was found for ${targetAdminId}. Use /posts or /postid to find its private ID.`);
+        return;
+      }
+      if (directValue) {
+        const directInput = parseDirectStreamingInput(directValue);
+        if (directInput.error) {
+          await ctx.reply(directInput.error);
+          return;
+        }
+        if (directInput.action === 'delete') {
+          const outcome = await removeAttachedPlayers({ repository, targetAdminId, removal: directInput.delete, config });
+          if (outcome.error) {
+            await ctx.reply(`${outcome.error} Use /players ${targetAdminId} to list the current players with their numbers.`);
+            return;
+          }
+          await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+          await ctx.reply(
+            `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} player${outcome.remaining === 1 ? '' : 's'} still attached. No announcement was sent and no file was changed.`,
+            playersKeyboard(outcome.content, playersList(outcome.content, config))
+          );
+          return;
+        }
+        // Each labeled line becomes its own episode group, and every link of a
+        // group is attached to that group's episode.
+        const manual = buildManualPlayerManifest(targetAdminId, directValue, config);
+        if (manual.error) {
+          await ctx.reply(manual.error);
+          return;
+        }
+        const { manifest } = manual;
+        const links = { urls: manifest.entries, rejected: manual.rejected };
+        if (!links.urls.length) {
+          const oneClickHost = oneClickDownloadHost(directValue);
+          await ctx.reply(oneClickHost
+            ? `${oneClickHost} is a one-click download host, not a player: a visitor lands on a wait-and-continue page that also refuses to be framed, so it cannot become a Watch player. Keep those links in the post's file list for delivery. Hosts that publish a real embed — Dailymotion, Rumble, Vimeo, OK.ru, Dood, StreamWish, Mixdrop, StreamTape, SeekStreaming — are accepted automatically, and any other one works after you add its domain to STREAMING_ALLOWED_HOSTS. If a host gives you an <iframe …> embed code, paste the whole code and it is read from that.`
+            : 'That player URL or iframe is not an approved HTTPS streaming source. Accepted by default: SeekStreaming Embed Link/Embed Code, Dailymotion, Rumble, Vimeo, OK.ru, Dood, StreamWish, Mixdrop, and StreamTape — page links are converted to their embeddable player URL automatically. Add another trusted domain through STREAMING_ALLOWED_HOSTS, or paste the provider’s own <iframe …> embed code. For an episode-specific player, use /cmd SB-0123ABCDEF ep 1 <player URL>.');
+          return;
+        }
+        const result = await applyStreamingManifest({
+          repository,
+          targetAdminId,
+          config,
+          // Manual links are added, never silently replaced: a second source for
+          // the same episode is a deliberate choice by the publisher.
+          granularity: 'exact',
+          manifest
+        });
+        await repository.deleteStreamImport?.(chatId(ctx), userId(ctx));
+        const rejectedNote = links.rejected.length
+          ? `\nSkipped ${links.rejected.length} link${links.rejected.length === 1 ? '' : 's'} from an unapproved host: ${links.rejected.slice(0, 3).join(', ')}${links.rejected.length > 3 ? '…' : ''}`
+          : '';
+        await ctx.reply(`${streamImportResultText(result, config)}${episodeCoverageNote(manual.episodes, manifest.entries.length)}${rejectedNote}${result.updated.length ? `\nManage them with /players ${targetAdminId}` : ''}`);
+        return;
+      }
+    }
+
+    await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId });
+    await ctx.reply(streamImportInstructions(targetAdminId));
+  });
+
+  // ── /repair: re-run today's indexing rules over cards indexed by an older build.
+  // A card is parsed once, when it is written, so a rule shipped later never reaches
+  // the cards published before it. This is the one command that catches the whole
+  // site up after a deploy, without re-uploading a single file.
+  const repairReportText = async ({ dryRun, adminId = null, ctx = null }) => {
+    const report = await repository.reindexContent({ dryRun, adminId });
+    const mediaReport = typeof repository.reconcileCatalogMediaFromFiles === 'function'
+      ? await repository.reconcileCatalogMediaFromFiles({ dryRun, adminId }).catch(() => ({ checked: 0, updated: 0, cards: [] }))
+      : { checked: 0, updated: 0, cards: [] };
+    if (adminId && !report.checked) {
+      return `No published catalog post was found for ${adminId}. Use /posts or /postid to find its current ID.`;
+    }
+    const lines = [];
+    lines.push(`▸ ${dryRun ? 'Preview · ' : ''}${report.checked} published card${report.checked === 1 ? '' : 's'} checked — ${report.updated} ${dryRun ? 'would be re-indexed' : 're-indexed'}${mediaReport.updated ? `, ${mediaReport.updated} ${dryRun ? 'would have' : 'had'} audio/subtitles/qualities synced from files` : ''}.`);
+    for (const card of report.cards.slice(0, 10)) {
+      lines.push([
+        `▪ ${cleanText(card.title, 48)} (${card.adminId})`,
+        card.notes.length ? card.notes.join(' · ') : 'index rebuilt',
+        card.unindexed.length ? `${card.unindexed.length} file${card.unindexed.length === 1 ? '' : 's'} still unnumbered` : null
+      ].filter(Boolean).join(' — '));
+    }
+    if (report.cards.length > 10) lines.push(`▪ +${report.cards.length - 10} more card${report.cards.length - 10 === 1 ? '' : 's'} not listed here.`);
+    const seasonWord = report.seasonPacks
+      ? ` ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} on these cards ${report.seasonPacks === 1 ? 'is' : 'are'} filed by season, and`
+      : ' and';
+    lines.push(report.updated || mediaReport.updated
+      ? `▪ Nothing was dropped${seasonWord} ${report.unindexed} file${report.unindexed === 1 ? ' has' : 's have'} no episode number at all.${dryRun ? ' Re-send those with a caption like “Ep 12” only if a number was really missed.' : ' They stay in the card’s file list and are delivered as files.'}`
+      : `▪ Every card already matches the indexing rules in this build${report.seasonPacks ? `, including ${report.seasonPacks} complete-season file${report.seasonPacks === 1 ? '' : 's'} filed by season` : ''}. Nothing was written.`);
+    // The channel post lists how many files and episodes a release carries, so a card
+    // whose index changed has an announcement that no longer matches it. Same lane as
+    // every other edit, so a site-wide repair cannot burst its way into a flood limit.
+    const changedIds = new Set([
+      ...(report.cards || []).map((c) => c.adminId),
+      ...(mediaReport.cards || []).map((c) => c.adminId)
+    ]);
+    if (!dryRun && changedIds.size && ctx && typeof repository.listAnnouncedContent === 'function') {
+      const announced = new Set((await repository.listAnnouncedContent({ adminId })).map((entry) => entry.adminId));
+      let queuedAnnouncements = 0;
+      for (const changedAdminId of changedIds) {
+        if (!announced.has(changedAdminId)) continue;
+        const content = await repository.findContentByAdminId?.(changedAdminId);
+        if (!content) continue;
+        queueAnnouncementSync({ telegram: ctx.telegram, repository, content, config, adminId: changedAdminId, notifyChatId: chatId(ctx) }, { detached: true });
+        queuedAnnouncements += 1;
+      }
+      if (queuedAnnouncements) {
+        lines.push(`▪ ${queuedAnnouncements} channel announcement${queuedAnnouncements === 1 ? '' : 's'} queued so the posted copy matches the corrected card — one edit at a time on the lane, retried when Telegram lifts its limit, and /sync lists anything still waiting.`);
+      }
+    }
+    lines.push('Titles, Post IDs, slugs, posters, players, and delivery links were not touched, and no file was re-uploaded. Franchise collections are the one thing added — they come from the titles you already set, which is how Iron Man 2 finds its collection page without anyone naming it.');
+    if (typeof repository.listStorageCaptionTargets === 'function') {
+      lines.push('▪ The database channel’s own captions are outside a re-index: /sync db lists the copied file posts still opening with an @channel handle, and /sync db go rewrites them to the label this catalog stored.');
+    }
+    if (dryRun && report.updated) lines.push('Applying also queues a channel-announcement refresh for the cards that change, because the posted copy lists file and episode counts. To apply it: /repair go');
+    if (dryRun && !report.updated) lines.push('To apply it anyway: /repair go');
+    return lines.join('\n').slice(0, 3_800);
+  };
+
+  bot.command('repair', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.reindexContent !== 'function') {
+      await ctx.reply('Re-indexing is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 60).trim();
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    if (!targetAdminId && argument && !/^(?:go|run|apply|all|preview|check)$/i.test(argument)) {
+      await ctx.reply([
+        'Usage:',
+        '/repair — shows what today’s rules would change, writes nothing',
+        '/repair go — applies it to every published card',
+        '/repair SB-0123ABCDEF — re-indexes that one card now',
+        'A card is indexed when it is published, so a rule added later never reaches older cards. This is how they catch up after a deploy without re-uploading anything.'
+      ].join('\n'));
+      return;
+    }
+    await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
+    const dryRun = !targetAdminId && (!argument || /^(?:preview|check)$/i.test(argument));
+    await ctx.reply(await repairReportText({ dryRun, adminId: targetAdminId, ctx }));
+  });
+
+  // ── /sync: the announcement channels on their own. Re-indexing fixes a card; this fixes
+  //    the copy a channel shows, which is where a post published before the channel-tag
+  //    cleaner still reads "@somechannel". Nothing here uploads a file or edits a card, and
+  //    every send rides the paced lane, so a site-wide refresh cannot fire hundreds of
+  //    simultaneous edits and get refused the way a big /batch used to.
+  bot.command('sync', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.listAnnouncedContent !== 'function') {
+      await ctx.reply('Channel refresh is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 60).trim();
+    // ── /sync db: the database channel's own captions. A file post copied in from a
+    //    publisher's channel keeps whatever @handle its sender put in front of it, which is
+    //    invisible on the website (the stored label is sanitized) and still staring at anyone
+    //    who opens the channel. This writes the stored label back over the message.
+    const storageMode = /^(?:db|database|storage|captions)\b[\s:,-]*(.*)$/i.exec(argument);
+    if (storageMode) {
+      const rest = storageMode[1].trim();
+      const storageAdminId = postIdsFromCommand(rest)[0] || null;
+      const only = cleanText(rest.replace(/SB-[A-F0-9]{10}/gi, ' '), 40).trim();
+      if (/^(?:retry|reset|forget|clear)$/i.test(only)) {
+        const forgotten = clearStorageCaptionMemory();
+        const total = forgotten.blocked + forgotten.clean;
+        await ctx.reply(total
+          ? `Forgot ${forgotten.blocked} refused message${forgotten.blocked === 1 ? '' : 's'} and ${forgotten.clean} already-clean message${forgotten.clean === 1 ? '' : 's'}. /sync db reads them all again, and /sync db go will try ${total === 1 ? 'it' : 'them'} once more.`
+          : 'Nothing was remembered from an earlier run, so there is nothing to forget. /sync db lists what can be cleaned.');
+        return;
+      }
+      if (/^(?:status|progress|how)$/i.test(only)) {
+        await ctx.reply(storageSweepStatusText());
+        return;
+      }
+      if (only && !/^(?:go|run|apply|all|preview|check)$/i.test(only)) {
+        await ctx.reply([
+          'Usage:',
+          '/sync db — reads the caption on every database-channel file post and shows which carry an @channel prefix; it changes nothing',
+          '/sync db go — cleans them all, a page at a time, and answers again when the sweep is done',
+          '/sync db SB-0123ABCDEF — that card’s posts only',
+          '/sync db status — how far the running sweep has got',
+          '/sync db retry — forget which messages were refused or already clean, so they are read again',
+          'Nothing is re-uploaded and no caption is invented: a message is only ever set to the cleaned form of the caption Telegram reports for it. A post this bot did not send cannot be edited by any bot, and is listed rather than retried.'
+        ].join('\n'));
+        return;
+      }
+      if (typeof repository.listStorageCaptionTargets !== 'function') {
+        await ctx.reply('Database-caption cleanup is not available in this catalog store.');
+        return;
+      }
+      const storageApply = Boolean(storageAdminId) || /^(?:go|run|apply|all)$/i.test(only);
+      const { targets: storageTargets, stats: storageStats } = await listStorageCaptionTargets(repository, { adminId: storageAdminId, config });
+      // A single card is a small enough job to read and answer in one go; everything else is
+      // queued so the command's reply is never held up by a channel that is rate limiting.
+      const storageCards = new Set(storageTargets.map((entry) => entry.adminId).filter(Boolean)).size;
+      if (!storageApply) {
+        await ctx.reply(storageScrubPreviewText({
+          targets: storageTargets,
+          cards: storageCards,
+          blocked: listStorageCaptionBlockers().length,
+          stats: storageStats,
+          single: Boolean(storageAdminId)
+        }));
+        return;
+      }
+      if (!storageTargets.length) {
+        await ctx.reply(storageScrubPreviewText({ targets: [], cards: 0, blocked: listStorageCaptionBlockers().length, stats: storageStats, apply: true }));
+        return;
+      }
+      // The publisher's own chat is the safe place to forward a message into for inspection,
+      // exactly as /batch does, and the preview is deleted again per message.
+      const sweepQueued = queueStorageCaptionSweep({
+        telegram: ctx.telegram,
+        repository,
+        config,
+        adminId: storageAdminId,
+        notifyChatId: chatId(ctx),
+        // Never awaited. A sweep of a whole database outlives a Telegram request timeout, and
+        // holding the update open used to turn a command that worked into "Something went wrong
+        // while handling that request". The sweep reports here when it finishes instead.
+        inspectChatId: chatId(ctx)
+      });
+      await ctx.reply([
+        storageScrubPreviewText({
+          targets: storageTargets,
+          cards: storageCards,
+          blocked: listStorageCaptionBlockers().length,
+          stats: storageStats,
+          apply: true,
+          single: Boolean(storageAdminId)
+        }),
+        sweepQueued
+          ? '▪ Running on the lane: every database message this catalog knows, a page at a time — not only the first page. This reply is not waiting for it, it answers again when the sweep finishes, and /sync db status asks how far it has got. A caption Telegram refuses is retried rather than dropped.'
+          : '▪ A sweep is already running on the lane and will report here when it finishes. /sync db status shows how far it has got.'
+      ].filter(Boolean).join('\n'));
+      return;
+    }
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    if (/^(?:retry|reset|forget|clear)$/i.test(argument)) {
+      const forgotten = clearAnnouncementUnsyncable();
+      // A message this bot failed to edit is kept on the card with the reason, so the publisher can
+      // act on it; after the bot's rights change, that memory has to go or the copy stays stale
+      // forever while every later edit answers "already remembered".
+      for (const content of await repository.listAnnouncedContent({}).catch(() => [])) {
+        const refs = Array.isArray(content.announcementRefs) ? content.announcementRefs : [];
+        const marked = refs.filter((reference) => reference?.syncError);
+        if (!marked.length || typeof repository.updateContentByAdminId !== 'function') continue;
+        await Promise.resolve(repository.updateContentByAdminId(content.adminId, {
+          announcementRefs: refs.map((reference) => (reference?.syncError ? { ...reference, syncError: null } : reference))
+        })).catch(() => {});
+      }
+      await ctx.reply(forgotten
+        ? `Forgot ${forgotten} channel message${forgotten === 1 ? '' : 's'} this bot could not edit, and cleared the refusals on the cards. /sync go tries them all again — if the bot was not an administrator of that channel, add it there first, or the same answer comes back.`
+        : 'Nothing was remembered as uneditable, so there is nothing to forget. /sync lists what is behind, and /sync go sends it.');
+      return;
+    }
+    if (argument && !targetAdminId && !/^(?:go|run|apply|all|preview|check|status|retry|reset|forget|clear|now|force|fresh|re-?check|rescan)$/i.test(argument)) {
+      await ctx.reply([
+        'Usage:',
+        '/sync — shows which channel posts no longer match their card, sends nothing',
+        '/sync go — refreshes every one of them, one edit at a time',
+        '/sync SB-0123ABCDEF — refreshes that post’s announcement now and reports the result',
+        '/sync retry — forgets which channel copies this bot could not edit, so they are attempted again',
+        '/sync force — re-reads the whole archive now instead of answering from the sweep it just did',
+        '/sync db — and /sync db go — the same for the captions on messages in the database channel',
+        'A refused edit is not lost: it stays queued and is retried after Telegram’s own wait.'
+      ].join('\n'));
+      return;
+    }
+    const apply = Boolean(targetAdminId) || /^(?:go|run|apply|all)$/i.test(argument);
+    const force = /^(?:now|force|fresh|re-?check|rescan)$/i.test(argument);
+    await Promise.resolve(ctx.replyWithChatAction?.('typing')).catch(() => {});
+    // One sweep, not one per command. /sync and /sync go read every announced card, which on a
+    // catalog of hundreds is the slow part, and running them back to back checked the same cards
+    // twice. A fresh preview is therefore reused by /sync go, which then re-reads only the few cards
+    // it is about to touch; /sync force always checks the whole archive again.
+    const memoKey = targetAdminId || '*';
+    const memoIsFresh = (maxAgeMs) => !force && announcementSweepMemo
+      && announcementSweepMemo.key === memoKey
+      && Date.now() - announcementSweepMemo.at <= maxAgeMs;
+    const reuseAge = !apply
+      ? (memoIsFresh(ANNOUNCEMENT_SYNC_PREVIEW_TTL_MS) ? Date.now() - announcementSweepMemo.at : null)
+      : (memoIsFresh(ANNOUNCEMENT_SYNC_APPLY_TTL_MS) ? Date.now() - announcementSweepMemo.at : null);
+    const sweep = reuseAge === null
+      ? await sweepAnnouncedCards({ repository, config, adminId: targetAdminId })
+      : announcementSweepMemo.sweep;
+    if (!apply || reuseAge === null) announcementSweepMemo = { key: memoKey, at: Date.now(), sweep };
+    const status = announcementSyncStatus();
+    const { stale, refs, checked, matching, leftAlone, deferred } = sweep;
+    if (targetAdminId && !checked) {
+      await ctx.reply(`No published post with a Telegram announcement was found for ${targetAdminId}. /posts lists what has one, and 18+ releases are never announced.`);
+      return;
+    }
+
+    const took = sweep.elapsedMs >= 1000 ? `${(sweep.elapsedMs / 1000).toFixed(1)} s` : `${sweep.elapsedMs} ms`;
+    const lines = [];
+    lines.push([
+      `\u25b8 ${apply ? 'Applying \u00b7 ' : 'Preview \u00b7 '}${checked} announced card${checked === 1 ? '' : 's'} checked in ${took}`,
+      `${stale.length} ${apply ? 'refreshing' : 'need'} a channel refresh (${refs} posted message${refs === 1 ? '' : 's'})`,
+      `${matching} ${matching === 1 ? 'already matches' : 'already match'} and cost no call at all`,
+      leftAlone ? `${leftAlone} ${leftAlone === 1 ? 'card has' : 'cards have'} ${deferred} copy${deferred === 1 ? '' : 'ies'} this bot cannot edit${stale.length ? ', not counted above' : ''}` : null
+    ].filter(Boolean).join(' \u2014 ') + '.');
+    lines.push(reuseAge === null
+      ? `\u25aa ${matching} of those ${checked === 1 ? 'card was' : 'cards were'} skipped without asking Telegram: each one already carries the caption, link, and artwork its posted copy remembers.${leftAlone ? ` ${leftAlone} ${leftAlone === 1 ? 'is' : 'are'} left alone for a reason that will not change on its own.` : ''}`
+      : `\u25aa Answered from the sweep ${shortDuration(reuseAge)} ago, so nothing was re-checked${apply ? ' - only the cards about to be edited were read again' : ''}. ${force ? '' : 'Send /sync force to check the whole archive again.'}`);
+    for (const entry of stale.slice(0, 8)) {
+      lines.push(`\u25aa ${entry.content.adminId} \u00b7 ${cleanText(entry.content.title, 44)} \u2014 ${entry.refs} message${entry.refs === 1 ? '' : 's'}${entry.remembered ? ` (${entry.remembered} ${entry.remembered === 1 ? 'copy' : 'copies'} this bot did not post)` : ''}${entry.reason ? ` \u00b7 Telegram said: ${cleanText(entry.reason, 90)}` : ''}`);
+    }
+    if (stale.length > 8) lines.push(`\u25aa +${stale.length - 8} more not listed here.`);
+    lines.push(status.pending
+      ? `\u25aa Lane: ${status.pending} job${status.pending === 1 ? '' : 's'} queued${status.totals.retried ? `, ${status.totals.retried} send${status.totals.retried === 1 ? '' : 's'} already waited out a Telegram limit` : ''}.`
+      : '\u25aa Lane is idle.');
+    if (status.stale.length) {
+      lines.push(`\u25aa Still refused after their rounds: ${status.stale.slice(0, 10).map((entry) => `${entry.key || entry.label}${entry.blocked ? ' (this bot cannot edit that channel \u2014 add it as an administrator with \u201cManage messages\u201d)' : entry.reason ? ` (${cleanText(entry.reason, 60)})` : ''}`).filter(Boolean).join('; ')}. /sync go tries again, and /sync retry forgets what was remembered \u2014 the cards themselves are already correct.`);
+    }
+    lines.push('\u25aa The database channel\u2019s own captions are a separate sweep: /sync db reads each file post\u2019s caption from Telegram and cleans it, on this same lane.');
+    if (!stale.length) {
+      lines.push('Every announcement already shows what this build would publish, so there is nothing to send. A post whose copy predates the channel-tag cleaner is refreshed here once and never again.');
+    } else if (apply) {
+      let queued = 0;
+      let caughtUp = 0;
+      for (const entry of stale) {
+        // A reused preview is a snapshot, so the handful of cards about to be touched are read again
+        // rather than sent from what the archive said a minute ago.
+        let content = entry.content;
+        if (reuseAge !== null && typeof repository.findContentByAdminId === 'function') {
+          content = await Promise.resolve(repository.findContentByAdminId(entry.content.adminId)).catch(() => null) || entry.content;
+          const link = config ? getContentPageUrl(config, content) : null;
+          const caption = announcementCaption(content);
+          const behind = (Array.isArray(content.announcementRefs) ? content.announcementRefs : []).filter(
+            (reference) => !announcementReferenceIsCurrent(reference, { caption, link, posterUrl: content.posterUrl || null })
+              && !announcementRefIsDeferred(reference, { caption, link, posterUrl: content.posterUrl || null })
+              && !announcementUnsyncable.has(announcementRefKey(reference))
+          );
+          if (!behind.length) {
+            caughtUp += 1;
+            continue;
+          }
+        }
+        const job = queueAnnouncementSync({
+          telegram: ctx.telegram,
+          repository,
+          content,
+          config,
+          adminId: content.adminId,
+          notifyChatId: chatId(ctx)
+        });
+        if (stale.length === 1 && job) {
+          const { settled, result } = await settleQueuedJob(job);
+          if (settled) lines.push(announcementSyncNote(result));
+          else {
+            job.catch(() => {});
+            lines.push('\u25aa Queued behind the work already on the lane, so this reply is not waiting for it; the lane reports the edit when it goes through.');
+          }
+        }
+        else if (job) job.catch(() => {});
+        queued += 1;
+      }
+      if (caughtUp) {
+        lines.push(`\u25aa ${caughtUp} ${caughtUp === 1 ? 'card had' : 'cards had'} already caught up since that preview, so nothing was sent for ${caughtUp === 1 ? 'it' : 'them'}.`);
+      }
+      if (!queued) {
+        lines.push('Nothing needed sending after all \u2014 every copy on that list was already correct.');
+      } else if (stale.length > 1) {
+        const minutes = Math.max(1, Math.ceil((refs * ANNOUNCEMENT_SYNC_SPACING_MS) / 60_000));
+        lines.push(`\u25aa ${queued} card${queued === 1 ? '' : 's'} queued on the lane, one edit per ${(ANNOUNCEMENT_SYNC_SPACING_MS / 1000).toFixed(1)}s \u2014 roughly ${minutes} minute${minutes === 1 ? '' : 's'} of sending. This reply is not waiting for it; /sync shows progress, and you get a message only if something never gets through.`);
+      }
+    } else {
+      lines.push(`To send them: /sync go${targetAdminId ? '' : ', or /sync SB-\u2026 for a single card'}. A refresh only ever touches the ${stale.length} ${stale.length === 1 ? 'card' : 'cards'} above, never the ${matching} that already match.`);
+    }
+    await ctx.reply(lines.filter(Boolean).join('\n'));
+  });
+
+  // ── /players: the list view of attached players, with Remove buttons. The
+  //    numbers here are the numbers `del <n>` uses, so a wrong or bulk import is
+  //    reversible without remembering provider URLs.
+  bot.command('players', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (typeof repository.findContentByAdminId !== 'function') {
+      await ctx.reply('Player management is not available in this catalog store.');
+      return;
+    }
+    const argument = parseCommandArgument(ctx.message.text, 120);
+    const targetAdminId = postIdsFromCommand(argument)[0] || null;
+    const scoped = targetAdminId ? cleanText(String(argument).replace(targetAdminId, ' '), 80) : String(argument || '');
+    let view = parsePlayersView(scoped);
+    if (view.error) {
+      await ctx.reply(view.error);
+      return;
+    }
+    if (!targetAdminId) {
+      const posts = typeof repository.listAdminContent === 'function' ? await repository.listAdminContent(10) : [];
+      await ctx.reply([
+        'Usage: /players SB-0123ABCDEF',
+        'That lists every player attached to a release and lets you remove one, an episode range, or all of them.',
+        'A card with many episodes is easier to narrow than to scroll: /players SB-0123ABCDEF 176 (that episode), ep 170-180 (a range), missing (the episodes nobody has filled yet), #12 (row twelve), or 3 (page three). The buttons below the list do the same, and a Remove button always names the card it acts on.',
+        posts.length ? `Recent post IDs:\n${posts.map((post) => `▪ ${post.adminId} — ${cleanText(post.title, 60)}`).join('\n')}` : 'No published posts were found in this bot store yet.'
+      ].join('\n'));
+      return;
+    }
+    const content = await repository.findContentByAdminId(targetAdminId);
+    if (!content) {
+      await ctx.reply(`No published catalog post was found for ${targetAdminId}. Use /posts or /postid to find its private ID.`);
+      return;
+    }
+    // Re-read with the card in hand: a bare number means the episode they are
+    // looking for on a card that has it, and a page number on one that does not.
+    view = parsePlayersView(scoped, content);
+    const entries = playersList(content, config);
+    if (view.mode === 'missing') {
+      await ctx.reply(playersMissingText(content, entries, config), playersKeyboard(content, entries, { mode: 'missing', page: 1 }));
+      return;
+    }
+    await ctx.reply(playersListText(content, entries, config, view), playersKeyboard(content, entries, view));
+  });
+
+  bot.action(/^ply:rem:([A-Z0-9-]{4,40}):(all|\d{1,4})(?::([a-z0-9-]{1,16}):(\d{1,4}))?$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, removalAdminId, rawTarget, rawView, rawPage] = ctx.match;
+    const view = rawView ? { ...playersViewFromKey(rawView), page: Number(rawPage) || 1 } : { mode: 'all', page: 1 };
+    const removal = rawTarget === 'all'
+      ? { mode: 'all' }
+      : { mode: 'index', indexes: [Number(rawTarget)] };
+    let outcome;
+    try {
+      outcome = await removeAttachedPlayers({ repository, targetAdminId: removalAdminId, removal, config });
+    } catch (error) {
+      console.error('[telegram] player removal failed:', error?.message || 'Unknown error');
+      await acknowledgeTap(ctx, 'The player could not be removed. Nothing was changed.', { alert: true });
+      return;
+    }
+    if (outcome.error) {
+      await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
+      return;
+    }
+    const note = `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached. No announcement was sent and no file was changed.`;
+    // The same view comes back, so clearing one episode's players never throws the
+    // publisher to page one of everything they were not looking at.
+    const pages = Math.max(1, Math.ceil(outcome.remaining / PLAYERS_PAGE_SIZE));
+    const nextView = { ...view, page: outcome.remaining ? Math.min(view.page || 1, pages) : 1 };
+    await renderPlayersMessage(ctx, repository, config, outcome.content.adminId, nextView, note);
+    await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
+  });
+
+  bot.action(/^ply:remep:([A-Z0-9-]{4,40}):(\d{1,3})-(\d{1,3})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, episodeAdminId, rawStart, rawEnd] = ctx.match;
+    const start = Number(rawStart);
+    const end = Number(rawEnd) || start;
+    const view = { mode: 'episode', episode: { start, end, label: directEpisodeLabel(start, end) }, page: 1 };
+    const outcome = await removeAttachedPlayers({ repository, targetAdminId: episodeAdminId, removal: { mode: 'episode', episode: view.episode }, config });
+    if (outcome.error) {
+      await acknowledgeTap(ctx, `${outcome.error} Nothing was changed.`, { alert: true });
+      return;
+    }
+    await renderPlayersMessage(ctx, repository, config, episodeAdminId, view, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'} (${outcome.scope}) from “${outcome.content.title}”. ${outcome.remaining} still attached.`);
+    await acknowledgeTap(ctx, `Removed ${outcome.removed} player${outcome.removed === 1 ? '' : 's'}`);
+  });
+
+  bot.action(/^ply:pag:([A-Z0-9-]{4,40}):([a-z0-9-]{1,16}):(\d{1,4})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, pageAdminId, rawView, rawPage] = ctx.match;
+    const view = { ...playersViewFromKey(rawView), page: Number(rawPage) || 1 };
+    const rendered = await renderPlayersMessage(ctx, repository, config, pageAdminId, view);
+    if (rendered === 'gone') {
+      await acknowledgeTap(ctx, 'That post is no longer available. Use /posts to find its current private ID.', { alert: true });
+      return;
+    }
+    await acknowledgeTap(ctx, view.mode === 'episode' ? view.episode.label : view.mode === 'missing' ? 'Episodes without a player' : `Page ${view.page}`);
+  });
+
+  bot.action(/^ply:add:([A-Z0-9-]{4,40})$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const [, addAdminId] = ctx.match;
+    const content = await repository.findContentByAdminId?.(addAdminId);
+    if (!content) {
+      await acknowledgeTap(ctx, 'That post is no longer available. Use /posts to find its current private ID.', { alert: true });
+      return;
+    }
+    if (typeof repository.startStreamImport !== 'function') {
+      await acknowledgeTap(ctx, 'Player links can only be pasted in the private publisher chat.', { alert: true });
+      return;
+    }
+    await repository.startStreamImport({ chatId: chatId(ctx), ownerId: userId(ctx), targetAdminId: content.adminId });
+    await acknowledgeTap(ctx, 'Now paste the player URL or the provider export');
+    await ctx.reply(streamImportInstructions(content.adminId));
+  });
+
+  bot.action(/^ply:close$/, async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    await acknowledgeTap(ctx, 'Player list closed. Use /players SB-0123ABCDEF to show it again.');
+  });
+
+  bot.command('backup', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (!config.telegram.storageChannelId) {
+      await ctx.reply('TELEGRAM_STORAGE_CHANNEL_ID is required before I can send a private backup file.');
+      return;
+    }
+    try {
+      await ctx.reply('Creating a signed, compressed application backup and sending it only to the private storage channel…');
+      const createdAt = new Date().toISOString();
+      const backup = await sendStorageBackup({ repository, telegram: bot.telegram, config, createdAt });
+      const month = indiaMonthKey(createdAt);
+      if (month && typeof repository.markMonthlyBackupCreated === 'function') {
+        await repository.markMonthlyBackupCreated({ month, createdAt });
+      }
+      await ctx.reply(`✅ Backup sent privately as ${backup.filename}. Snapshot: ${formatBackupCounts(backup.counts)}. Keep the file private; it is signed and can be restored with /recover.`);
+    } catch (error) {
+      const message = cleanText(error?.message || 'The backup could not be created.', 500);
+      console.error('[telegram] backup failed:', message);
+      await ctx.reply(`Backup was not sent. ${message}`);
+    }
+  });
+
+  bot.command('recover', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    if (await repository.findStreamImport?.(chatId(ctx), userId(ctx))) {
+      await ctx.reply('A manual Watch-link import is waiting for a document. Finish it or use /cmd cancel first, then start /recover.');
+      return;
+    }
+    if (ctx.chat?.type && ctx.chat.type !== 'private') {
+      await ctx.reply('For safety, run /recover in your private chat with this bot, then send the signed backup document there.');
+      return;
+    }
+    if (typeof repository.startBackupRecovery !== 'function') {
+      await ctx.reply('Backup recovery is not available in this catalog store.');
+      return;
+    }
+    try {
+      await repository.startBackupRecovery({ chatId: chatId(ctx), ownerId: userId(ctx) });
+      await ctx.reply([
+        'Recovery mode is armed for 15 minutes.',
+        'Send one unmodified SoraBox .json.gz backup document in this private chat.',
+        'I will verify its signature before replacing catalog/application data. This works after switching to a new or empty MongoDB URI, provided BACKUP_SIGNING_SECRET is unchanged.',
+        'Do not send backups in a public group.'
+      ].join('\n'));
+    } catch (error) {
+      const message = cleanText(error?.message || 'Could not arm backup recovery.', 300);
+      console.error('[telegram] could not arm backup recovery:', message);
+      await ctx.reply(`Recovery was not armed. ${message}`);
+    }
+  });
+
+  bot.command('addchannel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedId = normalizeChannelId(parseCommandArgument(ctx.message.text));
+    if (!suppliedId) {
+      await ctx.reply('Usage: /addchannel -1001234567890\nThe bot must be an administrator in that Telegram channel first.');
+      return;
+    }
+    try {
+      const chat = await ctx.telegram.getChat(suppliedId);
+      if (chat.type !== 'channel') {
+        await ctx.reply('That ID is not a Telegram channel. Add a channel ID (normally beginning with -100) or a public @channelusername.');
+        return;
+      }
+      if (String(chat.id) === String(config.telegram.storageChannelId || '')) {
+        await ctx.reply('The private database channel cannot be an announcement destination. Keeping it separate prevents auto-publish loops and keeps stored media uncluttered.');
+        return;
+      }
+      const channel = await repository.addAnnouncementChannel({
+        channelId: chat.id,
+        title: chat.title || '',
+        username: chat.username || '',
+        addedBy: userId(ctx)
+      });
+      await ctx.reply(`Announcement channel saved: ${channel.title || channel.username || channel.channelId}. Every future published post will be sent there with poster, details, and delivery button.`);
+    } catch (error) {
+      console.error('[telegram] add channel failed:', error?.description || error?.message || 'Unknown error');
+      await ctx.reply('I could not access that channel. Check the ID and make the bot an administrator there, then try again.');
+    }
+  });
+
+  bot.command('channels', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const channels = await repository.listAnnouncementChannels();
+    if (!channels.length) {
+      await ctx.reply('No announcement channels are configured. Use /addchannel <channel_id> after making the bot an admin.');
+      return;
+    }
+    await ctx.reply(['Announcement channels:', '', ...channels.map((channel, index) => `${index + 1}. ${channel.title || channel.username || 'Untitled channel'} — ${channel.channelId}`), '', 'Remove one with /removechannel <channel_id>.'].join('\n'));
+  });
+
+  bot.command('removechannel', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const suppliedId = normalizeChannelId(parseCommandArgument(ctx.message.text));
+    if (!suppliedId) {
+      await ctx.reply('Usage: /removechannel -1001234567890');
+      return;
+    }
+    const removed = await repository.removeAnnouncementChannel(suppliedId);
+    await ctx.reply(removed ? `Removed ${removed.title || removed.channelId} from automatic announcements.` : 'That channel was not in the announcement list.');
+  });
+
+  bot.command('requests', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const requests = await repository.listRequests({ status: 'open', limit: 200 });
+    await ctx.reply(requestManagerText(requests.length), requestManagerKeyboard());
+  });
+
+  bot.command('imgapis', async (ctx) => handleImgApisCommand(ctx, repository, config));
+  bot.command('addimgapi', async (ctx) => handleAddImgApiCommand(ctx, repository, config));
+  for (const cmd of ['removeimgapi', 'delimgapi']) {
+    bot.command(cmd, async (ctx) => handleRemoveImgApiCommand(ctx, repository, config));
+  }
+  for (const cmd of ['maintanence', 'maintenance']) {
+    bot.command(cmd, async (ctx) => handleMaintenanceCommand(ctx, repository, config));
+  }
+  bot.action(/^maint:(?:on|off|status)$/, async (ctx) => handleMaintenanceAction(ctx, repository, config, ctx.match?.[0]));
+  bot.command('restart', async (ctx) => handleRestartCommand(ctx, repository, config, onRestart));
+
+  bot.action('requests:select', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.startRequestSelection({ chatId: chatId(ctx), ownerId: userId(ctx) });
+    await renderRequestSelection(ctx, repository, 0);
+  });
+
+  bot.action(/^requests:page:(\d{1,3})$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await renderRequestSelection(ctx, repository, Number(ctx.match[1]));
+  });
+
+  bot.action(/^requests:toggle:(REQ-[A-F0-9]{10}):(\d{1,3})$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const selection = await repository.toggleRequestSelection(chatId(ctx), userId(ctx), ctx.match[1]);
+    if (!selection) {
+      await replaceInteractiveMessage(ctx, 'That request is no longer open, or your selection expired. Start Select requests again.', requestManagerKeyboard());
+      return;
+    }
+    await renderRequestSelection(ctx, repository, Number(ctx.match[2]));
+  });
+
+  bot.action(/^requests:resolve:(completed|rejected)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const selection = await repository.findRequestSelection(chatId(ctx), userId(ctx));
+    const requestIds = selection?.requestIds || [];
+    if (!requestIds.length) {
+      await replaceInteractiveMessage(ctx, 'Select at least one open request before choosing a status.', requestManagerKeyboard());
+      return;
+    }
+    // Persist the status first, then notify requesters. A delivery failure can
+    // never leave a request looking unresolved after the publisher acted.
+    const status = ctx.match[1];
+    const resolved = await repository.resolveRequests({ requestIds, status, resolvedBy: userId(ctx) });
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    const notifications = await notifyResolvedRequesters(bot, resolved, status);
+    const remaining = await repository.listRequests({ status: 'open', limit: 200 });
+    const label = status === 'completed' ? 'Completed' : 'Rejected';
+    await replaceInteractiveMessage(
+      ctx,
+      `${label} ${resolved.length} request${resolved.length === 1 ? '' : 's'} immediately. ${notifications.notified} requester${notifications.notified === 1 ? '' : 's'} notified${notifications.failed ? `; ${notifications.failed} notification${notifications.failed === 1 ? '' : 's'} could not be delivered` : ''}. ${remaining.length} open request${remaining.length === 1 ? '' : 's'} remain.`,
+      requestManagerKeyboard()
+    );
+  });
+
+  bot.action('requests:back', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.deleteRequestSelection(chatId(ctx), userId(ctx));
+    await replaceInteractiveMessage(ctx, 'Request management closed. Choose a publisher action below.', panelKeyboard());
+  });
+
+  bot.action(/^postid:(today|yesterday|week|month)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    const window = postIdTimeWindow(ctx.match[1]);
+    const posts = await repository.listAdminContent({ startAt: window.startAt, endAt: window.endAt, limit: 100 });
+    await replyBatchDiagnostics(ctx, formatPostIdResults(window, posts).split('\n'));
+  });
+
+  bot.action('postid:back', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await replaceInteractiveMessage(ctx, 'Post-ID lookup closed. Choose a publisher action below.', panelKeyboard());
+  });
+
+  bot.action(/^auto:(status|on|off)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+
+    const action = ctx.match[1];
+    if (action === 'on' && !config.telegram.storageChannelId) {
+      const settings = await repository.getAutoPublishSettings();
+      await ctx.reply('Auto-publish cannot be enabled until TELEGRAM_STORAGE_CHANNEL_ID is configured with the private database channel’s numeric -100… ID.', autoPublishKeyboard(Boolean(settings?.enabled)));
+      return;
+    }
+
+    const settings = action === 'on' || action === 'off'
+      ? await repository.setAutoPublishSettings({
+        enabled: action === 'on',
+        updatedBy: userId(ctx),
+        // Completion/error reports must go to the authorized publisher, never
+        // back into the private database channel.
+        notifyChatId: ctx.chat?.type === 'private' ? chatId(ctx) : undefined
+      })
+      : await repository.getAutoPublishSettings();
+    await ctx.reply(autoPublishStatusText(settings, config), autoPublishKeyboard(Boolean(settings?.enabled)));
+  });
+
+  bot.action(/^new:(anime|cartoon|donghua|kdrama|movie|web-series|tv|adult)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginDraft(ctx, ctx.match[1], '', repository, config);
+  });
+
+  bot.action('draft:status', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await showDraftStatus(ctx, repository);
+  });
+
+  bot.action('draft:cancel', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await repository.deleteSession(chatId(ctx), userId(ctx));
+    await ctx.reply('Draft discarded. No catalog record was created.', panelKeyboard());
+  });
+
+  bot.action('draft:done', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await publishDraft(ctx, bot, repository, config);
+  });
+
+  bot.on('message', async (ctx) => {
+    if (!(await isPublisher(ctx, repository, config))) return;
+    const message = ctx.message;
+    if (await handleBackupRecoveryUpload(ctx, repository, config)) return;
+    if (await handleStreamImportUpload(ctx, repository, config)) return;
+    // An armed /poster conversation takes the next message (post ID, image
+    // link, or title) before it can be mistaken for a draft title.
+    if (await handlePosterFlowMessage(ctx, repository, config)) return;
+    // A forwarded announcement or a pasted card link is a question about a Post ID, and it is
+    // answered here rather than being mistaken for the next title typed into a draft.
+    if (await handlePostIdLookupMessage(ctx, repository, config)) return;
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+
+    if (isMediaMessage(message)) {
+      if (session?.workflow === 'batch') {
+        await ctx.reply('This batch is waiting for private storage links, not new uploads. Send the first/last https://t.me/c/... links, or use /cancel and start a normal draft.');
+        return;
+      }
+      if (!session) {
+        await ctx.reply('Start a draft first with /panel, then upload files.');
+        return;
+      }
+      if (!session.title) {
+        await ctx.reply('Send the release title before uploading files.');
+        return;
+      }
+      const storageChannelId = storageChannelForCategory(config, session.category);
+      if (!storageChannelId) {
+        await ctx.reply(`${storageEnvironmentName(session.category)} is not configured. Add the bot as an admin to the ${storageChannelDescription(session.category)}, configure its ID, then try again.`);
+        return;
+      }
+      if (isAdultCategory(session.category) && !hasDedicatedAdultStorage(config)) {
+        await ctx.reply(`${adultStorageConfigurationHint(config)} Fix it before uploading to this 18+ draft.`);
+        return;
+      }
+
+      let stored;
+      try {
+        stored = await storeMediaInChannel(
+          ctx.telegram,
+          storageChannelId,
+          chatId(ctx),
+          message
+        );
+      } catch (error) {
+        console.error(
+          '[telegram] storage transport failed:',
+          error?.copyError?.description || error?.copyError?.message || error?.message || 'Unknown error',
+          '| fallback:',
+          error?.fallbackError?.description || error?.fallbackError?.message || 'not attempted'
+        );
+        await ctx.reply(`I could not store that file. ${storageErrorHint(error)}`);
+        return;
+      }
+
+      // A publisher-uploaded copy is emitted back to the bot as a channel_post
+      // in many Telegram setups. Mark it before persistence so /auto never
+      // turns a normal draft file into a second, one-file catalog post.
+      ignoreAutoStorageMessage(stored.storageMessageId);
+
+      let updated;
+      let last;
+      let summary;
+      try {
+        updated = await repository.appendSessionFile(
+          chatId(ctx),
+          userId(ctx),
+          fileFromMessage(message, stored.storageMessageId, stored.method, stored.storageChannelId || storageChannelId)
+        );
+        if (!updated?.files?.length) {
+          throw new Error('The active draft was no longer available after the file reached Telegram storage.');
+        }
+        last = updated.files.at(-1);
+        summary = summarizeEpisodes(updated.files);
+      } catch (error) {
+        // A screenshot of the database channel can show the media in this case:
+        // Telegram storage succeeded, but MongoDB could not attach its message ID
+        // to the draft. Keep this separate from a channel-permission failure.
+        console.error('[telegram] draft record failed after storage success:', error?.message || 'Unknown error');
+        await ctx.reply(
+          'The file reached the storage channel, but I could not attach it to this upload draft. Please use /status. If it is not listed, start a new draft before uploading again; do not assume the channel copy is linked to the website.'
+        );
+        return;
+      }
+
+      const size = formatBytes(last.size);
+      const fallbackNote = stored.method === 'file-id-fallback' ? ' Stored with Telegram’s file-ID fallback.' : '';
+      await ctx.reply(
+        `Added ${updated.files.length} file${updated.files.length === 1 ? '' : 's'} to this draft${size ? ` · latest ${size}` : ''}${episodeUploadNote(last, {
+          // The release is episodic when its other files already found their
+          // number, which is when a missing one is worth complaining about.
+          episodic: (updated.files || []).some((entry) => entry !== last && entry?.episode?.start)
+        })}.${summary.releaseLabel ? ` Current index: ${summary.releaseLabel}.` : ''}${fallbackNote} Use /done when the upload is complete.`,
+        uploadKeyboard()
+      );
+      return;
+    }
+
+    if (message.text && !message.text.startsWith('/') && session?.workflow === 'batch') {
+      await handleBatchLink(ctx, session, bot, repository, config);
+      return;
+    }
+
+    if (message.text && !message.text.startsWith('/') && session && !session.title) {
+      await updateTitleAndMetadata({ ctx, repository, config, title: message.text });
+      return;
+    }
+
+    if (message.text && !message.text.startsWith('/') && session) {
+      await ctx.reply('Your title is already set. Upload files, edit metadata with /help, or use /done to publish.', uploadKeyboard());
+    }
+  });
+
+  bot.catch(async (error, ctx) => {
+    const diagnostic = automationDiagnostic(error);
+    const channelPost = ctx?.channelPost || ctx?.update?.channel_post;
+    if (channelPost) {
+      // Never put a fallback reply into the database channel. Those generic
+      // replies were themselves channel posts and made real upload failures
+      // look like a growing series of broken catalog messages.
+      console.error('[telegram] unhandled channel-post error (reply suppressed):', diagnostic);
+      try {
+        const settings = await repository.getAutoPublishSettings();
+        await notifyAutomationPublisher(bot, settings, {
+          state: 'failed',
+          session: { title: 'Storage channel update', files: [] },
+          error: diagnostic
+        });
+      } catch (notificationError) {
+        console.error('[telegram] could not report suppressed channel error:', automationDiagnostic(notificationError));
+      }
+      return;
+    }
+
+    if (isTelegramHandlerTimeout(error)) {
+      console.warn('[telegram] an update handler outlived its time budget; the job keeps running and reports in its own message.');
+      try {
+        await ctx.reply('▪ Still working — this is a large job, and it answers in its own message when it finishes. Nothing was lost, and you do not need to send it again.');
+      } catch {
+        // The work continues regardless of whether this note could be delivered.
+      }
+      return;
+    }
+    console.error('[telegram] unhandled update error:', diagnostic);
+    try {
+      await ctx.reply('Something went wrong while handling that request. Please try again.');
+    } catch {
+      // No further action is possible if Telegram cannot receive the fallback reply.
+    }
+  });
+
+  try {
+    // Public command menu stays intentionally small. Publisher scopes are
+    // installed both for configured owners at startup and for a permitted user
+    // on /start or /login, so Telegram reliably exposes /posts and /postid.
+    await bot.telegram.setMyCommands(VISITOR_COMMANDS);
+    await setConfiguredPublisherCommandScopes(bot, config, repository);
+  } catch (error) {
+    console.warn('[telegram] Could not register bot commands:', error?.message || 'Unknown error');
+  }
+
+  // A process can stop while an ImgBB/metadata request is in flight. Release
+  // its durable claim before polling begins so that group is retried instead of
+  // stranded or routed into a late-arrival group during startup.
+  if (typeof repository.releaseAutomationClaims === 'function') {
+    try {
+      const released = await repository.releaseAutomationClaims();
+      if (released) console.warn(`[telegram] released ${released} interrupted automation claim${released === 1 ? '' : 's'} for retry.`);
+    } catch (error) {
+      console.error('[telegram] could not recover interrupted automation claims:', automationDiagnostic(error));
+    }
+  }
+
+  await bot.launch({
+    dropPendingUpdates: false,
+    polling: {
+      timeout: 20,
+      limit: 100,
+      allowedUpdates: ['message', 'edited_message', 'channel_post', 'edited_channel_post', 'callback_query']
+    }
+  }, () => {
+    const deliveryBot = synchronizeDeliveryBotUsername(config, bot.botInfo);
+    if (deliveryBot.changed) {
+      console.warn(
+        `[telegram] Token belongs to @${deliveryBot.username}, replacing configured @${deliveryBot.previousUsername} for dynamic delivery links.`
+      );
+    } else {
+      console.info(`[telegram] Delivery links are using @${deliveryBot.username || 'an unconfigured bot'}.`);
+    }
+  });
+
+  // Process any group whose persisted deadline elapsed while Koyeb restarted,
+  // then continue checking at a modest interval. There is no in-memory-only
+  // debounce state, so a restart cannot split a 100-file upload into cards.
+  await runAutomationQueue();
+  const automationTimer = setInterval(() => { void runAutomationQueue(); }, AUTO_QUEUE_INTERVAL_MS);
+  automationTimer.unref?.();
+
+  // Automatically reconcile stored posts' audio/subtitle languages and video qualities
+  // from their actual files on startup/redeploy (leaving posts without file language tags untouched).
+  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
+    Promise.resolve(repository.reconcileCatalogMediaFromFiles({ dryRun: false }))
+      .then(async (reconciled) => {
+        if (!reconciled?.updated) return;
+        console.info(`[telegram] startup media reconciliation updated ${reconciled.updated} of ${reconciled.checked} catalog post(s) from their file metadata.`);
+        if (typeof repository.listAnnouncedContent === 'function') {
+          const announced = new Set((await repository.listAnnouncedContent()).map((entry) => entry.adminId));
+          for (const card of reconciled.cards || []) {
+            if (!announced.has(card.adminId)) continue;
+            const content = await repository.findContentByAdminId?.(card.adminId);
+            if (!content) continue;
+            queueAnnouncementSync({ telegram: bot.telegram, repository, content, config, adminId: card.adminId }, { detached: true });
+          }
+        }
+      })
+      .catch((error) => {
+        console.warn('[telegram] startup media reconciliation skipped:', automationDiagnostic(error));
+      });
+  }
+
+  let monthlyBackupPromise = null;
+  const runMonthlyBackupSafely = () => {
+    if (monthlyBackupPromise) return monthlyBackupPromise;
+    monthlyBackupPromise = runMonthlyBackup({ bot, repository, config })
+      .then((result) => {
+        if (result.sent) console.info(`[telegram] monthly signed backup sent for ${result.month}.`);
+        return result;
+      })
+      .catch((error) => {
+        console.error('[telegram] monthly backup failed:', automationDiagnostic(error));
+        return { sent: false, reason: 'error' };
+      })
+      .finally(() => { monthlyBackupPromise = null; });
+    return monthlyBackupPromise;
+  };
+  // Check at startup and periodically. The durable monthly claim prevents a
+  // restart or multiple worker wakeups from generating duplicate archive files.
+  await runMonthlyBackupSafely();
+  const monthlyBackupTimer = setInterval(() => { void runMonthlyBackupSafely(); }, 6 * 60 * 60 * 1000);
+  monthlyBackupTimer.unref?.();
+
+  const originalStop = bot.stop.bind(bot);
+  bot.stop = (reason) => {
+    clearInterval(automationTimer);
+    clearInterval(monthlyBackupTimer);
+    return originalStop(reason);
+  };
+
+  console.info('[telegram] Long polling started. Keep this service at one replica.');
+  return bot;
+}

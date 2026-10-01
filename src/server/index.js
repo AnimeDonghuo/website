@@ -1,0 +1,775 @@
+import crypto from 'node:crypto';
+import compression from 'compression';
+import express from 'express';
+import helmet from 'helmet';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createCatalogRepository } from './catalog.repository.js';
+import { getDeliveryRedirectPath, getTelegramDeliveryUrl, getTelegramFileDeliveryUrl, loadConfig } from './config.js';
+import { CATEGORIES, CATEGORY_IDS, categoryDetails, cleanText, formatBytes } from './lib/strings.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, compareQualityAscending, detectMediaQuality, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { mergeContentStreamWithTelegramFiles, publicStreamingData, streamingFrameSources } from './services/streaming-service.js';
+import {
+  BoundedRateLimiter,
+  getClientIp,
+  parseAndValidatePlaybackTarget,
+  requestPlaybackGrant,
+  resolveCatalogContent,
+  resolveOrCreatePlaybackSession,
+  verifyPlaybackCsrf
+} from './services/playback-service.js';
+import { addSubsPleaseMagnets, createSubsPleaseService, magnetContentRevision } from './services/subsplease-service.js';
+import { launchTelegramBot } from './services/telegram-bot.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const defaultDistPath = path.resolve(__dirname, '../../dist');
+const VISITOR_COOKIE_NAME = 'sorabox_visitor';
+const VISITOR_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 365;
+const ADULT_ACCESS_COOKIE_NAME = 'sorabox_adult_access';
+// Consent is intentionally short-lived and browser-local. This is an age gate,
+// not an identity system; users are prompted again in a later browser session.
+const ADULT_ACCESS_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 12;
+
+function cookieValue(request, name) {
+  const cookieHeader = String(request.headers.cookie || '');
+  const prefix = `${name}=`;
+  for (const item of cookieHeader.split(';')) {
+    const trimmed = item.trim();
+    if (!trimmed.startsWith(prefix)) continue;
+    try {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function anonymousVisitorId(request, response, config) {
+  const existing = cookieValue(request, VISITOR_COOKIE_NAME);
+  if (/^[A-Za-z0-9_-]{24,128}$/.test(existing || '')) return existing;
+  // A random first-party cookie counts returning visits without collecting an
+  // IP address, user agent, query string, or any public profile information.
+  const visitorId = crypto.randomBytes(24).toString('base64url');
+  response.cookie(VISITOR_COOKIE_NAME, visitorId, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.environment === 'production',
+    maxAge: VISITOR_COOKIE_MAX_AGE_MS,
+    path: '/'
+  });
+  return visitorId;
+}
+
+function hasAdultAccess(request) {
+  return cookieValue(request, ADULT_ACCESS_COOKIE_NAME) === '1';
+}
+
+function grantAdultAccess(response, config) {
+  response.cookie(ADULT_ACCESS_COOKIE_NAME, '1', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.environment === 'production',
+    maxAge: ADULT_ACCESS_COOKIE_MAX_AGE_MS,
+    path: '/'
+  });
+}
+
+function isAdultContent(item) {
+  return item?.category === 'adult';
+}
+
+function isTrackableSiteVisit(request) {
+  if (request.method !== 'GET') return false;
+  if (request.path === '/api' || request.path.startsWith('/api/') || request.path === '/deliver' || request.path.startsWith('/deliver/')) return false;
+  if (/\.[A-Za-z0-9]{1,8}$/.test(request.path)) return false;
+  return String(request.headers.accept || '').includes('text/html');
+}
+
+function serializeDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/**
+ * The episode index a visitor sees. A card that spans seasons (after /merge, or
+ * an upload of several seasons in one release) carries the season number so the
+ * page can put each block under its own heading and never read Season 2's
+ * Episode 01 as Season 1's. A single-season card keeps `season: null`, which is
+ * how the guide stays exactly as it was.
+ */
+function publicEpisodeGroups(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((group) => {
+      const start = Number(group?.start);
+      const end = Number(group?.end);
+      const season = Number(group?.season);
+      const seasonNumber = Number.isInteger(season) && season >= 1 && season <= 99 ? season : null;
+      return {
+        start,
+        end,
+        label: cleanText(group?.label, 50),
+        combined: Number.isInteger(start) && Number.isInteger(end) && end > start,
+        fileCount: Math.max(1, Number(group?.fileCount) || 1),
+        season: seasonNumber,
+        seasonLabel: seasonNumber ? `Season ${seasonNumber}` : null
+      };
+    })
+    .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
+    .sort((first, second) => (first.season || 0) - (second.season || 0) || first.start - second.start || first.end - second.end);
+}
+
+function publicLanguages(content) {
+  const savedLanguages = Array.isArray(content?.languages)
+    ? content.languages
+      .map((language) => cleanText(language, 40))
+      .filter((language) => language && !/^multi(?:\s+language)?$/i.test(language) && !/\b(?:sub|subs|subtitle|subtitles|cc)$/i.test(language))
+    : [];
+  const uploadLanguages = content?.languageSource === 'manual' ? [] : summarizeUploadLanguages(content?.files || []);
+  const languages = uploadLanguages.length ? uploadLanguages : savedLanguages;
+  const uniqueLanguages = [];
+  const seen = new Set();
+  for (const language of languages) {
+    const key = language.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueLanguages.push(language);
+    if (uniqueLanguages.length === 8) break;
+  }
+  return uniqueLanguages;
+}
+
+function publicSubtitleLanguages(content) {
+  const savedLanguages = Array.isArray(content?.subtitleLanguages)
+    ? content.subtitleLanguages.map((language) => cleanText(language, 40)).filter(Boolean)
+    : [];
+  // Older cards put labels such as "English Sub" in the one shared language
+  // array. Present those accurately without requiring a risky data migration.
+  const legacySubtitleLanguages = Array.isArray(content?.languages)
+    ? content.languages
+      .map((language) => cleanText(language, 40).replace(/\s*(?:sub|subs|subtitle|subtitles|cc)$/i, ''))
+      .filter((language, index) => /\b(?:sub|subs|subtitle|subtitles|cc)$/i.test(String(content.languages[index] || '')) && language)
+    : [];
+  const uploadLanguages = content?.subtitleLanguageSource === 'manual'
+    ? []
+    : summarizeSubtitleLanguages(content?.files || []);
+  const languages = uploadLanguages.length ? uploadLanguages : savedLanguages.length ? savedLanguages : legacySubtitleLanguages;
+  return [...new Map(languages.map((language) => [language.toLowerCase(), language])).values()].slice(0, 8);
+}
+
+function isUsableTelegramFileName(value) {
+  const filename = cleanText(value, 180);
+  return Boolean(filename) && !/^(?:document|video|audio|animation|photo|file)-\d+$/i.test(filename);
+}
+
+function catalogFileTitle(content) {
+  let title = cleanDeliveryFileName(content?.title);
+  const releaseLabel = cleanText(content?.releaseLabel, 80);
+  // Older native-video uploads only retained a shortened display name. If the
+  // catalog metadata knows this is a season, use it to restore the meaningful
+  // file title rather than exposing a leftover tag such as "ESubs".
+  if (title && /^season\s*\d+\b/i.test(releaseLabel) && !/\bseason\s*\d+\b/i.test(title)) {
+    title = `${title} ${releaseLabel}`;
+  }
+  return title;
+}
+
+function publicFileChoiceLabel(file, content, index) {
+  const rawLabel = isUsableTelegramFileName(file?.sourceLabel)
+    ? file.sourceLabel
+    : isUsableTelegramFileName(file?.name)
+      ? file.name
+      : file?.displayName;
+  const sourceTitle = cleanDeliveryFileName(rawLabel);
+  const catalogTitle = catalogFileTitle(content);
+  if (!sourceTitle) return catalogTitle || `Delivery file ${index + 1}`;
+
+  // Prefer a richer canonical title when a legacy file record only retained a
+  // shortened prefix. For example, `The Gentlemen ESubs` becomes
+  // `The Gentlemen Season 1` when the catalog title contains the season.
+  const sourceKey = sourceTitle.toLowerCase();
+  const catalogKey = catalogTitle?.toLowerCase() || '';
+  if (catalogTitle && (sourceKey === catalogKey || catalogKey.startsWith(`${sourceKey} `))) return catalogTitle;
+  return sourceTitle;
+}
+
+function publicFileChoices(files, config, shareCode, content) {
+  if (!Array.isArray(files)) return [];
+  // A published detail page intentionally lists every uploaded file: selecting
+  // one must never force a visitor to receive a different quality or episode.
+  // Season attribution comes from the same helper the catalog grouping uses, so
+  // a file listed under Season 2 on the card is still Season 2 on its episode
+  // page. A card with one season gets nulls and behaves as before.
+  const attributedSeasons = attributeUploadSeasons(files).entries.map((entry) => entry.season ?? null);
+  const choices = files.map((file, index) => {
+    const episode = publicEpisodeGroups([file?.episode])[0] || null;
+    const season = attributedSeasons[index] ?? null;
+    const quality = cleanText(file?.quality, 20) || detectMediaQuality({
+      filename: file?.name,
+      caption: file?.sourceLabel || file?.displayName,
+      height: file?.height,
+      width: file?.width
+    });
+    const label = publicFileChoiceLabel(file, content, index);
+    const telegramUrl = getTelegramFileDeliveryUrl(config, shareCode, index + 1);
+    const deliveryUrl = getDeliveryRedirectPath(shareCode, index + 1);
+
+    return {
+      id: `file-${index + 1}`,
+      position: index + 1,
+      label,
+      // The uploader's own full wording, kept intact so a visitor can tell two
+      // similarly titled files apart instead of reading a shortened label.
+      fileName: publicFileDisplayName(file?.sourceLabel || file?.name || file?.displayName) || null,
+      quality: quality ? normalizeQualityLabel(quality) : null,
+      size: formatBytes(Number(file?.size) || 0),
+      kind: ['document', 'video', 'audio', 'animation', 'photo'].includes(file?.kind) ? file.kind : 'file',
+      // A complete-season upload is labelled as such so the card can group it by
+      // season instead of showing it as a file that failed to be indexed.
+      seasonPack: seasonPackOf(file)?.season ?? null,
+      season,
+      episode,
+      telegramUrl,
+      deliveryUrl,
+      deliveryReady: Boolean(telegramUrl && deliveryUrl)
+    };
+  });
+
+  // Known qualities then read as a ladder (small file → 4K) rather than in
+  // random upload order, grouped per episode so a series list still walks
+  // through its episodes in sequence.
+  return choices.sort((first, second) => {
+    // Seasons walk in order first, so a merged card lists Season 1's episodes
+    // before Season 2's instead of interleaving them by episode number.
+    const seasonOrder = (Number(first?.season) || 0) - (Number(second?.season) || 0);
+    if (seasonOrder !== 0) return seasonOrder;
+    const firstEpisode = Number(first?.episode?.start);
+    const secondEpisode = Number(second?.episode?.start);
+    const firstKnown = Number.isInteger(firstEpisode) && firstEpisode >= 1;
+    const secondKnown = Number.isInteger(secondEpisode) && secondEpisode >= 1;
+    if (firstKnown && secondKnown && firstEpisode !== secondEpisode) return firstEpisode - secondEpisode;
+    if (firstKnown !== secondKnown) return firstKnown ? -1 : 1;
+    const qualityOrder = compareQualityAscending(first?.quality, second?.quality);
+    if (qualityOrder !== 0) return qualityOrder;
+    if (firstKnown && secondKnown) {
+      const firstEnd = Number(first?.episode?.end) || firstEpisode;
+      const secondEnd = Number(second?.episode?.end) || secondEpisode;
+      if (firstEnd !== secondEnd) return firstEnd - secondEnd;
+    }
+    return first.position - second.position;
+  });
+}
+
+export function toPublicContent(content, config, { includeFileChoices = true } = {}) {
+  if (!content) return null;
+  const category = categoryDetails(content.category);
+  const shareCode = content.shareCode || null;
+  const telegramUrl = content.hasDelivery ? getTelegramDeliveryUrl(config, shareCode) : null;
+  const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
+  const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode, content) : [];
+  const effectiveStream = mergeContentStreamWithTelegramFiles(content.stream, content, config);
+
+  return {
+    id: String(content._id || content.id || content.slug),
+    slug: content.slug,
+    title: content.title,
+    category: content.category,
+    categoryLabel: category.label,
+    tone: content.art?.tone || category.tone,
+    art: content.art || { tone: category.tone },
+    year: content.year || null,
+    languages: publicLanguages(content),
+    subtitleLanguages: publicSubtitleLanguages(content),
+    genres: Array.isArray(content.genres) ? content.genres : [],
+    description: content.description || '',
+    status: content.status || 'New release',
+    releaseLabel: content.releaseLabel || null,
+    posterUrl: content.posterUrl || null,
+    backdropUrl: content.backdropUrl || content.posterUrl || null,
+    filesCount: Number(content.filesCount) || 0,
+    fileChoices,
+    // This contains only previously validated provider URLs. It deliberately
+    // has no upload token, dashboard URL, or private storage data.
+    stream: publicStreamingData(effectiveStream, config.streaming || {}),
+    episodeGroups: publicEpisodeGroups(content.episodeGroups),
+    episodeCount: Math.max(0, Number(content.episodeCount) || 0),
+    featured: Boolean(content.featured),
+    publishedAt: serializeDate(content.publishedAt),
+    telegramUrl,
+    deliveryUrl,
+    deliveryReady: Boolean(telegramUrl && deliveryUrl)
+  };
+}
+
+function apiError(res, status, message) {
+  res.status(status).json({ error: message });
+}
+
+function playerCspOrigin(origin) {
+  if (!origin) return null;
+  try {
+    return new URL(origin).origin;
+  } catch {
+    return null;
+  }
+}
+
+export function createApp({ config, repository, distPath = defaultDistPath, subsPlease = null }) {
+  const app = express();
+  app.disable('x-powered-by');
+  const configuredPlayerOrigin = playerCspOrigin(config.playback?.playerOrigin);
+  app.use(
+    helmet({
+      crossOriginEmbedderPolicy: false,
+      // The catalog is intentionally embeddable in the Arena/Koyeb live preview.
+      frameguard: false,
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          baseUri: ["'self'"],
+          fontSrc: ["'self'", 'https:', 'data:'],
+          imgSrc: ["'self'", 'https:', 'data:'],
+          objectSrc: ["'none'"],
+          scriptSrc: ["'self'", configuredPlayerOrigin].filter(Boolean),
+          styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+          connectSrc: ["'self'"],
+          // /watch embeds only approved HTTPS player hosts. Koyeb serves the
+          // page; the video itself remains at the provider and never transits
+          // this process.
+          frameSrc: ["'self'", configuredPlayerOrigin, ...streamingFrameSources(config.streaming || {})].filter(Boolean),
+          frameAncestors: null,
+          upgradeInsecureRequests: config.environment === 'production' ? [] : null
+        }
+      }
+    })
+  );
+  app.use(compression());
+  app.use(express.json({ limit: '32kb' }));
+  app.use(async (request, response, next) => {
+    let isMaintenance = false;
+    try {
+      if (typeof repository.isMaintenanceActive === 'function') {
+        isMaintenance = await repository.isMaintenanceActive();
+      }
+    } catch {
+      isMaintenance = false;
+    }
+    if (!isMaintenance) return next();
+
+    if (request.path === '/api/health') {
+      response.set('Cache-Control', 'no-store');
+      return response.json({
+        ok: true,
+        maintenance: true,
+        catalogStore: repository.kind,
+        persistent: repository.persistent,
+        telegramPolling: Boolean(config.telegram.botToken && config.telegram.mode === 'polling'),
+        deliveryBotUsername: config.telegram.botUsername || null,
+        announcementSiteUrl: config.siteUrl || null,
+        now: new Date().toISOString()
+      });
+    }
+
+    const maintenanceMessage = 'site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box';
+    response.status(404);
+    response.set('Cache-Control', 'no-store');
+
+    if (request.path.startsWith('/api/')) {
+      return response.json({ error: maintenanceMessage });
+    }
+
+    if (request.accepts('html')) {
+      return response.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>404 - Site Under Maintenance</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #e1e7ec; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; text-align: center; }
+    .card { max-width: 540px; background: #1a1e29; border: 1px solid #2d3446; border-radius: 16px; padding: 40px 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    h1 { font-size: 2.5rem; margin: 0 0 16px; color: #f87171; }
+    p { font-size: 1.1rem; line-height: 1.6; margin: 0 0 24px; color: #cbd5e1; }
+    a { display: inline-block; background: #2563eb; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; transition: background 0.2s; }
+    a:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>404</h1>
+    <p>site is under maintenance and will soon be active till then kindly join our tg channel https://t.me/Sora_Box</p>
+    <a href="https://t.me/Sora_Box" target="_blank" rel="noopener noreferrer">Join Telegram Channel</a>
+  </div>
+</body>
+</html>`);
+    }
+
+    return response.type('text').send(`404 ${maintenanceMessage}`);
+  });
+  app.use(async (request, response, next) => {
+    if (!isTrackableSiteVisit(request) || typeof repository.recordSiteVisit !== 'function') return next();
+    try {
+      await repository.recordSiteVisit({
+        visitorId: anonymousVisitorId(request, response, config),
+        path: request.path
+      });
+    } catch (error) {
+      // Catalog browsing must remain available if optional analytics storage is
+      // temporarily unavailable.
+      console.warn('[server] anonymous visit was not recorded:', error?.message || 'Unknown error');
+    }
+    return next();
+  });
+
+  app.get('/api/health', (_request, response) => {
+    response.set('Cache-Control', 'no-store');
+    response.json({
+      ok: true,
+      catalogStore: repository.kind,
+      persistent: repository.persistent,
+      telegramPolling: Boolean(config.telegram.botToken && config.telegram.mode === 'polling'),
+      deliveryBotUsername: config.telegram.botUsername || null,
+      announcementSiteUrl: config.siteUrl || null,
+      now: new Date().toISOString()
+    });
+  });
+
+  const playbackLimiter = new BoundedRateLimiter({
+    maxRequests: config.playback?.rateLimitMax || 60,
+    windowMs: config.playback?.rateLimitWindowMs || 60_000
+  });
+
+  app.get('/api/config', (_request, response) => {
+    response.set('Cache-Control', 'public, max-age=300');
+    response.json({
+      catalogName: 'SoraBox',
+      categories: CATEGORIES,
+      deliveryConfigured: Boolean(config.telegram.botUsername),
+      announcementSiteConfigured: Boolean(config.siteUrl),
+      demoMode: !repository.persistent,
+      watchPlayerOrigin: config.playback?.playerOrigin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
+    });
+  });
+
+  app.post('/api/playback-token', async (request, response) => {
+    response.set('Cache-Control', 'no-store');
+
+    // 1. CSRF defense: verify fetch metadata and origin
+    const csrfCheck = verifyPlaybackCsrf(request, config);
+    if (!csrfCheck.valid) {
+      return apiError(response, 403, csrfCheck.error);
+    }
+
+    // 2. Session verification and HttpOnly guest session issuance
+    const session = resolveOrCreatePlaybackSession(request, response, config);
+
+    // 3. Bounded per-session/IP rate limiting
+    const clientIp = getClientIp(request);
+    const rateLimitKey = `${session.visitorId}:${clientIp}`;
+    const rateCheck = playbackLimiter.isAllowed(rateLimitKey);
+    if (!rateCheck.allowed) {
+      response.set('Retry-After', String(rateCheck.retryAfterSeconds));
+      return apiError(response, 429, 'Too many playback token requests. Please wait before retrying.');
+    }
+
+    // 4. Target validation and channel verification
+    const targetCheck = parseAndValidatePlaybackTarget(request.body, config.playback?.allowedChannelIds);
+    if (!targetCheck.valid) {
+      return apiError(response, targetCheck.status || 400, targetCheck.error);
+    }
+
+    // 5. Catalog resolution against published records
+    const resolution = await resolveCatalogContent({
+      target: targetCheck,
+      repository,
+      allowedChannelIds: config.playback?.allowedChannelIds
+    });
+    if (!resolution.found) {
+      return apiError(response, resolution.status || 404, resolution.error);
+    }
+
+    // 6. Adult content permission check
+    if (resolution.isAdult && !hasAdultAccess(request)) {
+      return apiError(response, 403, 'Age confirmation is required to access adult video playback.');
+    }
+
+    // 7. Request grant from upstream player service
+    const grantResult = await requestPlaybackGrant({
+      target: targetCheck,
+      config
+    });
+    if (!grantResult.success) {
+      return apiError(response, grantResult.status || 502, grantResult.error);
+    }
+
+    return response.json(grantResult.data);
+  });
+
+  app.post('/api/adult-access', (request, response) => {
+    if (request.body?.confirmed !== true) return apiError(response, 400, 'Age confirmation is required before opening the 18+ catalog.');
+    grantAdultAccess(response, config);
+    response.set('Cache-Control', 'no-store');
+    return response.json({ allowed: true });
+  });
+
+  app.get('/api/categories', async (request, response, next) => {
+    try {
+      const adultAccess = hasAdultAccess(request);
+      // Counted in the store rather than counted off a page of results: a category with 400 cards
+      // used to report 100 and the rest looked like they had fallen off the catalog.
+      const counted = await Promise.all(CATEGORIES.map((category) => (
+        category.id === 'adult' && !adultAccess
+          ? Promise.resolve(0)
+          : repository.countContent({ category: category.id })
+      )));
+      const counts = Object.fromEntries(CATEGORIES.map((category, index) => [category.id, counted[index]]));
+      // Cookie-aware category data must not be shared by a CDN/cache. The
+      // category itself remains visible, but its catalog count stays private
+      // until the visitor has confirmed their age.
+      response.set('Cache-Control', 'private, no-store');
+      response.json({
+        categories: CATEGORIES.map((category) => ({
+          ...category,
+          count: category.id === 'adult' && !adultAccess ? 0 : counts[category.id] || 0
+        }))
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/content', async (request, response, next) => {
+    try {
+      const rawCategory = cleanText(request.query.category, 40);
+      const category = CATEGORY_IDS.has(rawCategory) ? rawCategory : undefined;
+      const query = cleanText(request.query.q, 100);
+      // A genre comes from the menu in the drawer, which lists every shelf a reader can land on.
+      const genre = cleanText(request.query.genre, 40) || undefined;
+      if (category === 'adult' && !hasAdultAccess(request)) {
+        return apiError(response, 403, 'Confirm that you are 18 or older to open this category.');
+      }
+      // A listing is a page, not the whole catalog. The old behaviour — ask for 100 and show those —
+      // meant everything past the hundredth card was unreachable, and every new release quietly
+      // pushed an old one off the site.
+      const limit = Math.max(1, Math.min(Number.parseInt(request.query.limit, 10) || 60, 100));
+      const asked = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
+      const scope = { category, query, genre };
+      const hideAdult = category !== 'adult';
+      // Counting first is what lets a page number be clamped instead of obeyed: `?page=99` on a shelf
+      // with two pages is a mistyped address, not an empty catalog, so it answers with the last page
+      // that does hold cards. The listing itself is cut in the store, so a page always holds `limit`
+      // cards (or the remainder) rather than a hundred minus whatever the filters later dropped.
+      const total = await repository.countContent({ ...scope, hideAdult });
+      const pages = Math.max(1, Math.ceil(total / limit));
+      const page = Math.min(asked, pages);
+      const listed = await repository.listContent({ ...scope, limit, offset: (page - 1) * limit, hideAdult });
+      // Adult cards never appear in home, all-catalog, or search responses.
+      // They are available only from the explicit age-confirmed 18+ category.
+      const items = category === 'adult' ? listed : listed.filter((item) => !isAdultContent(item));
+      response.set('Cache-Control', category === 'adult' ? 'private, no-store' : 'public, max-age=45, s-maxage=90');
+      return response.json({
+        items: items.map((item) => toPublicContent(item, config, { includeFileChoices: false })),
+        total,
+        page,
+        limit,
+        pages,
+        hasMore: page * limit < total
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/genres', async (_request, response, next) => {
+    try {
+      const genres = typeof repository.listGenres === 'function' ? await repository.listGenres({ limit: 60 }) : [];
+      response.set('Cache-Control', 'public, max-age=300, s-maxage=600');
+      return response.json({ genres });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/content/featured', async (_request, response, next) => {
+    try {
+      const items = (await repository.listContent({ limit: 100 })).filter((item) => !isAdultContent(item));
+      const featured = items.find((item) => item.featured) || items[0] || null;
+      if (!featured) return apiError(response, 404, 'No featured release is available.');
+      response.set('Cache-Control', 'public, max-age=45, s-maxage=90');
+      return response.json({ item: toPublicContent(featured, config, { includeFileChoices: false }) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/content/:slug', async (request, response, next) => {
+    try {
+      const slug = cleanText(request.params.slug, 80);
+      const item = await repository.findContentBySlug(slug);
+      if (!item) return apiError(response, 404, 'This release is unavailable.');
+      if (isAdultContent(item) && !hasAdultAccess(request)) {
+        return apiError(response, 403, 'Confirm that you are 18 or older to open this release.');
+      }
+      // Anime links are derived from the CURRENT card on every detail request.
+      // A rename/category correction cannot leave persisted stale magnet links.
+      response.set('Cache-Control', 'private, no-store');
+      const publicItem = toPublicContent(item, config);
+      const override = item.category === 'anime' && repository.findSubsPleaseOverride
+        ? await repository.findSubsPleaseOverride(item.adminId) : null;
+      const searchTitle = override?.title === item.title && override?.category === item.category ? override.searchTitle : item.title;
+      const matched = addSubsPleaseMagnets({ ...publicItem, title: searchTitle }, subsPlease?.entries() || [], item, subsPlease?.aliases?.(searchTitle) || []);
+      return response.json({ item: { ...matched, title: publicItem.title, magnetRevision: magnetContentRevision(item) } });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Archive discovery is separate from the detail request: a slow provider must
+  // never hold up the Telegram file list. The client fills existing rows in place.
+  app.get('/api/content/:slug/magnets', async (request, response, next) => {
+    try {
+      response.set('Cache-Control', 'private, no-store');
+      const item = await repository.findContentBySlug(cleanText(request.params.slug, 80));
+      if (!item) return apiError(response, 404, 'This release is unavailable.');
+      if (item.category !== 'anime') return response.json({ state: 'not-applicable', files: [] });
+      const revision = magnetContentRevision(item);
+      const resolved = subsPlease?.resolve
+        ? await subsPlease.resolve(toPublicContent(item, config), item)
+        : { state: 'unavailable', item: { fileChoices: [] } };
+      // A publisher can rename/reclassify the card while the HTTP lookup runs.
+      // In that case return no links for the previous identity.
+      const current = await repository.findContentBySlug(item.slug);
+      if (!current || magnetContentRevision(current) !== revision) return response.json({ state: 'stale', files: [] });
+      return response.json({ state: resolved.state, revision, files: resolved.item.fileChoices.map((file) => ({ id: file.id, magnet: file.magnet })) });
+    } catch (error) { return next(error); }
+  });
+
+  async function redirectToCurrentDeliveryBot(request, response, filePosition = null) {
+    const shareCode = cleanText(request.params.shareCode, 48);
+    const redirectPath = getDeliveryRedirectPath(shareCode, filePosition);
+    if (!redirectPath) return response.status(404).type('text').send('That delivery link is invalid.');
+    const content = await repository.findContentByShareCode(shareCode);
+    // Keep legacy delivery redirects stable even when a catalog record has
+    // since been deleted; the active bot remains the authority for that old
+    // payload. When a record is available, however, its adult category cannot
+    // bypass the website age confirmation.
+    if (isAdultContent(content) && !hasAdultAccess(request)) {
+      return response.status(403).type('text').send('This 18+ delivery link requires age confirmation. Return to the 18+ catalog and confirm your age first.');
+    }
+    const telegramUrl = filePosition === null
+      ? getTelegramDeliveryUrl(config, shareCode)
+      : getTelegramFileDeliveryUrl(config, shareCode, filePosition);
+    if (!telegramUrl) return response.status(503).type('text').send('Telegram delivery is being configured. Please try again shortly.');
+    response.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    return response.redirect(302, telegramUrl);
+  }
+
+  // These first-party URLs are intentionally stable. They redirect to the
+  // currently active Telegram bot at click time, so a replacement bot/token
+  // does not require rewriting every existing catalog page.
+  app.get('/deliver/:shareCode', (request, response, next) => {
+    redirectToCurrentDeliveryBot(request, response).catch(next);
+  });
+  app.get('/deliver/:shareCode/file/:filePosition', (request, response, next) => {
+    redirectToCurrentDeliveryBot(request, response, request.params.filePosition).catch(next);
+  });
+
+  app.use('/api', (_request, response) => apiError(response, 404, 'API route not found.'));
+
+  if (fs.existsSync(distPath)) {
+    app.use(
+      express.static(distPath, {
+        etag: true,
+        maxAge: '1h',
+        immutable: false
+      })
+    );
+    app.use((request, response, next) => {
+      if (request.method !== 'GET' && request.method !== 'HEAD') return next();
+      if (!request.accepts('html')) return next();
+      return response.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    app.get('/', (_request, response) => {
+      response.type('html').send('<p>SoraBox API is running. Start the Vite client with <code>npm run dev:client</code>.</p>');
+    });
+  }
+
+  app.use((request, response) => {
+    if (request.path.startsWith('/api/')) return apiError(response, 404, 'API route not found.');
+    return response.status(404).type('text').send('Not found');
+  });
+
+  app.use((error, _request, response, _next) => {
+    console.error('[server] request failed:', error?.message || error);
+    if (response.headersSent) return;
+    return apiError(response, 500, 'Something went wrong. Please try again shortly.');
+  });
+
+  return app;
+}
+
+export async function startServer() {
+  const config = loadConfig();
+  const repository = await createCatalogRepository(config);
+  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
+    await repository.reconcileCatalogMediaFromFiles({ dryRun: false }).catch((error) => {
+      console.warn('[server] startup media reconciliation skipped:', error?.message || error);
+    });
+  }
+  const subsPlease = createSubsPleaseService({ repository });
+  const app = createApp({ config, repository, subsPlease });
+  // Feed outages never block server startup or Telegram publishing.
+  void subsPlease.start();
+  const server = app.listen(config.port, '0.0.0.0', () => {
+    console.info(`[server] SoraBox listening on 0.0.0.0:${config.port} (${repository.kind} catalog)`);
+    console.info(`[server] Announcement site URL: ${config.siteUrl || 'not configured'}`);
+    if (!repository.persistent) {
+      console.warn('[server] MongoDB is not configured: using non-persistent demo content.');
+    }
+  });
+
+  let closing = false;
+  let bot = null;
+  const close = async (signal) => {
+    if (closing) return;
+    closing = true;
+    console.info(`[server] ${signal} received; shutting down.`);
+    if (bot?.stop) {
+      try { bot.stop(signal); } catch {}
+    }
+    if (subsPlease?.stop) {
+      try { await subsPlease.stop(); } catch {}
+    }
+    try { await new Promise((resolve) => server.close(resolve)); } catch {}
+    try { await repository.close(); } catch {}
+    process.exit(0);
+  };
+  process.once('SIGINT', () => void close('SIGINT'));
+  process.once('SIGTERM', () => void close('SIGTERM'));
+
+  try {
+    bot = await launchTelegramBot({
+      config,
+      repository,
+      subsPlease,
+      serializeMagnetContent: (content) => toPublicContent(content, config),
+      onRestart: () => close('RESTART')
+    });
+  } catch (error) {
+    console.error('[telegram] Bot did not start:', error?.message || error);
+  }
+
+  return { app, server, repository, bot, subsPlease };
+}
+
+const launchedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (launchedDirectly) {
+  startServer().catch((error) => {
+    console.error('[server] Startup failed:', error?.message || error);
+    process.exit(1);
+  });
+}

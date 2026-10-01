@@ -1,0 +1,473 @@
+function episodeRange(value) {
+  const start = Number(value?.start);
+  const end = Number(value?.end ?? value?.start);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 999) return null;
+  return { start, end };
+}
+
+/** A usable season number only: nothing, `0`, and text never become Season 0. */
+function episodeSeason(value) {
+  const season = Number(value?.season);
+  return Number.isInteger(season) && season >= 1 && season <= 99 ? season : null;
+}
+
+export function formatEpisodeNumber(value) {
+  return String(value).padStart(2, '0');
+}
+
+/**
+ * An episode route plus the season it belongs to. A card that spans seasons has
+ * more than one Episode 01, so `?s=2` travels beside the number and keeps the
+ * page on the right block.
+ */
+export function parseEpisodeRoute(value, season = null) {
+  const match = String(value || '').match(/^(\d{1,3})(?:-(\d{1,3}))?$/);
+  if (!match) return null;
+  const range = episodeRange({ start: match[1], end: match[2] || match[1] });
+  if (!range) return null;
+  return {
+    ...range,
+    season: episodeSeason({ season }),
+    label: range.start === range.end
+      ? `Episode ${formatEpisodeNumber(range.start)}`
+      : `Episodes ${formatEpisodeNumber(range.start)}–${formatEpisodeNumber(range.end)}`
+  };
+}
+
+export function episodePagePath(item, group) {
+  const range = episodeRange(group);
+  if (!range) return `/${item.category}/${item.slug}`;
+  const pathRange = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+  const season = episodeSeason(group);
+  return `/${item.category}/${item.slug}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
+}
+
+/**
+ * The episode-index block a route belongs to. When the route names a season the
+ * same-numbered block of another season is never an acceptable match; an older
+ * card without season data still falls back to the number alone.
+ */
+export function findEpisodeGroup(groups = [], episode = null) {
+  const range = episodeRange(episode);
+  if (!range) return null;
+  const list = Array.isArray(groups) ? groups : [];
+  const season = episodeSeason(episode);
+  const matches = list.filter((group) => Number(group?.start) === range.start && Number(group?.end ?? group?.start) === range.end);
+  if (!season) return matches[0] || null;
+  const seasonMatches = matches.filter((group) => episodeSeason(group) === season);
+  if (seasonMatches.length) return seasonMatches[0];
+  // A card whose blocks carry no season at all (published before merging existed)
+  // is still readable by number alone, so an old link never turns into a 404.
+  return matches.find((group) => !episodeSeason(group)) || null;
+}
+
+/**
+ * A Watch link can only be attached to a delivery episode when both have an
+ * explicit episode range. A release-wide player is deliberately not treated
+ * as a fallback for every episode.
+ */
+export function rangesOverlap(first, second) {
+  const left = episodeRange(first);
+  const right = episodeRange(second);
+  return Boolean(left && right && left.start <= right.end && left.end >= right.start);
+}
+
+export function streamEntriesForEpisode(entries = [], episode) {
+  const requested = episodeRange(episode);
+  if (!requested) return [];
+  // A player must cover the whole delivery range shown beside it. This avoids
+  // offering an Episode 1 player on a single file that actually represents
+  // Episodes 1–20 just because their ranges touch at the first episode.
+  return (Array.isArray(entries) ? entries : []).filter((entry) => {
+    const streamEpisode = episodeRange(entry?.episode);
+    return Boolean(streamEpisode && streamEpisode.start <= requested.start && streamEpisode.end >= requested.end);
+  });
+}
+
+/** Players that touch this episode at all, including a partial batch link. */
+export function overlappingStreamEntries(entries = [], episode) {
+  const requested = episodeRange(episode);
+  if (!requested) return [];
+  return (Array.isArray(entries) ? entries : []).filter((entry) => rangesOverlap(entry?.episode, requested));
+}
+
+/**
+ * An episode page offers every player the publisher attached to that episode.
+ * A covering link is preferred; an overlapping one is still surfaced so a Watch
+ * button never silently disappears from an episode a publisher linked.
+ */
+export function episodeStreamEntries(entries = [], episode) {
+  const covering = streamEntriesForEpisode(entries, episode);
+  if (covering.length) return covering;
+  return overlappingStreamEntries(entries, episode);
+}
+
+/**
+ * Files listed on an episode page. A combined upload (Episodes 1–5) is shown
+ * only on its own pack page, so a single episode never appears to contain the
+ * whole batch. When nothing matches exactly — an older card, or a shared link
+ * opened directly — overlapping files are still offered instead of a dead page.
+ */
+export function fileChoicesForEpisode(choices = [], episode, { includeOverlapping = true } = {}) {
+  const requested = episodeRange(episode);
+  if (!requested) return [];
+  let list = Array.isArray(choices) ? choices : [];
+  // A merged card holds the same episode number in two seasons. When the route
+  // names a season and the files really are season-tagged, only that block is
+  // offered; otherwise the list is left alone so older releases keep every file.
+  const season = episodeSeason(episode);
+  if (season && list.some((choice) => episodeSeason(choice))) {
+    list = list.filter((choice) => episodeSeason(choice) === season);
+  }
+  const exact = list.filter((choice) => {
+    const range = episodeRange(choice?.episode);
+    return Boolean(range && range.start === requested.start && range.end === requested.end);
+  });
+  if (exact.length || !includeOverlapping) return exact;
+  return list.filter((choice) => rangesOverlap(choice?.episode, requested));
+}
+
+/** Split one episode index into single episodes and combined pack uploads. */
+export function splitEpisodeGroups(groups = []) {
+  const list = Array.isArray(groups) ? groups : [];
+  const isSingle = (group) => Number.isInteger(group?.start) && group.start === Number(group?.end);
+  const episodes = list.filter(isSingle);
+  const packs = list.filter((group) => Number.isInteger(group?.start) && Number(group?.end) > group.start);
+  // Season blocks are only handed to the page when a card spans more than one
+  // season, so every other release renders its guide exactly as it did before.
+  const seasons = [];
+  for (const group of list) {
+    const season = episodeSeason(group);
+    if (!season) continue;
+    let block = seasons.find((entry) => entry.season === season);
+    if (!block) {
+      block = { season, seasonLabel: group.seasonLabel || `Season ${season}`, episodes: [], packs: [] };
+      seasons.push(block);
+    }
+    (isSingle(group) ? block.episodes : block.packs).push(group);
+  }
+  return { episodes, packs, seasons: seasons.length > 1 ? seasons : [] };
+}
+
+export function isReleaseLevelStream(entry) {
+  return !episodeRange(entry?.episode);
+}
+
+export function releaseLevelStreamEntries(entries = []) {
+  return (Array.isArray(entries) ? entries : []).filter(isReleaseLevelStream);
+}
+
+export function hasReleaseLevelWatch(stream) {
+  return releaseLevelStreamEntries(stream?.entries).length > 0;
+}
+
+/**
+ * Providers are what a viewer recognises. "Player 1" tells nobody which link is
+ * which, so a player is named after the service that hosts it, falling back to
+ * the publisher's own label and finally to the episode it belongs to.
+ */
+export function playerDisplayName(entry) {
+  const server = String(entry?.server || '').trim();
+  if (server) return server;
+  const label = String(entry?.label || '').trim();
+  if (label && !/^player\s*\d+$/i.test(label)) return label;
+  return String(entry?.episode?.label || 'Main player').trim();
+}
+
+/** The same name without the trailing word, for a compact button label. */
+export function playerShortName(entry) {
+  return playerDisplayName(entry).replace(/\s+server$/i, '');
+}
+
+function seasonFromLabel(label) {
+  const text = String(label || '');
+  const spelled = text.match(/\bseason\s*0*(\d{1,2})\b/i);
+  if (spelled) return Number(spelled[1]);
+  const compact = text.match(/\bs\s*0*(\d{1,2})(?!\d)(?![a-df-z])/i);
+  return compact ? Number(compact[1]) : null;
+}
+
+/**
+ * The season a viewer should be told about, if any. The season of the episode
+ * group wins, then a season spelled out in the release title. A movie with
+ * neither shows no season at all rather than an invented "Season 1".
+ */
+export function episodeSeasonNumber(item, episode) {
+  const range = episodeRange(episode);
+  if (!range) return null;
+  // The route itself knows its season after /merge, which is the only answer
+  // that cannot be confused with the same number in another block.
+  const requestedSeason = episodeSeason(episode);
+  if (requestedSeason) return requestedSeason;
+  for (const group of Array.isArray(item?.episodeGroups) ? item.episodeGroups : []) {
+    const start = Number(group?.start);
+    const end = Number(group?.end) || start;
+    if (!Number.isInteger(start) || range.start < start || range.start > end) continue;
+    const season = episodeSeason(group) || seasonFromLabel(group?.label);
+    if (season) return season;
+  }
+  return seasonFromLabel(item?.title);
+}
+
+// The pieces of an upload caption that are not the episode's name: emoji, source
+// and quality tags, audio tracks, and a number written as "Ep 176".
+const EPISODE_DECORATION = /[\p{Extended_Pictographic}\p{So}\p{Sk}]/gu;
+const QUALITY_TOKEN = /\b(\d{3,4}p|4k|8k|fhd|uhd|web[- ]?dl|hdtv|bluray|remux|x26[45]|hevc|av1|10[- ]?bit|dd?p?5\.1|aac\d?(\.\d)?|dts)\b/gi;
+const BARE_EPISODE_TEXT = /^(?:ep|eps?|episode|ch|chapter|cap)?\.?\s*\d{1,3}(?:\s*(?:-|–|to|of|\/)\s*\d{1,3})?$/i;
+// Everything a Telegram caption carries that is not the episode's name: audio
+// tracks, source tags, and the uploader's own decoration.
+const CAPTION_NOISE = /\b(?:hindi|english|tamil|telugu|malayalam|kannada|bengali|marathi|gujarati|punjabi|spanish|japanese|chinese|korean|dub(?:bed)?|sub(?:s|bed)?|esubs|multi\s*audio|dual\s*audio|audio|hd|sd|hq|new|latest|quality|complete|completed|collection|batch|pack|s\d{1,3}(?:e\d{1,3})?|e\d{1,3}|amp|web|dl|nf|amzn|attp|dsny|hulu|max)\b/gi;
+
+/** Letters and digits only, so "Shrouding.the.Heavens" and "Shrouding the Heavens" compare equal. */
+function squashed(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * A file caption is written for Telegram, not for a page heading: it repeats the
+ * release name, carries emoji, and ends in "Quality: ✅". What a viewer would
+ * call this episode is pulled out of it here, and a quality tag is returned
+ * separately, so the wording is never lost - only placed where it reads well.
+ */
+export function episodeNameFromLabel(label, releaseTitle) {
+  let text = String(label || '').replace(EPISODE_DECORATION, ' ').replace(/\s+/g, ' ').trim();
+  if (!text) return { name: null, quality: null };
+  const qualityMatch = [...text.matchAll(QUALITY_TOKEN)];
+  const quality = qualityMatch.length ? qualityMatch[0][1].toUpperCase() : null;
+
+  // The release name belongs to the page, so a caption that repeats it at the
+  // front ("Shrouding the Heavens Ep 176", "Shrouding.the.Heavens.176…") has that
+  // prefix removed even when it is written with dots and no spaces.
+  const release = squashed(releaseTitle);
+  if (release) {
+    const letters = squashed(text);
+    if (letters.startsWith(release) && release.length >= 3) {
+      let seen = 0;
+      let cut = 0;
+      for (let index = 0; index < text.length && seen < release.length; index += 1) {
+        if (/[a-z0-9]/i.test(text[index])) seen += 1;
+        cut = index + 1;
+      }
+      text = text.slice(cut);
+    }
+  }
+
+  text = text
+    .replace(QUALITY_TOKEN, ' ')
+    .replace(CAPTION_NOISE, ' ')
+    // A leading or trailing episode number is the page's own label, and a caption
+    // left with nothing but it has no name of its own.
+    .replace(BARE_EPISODE_TEXT, ' ')
+    .replace(/\b(?:ep|eps|episode|chapter|cap)\.?\s*\d{1,3}\b/gi, ' ')
+    .replace(/\bquality\b\s*[:\-]?/gi, ' ')
+    .replace(/\s*[:\-]\s*$/g, '')
+    .replace(/^\s*[-–:.#,|]+|[-–:.#,|]+\s*$/g, '')
+    .replace(/\s*[.:|#]\s*[.:|#]\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  // Two letters in a row is the shortest thing that can read as a title; a stray
+  // "2" or "dub" left behind is not. Nor is the release's own name written with
+  // dots and a number, or a fragment of it ("… Brotherhood EP 09") - comparing the
+  // letters alone sees through the punctuation the uploader used.
+  const releaseLetters = squashed(releaseTitle).replace(/\d+/g, '');
+  const textLetters = squashed(text).replace(/\d+/g, '');
+  const isReleaseItself = textLetters.length >= 3 && releaseLetters.includes(textLetters);
+  if (!text || text.length < 3 || !/[a-z]{2}/i.test(text) || BARE_EPISODE_TEXT.test(text) || isReleaseItself) {
+    return { name: null, quality };
+  }
+  return { name: text.slice(0, 90), quality };
+}
+
+/**
+ * What a Watch page announces: the release name once, then the episode number -
+ * never the raw upload caption. The season appears only when the release really
+ * is seasonal, and a movie lists its languages instead, which is the choice a
+ * viewer actually makes there.
+ */
+export function watchHeading(item, { episode = null, fileLabel = null, playerLabel = null } = {}) {
+  const range = episodeRange(episode);
+  const season = episodeSeasonNumber(item, episode);
+  const supplied = String(episode?.label || '').trim();
+  const episodeLabel = range
+    ? (supplied && !/^player\s*\d+$/i.test(supplied)
+      ? supplied
+      : (range.start === range.end
+        ? `Episode ${formatEpisodeNumber(range.start)}`
+        : `Episodes ${formatEpisodeNumber(range.start)}–${formatEpisodeNumber(range.end)}`))
+    : null;
+  const languages = (Array.isArray(item?.languages) ? item.languages : []).filter(Boolean);
+  const subtitles = (Array.isArray(item?.subtitleLanguages) ? item.subtitleLanguages : []).filter(Boolean);
+  const caption = episodeNameFromLabel(fileLabel, item?.title);
+  const quality = caption.quality;
+  // The heading is the release name plus what the episode is called. A caption
+  // that only repeated the show, its number, emoji, and a quality tag is not a
+  // name, so the canonical "Episode 176" is used instead.
+  const episodeName = range ? (caption.name || episodeLabel) : null;
+  const title = range
+    ? [item?.title, episodeName].filter(Boolean).join(' · ')
+    : (playerLabel || item?.title || 'Watch');
+  // The episode chip is only useful when the heading carries a name instead of the
+  // number; repeating "Episode 176" twice reads like a template.
+  const meta = range
+    ? [
+      season ? `Season ${season}` : null,
+      caption.name ? episodeLabel : null,
+      quality ? `Quality: ${quality}` : null
+    ].filter(Boolean)
+    : [languages.length ? languages.join(' · ') : null, subtitles.length ? `Subtitles: ${subtitles.join(' · ')}` : null].filter(Boolean);
+  return {
+    title,
+    seasonLabel: season ? `Season ${season}` : null,
+    episodeLabel,
+    // The name a caption gave this episode, when it gave one at all.
+    episodeName,
+    quality,
+    meta,
+    isEpisode: Boolean(range),
+    languages,
+    subtitles
+  };
+}
+
+export function watchPagePath(item, episode = null) {
+  const base = `/${item.category}/${item.slug}/watch`;
+  const range = episodeRange(episode);
+  if (!range) return base;
+  const pathRange = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+  const season = episodeSeason(episode);
+  return `${base}/episode/${pathRange}${season ? `?s=${season}` : ''}`;
+}
+
+export function getEntryQualities(entry) {
+  if (!entry || !Array.isArray(entry.qualities)) return [];
+  return entry.qualities.filter((opt) => opt && (opt.telegramUrl || opt.watchUrl || opt.embedUrl));
+}
+
+export function resolveActiveQualityOption(entry, selectedQuality = null) {
+  const qualities = getEntryQualities(entry);
+  if (!qualities.length) return null;
+  if (selectedQuality) {
+    const targetKey = String(selectedQuality).trim().toLowerCase();
+    const matched = qualities.find(
+      (opt) => String(opt.id || '').toLowerCase() === targetKey
+        || String(opt.quality || '').toLowerCase() === targetKey
+        || String(opt.label || '').toLowerCase() === targetKey
+    );
+    if (matched) return matched;
+  }
+  return qualities[0];
+}
+
+export function getProtectedPlaybackTarget(entry, { selectedQuality = null } = {}) {
+  if (!entry) return null;
+
+  const activeQuality = resolveActiveQualityOption(entry, selectedQuality);
+  const source = activeQuality || entry;
+
+  // 1. Direct telegramUrl property
+  if (source.telegramUrl && typeof source.telegramUrl === 'string') {
+    const match = source.telegramUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+    if (match) {
+      return {
+        type: 'url',
+        url: `https://t.me/c/${match[1]}/${match[2]}`,
+        ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+      };
+    }
+    return {
+      type: 'url',
+      url: source.telegramUrl,
+      ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+    };
+  }
+
+  // 2. Direct watchId property
+  if (source.watchId && typeof source.watchId === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(source.watchId)) {
+    return { type: 'id', id: source.watchId };
+  }
+
+  // 3. Inspect embedUrl or watchUrl
+  const candidateUrl = String(source.embedUrl || source.watchUrl || entry.embedUrl || entry.watchUrl || '').trim();
+  if (candidateUrl) {
+    const tgMatch = candidateUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+    if (tgMatch) {
+      return {
+        type: 'url',
+        url: `https://t.me/c/${tgMatch[1]}/${tgMatch[2]}`,
+        ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+      };
+    }
+
+    try {
+      const parsed = new URL(candidateUrl);
+      if (parsed.searchParams.has('url')) {
+        const innerUrl = parsed.searchParams.get('url');
+        const innerMatch = innerUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
+        if (innerMatch) {
+          return {
+            type: 'url',
+            url: `https://t.me/c/${innerMatch[1]}/${innerMatch[2]}`,
+            ...(activeQuality?.quality ? { quality: activeQuality.quality } : {})
+          };
+        }
+      }
+      const watchMatch = parsed.pathname.match(/^\/watch\/([a-zA-Z0-9_-]{1,100})$/i);
+      if (watchMatch) {
+        return { type: 'id', id: watchMatch[1] };
+      }
+    } catch {
+      // not a full URL
+    }
+  }
+
+  return null;
+}
+
+export function getPlayerIframeUrl(target, {
+  title = '',
+  label = '',
+  poster = '',
+  next = '',
+  quality = '',
+  qualities = [],
+  subUrl = '',
+  subLabel = '',
+  noAudioSelect = false,
+  origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
+} = {}) {
+  if (!target) return null;
+  const base = String(origin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app').replace(/\/+$/, '');
+  const url = new URL(target.type === 'id' ? `/watch/${encodeURIComponent(target.id)}` : '/watch', base);
+  if (target.type === 'url') {
+    url.searchParams.set('url', target.url);
+  }
+  if (title) url.searchParams.set('title', title);
+  if (label) url.searchParams.set('label', label);
+  if (poster) {
+    url.searchParams.set('avatar', poster);
+    url.searchParams.set('poster', poster);
+  }
+  if (next) url.searchParams.set('next', next);
+  const effectiveQuality = quality || target.quality || '';
+  if (effectiveQuality) url.searchParams.set('quality', effectiveQuality);
+  if (Array.isArray(qualities) && qualities.length > 1) {
+    const serialized = qualities
+      .filter((q) => q && (q.quality || q.label) && (q.telegramUrl || q.watchUrl))
+      .map((q) => `${q.quality || q.label}:${q.telegramUrl || q.watchUrl}`)
+      .join(',');
+    if (serialized) url.searchParams.set('qualities', serialized);
+  }
+  if (subUrl) {
+    url.searchParams.set('sub', subUrl);
+    if (subLabel) url.searchParams.set('subLabel', subLabel);
+  }
+  if (noAudioSelect) {
+    url.searchParams.set('audio', '0');
+  }
+  return url.toString();
+}
+
+export function ensurePlayerEmbedScript(origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app') {
+  // Retained for backward compatibility; player is now framed directly via getPlayerIframeUrl
+}

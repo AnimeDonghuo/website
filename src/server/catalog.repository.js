@@ -1,0 +1,3686 @@
+import { MongoClient } from 'mongodb';
+import { demoContent } from './demo-content.js';
+import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
+import { cleanMediaName, detectMediaQuality, detectUploadLanguages, detectUploadSubtitleLanguages, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
+import { mergeContentStreamWithTelegramFiles } from './services/streaming-service.js';
+
+const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
+const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
+const BACKUP_RECOVERY_TTL_MS = 1000 * 60 * 15;
+const STREAM_IMPORT_TTL_MS = 1000 * 60 * 15;
+// A /merge plan waits for the publisher's confirmation button for the same short
+// window, and never survives a backup restore.
+const MERGE_PLAN_TTL_MS = STREAM_IMPORT_TTL_MS;
+const POSTER_FLOW_TTL_MS = 1000 * 60 * 15;
+const MAX_ADMIN_CONTENT_RESULTS = 100;
+const MAX_REQUEST_RESULTS = 200;
+const BACKUP_COLLECTION_NAMES = [
+  'content',
+  'upload_sessions',
+  'requests',
+  'bot_users',
+  'site_visitors',
+  'site_visits',
+  'announcement_channels',
+  'automation_settings',
+  'backup_settings'
+];
+const MAX_BACKUP_DOCUMENTS_PER_COLLECTION = 500_000;
+
+// List cards only need safe display fields plus enough file-label information
+// to derive languages from older uploads. Storage message IDs and Telegram file
+// IDs are deliberately never selected for a public catalog listing.
+const LIST_CONTENT_PROJECTION = {
+  slug: 1,
+  title: 1,
+  category: 1,
+  art: 1,
+  year: 1,
+  languages: 1,
+  subtitleLanguages: 1,
+  subtitleLanguageSource: 1,
+  languageSource: 1,
+  genres: 1,
+  description: 1,
+  status: 1,
+  releaseLabel: 1,
+  posterUrl: 1,
+  backdropUrl: 1,
+  filesCount: 1,
+  episodeGroups: 1,
+  episodeCount: 1,
+  featured: 1,
+  publishedAt: 1,
+  shareCode: 1,
+  hasDelivery: 1,
+  stream: 1,
+  'files.name': 1,
+  'files.displayName': 1,
+  'files.languages': 1,
+  'files.audioLanguages': 1,
+  'files.subtitleLanguages': 1
+};
+
+function clone(value) {
+  return structuredClone(value);
+}
+
+function safeBackupCollections(data) {
+  if (Number(data?.schemaVersion) !== 1) {
+    throw new Error('The signed backup uses an unsupported application-data schema.');
+  }
+  const supplied = data?.collections;
+  if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied)) {
+    throw new Error('The backup does not contain an application collections payload.');
+  }
+  const collections = {};
+  for (const name of BACKUP_COLLECTION_NAMES) {
+    const rows = supplied[name] === undefined ? [] : supplied[name];
+    if (!Array.isArray(rows)) throw new Error(`Backup collection ${name} is not an array.`);
+    if (rows.length > MAX_BACKUP_DOCUMENTS_PER_COLLECTION) {
+      throw new Error(`Backup collection ${name} exceeds the safe document limit.`);
+    }
+    if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+      throw new Error(`Backup collection ${name} contains an invalid document.`);
+    }
+    collections[name] = rows;
+  }
+  return collections;
+}
+
+function backupSnapshot(collections) {
+  return {
+    schemaVersion: 1,
+    collections: Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name] || []]))
+  };
+}
+
+function sessionKey(chatId, ownerId) {
+  return `${String(chatId)}:${String(ownerId)}`;
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Visitors of a long-running show rarely remember the arc name; they remember "episode
+// 176". Storing the numbers, the words people type for them, and the season labels is what
+// makes an episode query reach the card that owns it — and from there the Watch page can be
+// opened straight at that episode. A card indexed before this existed is healed by /repair,
+// which re-runs the same normalization and now diffs searchText like any other index field.
+const EPISODE_SEARCH_TOKEN_LIMIT = 1_500;
+const EPISODE_SEARCH_SPAN_LIMIT = 1_000;
+
+function episodeSearchText(episodeGroups = [], episodeCount = 0) {
+  const groups = Array.isArray(episodeGroups) ? episodeGroups.slice(0, 600) : [];
+  const numbers = new Set();
+  const compact = new Set();
+  const labels = new Set();
+  for (const group of groups) {
+    const start = Number(group?.start);
+    const end = Number(group?.end ?? group?.start);
+    if (Number.isInteger(start) && start >= 1) {
+      numbers.add(start);
+      // typed without a space as often as with one
+      compact.add(`ep${start}`);
+      compact.add(`e${start}`);
+    }
+    if (Number.isInteger(end) && end >= 1) {
+      numbers.add(end);
+      compact.add(`ep${end}`);
+    }
+    // A combined upload names the whole span it covers, so every episode inside it
+    // is searchable. A thousand-hour release does not get a token per episode.
+    if (Number.isInteger(start) && Number.isInteger(end) && end > start && end - start <= EPISODE_SEARCH_SPAN_LIMIT) {
+      for (let episode = start + 1; episode < end; episode += 1) numbers.add(episode);
+    }
+    const label = cleanText(group?.label, 50);
+    if (label) labels.add(label.toLowerCase());
+    const season = Number(group?.season);
+    if (Number.isInteger(season) && season >= 1) {
+      labels.add(`season ${season}`);
+      labels.add(`s${String(season).padStart(2, '0')}`);
+      labels.add(`e${String(start).padStart(2, '0')}`);
+    }
+    const seasonLabel = cleanText(group?.seasonLabel, 30);
+    if (seasonLabel) labels.add(seasonLabel.toLowerCase());
+    if (numbers.size >= EPISODE_SEARCH_TOKEN_LIMIT) break;
+  }
+  const count = Number(episodeCount) || 0;
+  if (!numbers.size && !labels.size && !count) return '';
+  const ordered = [...numbers].sort((first, second) => first - second).slice(0, EPISODE_SEARCH_TOKEN_LIMIT);
+  // "file 07" is deliberately not indexed: it is a position in one card's list, not a
+  // name anyone searches for, and the word alone would match every series in the catalog.
+  return ['ep', 'episode', 'episodes', ...labels, ...compact, ...ordered].join(' ');
+}
+
+/**
+ * Every database-channel message this catalog knows about, as a caption sweep's work list.
+ *
+ * Deliberately *not* filtered by what the record kept as a label. A caption that arrives from a
+ * publisher's channel usually opens with that channel's own @handle, and a file record may or
+ * may not have stored the caption at all — a native video upload keeps its file name instead.
+ * So the sweep is handed the message IDs and reads each caption from Telegram itself, the way
+ * /batch reads a message before importing it, rather than trusting what the catalog remembered.
+ * `stats` reports what could not be addressed at all, because "nothing to clean" and "no channel
+ * to look in" need different answers.
+ */
+function storageCaptionTargets(records = [], { limit = 80, storageChannelId = null, adultStorageChannelId = null } = {}) {
+  const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+  const normalChannel = cleanText(storageChannelId, 80);
+  const adultChannel = cleanText(adultStorageChannelId, 80);
+  const seen = new Set();
+  const targets = [];
+  // `scanned` counts the cards this call looked at, so a caller walking an archive knows how far
+  // to advance; `capped` says the message ceiling cut into the window, which is a page boundary
+  // and not the end of the work.
+  const stats = { files: 0, noChannel: 0, legacyChannel: 0, cards: 0, scanned: 0, capped: false };
+  for (const record of records) {
+    if (!record || record.published === false) continue;
+    // A file posted before the catalog began persisting the source channel carries no channel
+    // of its own, which must not make it invisible: /batch reaches those messages through the
+    // configured database channel, so the sweep resolves the same way.
+    const fallback = String(record.category || '').trim().toLowerCase() === 'adult'
+      ? (adultChannel || normalChannel)
+      : normalChannel;
+    const files = Array.isArray(record.files) ? record.files : [];
+    let fromThisCard = 0;
+    for (const file of files) {
+      const messageId = Number(file?.storageMessageId);
+      if (!Number.isSafeInteger(messageId) || messageId < 1) continue;
+      stats.files += 1;
+      const storedChannel = cleanText(file?.storageChannelId, 80);
+      const channel = storedChannel || fallback;
+      if (!channel) {
+        stats.noChannel += 1;
+        continue;
+      }
+      const key = `${channel}:${messageId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const legacyChannel = !storedChannel;
+      if (legacyChannel) stats.legacyChannel += 1;
+      targets.push({
+        adminId: record.adminId || null,
+        title: cleanText(record.title, 70),
+        channel,
+        messageId,
+        ...(legacyChannel ? { legacyChannel: true } : {})
+      });
+      fromThisCard += 1;
+      if (targets.length >= ceiling) {
+        stats.capped = true;
+        stats.cards += 1;
+        return { targets, stats: { ...stats, scanned: records.length } };
+      }
+    }
+    if (fromThisCard) stats.cards += 1;
+  }
+  return { targets, stats: { ...stats, scanned: records.length } };
+}
+
+function searchPredicate(item, query) {
+  if (!query) return true;
+  const haystack = item.searchText || [
+    item.title,
+    item.description,
+    ...(item.genres || []),
+    ...(item.languages || []),
+    item.category,
+    episodeSearchText(item.episodeGroups, item.episodeCount)
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  return query.toLowerCase().split(/\s+/).filter(Boolean).every((term) => haystack.includes(term));
+}
+
+/**
+ * Whether a card belongs in a listing. One predicate for the memory store and one filter for Mongo,
+ * with the same rules: a category, a search phrase, and a genre tag.
+ */
+function contentMatchesList(item, { category = null, query = '', hideAdult = false, genre = null } = {}) {
+  if (category && item.category !== category) return false;
+  // A genre is a free-text label rather than a fixed list, so the match is on trimmed letters and
+  // case: "Action", "action " and "ACTION" are one shelf, not three pages of nothing.
+  const wantedGenre = cleanText(genre, 40)?.toLowerCase();
+  if (wantedGenre && !(Array.isArray(item.genres) ? item.genres : []).some((tag) => cleanText(tag, 40)?.toLowerCase() === wantedGenre)) return false;
+  // 18+ is never part of a public listing or a search: filtering it here rather than
+  // after the page is cut means a page still holds the number of cards it promised.
+  if (hideAdult && item.category === 'adult') return false;
+  return searchPredicate(item, query);
+}
+
+/**
+ * The spelling a group of tags is most often written with.
+ *
+ * A tie goes to the sentence-case form, because that is what a shelf looks like on a page —
+ * "Action" rather than "action" — and a tag nobody has capitalised yet is still shown, just lower.
+ */
+export function preferredSpelling(spellings) {
+  const entries = [...(spellings instanceof Map ? spellings : spellings || [])];
+  if (!entries.length) return null;
+  const startsUpper = (value) => (/[A-Z]/.test(String(value).charAt(0)) ? 1 : 0);
+  return entries.sort((first, second) => (
+    second[1] - first[1]
+    || startsUpper(second[0]) - startsUpper(first[0])
+    || String(first[0]).localeCompare(String(second[0]))
+  ))[0][0];
+}
+
+function sortByPublishedAt(items) {
+  return [...items].sort(
+    (first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime()
+  );
+}
+
+function normalizedMergeKey(value) {
+  return slugify(cleanText(value, 180));
+}
+
+function looseTitleMergeKey(value) {
+  // `cleanMediaName` intentionally preserves language words for display-like
+  // labels. A merge alias must also tolerate movie re-encodes titled with only
+  // their audio list, such as "RRR (2022) Hindi 1080p".
+  const cleaned = cleanMediaName(value)
+    .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|arabic|spanish|french|german|italian)\b/gi, ' ');
+  return normalizedMergeKey(cleaned);
+}
+
+function isStandaloneReleaseTitle(value) {
+  // Do not use a loose title key for distinct seasons/episodes of a series.
+  // Compact Telegram names such as S01E01 need the same protection as
+  // human-readable "Season 1" and "Episode 1" labels.
+  return !/\b(?:s(?:eason)?\s*\d{1,2}(?:\s*e(?:p(?:isode)?)?\s*\d{1,3})?|e(?:p(?:isode)?)?\s*\d{1,3}|\d{1,2}\s*x\s*\d{1,3})\b/i.test(String(value || ''));
+}
+
+function safeDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function adminContentListOptions(value) {
+  const supplied = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : { limit: value };
+  const limit = Math.max(1, Math.min(Number(supplied.limit) || 25, MAX_ADMIN_CONTENT_RESULTS));
+  const startAt = safeDateTime(supplied.startAt);
+  const endAt = safeDateTime(supplied.endAt);
+  return { limit, startAt, endAt };
+}
+
+function requestListOptions(value) {
+  const supplied = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : { limit: value };
+  const status = ['open', 'completed', 'rejected'].includes(supplied.status) ? supplied.status : 'open';
+  return {
+    status,
+    limit: Math.max(1, Math.min(Number(supplied.limit) || 12, MAX_REQUEST_RESULTS))
+  };
+}
+
+function safeRequestIds(requestIds) {
+  return [...new Set(
+    (Array.isArray(requestIds) ? requestIds : [])
+      .map((requestId) => String(requestId || '').toUpperCase())
+      .filter((requestId) => /^REQ-[A-F0-9]{10}$/.test(requestId))
+  )].slice(0, MAX_REQUEST_RESULTS);
+}
+
+function uniqueKeys(values = []) {
+  return [...new Set(values
+    .map((value) => normalizedMergeKey(value))
+    .filter((value) => value && value !== 'untitled-release'))]
+    .slice(0, 8);
+}
+
+function safeAnonymousId(value) {
+  return String(value || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 128);
+}
+
+function statisticNow(value) {
+  return safeDateTime(value) || new Date();
+}
+
+function activitySince(records, dateKey, threshold) {
+  return records.filter((record) => {
+    const value = safeDateTime(record?.[dateKey]);
+    return value && value >= threshold;
+  });
+}
+
+function uniqueActiveIds(records, dateKey, threshold, idKey) {
+  return new Set(activitySince(records, dateKey, threshold)
+    .map((record) => String(record?.[idKey] || ''))
+    .filter(Boolean)).size;
+}
+
+function storageReferenceChannel(value) {
+  return cleanText(value, 80);
+}
+
+/**
+ * Announcement messages this post already sent, so a later publisher edit can
+ * update the very same channel posts instead of leaving stale artwork or
+ * metadata in public Telegram channels.
+ */
+/** The Mongo half of the listing rules the memory store applies in `contentMatchesList`. */
+/** @param {{ hideAdult?: boolean }} [options] 18+ is excluded in the query, not after the page cut. */
+function contentListFilter({ category, query, hideAdult = false, genre = null } = {}) {
+  const filter = { published: true };
+  const wantedGenre = cleanText(genre, 40);
+  if (wantedGenre) filter.genres = new RegExp(`^${escapeRegex(wantedGenre)}$`, 'i');
+  if (hideAdult && !category) filter.category = { $ne: 'adult' };
+  if (CATEGORY_IDS.has(category)) filter.category = category;
+  const normalizedQuery = cleanText(query, 100);
+  if (normalizedQuery) {
+    const terms = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
+    filter.$and = [...(filter.$and || []), ...terms.map((term) => {
+      const expression = new RegExp(escapeRegex(term), 'i');
+      return {
+        $or: [
+          { searchText: expression },
+          { title: expression },
+          { description: expression },
+          { genres: expression },
+          { languages: expression }
+        ]
+      };
+    })];
+  }
+  return filter;
+}
+
+function normalizeAnnouncementRefs(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => ({
+      channelId: cleanText(entry?.channelId, 60),
+      messageId: Number.parseInt(entry?.messageId, 10) || 0,
+      kind: entry?.kind === 'text' ? 'text' : 'photo',
+      // The detail-page link the button carried when the card was posted. It is
+      // remembered so a later correction can rebuild the same button even when
+      // the edit path has no site config in hand; anything but a plain http(s)
+      // link is dropped, because this value is written back onto a Telegram
+      // button.
+      websiteUrl: /^https?:\/\//i.test(String(entry?.websiteUrl || '')) ? cleanText(entry.websiteUrl, 300) : null,
+      postedAt: cleanText(entry?.postedAt, 40) || null,
+      // What the channel post was last sent with. Remembering it lets a repeat edit answer
+      // "already correct" without calling Telegram at all — which is the difference between
+      // a bulk refresh staying inside the flood limit and tripping it — and lets /sync list
+      // stale posts by looking at the card alone. Stored verbatim on purpose: normalizing
+      // here (cleanText collapses whitespace) would put a stored caption out of reach of
+      // the freshly rendered one, and then nothing would ever look up to date again.
+      caption: typeof entry?.caption === 'string' && entry.caption && entry.caption.length <= 1_000 ? entry.caption : null,
+      posterUrl: /^https?:\/\//i.test(String(entry?.posterUrl || '')) ? cleanText(entry.posterUrl, 2_000) : null,
+      // Two small memories about *failures*, carried through the same normalizer so they survive a
+      // save: `syncError` is why Telegram refused an edit (and whether that reason can ever change),
+      // `posterUpgrade` that the photo itself would not attach. Without them a repeat /sync go re-asks
+      // about a hundred refused messages, which is the "checks everything again" cost they exist to end.
+      ...(entry?.syncError && typeof entry.syncError === 'object' ? {
+        syncError: {
+          reason: cleanText(entry.syncError.reason, 200) || null,
+          at: cleanText(entry.syncError.at, 40) || null,
+          blocked: entry.syncError.blocked === true,
+          signature: cleanText(entry.syncError.signature, 40) || null
+        }
+      } : {}),
+      ...(entry?.posterUpgrade && typeof entry.posterUpgrade === 'object' ? {
+        posterUpgrade: {
+          reason: cleanText(entry.posterUpgrade.reason, 200) || null,
+          at: cleanText(entry.posterUpgrade.at, 40) || null,
+          signature: cleanText(entry.posterUpgrade.signature, 40) || null
+        }
+      } : {})
+    }))
+    .filter((entry) => entry.channelId && Number.isInteger(entry.messageId) && entry.messageId > 0)
+    .slice(0, 100);
+}
+
+function sanitizeStoredFileRecord(file) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) return file;
+  const sourceLabel = cleanText(stripTelegramAttribution(file.sourceLabel, 500), 500);
+  const displayName = cleanText(stripTelegramAttribution(file.displayName, 180), 180);
+  const name = cleanText(stripTelegramAttribution(file.name, 180), 180);
+  return {
+    ...file,
+    // Keep a blank caption blank when it contained only a promotion. Public
+    // delivery labels will safely fall back to the filename/display name.
+    ...(file.sourceLabel === undefined ? {} : { sourceLabel }),
+    ...(file.displayName === undefined ? {} : { displayName }),
+    ...(file.name === undefined ? {} : { name }),
+    ...(file.storageChannelId === undefined ? {} : { storageChannelId: storageReferenceChannel(file.storageChannelId) || null })
+  };
+}
+
+function channelDigits(value) {
+  return String(value || '').replace(/^-100/, '').replace(/^-/, '').trim();
+}
+
+function storageReferenceMatches(file, storageMessageId, storageChannelId = null, includeLegacy = true) {
+  const fileId = file?.storageMessageId === null || file?.storageMessageId === undefined
+    ? ''
+    : String(file.storageMessageId);
+  if (!fileId || fileId !== String(storageMessageId)) return false;
+  const requestedChannel = storageReferenceChannel(storageChannelId);
+  if (!requestedChannel) return true;
+  const fileChannel = storageReferenceChannel(file?.storageChannelId);
+  // Records created before per-file source channels existed belong to the
+  // normal database channel only. Adult callers set includeLegacy=false so an
+  // equal message ID in the isolated 18+ channel can never be mistaken for an
+  // old normal-storage file.
+  if (!fileChannel) return includeLegacy;
+  return fileChannel === requestedChannel || (Boolean(channelDigits(fileChannel)) && channelDigits(fileChannel) === channelDigits(requestedChannel));
+}
+
+function uniqueFiles(existingFiles = [], additionalFiles = [], { supersedeExisting = false } = {}) {
+  const seenReferences = new Set();
+  const referenceOf = (file) => {
+    const storageId = file.storageMessageId === null || file.storageMessageId === undefined
+      ? ''
+      : String(file.storageMessageId);
+    if (!storageId) return '';
+    const storageChannelId = storageReferenceChannel(file.storageChannelId);
+    // Telegram message IDs are scoped to their channel. Include the source
+    // channel in the dedupe key so normal and 18+ private stores may both have
+    // message 42 without losing a legitimate file during a merge.
+    return `${storageChannelId || 'legacy'}:${storageId}`;
+  };
+
+  const keptExisting = [];
+  for (const rawFile of existingFiles) {
+    if (!rawFile || typeof rawFile !== 'object') continue;
+    const file = sanitizeStoredFileRecord(rawFile);
+    const reference = referenceOf(file);
+    if (reference) seenReferences.add(reference);
+    keptExisting.push(file);
+  }
+
+  const incoming = [];
+  for (const rawFile of additionalFiles) {
+    if (!rawFile || typeof rawFile !== 'object') continue;
+    const file = sanitizeStoredFileRecord(rawFile);
+    const reference = referenceOf(file);
+    if (reference && seenReferences.has(reference)) continue;
+    if (reference) seenReferences.add(reference);
+    incoming.push(file);
+  }
+
+  // A new upload for the same delivery slot replaces the older one, so an
+  // update never leaves a release looking half old and half new. Only a file
+  // that will actually be kept can supersede another: dropping both sides of a
+  // re-published storage message would lose the media entirely.
+  const replacements = supersedeExisting ? replacementIndex(incoming) : null;
+  const survivors = replacements?.size
+    ? keptExisting.filter((file) => !isSupersededBy(replacements, file))
+    : keptExisting;
+
+  return [...survivors, ...incoming];
+}
+
+/**
+ * Index the incoming files by their replacement identity. An episode range
+ * matches regardless of quality, while a non-episodic file also has to share
+ * the same quality and audio-language labels, so adding a second quality of a
+ * movie can never delete the first one.
+ */
+function replacementIndex(incomingFiles = []) {
+  const index = new Map();
+  for (const file of incomingFiles) {
+    const replacement = fileReplacementKey(file);
+    if (!replacement) continue;
+    const current = index.get(replacement.key) || { anyLanguage: false, languages: new Set() };
+    if (!replacement.languages) current.anyLanguage = true;
+    else current.languages.add(replacement.languages);
+    index.set(replacement.key, current);
+  }
+  return index;
+}
+
+function isSupersededBy(replacements, file) {
+  if (!replacements?.size) return false;
+  const replacement = fileReplacementKey(file);
+  if (!replacement) return false;
+  const incoming = replacements.get(replacement.key);
+  if (!incoming) return false;
+  // Either side naming no language is treated as the same default track list.
+  if (incoming.anyLanguage || !replacement.languages) return true;
+  return incoming.languages.has(replacement.languages);
+}
+
+// `supersedeExisting` is how a re-upload replaces its own slot. A merge passes
+// false: its files come from other seasons and other cards, so Season 2
+// Episode 1 must land beside Season 1 Episode 1 instead of replacing it.
+/**
+ * A feature film has no episode numbering to repair; every series category does.
+ * Reading the number off the file's own wording is therefore safe for a series
+ * and deliberately off for a movie.
+ */
+function isEpisodicCategory(category) {
+  return String(category || '').trim().toLowerCase() !== 'movie';
+}
+
+function contentFileAppendPatch(content, additionalFiles, { supersedeExisting = true } = {}) {
+  // Both sides are re-read for an episode number before anything is compared, so
+  // appending a season's early episodes can never leave them off the index, and a
+  // card saved with unnumbered files heals as its list is rebuilt.
+  const episodic = isEpisodicCategory(content?.category);
+  const files = uniqueFiles(
+    repairEpisodeGaps(content?.files || [], { episodic }),
+    repairEpisodeGaps(additionalFiles, { episodic }),
+    { supersedeExisting }
+  );
+  const episodeSummary = summarizeEpisodes(files);
+  const uploadLanguages = summarizeUploadLanguages(files);
+  const uploadSubtitleLanguages = summarizeSubtitleLanguages(files);
+  const now = new Date().toISOString();
+  const languages = content?.languageSource === 'manual' && Array.isArray(content?.languages) && content.languages.length
+    ? content.languages
+    : uploadLanguages.length
+      ? uploadLanguages
+      : content?.languages || [];
+  const subtitleLanguages = content?.subtitleLanguageSource === 'manual' && Array.isArray(content?.subtitleLanguages) && content.subtitleLanguages.length
+    ? content.subtitleLanguages
+    : uploadSubtitleLanguages.length
+      ? uploadSubtitleLanguages
+      : content?.subtitleLanguages || [];
+  const releaseLabel = episodeSummary.releaseLabel
+    || content?.releaseLabel
+    || (files.length === 1 ? 'Feature' : `${files.length} files`);
+
+  return {
+    files,
+    filesCount: files.length,
+    hasDelivery: files.length > 0,
+    episodeGroups: episodeSummary.groups,
+    episodeCount: episodeSummary.count,
+    releaseLabel,
+    languages,
+    subtitleLanguages,
+    subtitleLanguageSource: content?.subtitleLanguageSource === 'manual'
+      ? 'manual'
+      : uploadSubtitleLanguages.length
+        ? 'upload'
+        : content?.subtitleLanguageSource || null,
+    languageSource: content?.languageSource === 'manual'
+      ? 'manual'
+      : uploadLanguages.length
+        ? 'upload'
+        : content?.languageSource || null,
+    // the episode index is rebuilt with the files, so its search text has to be too
+    searchText: [content?.title, content?.description, content?.category, ...languages, ...subtitleLanguages, ...(content?.genres || []),
+      episodeSearchText(episodeSummary.groups, episodeSummary.count)]
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase(),
+    updatedAt: now
+  };
+}
+
+function cleanUniqueMetadataList(value, fallback = []) {
+  const source = Array.isArray(value) ? value : fallback;
+  const result = [];
+  const seen = new Set();
+  for (const raw of source) {
+    const item = cleanText(raw, 40);
+    const key = item.toLowerCase();
+    if (!item || seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+    if (result.length === 8) break;
+  }
+  return result;
+}
+
+function contentMetadataPatch(content, requested = {}) {
+  const title = requested.title === undefined ? content.title : cleanText(requested.title, 180) || content.title;
+  const category = requested.category === undefined
+    ? content.category
+    : CATEGORY_IDS.has(requested.category) ? requested.category : content.category;
+  const visibleLanguages = cleanUniqueMetadataList(requested.languages, content.languages || []);
+  const subtitleLanguages = cleanUniqueMetadataList(requested.subtitleLanguages, content.subtitleLanguages || []);
+  const genres = cleanUniqueMetadataList(requested.genres, content.genres || []);
+  const parsedYear = requested.year === undefined ? content.year : Number.parseInt(requested.year, 10);
+  const year = Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5
+    ? parsedYear
+    : content.year || null;
+  const description = requested.description === undefined ? content.description : cleanText(requested.description, 1400);
+  const status = requested.status === undefined ? content.status : cleanText(requested.status, 60) || content.status || 'New release';
+  const releaseLabel = requested.releaseLabel === undefined ? content.releaseLabel : cleanText(requested.releaseLabel, 80) || content.releaseLabel;
+  const posterUrl = requested.posterUrl === undefined ? content.posterUrl : cleanText(requested.posterUrl, 2_000) || null;
+  const backdropUrl = requested.backdropUrl === undefined
+    ? (requested.posterUrl === undefined ? content.backdropUrl : posterUrl)
+    : cleanText(requested.backdropUrl, 2_000) || posterUrl || null;
+  const titleKey = normalizedMergeKey(title);
+  const looseTitleKey = isStandaloneReleaseTitle(title) ? looseTitleMergeKey(title) : null;
+  return {
+    title,
+    category,
+    year,
+    languages: visibleLanguages,
+    subtitleLanguages,
+    subtitleLanguageSource: requested.subtitleLanguageSource !== undefined
+      ? requested.subtitleLanguageSource
+      : (requested.subtitleLanguages === undefined ? content.subtitleLanguageSource || null : 'manual'),
+    languageSource: requested.languageSource !== undefined
+      ? requested.languageSource
+      : (requested.languages === undefined ? content.languageSource || null : 'manual'),
+    genres,
+    description,
+    status,
+    releaseLabel,
+    posterUrl,
+    backdropUrl,
+    ...(requested.category === undefined ? {} : { art: { ...(content.art || {}), tone: categoryDetails(category).tone } }),
+    ...(requested.poster === undefined ? {} : { poster: requested.poster || null }),
+    ...(requested.announcementRefs === undefined ? {} : { announcementRefs: normalizeAnnouncementRefs(requested.announcementRefs) }),
+    titleKey,
+    automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, content.titleKey, titleKey, looseTitleKey]),
+    // a metadata edit leaves the episode index alone, so it carries the existing one over
+    // verbatim rather than dropping the numbers out of the search text
+    searchText: [title, description, category, ...visibleLanguages, ...subtitleLanguages, ...genres,
+      episodeSearchText(content?.episodeGroups, content?.episodeCount)]
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function normalizeContent(input) {
+  const now = new Date().toISOString();
+  const title = cleanText(input.title, 180) || 'Untitled release';
+  const category = CATEGORY_IDS.has(input.category) ? input.category : 'movie';
+  // Stored once, read by every page: the episode index is rebuilt from the same
+  // repaired list, so a file whose number was missed at upload time still shows
+  // up beside its siblings instead of silently living only in the file list.
+  const files = repairEpisodeGaps(Array.isArray(input.files) ? input.files : [], {
+    episodic: isEpisodicCategory(input.category)
+  })
+    .map(sanitizeStoredFileRecord)
+    .filter(Boolean);
+  const parsedYear = Number.parseInt(input.year, 10);
+  const languages = Array.isArray(input.languages)
+    ? input.languages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : [];
+  const subtitleLanguages = Array.isArray(input.subtitleLanguages)
+    ? input.subtitleLanguages.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : summarizeSubtitleLanguages(files);
+  const genres = Array.isArray(input.genres)
+    ? input.genres.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 8)
+    : [];
+  const description = cleanText(input.description, 1400);
+  const episodeSummary = summarizeEpisodes(files);
+  const suppliedEpisodeGroups = Array.isArray(input.episodeGroups)
+    ? input.episodeGroups
+      .map((group) => ({
+        start: Number(group?.start),
+        end: Number(group?.end),
+        label: cleanText(group?.label, 50),
+        fileCount: Math.max(1, Number(group?.fileCount) || 1)
+      }))
+      .filter((group) => Number.isInteger(group.start) && Number.isInteger(group.end) && group.start >= 1 && group.end >= group.start && group.end <= 999 && group.label)
+      .slice(0, 100)
+    : [];
+  const episodeGroups = episodeSummary.groups.length ? episodeSummary.groups : suppliedEpisodeGroups;
+  const suppliedEpisodeCount = Number(input.episodeCount);
+  const episodeCount = episodeSummary.count || (Number.isInteger(suppliedEpisodeCount) && suppliedEpisodeCount >= 0 ? suppliedEpisodeCount : 0);
+  const suppliedFilesCount = Number.isInteger(Number(input.filesCount)) ? Number(input.filesCount) : 0;
+  const filesCount = files.length || suppliedFilesCount;
+  const titleKey = normalizedMergeKey(title);
+  // A movie upload is often titled "RRR (2022) Hindi 1080p" on one day and
+  // simply "RRR" on another. Keep a cleaned alias for non-episodic releases
+  // while preserving explicit season/episode boundaries as distinct posts.
+  const looseTitleKey = isStandaloneReleaseTitle(title) ? looseTitleMergeKey(title) : null;
+
+  return {
+    title,
+    category,
+    year: Number.isInteger(parsedYear) && parsedYear >= 1888 && parsedYear <= new Date().getFullYear() + 5 ? parsedYear : null,
+    languages,
+    subtitleLanguages,
+    subtitleLanguageSource: ['manual', 'upload'].includes(input.subtitleLanguageSource) ? input.subtitleLanguageSource : null,
+    languageSource: ['manual', 'upload', 'metadata'].includes(input.languageSource) ? input.languageSource : null,
+    genres,
+    description,
+    status: cleanText(input.status, 60) || 'New release',
+    releaseLabel: cleanText(input.releaseLabel, 80) || episodeSummary.releaseLabel || (files.length === 1 ? 'Feature' : `${files.length} files`),
+    posterUrl: input.posterUrl || null,
+    backdropUrl: input.backdropUrl || input.posterUrl || null,
+    poster: input.poster || null,
+    metadataProvider: cleanText(input.metadataProvider, 30) || null,
+    tmdbId: input.tmdbId || null,
+    metadataKey: input.metadataKey ? normalizedMergeKey(input.metadataKey) : null,
+    art: input.art || null,
+    // Manually imported player links are normalized/validated by the streaming
+    // service before persistence. No media bytes are held by this field.
+    stream: input.stream && typeof input.stream === 'object' ? clone(input.stream) : null,
+    announcementRefs: normalizeAnnouncementRefs(input.announcementRefs),
+    // titleKey makes same-title merging work for manual, batch, and older
+    // records. Automation keeps raw and internet-verified aliases so slightly
+    // different upload labels still converge on one catalog record.
+    titleKey,
+    automationKey: input.automationKey ? normalizedMergeKey(input.automationKey) : null,
+    automationKeys: uniqueKeys([
+      ...(Array.isArray(input.automationKeys) ? input.automationKeys : []),
+      input.automationKey,
+      input.metadataKey,
+      titleKey,
+      looseTitleKey
+    ]),
+    files,
+    filesCount,
+    hasDelivery: files.length > 0 || Boolean(input.hasDelivery),
+    episodeGroups,
+    episodeCount,
+    searchText: [title, description, category, ...languages, ...subtitleLanguages, ...genres,
+      episodeSearchText(episodeGroups, episodeCount)].join(' ').replace(/\s+/g, ' ').trim().toLowerCase(),
+    featured: Boolean(input.featured),
+    published: input.published === false ? false : true,
+    publishedAt: input.publishedAt || now,
+    createdAt: input.createdAt || now,
+    updatedAt: now
+  };
+}
+
+/**
+ * Fields an episode index is made of. Everything here is derived from the stored file
+ * records, so re-running the current rules over a card reproduces exactly what a fresh
+ * upload of the same files would have produced — and nothing a publisher typed by hand
+ * (title, languages, poster, players, announcement references, delivery identity) is
+ * touched. This is what `/repair` writes.
+ */
+const REINDEX_FIELDS = ['files', 'filesCount', 'episodeGroups', 'episodeCount', 'releaseLabel', 'hasDelivery', 'searchText'];
+
+/**
+ * Re-derive a stored card's episode index with today's parsing rules.
+ *
+ * A card is indexed once, when it is written, so a rule shipped later — a filename
+ * pattern that now yields a number, complete-season files that are now filed by season
+ * instead of dropped — never reaches the cards published before it. Rather than ask a
+ * publisher to re-upload a season, this runs the record back through the same
+ * `normalizeContent` a fresh post goes through and reports what moved.
+ */
+export function reindexContentRecord(content) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content, changed: false, patch: {}, notes: [], unindexed: [], seasonPacks: 0 };
+  }
+  const rebuilt = normalizeContent({ ...clone(content), updatedAt: content.updatedAt, publishedAt: content.publishedAt });
+  const patchFields = {};
+  const notes = [];
+  for (const field of REINDEX_FIELDS) {
+    if (JSON.stringify(rebuilt[field] ?? null) === JSON.stringify(content[field] ?? null)) continue;
+    patchFields[field] = rebuilt[field];
+    if (field === 'episodeCount') notes.push(`episodes ${(Number(content.episodeCount) || 0)} → ${(Number(rebuilt.episodeCount) || 0)}`);
+    else if (field === 'episodeGroups') notes.push(`${(Array.isArray(content.episodeGroups) || []).length} → ${(rebuilt.episodeGroups || []).length} index blocks`);
+    else if (field === 'files') notes.push(`${(content.files || []).length} file records re-parsed`);
+    else if (field === 'releaseLabel') notes.push(`label “${content.releaseLabel || '—'}” → “${rebuilt.releaseLabel || '—'}”`);
+  }
+  const files = Array.isArray(patchFields.files) ? patchFields.files : (Array.isArray(content.files) ? content.files : []);
+  const unindexed = files.filter((file) => !hasEpisodeRange(file) && !seasonPackOf(file)).map((file) => file?.name || file?.displayName || 'unnamed file');
+  const seasonPacks = files.filter((file) => seasonPackOf(file)).length;
+  return {
+    content: Object.keys(patchFields).length ? { ...content, ...patchFields } : content,
+    changed: Boolean(Object.keys(patchFields).length),
+    patch: patchFields,
+    notes,
+    unindexed,
+    seasonPacks
+  };
+}
+
+/**
+ * Automatically check and fix a stored content record's file qualities, audio languages,
+ * and subtitle languages using what its files actually have.
+ * If the files do not specify any audio or subtitle languages, no change is made to audio or sub.
+ */
+export function reconcileContentMediaRecord(content, config = null) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content, changed: false, patch: {}, notes: [] };
+  }
+  const notes = [];
+  let filesChanged = false;
+  const enrichedFiles = content.files.map((file) => {
+    if (!file || typeof file !== 'object') return file;
+    let nextFile = file;
+    const caption = file.sourceLabel || file.displayName || '';
+    const filename = file.name || '';
+    if (!file.quality) {
+      const detectedQuality = detectMediaQuality({ caption, filename, height: file.height, width: file.width });
+      if (detectedQuality) {
+        nextFile = { ...nextFile, quality: detectedQuality };
+        filesChanged = true;
+      }
+    }
+    if (!Array.isArray(file.audioLanguages) || !file.audioLanguages.length) {
+      const detectedAudio = detectUploadLanguages({ caption, filename });
+      if (Array.isArray(detectedAudio) && detectedAudio.length) {
+        nextFile = { ...nextFile, audioLanguages: detectedAudio, languages: detectedAudio };
+        filesChanged = true;
+      }
+    }
+    if (!Array.isArray(file.subtitleLanguages) || !file.subtitleLanguages.length) {
+      const detectedSubs = detectUploadSubtitleLanguages({ caption, filename });
+      if (Array.isArray(detectedSubs) && detectedSubs.length) {
+        nextFile = { ...nextFile, subtitleLanguages: detectedSubs };
+        filesChanged = true;
+      }
+    }
+    return nextFile;
+  });
+
+  const baseRecord = filesChanged ? { ...content, files: enrichedFiles } : content;
+  const reindexed = reindexContentRecord(baseRecord);
+  const patchFields = { ...reindexed.patch };
+  if (filesChanged && !patchFields.files) {
+    patchFields.files = reindexed.content.files;
+  }
+  notes.push(...reindexed.notes);
+
+  const effectiveFiles = patchFields.files || content.files || [];
+  const fileAudio = summarizeUploadLanguages(effectiveFiles);
+  const fileSubs = summarizeSubtitleLanguages(effectiveFiles);
+
+  if (fileAudio.length > 0) {
+    if (JSON.stringify(content.languages || []) !== JSON.stringify(fileAudio) || content.languageSource !== 'upload') {
+      patchFields.languages = fileAudio;
+      patchFields.languageSource = 'upload';
+      notes.push(`audio → ${fileAudio.join(', ')}`);
+    }
+  }
+
+  if (fileSubs.length > 0) {
+    if (JSON.stringify(content.subtitleLanguages || []) !== JSON.stringify(fileSubs) || content.subtitleLanguageSource !== 'upload') {
+      patchFields.subtitleLanguages = fileSubs;
+      patchFields.subtitleLanguageSource = 'upload';
+      notes.push(`subtitles → ${fileSubs.join(', ')}`);
+    }
+  } else if (content.subtitleLanguageSource !== 'manual' && Array.isArray(content.subtitleLanguages) && content.subtitleLanguages.length > 0 && fileAudio.length > 0) {
+    patchFields.subtitleLanguages = [];
+    patchFields.subtitleLanguageSource = null;
+    notes.push('subtitles cleared (not in files)');
+  }
+
+  if (patchFields.languages || patchFields.subtitleLanguages) {
+    const nextLanguages = patchFields.languages || content.languages || [];
+    const nextSubtitles = patchFields.subtitleLanguages || content.subtitleLanguages || [];
+    const nextGroups = patchFields.episodeGroups || content.episodeGroups || [];
+    const nextCount = patchFields.episodeCount !== undefined ? patchFields.episodeCount : content.episodeCount;
+    patchFields.searchText = [
+      content.title,
+      content.description,
+      content.category,
+      ...nextLanguages,
+      ...nextSubtitles,
+      ...(content.genres || []),
+      episodeSearchText(nextGroups, nextCount)
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  if (filesChanged && effectiveFiles.length > 0) {
+    const updatedStream = mergeContentStreamWithTelegramFiles(content.stream, { ...content, ...patchFields, files: effectiveFiles }, config || {});
+    if (JSON.stringify(updatedStream?.entries || []) !== JSON.stringify(content.stream?.entries || [])) {
+      patchFields.stream = updatedStream;
+    }
+  }
+
+  const changed = Object.keys(patchFields).length > 0;
+  return {
+    content: changed ? { ...content, ...patchFields } : content,
+    changed,
+    patch: patchFields,
+    notes
+  };
+}
+
+function removeFileFromContentRecord(content, { storageMessageId = null, fileIndex = null, config = null } = {}) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
+    return { content: null, removedFile: null, patch: null };
+  }
+  const files = [...content.files];
+  let targetIdx = -1;
+  if (storageMessageId !== null && storageMessageId !== undefined && Number(storageMessageId) > 0) {
+    targetIdx = files.findIndex((f) => Number(f?.storageMessageId) === Number(storageMessageId));
+  }
+  if (targetIdx === -1 && fileIndex !== null && fileIndex !== undefined && Number.isInteger(Number(fileIndex))) {
+    const idx = Number(fileIndex);
+    if (idx >= 0 && idx < files.length) targetIdx = idx;
+  }
+  if (targetIdx === -1) {
+    return { content, removedFile: null, patch: null };
+  }
+
+  const [removedFile] = files.splice(targetIdx, 1);
+  const repairedFiles = repairEpisodeGaps(files, {
+    episodic: isEpisodicCategory(content.category)
+  }).map(sanitizeStoredFileRecord).filter(Boolean);
+  const episodeSummary = summarizeEpisodes(repairedFiles);
+  const episodeGroups = episodeSummary.groups;
+  const episodeCount = episodeSummary.count || 0;
+  const filesCount = repairedFiles.length;
+  const hasDelivery = filesCount > 0;
+  const releaseLabel = episodeSummary.releaseLabel || (filesCount === 1 ? 'Feature' : filesCount > 1 ? `${filesCount} files` : 'No files');
+
+  const fileAudio = summarizeUploadLanguages(repairedFiles);
+  const fileSubs = summarizeSubtitleLanguages(repairedFiles);
+  const languages = fileAudio.length > 0 ? fileAudio : (content.languages || []);
+  const subtitleLanguages = fileSubs.length > 0 ? fileSubs : (content.subtitleLanguages || []);
+  const languageSource = fileAudio.length > 0 ? 'upload' : (content.languageSource || null);
+  const subtitleLanguageSource = fileSubs.length > 0 ? 'upload' : (content.subtitleLanguageSource || null);
+
+  const nextCandidate = {
+    ...content,
+    files: repairedFiles,
+    fileCount: filesCount,
+    filesCount,
+    episodeGroups,
+    episodeCount,
+    releaseLabel,
+    hasDelivery,
+    languages,
+    subtitleLanguages,
+    languageSource,
+    subtitleLanguageSource
+  };
+
+  // Strip any stored Telegram stream entry pointing to the removed file's storageMessageId
+  let cleanedExistingStream = content.stream;
+  if (cleanedExistingStream && Array.isArray(cleanedExistingStream.entries) && Number(removedFile?.storageMessageId) > 0) {
+    const msgId = Number(removedFile.storageMessageId);
+    const filteredEntries = cleanedExistingStream.entries.filter((entry) => {
+      const url = `${entry?.telegramUrl || ''} ${entry?.embedUrl || ''} ${entry?.watchUrl || ''}`;
+      return !new RegExp(`/${msgId}(?:\\b|$|[?&])`).test(url);
+    });
+    cleanedExistingStream = filteredEntries.length ? { ...cleanedExistingStream, entries: filteredEntries } : null;
+  }
+  const stream = repairedFiles.length > 0
+    ? mergeContentStreamWithTelegramFiles(cleanedExistingStream, nextCandidate, config || {})
+    : cleanedExistingStream;
+
+  const searchText = [
+    content.title,
+    content.description,
+    content.category,
+    ...languages,
+    ...subtitleLanguages,
+    ...(content.genres || []),
+    episodeSearchText(episodeGroups, episodeCount)
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+
+  const patch = {
+    files: repairedFiles,
+    fileCount: filesCount,
+    filesCount,
+    episodeGroups,
+    episodeCount,
+    releaseLabel,
+    hasDelivery,
+    languages,
+    subtitleLanguages,
+    languageSource,
+    subtitleLanguageSource,
+    stream: stream || null,
+    searchText,
+    updatedAt: new Date().toISOString()
+  };
+
+  return {
+    content: { ...content, ...patch },
+    removedFile,
+    patch
+  };
+}
+
+export class MemoryCatalogRepository {
+  constructor(seed = demoContent) {
+    this.kind = 'memory';
+    this.persistent = false;
+    this.contents = new Map(
+      seed.map((item) => {
+        const normalized = normalizeContent(item);
+        return [item.slug, {
+          ...normalized,
+          id: item.id || `memory-${item.slug}`,
+          slug: item.slug,
+          shareCode: item.shareCode || makeShareCode(),
+          adminId: item.adminId || makeReference('SB'),
+          deliveryCount: item.deliveryCount || 0
+        }];
+      })
+    );
+    this.sessions = new Map();
+    this.adminSessions = new Map();
+    this.requests = new Map();
+    this.requestSelections = new Map();
+    this.backupRecoveries = new Map();
+    this.streamImports = new Map();
+    this.posterFlows = new Map();
+    this.mergePlans = new Map();
+    this.botUsers = new Map();
+    this.siteVisitors = new Map();
+    this.siteVisits = [];
+    this.announcementChannels = new Map();
+    this.autoPublishSettings = { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
+    this.backupSettings = { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
+    this.maintenanceSettings = { enabled: false, updatedAt: null, updatedBy: null };
+    this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+  }
+
+  async init() {}
+
+  async findSubsPleaseOverride(adminId) {
+    return clone(this.subsPleaseOverrides?.get(adminId) || null);
+  }
+
+  async saveSubsPleaseOverride(adminId, override) {
+    this.subsPleaseOverrides ||= new Map();
+    this.subsPleaseOverrides.set(adminId, clone(override));
+  }
+
+  async findSubsPleaseAliases(key) {
+    return clone(this.subsPleaseAliases?.get(key) || null);
+  }
+
+  async saveSubsPleaseAliases(key, aliases) {
+    this.subsPleaseAliases ||= new Map();
+    this.subsPleaseAliases.set(key, { key, aliases: clone(aliases) });
+  }
+
+  async loadSubsPleaseReleases(limit = 50_000) {
+    return [...(this.subsPleaseReleases || new Map()).values()].slice(-limit).map(clone);
+  }
+
+  async saveSubsPleaseReleases(releases) {
+    this.subsPleaseReleases ||= new Map();
+    for (const release of releases) {
+      this.subsPleaseReleases.delete(release.key);
+      this.subsPleaseReleases.set(release.key, clone(release));
+    }
+    if (this.subsPleaseReleases.size > 50_000) this.subsPleaseReleases = new Map([...this.subsPleaseReleases].slice(-50_000));
+  }
+
+  async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null } = {}) {
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const normalizedQuery = cleanText(query, 100);
+    const wantedGenre = cleanText(genre, 40) || null;
+    return sortByPublishedAt([...this.contents.values()])
+      .filter((item) => contentMatchesList(item, { category: normalizedCategory, query: normalizedQuery, hideAdult, genre: wantedGenre }))
+      .slice(Math.max(0, Number(offset) || 0), Math.max(0, Number(offset) || 0) + Math.max(1, Math.min(Number(limit) || 60, 100)))
+      .map(clone);
+  }
+
+  // The count a page needs to know it has more: without it, a listing that stops at 100 looks like
+  // a catalog of 100, which is exactly how "my old posts disappeared" reads from the outside.
+  async countContent({ category, query, hideAdult = false, genre = null } = {}) {
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const normalizedQuery = cleanText(query, 100);
+    const wantedGenre = cleanText(genre, 40) || null;
+    return [...this.contents.values()].filter((item) => (
+      contentMatchesList(item, { category: normalizedCategory, query: normalizedQuery, hideAdult, genre: wantedGenre })
+    )).length;
+  }
+
+  async listGenres({ limit = 60 } = {}) {
+    const counts = new Map();
+    for (const item of this.contents.values()) {
+      if (item.category === 'adult') continue;
+      for (const genre of item.genres || []) {
+        const name = cleanText(genre, 40);
+        if (!name) continue;
+        // "Action" and "action" are one shelf: the entry is keyed by the letters alone and shows the
+        // spelling the catalog uses most, so a list never offers two tiles for the same tag.
+        const key = name.toLowerCase();
+        const entry = counts.get(key) || { name, count: 0, spellings: new Map() };
+        entry.count += 1;
+        entry.spellings.set(name, (entry.spellings.get(name) || 0) + 1);
+        counts.set(key, entry);
+      }
+    }
+    return [...counts.values()]
+      .map((entry) => ({ name: preferredSpelling(entry.spellings), count: entry.count }))
+      .sort((first, second) => second.count - first.count || first.name.localeCompare(second.name))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 60, 200)));
+  }
+
+  async findContentBySlug(slug) {
+    const item = this.contents.get(slug);
+    return item ? clone(item) : null;
+  }
+
+  async findContentByShareCode(shareCode) {
+    const item = [...this.contents.values()].find((entry) => entry.shareCode === shareCode);
+    return item ? clone(item) : null;
+  }
+
+  async findContentByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
+    const item = [...this.contents.values()].find((entry) =>
+      Array.isArray(entry.files) && entry.files.some((file) => storageReferenceMatches(file, storageMessageId, storageChannelId, includeLegacy))
+    );
+    return item ? clone(item) : null;
+  }
+
+  // The announcement post is the thing a publisher can actually see in the channel, so it has to walk
+  // back to the card: forward that post to the bot and this is how its Post ID is found.
+  async findContentByAnnouncementMessage({ channelId = null, messageId = null } = {}) {
+    const wanted = Number.parseInt(messageId, 10);
+    if (!Number.isInteger(wanted) || wanted <= 0) return null;
+    const channel = cleanText(channelId, 60);
+    for (const entry of this.contents.values()) {
+      const reference = (Array.isArray(entry.announcementRefs) ? entry.announcementRefs : [])
+        .find((item) => Number.parseInt(item?.messageId, 10) === wanted
+          && (!channel || !item?.channelId || String(item.channelId) === channel));
+      if (reference) return clone(entry);
+    }
+    return null;
+  }
+
+  async findContentByMergeKey(mergeKey, category = null) {
+    const normalizedKey = normalizedMergeKey(mergeKey);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const item = [...this.contents.values()].find((entry) =>
+      entry.published !== false &&
+      (!normalizedCategory || entry.category === normalizedCategory) &&
+      (entry.metadataKey === normalizedKey || entry.automationKey === normalizedKey || entry.automationKeys?.includes(normalizedKey) || entry.titleKey === normalizedKey || entry.slug === normalizedKey
+        // Legacy cards may have only a noisy title/slug such as "RRR (2022)".
+        // Use the cleaned key only for a standalone release, never seasons.
+        || (isStandaloneReleaseTitle(entry.title) && looseTitleMergeKey(entry.title) === normalizedKey))
+    );
+    return item ? clone(item) : null;
+  }
+
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = [], category = null) {
+    const item = await this.findContentByMergeKey(mergeKey, category);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    // Keep the category check in the write path as well as the lookup. This
+    // guards against an administrator changing a category between the lookup
+    // and append, and prevents a shared title from crossing catalog sections.
+    if (!saved || (normalizedCategory && saved.category !== normalizedCategory)) return null;
+    Object.assign(saved, contentFileAppendPatch(saved, additionalFiles), {
+      automationKey: saved.automationKey || normalizedMergeKey(mergeKey),
+      automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
+    });
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  /**
+   * /merge absorbs another post's files. The moved records are appended to this
+   * post and its episode groups, counts, and languages are rebuilt from the
+   * whole list, so a merged-in season keeps its own numbering. Absorbed merge
+   * keys are recorded so a later upload of the old season title lands here
+   * instead of creating a second card.
+   */
+  async appendFilesToContentByAdminId(adminId, additionalFiles = [], aliases = [], options = {}) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    Object.assign(saved, contentFileAppendPatch(saved, additionalFiles, { supersedeExisting: options.supersede !== false }), {
+      automationKeys: uniqueKeys([...(saved.automationKeys || []), saved.automationKey, ...(Array.isArray(aliases) ? aliases : [])])
+    });
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  /**
+   * Replace a post's file list outright, which is how /merge removes one season
+   * or a few episodes that were attached to the wrong card. Private storage
+   * messages are never touched, so a removed file can be re-added later.
+   */
+  async replaceContentFilesByAdminId(adminId, files = []) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    Object.assign(saved, contentFileAppendPatch({ ...saved, files: [] }, Array.isArray(files) ? files : []));
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  async listAdminContent(options = {}) {
+    const { limit, startAt, endAt } = adminContentListOptions(options);
+    return sortByPublishedAt([...this.contents.values()])
+      .filter((item) => item.published !== false)
+      .filter((item) => {
+        if (!startAt && !endAt) return true;
+        const publishedAt = safeDateTime(item.publishedAt);
+        if (!publishedAt) return false;
+        return (!startAt || publishedAt >= startAt) && (!endAt || publishedAt < endAt);
+      })
+      .slice(0, limit)
+      .map((item) => clone({
+        adminId: item.adminId,
+        title: item.title,
+        category: item.category,
+        filesCount: item.filesCount || item.files?.length || 0,
+        episodeCount: item.episodeCount || 0,
+        publishedAt: item.publishedAt,
+        updatedAt: item.updatedAt
+      }));
+  }
+
+  async findContentByTitle(title, { category = null, limit = 3 } = {}) {
+    const titleKey = normalizedMergeKey(title);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    return [...this.contents.values()]
+      .filter((entry) => entry.published !== false && (entry.titleKey === titleKey || entry.slug === titleKey) && (!normalizedCategory || entry.category === normalizedCategory))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 3, 10)))
+      .map(clone);
+  }
+
+  async findContentByAdminId(adminId) {
+    const item = [...this.contents.values()].find((entry) => entry.adminId === String(adminId).toUpperCase());
+    return item ? clone(item) : null;
+  }
+
+  async updateContentStreamByAdminId(adminId, stream) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    if (!saved) return null;
+    saved.stream = stream && typeof stream === 'object' ? clone(stream) : null;
+    saved.updatedAt = new Date().toISOString();
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  async deleteContentByAdminId(adminId) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    this.contents.delete(item.slug);
+    return item;
+  }
+
+  async updateContentByAdminId(adminId, patch) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return null;
+    const saved = this.contents.get(item.slug);
+    Object.assign(saved, contentMetadataPatch(saved, patch));
+    this.contents.set(saved.slug, saved);
+    return clone(saved);
+  }
+
+  async reindexContent({ dryRun = false, limit = 5_000, adminId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [], unindexed: 0, seasonPacks: 0 };
+    for (const [slug, saved] of [...this.contents.entries()]) {
+      if (wanted && saved.adminId !== wanted) continue;
+      if (report.checked >= Math.max(1, Number(limit) || 5_000)) break;
+      report.checked += 1;
+      const result = reindexContentRecord(saved);
+      report.seasonPacks += result.seasonPacks;
+      report.unindexed += result.unindexed.length;
+      if (!result.changed) continue;
+      if (!dryRun) this.contents.set(slug, { ...result.content, updatedAt: new Date().toISOString() });
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
+    }
+    return report;
+  }
+
+  async reconcileCatalogMediaFromFiles({ dryRun = false, limit = 5_000, adminId = null, config = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [] };
+    for (const [slug, saved] of [...this.contents.entries()]) {
+      if (wanted && saved.adminId !== wanted) continue;
+      if (report.checked >= Math.max(1, Number(limit) || 5_000)) break;
+      report.checked += 1;
+      const result = reconcileContentMediaRecord(saved, config);
+      if (!result.changed) continue;
+      const nextSaved = { ...result.content, updatedAt: new Date().toISOString() };
+      if (!dryRun) this.contents.set(slug, nextSaved);
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, content: clone(nextSaved) });
+    }
+    return report;
+  }
+
+  async removeFileFromContentByAdminId(adminId, options = {}) {
+    const item = await this.findContentByAdminId(adminId);
+    if (!item) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const saved = this.contents.get(item.slug);
+    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!removedFile || !patch) {
+      return { content: clone(saved), removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+    }
+    Object.assign(saved, patch);
+    this.contents.set(saved.slug, saved);
+    const clonedRemoved = clone(removedFile);
+    return {
+      content: clone(saved),
+      removed: clonedRemoved,
+      removedFile: clonedRemoved,
+      remainingCount: Array.isArray(saved.files) ? saved.files.length : 0
+    };
+  }
+
+  /**
+   * Published cards that remember where their announcement landed, for /sync. The
+   * reference list is the whole point of the query — a card nobody announced to a
+   * channel has no copy to refresh — so it is filtered here rather than in the bot, and
+   * the records come back complete because the caption is rendered from the card.
+   */
+  async listAnnouncedContent({ adminId = null, limit = 2_000 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Number(limit) || 2_000);
+    const items = [];
+    for (const saved of this.contents.values()) {
+      if (saved.published === false) continue;
+      if (wanted && saved.adminId !== wanted) continue;
+      if (!saved.announcementRefs?.length) continue;
+      items.push(clone(saved));
+      if (items.length >= ceiling) break;
+    }
+    return items;
+  }
+
+  /**
+   * The database channel's own captions, as this catalog remembers them. Ordered newest
+   * first and capped, because a sweep is paced against Telegram's flood limit and a
+   * publisher is better off seeing the newest posts than waiting on an entire archive.
+   */
+  async listStorageCaptionTargets({ adminId = null, limit = 80, skip = 0, cards = null, storageChannelId = null, adultStorageChannelId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+    const window = Math.max(1, Number(cards) || Math.max(20, ceiling * 6));
+    const offset = Math.max(0, Number(skip) || 0);
+    const candidates = [...this.contents.values()]
+      .filter((entry) => entry.published !== false && (!wanted || entry.adminId === wanted))
+      .sort((first, second) => new Date(second.publishedAt || 0).getTime() - new Date(first.publishedAt || 0).getTime());
+    const records = candidates.slice(offset, offset + window + 1);
+    const more = records.length > window;
+    const listed = storageCaptionTargets(records.slice(0, window), { limit: ceiling, storageChannelId, adultStorageChannelId });
+    return { ...listed, more, stats: { ...listed.stats, more } };
+  }
+
+  async createContent(input) {
+    const baseSlug = slugify(input.title);
+    let suffix = 0;
+    let slug = baseSlug;
+    while (this.contents.has(slug)) {
+      suffix += 1;
+      slug = `${baseSlug}-${suffix + 1}`;
+    }
+
+    const content = {
+      ...normalizeContent(input),
+      id: `memory-${makeShareCode()}`,
+      slug,
+      shareCode: makeShareCode(),
+      adminId: makeReference('SB')
+    };
+    this.contents.set(slug, content);
+    return clone(content);
+  }
+
+  async incrementDelivery(shareCode) {
+    const item = [...this.contents.values()].find((entry) => entry.shareCode === shareCode);
+    if (!item) return;
+    item.deliveryCount = (item.deliveryCount || 0) + 1;
+    item.updatedAt = new Date().toISOString();
+  }
+
+  async startSession({ chatId, ownerId, category, title = '' }) {
+    const key = sessionKey(chatId, ownerId);
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      category: CATEGORY_IDS.has(category) ? category : 'movie',
+      title: cleanText(title, 180),
+      workflow: 'manual',
+      batch: null,
+      auto: null,
+      overrides: null,
+      metadata: null,
+      posterOriginalUrl: null,
+      files: [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+    };
+    this.sessions.set(key, session);
+    return clone(session);
+  }
+
+  async findSession(chatId, ownerId) {
+    const item = this.sessions.get(sessionKey(chatId, ownerId));
+    if (!item) return null;
+    if (new Date(item.expiresAt).getTime() < Date.now()) {
+      this.sessions.delete(sessionKey(chatId, ownerId));
+      return null;
+    }
+    return clone(item);
+  }
+
+  async updateSession(chatId, ownerId, patch) {
+    const key = sessionKey(chatId, ownerId);
+    const item = this.sessions.get(key);
+    if (!item) return null;
+    Object.assign(item, clone(patch), {
+      updatedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+    });
+    this.sessions.set(key, item);
+    return clone(item);
+  }
+
+  async appendSessionFile(chatId, ownerId, file) {
+    const key = sessionKey(chatId, ownerId);
+    const item = this.sessions.get(key);
+    if (!item) return null;
+    item.files.push(clone(sanitizeStoredFileRecord(file)));
+    item.updatedAt = new Date().toISOString();
+    item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    return clone(item);
+  }
+
+  async replaceSessionFiles(chatId, ownerId, files) {
+    const key = sessionKey(chatId, ownerId);
+    const item = this.sessions.get(key);
+    if (!item) return null;
+    item.files = Array.isArray(files) ? clone(files.map(sanitizeStoredFileRecord).filter(Boolean)) : item.files;
+    item.updatedAt = new Date().toISOString();
+    item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    this.sessions.set(key, item);
+    return clone(item);
+  }
+
+  async queueAutomationSession({ chatId, ownerId, category, title, file, groupKey, scheduledAt, maxWaitAt, firstReceivedAt, receivedAt = new Date().toISOString() }) {
+    const key = sessionKey(chatId, ownerId);
+    const existing = this.sessions.get(key);
+    if (existing && new Date(existing.expiresAt).getTime() <= Date.now()) this.sessions.delete(key);
+    const current = this.sessions.get(key);
+    // A publisher is claiming the group. The caller creates a short-lived late
+    // group instead of modifying a snapshot that is about to be published.
+    if (current?.auto?.status === 'publishing') return clone(current);
+
+    const item = current || {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      category: CATEGORY_IDS.has(category) ? category : 'movie',
+      title: cleanText(title, 180),
+      workflow: 'automation',
+      batch: null,
+      auto: null,
+      overrides: null,
+      metadata: null,
+      posterOriginalUrl: null,
+      files: [],
+      createdAt: receivedAt,
+      updatedAt: receivedAt,
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+    };
+    const safeGroupKey = normalizedMergeKey(groupKey);
+    const deadline = String(maxWaitAt || scheduledAt) < String(scheduledAt)
+      ? String(maxWaitAt || scheduledAt)
+      : String(scheduledAt);
+    item.category = item.category || (CATEGORY_IDS.has(category) ? category : 'movie');
+    item.title = item.title || cleanText(title, 180);
+    item.workflow = 'automation';
+    item.auto = {
+      ...(item.auto || {}),
+      groupKey: safeGroupKey,
+      status: 'collecting',
+      firstReceivedAt: item.auto?.firstReceivedAt || firstReceivedAt || receivedAt,
+      lastReceivedAt: receivedAt,
+      maxWaitAt: item.auto?.maxWaitAt || maxWaitAt || scheduledAt,
+      scheduledAt: deadline,
+      lastError: null
+    };
+    item.files = uniqueFiles(item.files, [file]);
+    item.updatedAt = receivedAt;
+    item.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    this.sessions.set(key, item);
+    return clone(item);
+  }
+
+  async listDueAutomationSessions({ limit = 20, now = new Date().toISOString() } = {}) {
+    return [...this.sessions.values()]
+      .filter((session) => new Date(session.expiresAt).getTime() > Date.now())
+      .filter((session) => session.workflow === 'automation' && session.auto?.status === 'collecting')
+      .filter((session) => String(session.auto?.scheduledAt || '') <= String(now))
+      .sort((first, second) => String(first.auto?.scheduledAt || '').localeCompare(String(second.auto?.scheduledAt || '')))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 20, 50)))
+      .map(clone);
+  }
+
+  async claimAutomationSession(chatId, ownerId, { now = new Date().toISOString() } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.sessions.get(key);
+    if (!session || new Date(session.expiresAt).getTime() <= Date.now()) return null;
+    if (session.workflow !== 'automation' || session.auto?.status !== 'collecting' || String(session.auto?.scheduledAt || '') > String(now)) return null;
+    session.auto = { ...session.auto, status: 'publishing', claimedAt: now, lastError: null };
+    session.updatedAt = now;
+    this.sessions.set(key, session);
+    return clone(session);
+  }
+
+  async markAutomationSessionFailed(chatId, ownerId, { error, failedAt = new Date().toISOString() } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.sessions.get(key);
+    if (!session) return null;
+    session.auto = {
+      ...(session.auto || {}),
+      status: 'failed',
+      failedAt,
+      scheduledAt: null,
+      lastError: cleanText(error, 300) || 'Unknown automation error'
+    };
+    session.updatedAt = failedAt;
+    this.sessions.set(key, session);
+    return clone(session);
+  }
+
+  async releaseAutomationClaims({ now = new Date().toISOString() } = {}) {
+    let released = 0;
+    for (const [key, session] of this.sessions.entries()) {
+      if (session.workflow !== 'automation' || session.auto?.status !== 'publishing') continue;
+      session.auto = {
+        ...session.auto,
+        status: 'collecting',
+        scheduledAt: now,
+        releasedAt: now
+      };
+      session.updatedAt = now;
+      this.sessions.set(key, session);
+      released += 1;
+    }
+    return released;
+  }
+
+  async findSessionByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
+    for (const [key, session] of this.sessions.entries()) {
+      if (new Date(session.expiresAt).getTime() <= Date.now()) {
+        this.sessions.delete(key);
+        continue;
+      }
+      if (Array.isArray(session.files) && session.files.some((file) => storageReferenceMatches(file, storageMessageId, storageChannelId, includeLegacy))) {
+        return clone(session);
+      }
+    }
+    return null;
+  }
+
+  async deleteSession(chatId, ownerId) {
+    this.sessions.delete(sessionKey(chatId, ownerId));
+  }
+
+  async createAdminSession({ chatId, ownerId, expiresAt }) {
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(expiresAt).toISOString()
+    };
+    this.adminSessions.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findAdminSession(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.adminSessions.get(key);
+    if (!session) return null;
+    if (new Date(session.expiresAt).getTime() <= Date.now()) {
+      this.adminSessions.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteAdminSession(chatId, ownerId) {
+    this.adminSessions.delete(sessionKey(chatId, ownerId));
+  }
+
+  async listActiveAdminSessions() {
+    const active = [];
+    for (const [key, session] of this.adminSessions.entries()) {
+      if (new Date(session.expiresAt).getTime() <= Date.now()) {
+        this.adminSessions.delete(key);
+        continue;
+      }
+      active.push(clone(session));
+    }
+    return active;
+  }
+
+  async createRequest({ requestText, requester }) {
+    const now = new Date().toISOString();
+    const request = {
+      id: makeReference('REQ'),
+      requestText: cleanText(requestText, 500),
+      requester: {
+        id: String(requester?.id || ''),
+        username: cleanText(requester?.username || '', 60),
+        name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
+      },
+      status: 'open',
+      createdAt: now,
+      statusUpdatedAt: now,
+      resolvedAt: null,
+      resolvedBy: null,
+      resolution: null
+    };
+    this.requests.set(request.id, request);
+    return clone(request);
+  }
+
+  async listRequests(options = {}) {
+    const { status, limit } = requestListOptions(options);
+    return [...this.requests.values()]
+      .filter((request) => request.status === status)
+      .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt))
+      .slice(0, limit)
+      .map(clone);
+  }
+
+  async startRequestSelection({ chatId, ownerId, expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const selection = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      requestIds: [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + REQUEST_SELECTION_TTL_MS).toISOString()
+    };
+    this.requestSelections.set(sessionKey(chatId, ownerId), selection);
+    return clone(selection);
+  }
+
+  async findRequestSelection(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const selection = this.requestSelections.get(key);
+    if (!selection) return null;
+    const expiresAt = safeDateTime(selection.expiresAt);
+    if (!expiresAt || expiresAt.getTime() <= Date.now()) {
+      this.requestSelections.delete(key);
+      return null;
+    }
+    return clone(selection);
+  }
+
+  async toggleRequestSelection(chatId, ownerId, requestId, { expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const key = sessionKey(chatId, ownerId);
+    const selection = await this.findRequestSelection(chatId, ownerId);
+    const id = safeRequestIds([requestId])[0];
+    if (!selection || !id || this.requests.get(id)?.status !== 'open') return null;
+    const selected = new Set(selection.requestIds || []);
+    if (selected.has(id)) selected.delete(id);
+    else if (selected.size < MAX_REQUEST_RESULTS) selected.add(id);
+    const saved = {
+      ...selection,
+      requestIds: safeRequestIds([...selected]),
+      updatedAt: new Date().toISOString(),
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + REQUEST_SELECTION_TTL_MS).toISOString()
+    };
+    this.requestSelections.set(key, saved);
+    return clone(saved);
+  }
+
+  async deleteRequestSelection(chatId, ownerId) {
+    this.requestSelections.delete(sessionKey(chatId, ownerId));
+  }
+
+  async startBackupRecovery({ chatId, ownerId, expiresAt = new Date(Date.now() + BACKUP_RECOVERY_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const recovery = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      createdAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + BACKUP_RECOVERY_TTL_MS).toISOString()
+    };
+    this.backupRecoveries.set(sessionKey(chatId, ownerId), recovery);
+    return clone(recovery);
+  }
+
+  async findBackupRecovery(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const recovery = this.backupRecoveries.get(key);
+    if (!recovery) return null;
+    if (!safeDateTime(recovery.expiresAt) || safeDateTime(recovery.expiresAt).getTime() <= Date.now()) {
+      this.backupRecoveries.delete(key);
+      return null;
+    }
+    return clone(recovery);
+  }
+
+  async deleteBackupRecovery(chatId, ownerId) {
+    this.backupRecoveries.delete(sessionKey(chatId, ownerId));
+  }
+
+  /**
+   * Short-lived publisher artwork flow: it remembers whether the old style
+   * (post ID + image link) or the new style (post ID + title + artwork
+   * buttons) was chosen, so the publisher can answer in separate messages.
+   */
+  async startPosterFlow({
+    chatId,
+    ownerId,
+    style = null,
+    targetAdminId = null,
+    stage = 'style',
+    query = '',
+    candidates = [],
+    expiresAt = new Date(Date.now() + POSTER_FLOW_TTL_MS)
+  } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      style: cleanText(style, 20) || null,
+      targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+      stage,
+      query: cleanText(query, 180),
+      candidates: Array.isArray(candidates) ? candidates.slice(0, 12) : [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + POSTER_FLOW_TTL_MS).toISOString()
+    };
+    this.posterFlows.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findPosterFlow(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.posterFlows.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.posterFlows.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async updatePosterFlow(chatId, ownerId, patch = {}) {
+    const current = await this.findPosterFlow(chatId, ownerId);
+    if (!current) return null;
+    const saved = this.posterFlows.get(sessionKey(chatId, ownerId));
+    Object.assign(saved, patch, { updatedAt: new Date().toISOString() });
+    return clone(saved);
+  }
+
+  async deletePosterFlow(chatId, ownerId) {
+    this.posterFlows.delete(sessionKey(chatId, ownerId));
+  }
+
+  async startStreamImport({ chatId, ownerId, targetAdminId = null, expiresAt = new Date(Date.now() + STREAM_IMPORT_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + STREAM_IMPORT_TTL_MS).toISOString()
+    };
+    this.streamImports.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findStreamImport(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.streamImports.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.streamImports.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteStreamImport(chatId, ownerId) {
+    this.streamImports.delete(sessionKey(chatId, ownerId));
+  }
+
+  async startMergePlan({ chatId, ownerId, plan = null, expiresAt = new Date(Date.now() + MERGE_PLAN_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const session = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      plan: plan && typeof plan === 'object' ? clone(plan) : null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt)?.toISOString() || new Date(Date.now() + MERGE_PLAN_TTL_MS).toISOString()
+    };
+    this.mergePlans.set(sessionKey(chatId, ownerId), session);
+    return clone(session);
+  }
+
+  async findMergePlan(chatId, ownerId) {
+    const key = sessionKey(chatId, ownerId);
+    const session = this.mergePlans.get(key);
+    if (!session) return null;
+    if (!safeDateTime(session.expiresAt) || safeDateTime(session.expiresAt).getTime() <= Date.now()) {
+      this.mergePlans.delete(key);
+      return null;
+    }
+    return clone(session);
+  }
+
+  async deleteMergePlan(chatId, ownerId) {
+    this.mergePlans.delete(sessionKey(chatId, ownerId));
+  }
+
+  async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
+    if (!['completed', 'rejected'].includes(status)) return [];
+    const ids = safeRequestIds(requestIds);
+    const now = safeDateTime(resolvedAt)?.toISOString() || new Date().toISOString();
+    const resolved = [];
+    for (const id of ids) {
+      const request = this.requests.get(id);
+      if (!request || request.status !== 'open') continue;
+      Object.assign(request, {
+        status,
+        statusUpdatedAt: now,
+        resolvedAt: now,
+        resolvedBy: resolvedBy === null || resolvedBy === undefined ? null : String(resolvedBy),
+        resolution: status
+      });
+      this.requests.set(id, request);
+      resolved.push(clone(request));
+    }
+    return resolved;
+  }
+
+  async recordBotUser(user, { seenAt = new Date().toISOString() } = {}) {
+    const id = String(user?.id || '');
+    if (!id) return null;
+    const now = safeDateTime(seenAt)?.toISOString() || new Date().toISOString();
+    const existing = this.botUsers.get(id);
+    const record = {
+      id,
+      username: cleanText(user?.username || existing?.username || '', 60),
+      name: cleanText([user?.first_name, user?.last_name].filter(Boolean).join(' ') || existing?.name || '', 100),
+      languageCode: cleanText(user?.language_code || existing?.languageCode || '', 20),
+      firstSeenAt: existing?.firstSeenAt || now,
+      lastSeenAt: now,
+      interactionCount: (existing?.interactionCount || 0) + 1
+    };
+    this.botUsers.set(id, record);
+    return clone(record);
+  }
+
+  async recordSiteVisit({ visitorId, path = '/', visitedAt = new Date().toISOString() } = {}) {
+    const id = safeAnonymousId(visitorId);
+    if (!id) return null;
+    const now = safeDateTime(visitedAt)?.toISOString() || new Date().toISOString();
+    const existing = this.siteVisitors.get(id);
+    const visitor = {
+      visitorId: id,
+      firstSeenAt: existing?.firstSeenAt || now,
+      lastSeenAt: now,
+      visitCount: (existing?.visitCount || 0) + 1
+    };
+    this.siteVisitors.set(id, visitor);
+    this.siteVisits.push({ visitorId: id, path: cleanText(path, 160) || '/', visitedAt: now });
+    // A demo/in-memory repository must not grow forever when used for a long
+    // local preview. Persistent deployments retain the complete analytics data.
+    if (this.siteVisits.length > 50_000) this.siteVisits.splice(0, this.siteVisits.length - 50_000);
+    return clone(visitor);
+  }
+
+  async getPublisherStats({ now = new Date() } = {}) {
+    const current = statisticNow(now);
+    const dayStart = new Date(current.getTime() - 24 * 60 * 60 * 1000);
+    const weekStart = new Date(current.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const catalog = [...this.contents.values()].filter((item) => item.published !== false);
+    const requests = [...this.requests.values()];
+    const visitors = [...this.siteVisitors.values()];
+    const visits = this.siteVisits;
+    const botUsers = [...this.botUsers.values()];
+    const byCategory = Object.fromEntries([...CATEGORY_IDS].map((category) => [category, 0]));
+    for (const item of catalog) byCategory[item.category] = (byCategory[item.category] || 0) + 1;
+    const requestByStatus = Object.fromEntries(['open', 'completed', 'rejected'].map((status) => [status, 0]));
+    for (const request of requests) requestByStatus[request.status] = (requestByStatus[request.status] || 0) + 1;
+    const latestVisit = visits.reduce((latest, visit) => !latest || String(visit.visitedAt) > String(latest) ? visit.visitedAt : latest, null);
+    const latestBotActivity = botUsers.reduce((latest, user) => !latest || String(user.lastSeenAt) > String(latest) ? user.lastSeenAt : latest, null);
+
+    return {
+      generatedAt: current.toISOString(),
+      catalog: {
+        posts: catalog.length,
+        files: catalog.reduce((total, item) => total + Number(item.filesCount || item.files?.length || 0), 0),
+        episodes: catalog.reduce((total, item) => total + Number(item.episodeCount || 0), 0),
+        deliveries: catalog.reduce((total, item) => total + Number(item.deliveryCount || 0), 0),
+        byCategory
+      },
+      requests: { total: requests.length, ...requestByStatus },
+      site: {
+        visitors: visitors.length,
+        visits: visits.length,
+        activeVisitors24h: uniqueActiveIds(visitors, 'lastSeenAt', dayStart, 'visitorId'),
+        activeVisitors7d: uniqueActiveIds(visitors, 'lastSeenAt', weekStart, 'visitorId'),
+        visits24h: activitySince(visits, 'visitedAt', dayStart).length,
+        visits7d: activitySince(visits, 'visitedAt', weekStart).length,
+        latestActivityAt: latestVisit
+      },
+      bot: {
+        users: botUsers.length,
+        interactions: botUsers.reduce((total, user) => total + Number(user.interactionCount || 0), 0),
+        activeUsers24h: activitySince(botUsers, 'lastSeenAt', dayStart).length,
+        activeUsers7d: activitySince(botUsers, 'lastSeenAt', weekStart).length,
+        latestActivityAt: latestBotActivity
+      }
+    };
+  }
+
+  async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {
+    const channel = {
+      channelId: String(channelId),
+      title: cleanText(title, 120),
+      username: cleanText(username, 80),
+      addedBy: String(addedBy),
+      addedAt: new Date().toISOString()
+    };
+    this.announcementChannels.set(channel.channelId, channel);
+    return clone(channel);
+  }
+
+  async listAnnouncementChannels() {
+    return [...this.announcementChannels.values()].sort((first, second) => first.title.localeCompare(second.title)).map(clone);
+  }
+
+  async removeAnnouncementChannel(channelId) {
+    const key = String(channelId);
+    const channel = this.announcementChannels.get(key);
+    this.announcementChannels.delete(key);
+    return channel ? clone(channel) : null;
+  }
+
+  async getAutoPublishSettings() {
+    return clone(this.autoPublishSettings);
+  }
+
+  async setAutoPublishSettings({ enabled, updatedBy = null, notifyChatId = undefined }) {
+    const now = new Date().toISOString();
+    this.autoPublishSettings = {
+      enabled: Boolean(enabled),
+      enabledAt: enabled ? now : null,
+      updatedAt: now,
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy),
+      notifyChatId: notifyChatId === undefined
+        ? this.autoPublishSettings.notifyChatId || null
+        : notifyChatId === null || notifyChatId === '' ? null : String(notifyChatId)
+    };
+    return clone(this.autoPublishSettings);
+  }
+
+  async getMaintenanceSettings() {
+    return clone(this.maintenanceSettings || { enabled: false, updatedAt: null, updatedBy: null });
+  }
+
+  async setMaintenanceSettings({ enabled, updatedBy = null }) {
+    this.maintenanceSettings = {
+      enabled: Boolean(enabled),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    return clone(this.maintenanceSettings);
+  }
+
+  async isMaintenanceActive() {
+    return Boolean(this.maintenanceSettings?.enabled);
+  }
+
+  async getPosterSettings() {
+    return clone(this.imgbbSettings || { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null });
+  }
+
+  async getPosterApiKeys() {
+    return clone(this.imgbbSettings?.keys || []);
+  }
+
+  async addPosterApiKey(key, addedBy = null) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return this.getPosterApiKeys();
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.keys.includes(cleanKey)) {
+      this.imgbbSettings.keys.push(cleanKey);
+      this.imgbbSettings.updatedAt = new Date().toISOString();
+      this.imgbbSettings.updatedBy = addedBy ? String(addedBy) : null;
+    }
+    return clone(this.imgbbSettings.keys);
+  }
+
+  async removePosterApiKey(key) {
+    const cleanKey = String(key || '').trim();
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    this.imgbbSettings.keys = (this.imgbbSettings.keys || []).filter((k) => k !== cleanKey);
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+    return clone(this.imgbbSettings.keys);
+  }
+
+  async getPosterKeyStats() {
+    return clone(this.imgbbSettings?.stats || {});
+  }
+
+  async recordPosterUpload(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.stats[cleanKey]) {
+      this.imgbbSettings.stats[cleanKey] = { uploads: 0, refusals: 0, lastSuccessAt: null, lastRefusalAt: null };
+    }
+    this.imgbbSettings.stats[cleanKey].uploads = (this.imgbbSettings.stats[cleanKey].uploads || 0) + 1;
+    this.imgbbSettings.stats[cleanKey].lastSuccessAt = new Date().toISOString();
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+  }
+
+  async recordPosterRefusal(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    if (!this.imgbbSettings.stats[cleanKey]) {
+      this.imgbbSettings.stats[cleanKey] = { uploads: 0, refusals: 0, lastSuccessAt: null, lastRefusalAt: null };
+    }
+    this.imgbbSettings.stats[cleanKey].refusals = (this.imgbbSettings.stats[cleanKey].refusals || 0) + 1;
+    this.imgbbSettings.stats[cleanKey].lastRefusalAt = new Date().toISOString();
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+  }
+
+  async getFallbackPosterUrl() {
+    return this.imgbbSettings?.fallbackPosterUrl || null;
+  }
+
+  async setFallbackPosterUrl(url) {
+    if (!this.imgbbSettings) this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    this.imgbbSettings.fallbackPosterUrl = String(url || '').trim() || null;
+    this.imgbbSettings.updatedAt = new Date().toISOString();
+    return this.imgbbSettings.fallbackPosterUrl;
+  }
+
+  async exportBackupData() {
+    return backupSnapshot({
+      content: [...this.contents.values()].map(clone),
+      upload_sessions: [...this.sessions.values()].map(clone),
+      requests: [...this.requests.values()].map(clone),
+      bot_users: [...this.botUsers.values()].map(clone),
+      site_visitors: [...this.siteVisitors.values()].map(clone),
+      site_visits: this.siteVisits.map(clone),
+      announcement_channels: [...this.announcementChannels.values()].map(clone),
+      automation_settings: [
+        { _id: 'auto-publish', ...clone(this.autoPublishSettings) },
+        ...(this.maintenanceSettings?.enabled ? [{ _id: 'maintenance-mode', ...clone(this.maintenanceSettings) }] : []),
+        ...(this.imgbbSettings?.keys?.length || this.imgbbSettings?.fallbackPosterUrl ? [{ _id: 'imgbb-settings', ...clone(this.imgbbSettings) }] : [])
+      ],
+      backup_settings: [{ _id: 'monthly-backup', ...clone(this.backupSettings) }]
+    });
+  }
+
+  async restoreBackupData(data) {
+    const collections = safeBackupCollections(data);
+    // Stream imports are short-lived prompts, not recoverable application data.
+    // Clear any pre-recovery prompt so it cannot attach a stale manifest to a
+    // restored catalog.
+    this.streamImports.clear();
+    this.mergePlans.clear();
+    this.contents = new Map(collections.content.map((item) => [String(item.slug), clone(item)]));
+    this.sessions = new Map(collections.upload_sessions.map((item) => [sessionKey(item.chatId, item.ownerId), clone(item)]));
+    this.requests = new Map(collections.requests.map((item) => [String(item.id), clone(item)]));
+    this.botUsers = new Map(collections.bot_users.map((item) => [String(item.id), clone(item)]));
+    this.siteVisitors = new Map(collections.site_visitors.map((item) => [String(item.visitorId), clone(item)]));
+    this.siteVisits = collections.site_visits.map(clone);
+    this.announcementChannels = new Map(collections.announcement_channels.map((item) => [String(item.channelId), clone(item)]));
+    const autoSettings = collections.automation_settings.find((item) => String(item._id) === 'auto-publish');
+    const { _id: ignoredAutoSettingsId, ...savedAutoSettings } = autoSettings || {};
+    this.autoPublishSettings = autoSettings
+      ? clone(savedAutoSettings)
+      : { enabled: false, enabledAt: null, updatedAt: null, updatedBy: null, notifyChatId: null };
+    const maintSettings = collections.automation_settings.find((item) => String(item._id) === 'maintenance-mode');
+    if (maintSettings) {
+      const { _id: ignoredMaintId, ...savedMaint } = maintSettings;
+      this.maintenanceSettings = clone(savedMaint);
+    }
+    const imgbbSettingsDoc = collections.automation_settings.find((item) => String(item._id) === 'imgbb-settings');
+    if (imgbbSettingsDoc) {
+      const { _id: ignoredImgbbId, ...savedImgbb } = imgbbSettingsDoc;
+      this.imgbbSettings = clone(savedImgbb);
+    }
+    const backupSettings = collections.backup_settings.find((item) => String(item._id) === 'monthly-backup');
+    const { _id: ignoredBackupSettingsId, ...savedBackupSettings } = backupSettings || {};
+    this.backupSettings = backupSettings
+      ? clone(savedBackupSettings)
+      : { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
+    return Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name].length]));
+  }
+
+  async getBackupSettings() {
+    return clone(this.backupSettings);
+  }
+
+  async claimMonthlyBackup({ month, now = new Date().toISOString(), claimTtlMs = 30 * 60_000 } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return false;
+    const current = safeDateTime(now) || new Date();
+    const claimExpiresAt = safeDateTime(this.backupSettings.claimExpiresAt);
+    if (this.backupSettings.lastBackupMonth === safeMonth) return false;
+    if (this.backupSettings.inProgressMonth === safeMonth && claimExpiresAt && claimExpiresAt > current) return false;
+    this.backupSettings = {
+      ...this.backupSettings,
+      inProgressMonth: safeMonth,
+      claimExpiresAt: new Date(current.getTime() + Math.max(60_000, Number(claimTtlMs) || 30 * 60_000)).toISOString(),
+      updatedAt: current.toISOString()
+    };
+    return true;
+  }
+
+  async markMonthlyBackupCreated({ month, createdAt = new Date().toISOString() } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return null;
+    this.backupSettings = {
+      ...this.backupSettings,
+      lastBackupMonth: safeMonth,
+      lastBackupAt: safeDateTime(createdAt)?.toISOString() || new Date().toISOString(),
+      inProgressMonth: null,
+      claimExpiresAt: null,
+      updatedAt: new Date().toISOString()
+    };
+    return clone(this.backupSettings);
+  }
+
+  async releaseMonthlyBackupClaim({ month } = {}) {
+    if (this.backupSettings.inProgressMonth === String(month || '')) {
+      this.backupSettings = {
+        ...this.backupSettings,
+        inProgressMonth: null,
+        claimExpiresAt: null,
+        updatedAt: new Date().toISOString()
+      };
+    }
+    return clone(this.backupSettings);
+  }
+
+  async close() {}
+}
+
+export class MongoCatalogRepository {
+  constructor(client, db) {
+    this.kind = 'mongodb';
+    this.persistent = true;
+    this.client = client;
+    this.db = db;
+    this.contents = db.collection('content');
+    this.sessions = db.collection('upload_sessions');
+    this.adminSessions = db.collection('admin_sessions');
+    this.requests = db.collection('requests');
+    this.requestSelections = db.collection('request_selections');
+    this.backupRecoveries = db.collection('backup_recoveries');
+    this.streamImports = db.collection('stream_imports');
+    this.posterFlows = db.collection('poster_flows');
+    this.mergePlans = db.collection('merge_plans');
+    this.botUsers = db.collection('bot_users');
+    this.siteVisitors = db.collection('site_visitors');
+    this.siteVisits = db.collection('site_visits');
+    this.announcementChannels = db.collection('announcement_channels');
+    this.automationSettings = db.collection('automation_settings');
+    this.backupSettings = db.collection('backup_settings');
+    this.subsPleaseReleases = db.collection('subsplease_releases');
+    this.subsPleaseAliases = db.collection('subsplease_aliases');
+    this._maintenanceActive = undefined;
+  }
+
+  async init() {
+    await Promise.all([
+      this.subsPleaseReleases.createIndex({ seenAt: -1 }),
+      this.contents.createIndex({ slug: 1 }, { unique: true }),
+      this.contents.createIndex({ shareCode: 1 }, { unique: true }),
+      this.contents.createIndex({ adminId: 1 }, { unique: true }),
+      this.contents.createIndex({ publishedAt: -1 }),
+      this.contents.createIndex({ category: 1, publishedAt: -1 }),
+      this.contents.createIndex({ 'files.storageMessageId': 1 }),
+      this.contents.createIndex({ automationKey: 1 }),
+      this.contents.createIndex({ automationKeys: 1 }),
+      this.contents.createIndex({ metadataKey: 1 }),
+      this.contents.createIndex({ titleKey: 1 }),
+      this.sessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.sessions.createIndex({ 'files.storageMessageId': 1 }),
+      this.sessions.createIndex({ workflow: 1, 'auto.status': 1, 'auto.scheduledAt': 1 }),
+      this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.adminSessions.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.adminSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.requests.createIndex({ id: 1 }, { unique: true }),
+      this.requests.createIndex({ status: 1, createdAt: -1 }),
+      this.requestSelections.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.requestSelections.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.backupRecoveries.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.backupRecoveries.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.streamImports.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.streamImports.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.posterFlows.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.posterFlows.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.mergePlans.createIndex({ chatId: 1, ownerId: 1 }, { unique: true }),
+      this.mergePlans.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.botUsers.createIndex({ id: 1 }, { unique: true }),
+      this.botUsers.createIndex({ lastSeenAt: -1 }),
+      this.siteVisitors.createIndex({ visitorId: 1 }, { unique: true }),
+      this.siteVisitors.createIndex({ lastSeenAt: -1 }),
+      this.siteVisits.createIndex({ visitedAt: -1 }),
+      this.siteVisits.createIndex({ visitorId: 1, visitedAt: -1 }),
+      this.announcementChannels.createIndex({ channelId: 1 }, { unique: true })
+    ]);
+    try {
+      const maint = await this.getMaintenanceSettings();
+      this._maintenanceActive = Boolean(maint?.enabled);
+    } catch {
+      this._maintenanceActive = false;
+    }
+  }
+
+  async findSubsPleaseOverride(adminId) {
+    return this.subsPleaseAliases.findOne({ _id: `post:${adminId}` });
+  }
+
+  async saveSubsPleaseOverride(adminId, override) {
+    await this.subsPleaseAliases.updateOne({ _id: `post:${adminId}` }, { $set: override }, { upsert: true });
+  }
+
+  async findSubsPleaseAliases(key) {
+    return this.subsPleaseAliases.findOne({ _id: key });
+  }
+
+  async saveSubsPleaseAliases(key, aliases) {
+    await this.subsPleaseAliases.updateOne({ _id: key }, { $set: { key, aliases, checkedAt: new Date() } }, { upsert: true });
+  }
+
+  async loadSubsPleaseReleases(limit = 50_000) {
+    // Reverse the newest-first query so the in-memory cache evicts oldest first.
+    return (await this.subsPleaseReleases.find({}).sort({ seenAt: -1 }).limit(limit).toArray()).reverse();
+  }
+
+  async saveSubsPleaseReleases(releases) {
+    if (!releases.length) return;
+    const seenAt = new Date();
+    await this.subsPleaseReleases.bulkWrite(releases.map((release) => ({
+      updateOne: { filter: { _id: release.key }, update: { $set: { ...release, seenAt } }, upsert: true }
+    })), { ordered: false });
+  }
+
+  async listContent({ category, query, limit = 60, offset = 0, hideAdult = false, genre = null, includeAdminId = false } = {}) {
+    const filter = contentListFilter({ category, query, hideAdult, genre });
+    const start = Math.max(0, Number(offset) || 0);
+
+    // The list serializer uses safe file labels to resolve legacy language tags
+    // such as "Multi (Hindi + Malayalam)". It never returns `files` to clients.
+    return this.contents
+      .find(filter, { projection: includeAdminId ? { ...LIST_CONTENT_PROJECTION, adminId: 1 } : LIST_CONTENT_PROJECTION })
+      .sort({ featured: -1, publishedAt: -1 })
+      .skip(start)
+      .limit(Math.max(1, Math.min(Number(limit) || 60, 100)))
+      .toArray();
+  }
+
+  async countContent({ category, query, hideAdult = false, genre = null } = {}) {
+    return this.contents.countDocuments(contentListFilter({ category, query, hideAdult, genre }));
+  }
+
+  async listGenres({ limit = 60 } = {}) {
+    const rows = await this.contents.aggregate([
+      { $match: { published: true, category: { $ne: 'adult' }, genres: { $exists: true, $ne: [] } } },
+      { $unwind: '$genres' },
+      // Grouped on the lower-cased tag so "Action" and "action" share one shelf; the spellings come
+      // along so the shelf can be named the way the catalog names it most.
+      { $group: { _id: { $toLower: '$genres' }, count: { $sum: 1 }, spellings: { $push: '$genres' } } },
+      { $sort: { count: -1, _id: 1 } },
+      { $limit: Math.max(1, Math.min(Number(limit) || 60, 200)) }
+    ], { allowDiskUse: true }).toArray();
+    return rows
+      .map((row) => {
+        const spellings = new Map();
+        for (const value of row.spellings || []) {
+          const name = cleanText(value, 40);
+          if (name) spellings.set(name, (spellings.get(name) || 0) + 1);
+        }
+        return { name: preferredSpelling(spellings) || cleanText(row._id, 40), count: row.count };
+      })
+      .filter((row) => row.name);
+  }
+
+  async findContentBySlug(slug) {
+    // Detail pages need the saved file labels/quality/episode information to
+    // create individual Telegram choices. The public serializer strips all
+    // raw Telegram IDs and storage message IDs before returning this record.
+    return this.contents.findOne(
+      { slug, published: true },
+      { projection: { 'poster.deleteUrl': 0 } }
+    );
+  }
+
+  async findContentByShareCode(shareCode) {
+    return this.contents.findOne({ shareCode, published: true });
+  }
+
+  /** See the in-memory store: a forwarded announcement post resolves back to its catalog card. */
+  async findContentByAnnouncementMessage({ channelId = null, messageId = null } = {}) {
+    const wanted = Number.parseInt(messageId, 10);
+    if (!Number.isInteger(wanted) || wanted <= 0) return null;
+    const channel = cleanText(channelId, 60);
+    return this.contents.findOne({
+      'announcementRefs.messageId': wanted,
+      ...(channel
+        ? { $or: [{ 'announcementRefs.channelId': channel }, { 'announcementRefs.channelId': { $exists: false } }, { 'announcementRefs.channelId': null }] }
+        : {})
+    }, { projection: { 'poster.deleteUrl': 0 } });
+  }
+
+  async findContentByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
+    const asNumber = Number(storageMessageId);
+    const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    const sourceChannel = storageReferenceChannel(storageChannelId);
+    const channelVariants = sourceChannel
+      ? [...new Set([sourceChannel, sourceChannel.replace(/^-100/, ''), `-100${sourceChannel.replace(/^-100/, '')}`])].filter(Boolean)
+      : [];
+    const fileMatch = channelVariants.length
+      ? {
+        storageMessageId: { $in: values },
+        ...(includeLegacy
+          ? { $or: [{ storageChannelId: { $in: channelVariants } }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
+          : { storageChannelId: { $in: channelVariants } })
+      }
+      : { storageMessageId: { $in: values } };
+    return this.contents.findOne(
+      { files: { $elemMatch: fileMatch } },
+      { projection: { slug: 1, title: 1, adminId: 1, shareCode: 1, category: 1, published: 1 } }
+    );
+  }
+
+  async findContentByMergeKey(mergeKey, category = null) {
+    const normalizedKey = normalizedMergeKey(mergeKey);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const scope = {
+      published: { $ne: false },
+      ...(normalizedCategory ? { category: normalizedCategory } : {})
+    };
+    const exact = await this.contents.findOne({
+      ...scope,
+      $or: [
+        { metadataKey: normalizedKey },
+        { automationKey: normalizedKey },
+        { automationKeys: normalizedKey },
+        { titleKey: normalizedKey },
+        // Old records predate titleKey; their first slug remains a useful
+        // backwards-compatible same-title match.
+        { slug: normalizedKey }
+      ]
+    });
+    if (exact) return exact;
+
+    // Migration-safe fallback for old noisy standalone movie titles, e.g.
+    // `RRR (2022)` before title aliases existed. The indexed/direct keys above
+    // remain the normal path; validate the cleaned key after a narrow title
+    // prefix query so this never loosely joins different named releases.
+    const titlePattern = normalizedKey
+      .split('-')
+      .filter(Boolean)
+      .map(escapeRegex)
+      .join('[\\s._-]+');
+    if (!titlePattern) return null;
+    const candidates = await this.contents.find({
+      ...scope,
+      title: new RegExp(`^\\s*${titlePattern}(?:\\s|\\(|\\[|\\.|_|-|$)`, 'i')
+    }, { projection: { title: 1, category: 1 } }).limit(20).toArray();
+    return candidates.find((entry) => isStandaloneReleaseTitle(entry.title) && looseTitleMergeKey(entry.title) === normalizedKey) || null;
+  }
+
+  async appendFilesToContentByMergeKey(mergeKey, additionalFiles, aliases = [], category = null) {
+    const content = await this.findContentByMergeKey(mergeKey, category);
+    if (!content) return null;
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    const patch = {
+      ...contentFileAppendPatch(content, additionalFiles),
+      automationKey: content.automationKey || normalizedMergeKey(mergeKey),
+      automationKeys: uniqueKeys([...(content.automationKeys || []), content.automationKey, mergeKey, ...(Array.isArray(aliases) ? aliases : [])])
+    };
+    return this.contents.findOneAndUpdate(
+      { _id: content._id, ...(normalizedCategory ? { category: normalizedCategory } : {}) },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async appendFilesToContentByAdminId(adminId, additionalFiles = [], aliases = [], options = {}) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    const patch = {
+      ...contentFileAppendPatch(content, additionalFiles, { supersedeExisting: options.supersede !== false }),
+      automationKeys: uniqueKeys([
+        ...(content.automationKeys || []), content.automationKey, ...(Array.isArray(aliases) ? aliases : [])
+      ])
+    };
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async replaceContentFilesByAdminId(adminId, files = []) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    const patch = contentFileAppendPatch({ ...content, files: [] }, Array.isArray(files) ? files : []);
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async listAdminContent(options = {}) {
+    const { limit, startAt, endAt } = adminContentListOptions(options);
+    const filter = { published: { $ne: false } };
+    if (startAt || endAt) {
+      filter.publishedAt = {
+        ...(startAt ? { $gte: startAt.toISOString() } : {}),
+        ...(endAt ? { $lt: endAt.toISOString() } : {})
+      };
+    }
+    return this.contents
+      .find(
+        filter,
+        {
+          projection: {
+            adminId: 1,
+            title: 1,
+            category: 1,
+            filesCount: 1,
+            episodeCount: 1,
+            publishedAt: 1,
+            updatedAt: 1
+          }
+        }
+      )
+      .sort({ publishedAt: -1 })
+      .limit(limit)
+      .toArray();
+  }
+
+  async findContentByTitle(title, { category = null, limit = 3 } = {}) {
+    const titleKey = normalizedMergeKey(title);
+    const normalizedCategory = CATEGORY_IDS.has(category) ? category : null;
+    return this.contents.find({
+      published: { $ne: false },
+      // Old records may predate titleKey, so retain their stable original slug
+      // as the exact-title fallback for a manual provider export.
+      $or: [{ titleKey }, { slug: titleKey }],
+      ...(normalizedCategory ? { category: normalizedCategory } : {})
+    }).limit(Math.max(1, Math.min(Number(limit) || 3, 10))).toArray();
+  }
+
+  async findContentByAdminId(adminId) {
+    return this.contents.findOne({ adminId: String(adminId).toUpperCase() });
+  }
+
+  async updateContentStreamByAdminId(adminId, stream) {
+    return this.contents.findOneAndUpdate(
+      { adminId: String(adminId).toUpperCase(), published: { $ne: false } },
+      {
+        $set: {
+          stream: stream && typeof stream === 'object' ? stream : null,
+          updatedAt: new Date().toISOString()
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async deleteContentByAdminId(adminId) {
+    return this.contents.findOneAndDelete(
+      { adminId: String(adminId).toUpperCase() },
+      { includeResultMetadata: false }
+    );
+  }
+
+  async updateContentByAdminId(adminId, patch) {
+    const content = await this.findContentByAdminId(adminId);
+    if (!content) return null;
+    return this.contents.findOneAndUpdate(
+      { _id: content._id },
+      { $set: contentMetadataPatch(content, patch) },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async reindexContent({ dryRun = false, limit = 5_000, adminId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [], unindexed: 0, seasonPacks: 0 };
+    const cursor = this.contents.find(wanted ? { adminId: wanted } : {}, { limit: Math.max(1, Number(limit) || 5_000) });
+    for await (const saved of cursor) {
+      report.checked += 1;
+      const result = reindexContentRecord(saved);
+      report.seasonPacks += result.seasonPacks;
+      report.unindexed += result.unindexed.length;
+      if (!result.changed) continue;
+      if (!dryRun) {
+        await this.contents.updateOne(
+          { _id: saved._id },
+          { $set: { ...result.patch, updatedAt: new Date().toISOString() } }
+        );
+      }
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, unindexed: result.unindexed });
+    }
+    return report;
+  }
+
+  async reconcileCatalogMediaFromFiles({ dryRun = false, limit = 5_000, adminId = null, config = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const report = { checked: 0, updated: 0, dryRun: Boolean(dryRun), cards: [] };
+    const cursor = this.contents.find(wanted ? { adminId: wanted } : {}, { limit: Math.max(1, Number(limit) || 5_000) });
+    for await (const saved of cursor) {
+      report.checked += 1;
+      const result = reconcileContentMediaRecord(saved, config);
+      if (!result.changed) continue;
+      const updatedAt = new Date().toISOString();
+      if (!dryRun) {
+        await this.contents.updateOne(
+          { _id: saved._id },
+          { $set: { ...result.patch, updatedAt } }
+        );
+      }
+      report.updated += 1;
+      report.cards.push({ adminId: saved.adminId, title: saved.title, notes: result.notes, content: { ...saved, ...result.patch, updatedAt } });
+    }
+    return report;
+  }
+
+  async removeFileFromContentByAdminId(adminId, options = {}) {
+    const saved = await this.findContentByAdminId(adminId);
+    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!removedFile || !patch) {
+      return { content: saved, removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+    }
+    const updated = await this.contents.findOneAndUpdate(
+      { _id: saved._id },
+      { $set: patch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+    return {
+      content: updated,
+      removed: removedFile,
+      removedFile,
+      remainingCount: Array.isArray(updated?.files) ? updated.files.length : 0
+    };
+  }
+
+  async listAnnouncedContent({ adminId = null, limit = 2_000 } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const filter = { published: { $ne: false }, 'announcementRefs.0': { $exists: true } };
+    if (wanted) filter.adminId = wanted;
+    return this.contents.find(filter, { limit: Math.max(1, Number(limit) || 2_000) }).toArray();
+  }
+
+  /**
+   * The database channel's own captions, as this catalog remembers them. Only the fields a
+   * caption sweep needs are read: an archive of thousands of file records must not be
+   * pulled into memory to fix a few dozen captions.
+   */
+  async listStorageCaptionTargets({ adminId = null, limit = 80, skip = 0, cards = null, storageChannelId = null, adultStorageChannelId = null } = {}) {
+    const wanted = adminId ? String(adminId).toUpperCase() : null;
+    const ceiling = Math.max(1, Math.min(Number(limit) || 80, 600));
+    const window = Math.max(1, Number(cards) || Math.max(20, ceiling * 6));
+    const offset = Math.max(0, Number(skip) || 0);
+    const filter = { published: { $ne: false } };
+    if (wanted) filter.adminId = wanted;
+    const fetched = await this.contents
+      // Only the message reference is needed: what the caption says is read from Telegram, and
+      // the title and category only exist so the reply can name the card in the publisher's words.
+      .find(filter, { projection: { adminId: 1, title: 1, category: 1, publishedAt: 1, 'files.storageMessageId': 1, 'files.storageChannelId': 1 } })
+      .sort({ publishedAt: -1 })
+      // One card past the window is fetched only to learn whether the archive continues, which is
+      // what lets a sweep walk a whole database in pages without a count query.
+      .skip(offset)
+      .limit(window + 1)
+      .toArray();
+    const more = fetched.length > window;
+    const listed = storageCaptionTargets(fetched.slice(0, window), { limit: ceiling, storageChannelId, adultStorageChannelId });
+    return { ...listed, more, stats: { ...listed.stats, more } };
+  }
+
+  async createContent(input) {
+    const baseSlug = slugify(input.title);
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const suffix = attempt === 0 ? '' : `-${attempt + 1}`;
+      const document = {
+        ...normalizeContent(input),
+        slug: `${baseSlug}${suffix}`,
+        shareCode: makeShareCode(),
+        adminId: makeReference('SB')
+      };
+
+      try {
+        const result = await this.contents.insertOne(document);
+        return { ...document, _id: result.insertedId };
+      } catch (error) {
+        if (error?.code !== 11000 || attempt === 15) throw error;
+      }
+    }
+    throw new Error('Could not create a unique content record.');
+  }
+
+  async incrementDelivery(shareCode) {
+    await this.contents.updateOne(
+      { shareCode },
+      { $inc: { deliveryCount: 1 }, $set: { updatedAt: new Date().toISOString() } }
+    );
+  }
+
+  async startSession({ chatId, ownerId, category, title = '' }) {
+    const now = new Date().toISOString();
+    const result = await this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          category: CATEGORY_IDS.has(category) ? category : 'movie',
+          title: cleanText(title, 180),
+          workflow: 'manual',
+          batch: null,
+          auto: null,
+          overrides: null,
+          metadata: null,
+          posterOriginalUrl: null,
+          files: [],
+          updatedAt: now,
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        },
+        $setOnInsert: {
+          chatId: String(chatId),
+          ownerId: String(ownerId),
+          createdAt: now
+        }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async findSession(chatId, ownerId) {
+    return this.sessions.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async updateSession(chatId, ownerId, patch) {
+    const safePatch = { ...patch };
+    delete safePatch.chatId;
+    delete safePatch.ownerId;
+    delete safePatch.files;
+    safePatch.updatedAt = new Date().toISOString();
+    safePatch.expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+
+    const result = await this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      { $set: safePatch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async appendSessionFile(chatId, ownerId, file) {
+    const filter = { chatId: String(chatId), ownerId: String(ownerId) };
+    const update = await this.sessions.updateOne(
+      filter,
+      {
+        $push: { files: sanitizeStoredFileRecord(file) },
+        $set: {
+          updatedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      }
+    );
+
+    // updateOne gives an unambiguous matchedCount across MongoDB driver versions.
+    // Fetching afterward also means callers always receive the actual saved draft,
+    // rather than a findOneAndUpdate metadata wrapper.
+    if (update.matchedCount !== 1) return null;
+    return this.sessions.findOne(filter);
+  }
+
+  async replaceSessionFiles(chatId, ownerId, files) {
+    return this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          files: Array.isArray(files) ? files.map(sanitizeStoredFileRecord).filter(Boolean) : [],
+          updatedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async queueAutomationSession({ chatId, ownerId, category, title, file, groupKey, scheduledAt, maxWaitAt, firstReceivedAt, receivedAt = new Date().toISOString() }) {
+    const filter = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      'auto.status': { $ne: 'publishing' }
+    };
+    const safeGroupKey = normalizedMergeKey(groupKey);
+    const safeCategory = CATEGORY_IDS.has(category) ? category : 'movie';
+    const auto = {
+      groupKey: safeGroupKey,
+      status: 'collecting',
+      firstReceivedAt: firstReceivedAt || receivedAt,
+      lastReceivedAt: receivedAt,
+      maxWaitAt: String(maxWaitAt || scheduledAt),
+      scheduledAt: String(maxWaitAt || scheduledAt) < String(scheduledAt)
+        ? String(maxWaitAt || scheduledAt)
+        : String(scheduledAt),
+      lastError: null
+    };
+
+    try {
+      return await this.sessions.findOneAndUpdate(
+        filter,
+        {
+          $set: {
+            category: safeCategory,
+            title: cleanText(title, 180),
+            workflow: 'automation',
+            batch: null,
+            auto,
+            overrides: null,
+            metadata: null,
+            posterOriginalUrl: null,
+            updatedAt: receivedAt,
+            expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+          },
+          $setOnInsert: {
+            chatId: String(chatId),
+            ownerId: String(ownerId),
+            createdAt: receivedAt
+          },
+          // Telegram can retry an update. Equal saved file objects are kept once.
+          $addToSet: { files: sanitizeStoredFileRecord(file) }
+        },
+        { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+      );
+    } catch (error) {
+      // A group claimed by the worker no longer matches the filter. Its unique
+      // session index may make the attempted upsert collide; return the current
+      // record so the caller can route the file into a late-arrival group.
+      if (error?.code === 11000) return this.findSession(chatId, ownerId);
+      throw error;
+    }
+  }
+
+  async listDueAutomationSessions({ limit = 20, now = new Date().toISOString() } = {}) {
+    return this.sessions
+      .find({
+        workflow: 'automation',
+        'auto.status': 'collecting',
+        'auto.scheduledAt': { $lte: String(now) },
+        expiresAt: { $gt: new Date() }
+      })
+      .sort({ 'auto.scheduledAt': 1 })
+      .limit(Math.max(1, Math.min(Number(limit) || 20, 50)))
+      .toArray();
+  }
+
+  async claimAutomationSession(chatId, ownerId, { now = new Date().toISOString() } = {}) {
+    return this.sessions.findOneAndUpdate(
+      {
+        chatId: String(chatId),
+        ownerId: String(ownerId),
+        workflow: 'automation',
+        'auto.status': 'collecting',
+        'auto.scheduledAt': { $lte: String(now) },
+        expiresAt: { $gt: new Date() }
+      },
+      {
+        $set: {
+          'auto.status': 'publishing',
+          'auto.claimedAt': now,
+          'auto.lastError': null,
+          updatedAt: now
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async markAutomationSessionFailed(chatId, ownerId, { error, failedAt = new Date().toISOString() } = {}) {
+    return this.sessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId), workflow: 'automation' },
+      {
+        $set: {
+          'auto.status': 'failed',
+          'auto.failedAt': failedAt,
+          'auto.scheduledAt': null,
+          'auto.lastError': cleanText(error, 300) || 'Unknown automation error',
+          updatedAt: failedAt,
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async releaseAutomationClaims({ now = new Date().toISOString() } = {}) {
+    const result = await this.sessions.updateMany(
+      { workflow: 'automation', 'auto.status': 'publishing' },
+      {
+        $set: {
+          'auto.status': 'collecting',
+          'auto.scheduledAt': String(now),
+          'auto.releasedAt': String(now),
+          updatedAt: String(now),
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS)
+        }
+      }
+    );
+    return result.modifiedCount || 0;
+  }
+
+  async findSessionByStorageMessageId(storageMessageId, storageChannelId = null, { includeLegacy = true } = {}) {
+    const asNumber = Number(storageMessageId);
+    const values = Number.isSafeInteger(asNumber) ? [asNumber, String(storageMessageId)] : [String(storageMessageId)];
+    const sourceChannel = storageReferenceChannel(storageChannelId);
+    const fileMatch = sourceChannel
+      ? {
+        storageMessageId: { $in: values },
+        ...(includeLegacy
+          ? { $or: [{ storageChannelId: sourceChannel }, { storageChannelId: { $exists: false } }, { storageChannelId: null }, { storageChannelId: '' }] }
+          : { storageChannelId: sourceChannel })
+      }
+      : { storageMessageId: { $in: values } };
+    return this.sessions.findOne(
+      { files: { $elemMatch: fileMatch }, expiresAt: { $gt: new Date() } },
+      { projection: { chatId: 1, ownerId: 1, workflow: 1, category: 1 } }
+    );
+  }
+
+  async deleteSession(chatId, ownerId) {
+    await this.sessions.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async createAdminSession({ chatId, ownerId, expiresAt }) {
+    const now = new Date().toISOString();
+    const result = await this.adminSessions.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: { createdAt: now, expiresAt: new Date(expiresAt) },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId) }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async findAdminSession(chatId, ownerId) {
+    return this.adminSessions.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteAdminSession(chatId, ownerId) {
+    await this.adminSessions.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async listActiveAdminSessions() {
+    return this.adminSessions.find(
+      { expiresAt: { $gt: new Date() } },
+      { projection: { chatId: 1, ownerId: 1 } }
+    ).toArray();
+  }
+
+  async createRequest({ requestText, requester }) {
+    const now = new Date().toISOString();
+    const document = {
+      id: makeReference('REQ'),
+      requestText: cleanText(requestText, 500),
+      requester: {
+        id: String(requester?.id || ''),
+        username: cleanText(requester?.username || '', 60),
+        name: cleanText([requester?.first_name, requester?.last_name].filter(Boolean).join(' '), 100)
+      },
+      status: 'open',
+      createdAt: now,
+      statusUpdatedAt: now,
+      resolvedAt: null,
+      resolvedBy: null,
+      resolution: null
+    };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        await this.requests.insertOne(document);
+        return document;
+      } catch (error) {
+        if (error?.code !== 11000 || attempt === 7) throw error;
+        document.id = makeReference('REQ');
+      }
+    }
+    throw new Error('Could not create a request ID.');
+  }
+
+  async listRequests(options = {}) {
+    const { status, limit } = requestListOptions(options);
+    return this.requests
+      .find({ status })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+  }
+
+  async startRequestSelection({ chatId, ownerId, expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const now = new Date().toISOString();
+    const document = {
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      requestIds: [],
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + REQUEST_SELECTION_TTL_MS)
+    };
+    return this.requestSelections.findOneAndUpdate(
+      { chatId: document.chatId, ownerId: document.ownerId },
+      { $set: document },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findRequestSelection(chatId, ownerId) {
+    return this.requestSelections.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async toggleRequestSelection(chatId, ownerId, requestId, { expiresAt = new Date(Date.now() + REQUEST_SELECTION_TTL_MS) } = {}) {
+    const id = safeRequestIds([requestId])[0];
+    if (!id) return null;
+    const request = await this.requests.findOne({ id, status: 'open' }, { projection: { id: 1 } });
+    if (!request) return null;
+    const current = await this.findRequestSelection(chatId, ownerId);
+    if (!current) return null;
+    const selected = new Set(current.requestIds || []);
+    if (selected.has(id)) selected.delete(id);
+    else if (selected.size < MAX_REQUEST_RESULTS) selected.add(id);
+    return this.requestSelections.findOneAndUpdate(
+      {
+        chatId: String(chatId),
+        ownerId: String(ownerId),
+        expiresAt: { $gt: new Date() }
+      },
+      {
+        $set: {
+          requestIds: safeRequestIds([...selected]),
+          updatedAt: new Date().toISOString(),
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + REQUEST_SELECTION_TTL_MS)
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async deleteRequestSelection(chatId, ownerId) {
+    await this.requestSelections.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startBackupRecovery({ chatId, ownerId, expiresAt = new Date(Date.now() + BACKUP_RECOVERY_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.backupRecoveries.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          createdAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + BACKUP_RECOVERY_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId) }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findBackupRecovery(chatId, ownerId) {
+    return this.backupRecoveries.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteBackupRecovery(chatId, ownerId) {
+    await this.backupRecoveries.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startStreamImport({ chatId, ownerId, targetAdminId = null, expiresAt = new Date(Date.now() + STREAM_IMPORT_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.streamImports.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + STREAM_IMPORT_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findStreamImport(chatId, ownerId) {
+    return this.streamImports.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteStreamImport(chatId, ownerId) {
+    await this.streamImports.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startMergePlan({ chatId, ownerId, plan = null, expiresAt = new Date(Date.now() + MERGE_PLAN_TTL_MS) } = {}) {
+    const now = new Date();
+    return this.mergePlans.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          plan: plan && typeof plan === 'object' ? plan : null,
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + MERGE_PLAN_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findMergePlan(chatId, ownerId) {
+    return this.mergePlans.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async deleteMergePlan(chatId, ownerId) {
+    await this.mergePlans.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async startPosterFlow({
+    chatId,
+    ownerId,
+    style = null,
+    targetAdminId = null,
+    stage = 'style',
+    query = '',
+    candidates = [],
+    expiresAt = new Date(Date.now() + POSTER_FLOW_TTL_MS)
+  } = {}) {
+    const now = new Date();
+    return this.posterFlows.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId) },
+      {
+        $set: {
+          style: cleanText(style, 20) || null,
+          targetAdminId: targetAdminId ? String(targetAdminId).toUpperCase() : null,
+          stage,
+          query: cleanText(query, 180),
+          candidates: Array.isArray(candidates) ? candidates.slice(0, 12) : [],
+          updatedAt: now,
+          expiresAt: safeDateTime(expiresAt) || new Date(Date.now() + POSTER_FLOW_TTL_MS)
+        },
+        $setOnInsert: { chatId: String(chatId), ownerId: String(ownerId), createdAt: now }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async findPosterFlow(chatId, ownerId) {
+    return this.posterFlows.findOne({
+      chatId: String(chatId),
+      ownerId: String(ownerId),
+      expiresAt: { $gt: new Date() }
+    });
+  }
+
+  async updatePosterFlow(chatId, ownerId, patch = {}) {
+    const safePatch = { ...patch };
+    delete safePatch.chatId;
+    delete safePatch.ownerId;
+    delete safePatch.createdAt;
+    safePatch.updatedAt = new Date();
+    return this.posterFlows.findOneAndUpdate(
+      { chatId: String(chatId), ownerId: String(ownerId), expiresAt: { $gt: new Date() } },
+      { $set: safePatch },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+  }
+
+  async deletePosterFlow(chatId, ownerId) {
+    await this.posterFlows.deleteOne({ chatId: String(chatId), ownerId: String(ownerId) });
+  }
+
+  async resolveRequests({ requestIds, status, resolvedBy = null, resolvedAt = new Date().toISOString() } = {}) {
+    if (!['completed', 'rejected'].includes(status)) return [];
+    const ids = safeRequestIds(requestIds);
+    const now = safeDateTime(resolvedAt)?.toISOString() || new Date().toISOString();
+    const results = await Promise.all(ids.map((id) => this.requests.findOneAndUpdate(
+      { id, status: 'open' },
+      {
+        $set: {
+          status,
+          statusUpdatedAt: now,
+          resolvedAt: now,
+          resolvedBy: resolvedBy === null || resolvedBy === undefined ? null : String(resolvedBy),
+          resolution: status
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    )));
+    return results.filter(Boolean);
+  }
+
+  async recordBotUser(user, { seenAt = new Date() } = {}) {
+    const id = String(user?.id || '');
+    if (!id) return null;
+    const now = safeDateTime(seenAt) || new Date();
+    const result = await this.botUsers.findOneAndUpdate(
+      { id },
+      {
+        $set: {
+          username: cleanText(user?.username || '', 60),
+          name: cleanText([user?.first_name, user?.last_name].filter(Boolean).join(' '), 100),
+          languageCode: cleanText(user?.language_code || '', 20),
+          lastSeenAt: now
+        },
+        // `$inc` creates a missing counter at 1 during an upsert. Do not also
+        // initialize interactionCount in $setOnInsert: MongoDB rejects two
+        // update operators targeting the same path in one update document.
+        $setOnInsert: { id, firstSeenAt: now },
+        $inc: { interactionCount: 1 }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async recordSiteVisit({ visitorId, path = '/', visitedAt = new Date() } = {}) {
+    const id = safeAnonymousId(visitorId);
+    if (!id) return null;
+    const now = safeDateTime(visitedAt) || new Date();
+    const visitor = await this.siteVisitors.findOneAndUpdate(
+      { visitorId: id },
+      {
+        $set: { lastSeenAt: now },
+        // `$inc` creates a missing counter at 1 during an upsert. Keeping it
+        // out of $setOnInsert avoids MongoDB's conflicting update-path error.
+        $setOnInsert: { visitorId: id, firstSeenAt: now },
+        $inc: { visitCount: 1 }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    await this.siteVisits.insertOne({ visitorId: id, path: cleanText(path, 160) || '/', visitedAt: now });
+    return visitor;
+  }
+
+  async getPublisherStats({ now = new Date() } = {}) {
+    const current = statisticNow(now);
+    const dayStart = new Date(current.getTime() - 24 * 60 * 60 * 1000);
+    const weekStart = new Date(current.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const [catalogRows, requestRows, visitorTotal, visitTotal, activeVisitors24h, activeVisitors7d, visits24h, visits7d, latestVisit, botRows, latestBotActivity] = await Promise.all([
+      this.contents.aggregate([
+        { $match: { published: { $ne: false } } },
+        { $group: { _id: '$category', posts: { $sum: 1 }, files: { $sum: { $ifNull: ['$filesCount', 0] } }, episodes: { $sum: { $ifNull: ['$episodeCount', 0] } }, deliveries: { $sum: { $ifNull: ['$deliveryCount', 0] } } } }
+      ]).toArray(),
+      this.requests.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]).toArray(),
+      this.siteVisitors.countDocuments({}),
+      this.siteVisits.countDocuments({}),
+      this.siteVisitors.countDocuments({ lastSeenAt: { $gte: dayStart } }),
+      this.siteVisitors.countDocuments({ lastSeenAt: { $gte: weekStart } }),
+      this.siteVisits.countDocuments({ visitedAt: { $gte: dayStart } }),
+      this.siteVisits.countDocuments({ visitedAt: { $gte: weekStart } }),
+      this.siteVisits.findOne({}, { sort: { visitedAt: -1 }, projection: { visitedAt: 1 } }),
+      this.botUsers.aggregate([{ $group: { _id: null, users: { $sum: 1 }, interactions: { $sum: { $ifNull: ['$interactionCount', 0] } }, activeUsers24h: { $sum: { $cond: [{ $gte: ['$lastSeenAt', dayStart] }, 1, 0] } }, activeUsers7d: { $sum: { $cond: [{ $gte: ['$lastSeenAt', weekStart] }, 1, 0] } } } }]).toArray(),
+      this.botUsers.findOne({}, { sort: { lastSeenAt: -1 }, projection: { lastSeenAt: 1 } })
+    ]);
+    const byCategory = Object.fromEntries([...CATEGORY_IDS].map((category) => [category, 0]));
+    const catalog = { posts: 0, files: 0, episodes: 0, deliveries: 0, byCategory };
+    for (const row of catalogRows) {
+      catalog.posts += Number(row.posts || 0);
+      catalog.files += Number(row.files || 0);
+      catalog.episodes += Number(row.episodes || 0);
+      catalog.deliveries += Number(row.deliveries || 0);
+      if (row._id) byCategory[row._id] = Number(row.posts || 0);
+    }
+    const requestCounts = Object.fromEntries(['open', 'completed', 'rejected'].map((status) => [status, 0]));
+    for (const row of requestRows) requestCounts[row._id] = Number(row.count || 0);
+    const bot = botRows[0] || {};
+    return {
+      generatedAt: current.toISOString(),
+      catalog,
+      requests: {
+        total: requestRows.reduce((total, row) => total + Number(row.count || 0), 0),
+        ...requestCounts
+      },
+      site: {
+        visitors: visitorTotal,
+        visits: visitTotal,
+        activeVisitors24h,
+        activeVisitors7d,
+        visits24h,
+        visits7d,
+        latestActivityAt: latestVisit?.visitedAt?.toISOString?.() || latestVisit?.visitedAt || null
+      },
+      bot: {
+        users: Number(bot.users || 0),
+        interactions: Number(bot.interactions || 0),
+        activeUsers24h: Number(bot.activeUsers24h || 0),
+        activeUsers7d: Number(bot.activeUsers7d || 0),
+        latestActivityAt: latestBotActivity?.lastSeenAt?.toISOString?.() || latestBotActivity?.lastSeenAt || null
+      }
+    };
+  }
+
+  async addAnnouncementChannel({ channelId, title = '', username = '', addedBy = '' }) {
+    const document = {
+      channelId: String(channelId),
+      title: cleanText(title, 120),
+      username: cleanText(username, 80),
+      addedBy: String(addedBy),
+      addedAt: new Date().toISOString()
+    };
+    await this.announcementChannels.updateOne(
+      { channelId: document.channelId },
+      { $set: document },
+      { upsert: true }
+    );
+    return document;
+  }
+
+  async listAnnouncementChannels() {
+    return this.announcementChannels.find({}).sort({ title: 1, addedAt: 1 }).toArray();
+  }
+
+  async removeAnnouncementChannel(channelId) {
+    return this.announcementChannels.findOneAndDelete(
+      { channelId: String(channelId) },
+      { includeResultMetadata: false }
+    );
+  }
+
+  async getAutoPublishSettings() {
+    return (await this.automationSettings.findOne({ _id: 'auto-publish' })) || {
+      enabled: false,
+      enabledAt: null,
+      updatedAt: null,
+      updatedBy: null,
+      notifyChatId: null
+    };
+  }
+
+  async setAutoPublishSettings({ enabled, updatedBy = null, notifyChatId = undefined }) {
+    const now = new Date().toISOString();
+    const previous = await this.getAutoPublishSettings();
+    const settings = {
+      enabled: Boolean(enabled),
+      enabledAt: enabled ? now : null,
+      updatedAt: now,
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy),
+      notifyChatId: notifyChatId === undefined
+        ? previous.notifyChatId || null
+        : notifyChatId === null || notifyChatId === '' ? null : String(notifyChatId)
+    };
+    await this.automationSettings.updateOne(
+      { _id: 'auto-publish' },
+      { $set: settings },
+      { upsert: true }
+    );
+    return settings;
+  }
+
+  async getMaintenanceSettings() {
+    return (await this.automationSettings.findOne({ _id: 'maintenance-mode' })) || {
+      enabled: false,
+      updatedAt: null,
+      updatedBy: null
+    };
+  }
+
+  async setMaintenanceSettings({ enabled, updatedBy = null }) {
+    const settings = {
+      enabled: Boolean(enabled),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    await this.automationSettings.updateOne(
+      { _id: 'maintenance-mode' },
+      { $set: settings },
+      { upsert: true }
+    );
+    this._maintenanceActive = settings.enabled;
+    return settings;
+  }
+
+  async isMaintenanceActive() {
+    if (this._maintenanceActive !== undefined) return this._maintenanceActive;
+    const settings = await this.getMaintenanceSettings();
+    this._maintenanceActive = Boolean(settings?.enabled);
+    return this._maintenanceActive;
+  }
+
+  async getPosterSettings() {
+    return (await this.automationSettings.findOne({ _id: 'imgbb-settings' })) || {
+      keys: [],
+      stats: {},
+      fallbackPosterUrl: null,
+      updatedAt: null
+    };
+  }
+
+  async getPosterApiKeys() {
+    const settings = await this.getPosterSettings();
+    return Array.isArray(settings.keys) ? settings.keys : [];
+  }
+
+  async addPosterApiKey(key, addedBy = null) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return this.getPosterApiKeys();
+    const settings = await this.getPosterSettings();
+    const currentKeys = Array.isArray(settings.keys) ? settings.keys : [];
+    if (!currentKeys.includes(cleanKey)) {
+      currentKeys.push(cleanKey);
+      await this.automationSettings.updateOne(
+        { _id: 'imgbb-settings' },
+        {
+          $set: {
+            keys: currentKeys,
+            updatedAt: new Date().toISOString(),
+            updatedBy: addedBy === null || addedBy === undefined ? null : String(addedBy)
+          }
+        },
+        { upsert: true }
+      );
+    }
+    return currentKeys;
+  }
+
+  async removePosterApiKey(key) {
+    const cleanKey = String(key || '').trim();
+    const settings = await this.getPosterSettings();
+    const currentKeys = (Array.isArray(settings.keys) ? settings.keys : []).filter((k) => k !== cleanKey);
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      { $set: { keys: currentKeys, updatedAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+    return currentKeys;
+  }
+
+  async getPosterKeyStats() {
+    const settings = await this.getPosterSettings();
+    return settings.stats || {};
+  }
+
+  async recordPosterUpload(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      {
+        $inc: { [`stats.${cleanKey}.uploads`]: 1 },
+        $set: { [`stats.${cleanKey}.lastSuccessAt`]: now, updatedAt: now }
+      },
+      { upsert: true }
+    );
+  }
+
+  async recordPosterRefusal(key) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      {
+        $inc: { [`stats.${cleanKey}.refusals`]: 1 },
+        $set: { [`stats.${cleanKey}.lastRefusalAt`]: now, updatedAt: now }
+      },
+      { upsert: true }
+    );
+  }
+
+  async getFallbackPosterUrl() {
+    const settings = await this.getPosterSettings();
+    return settings.fallbackPosterUrl || null;
+  }
+
+  async setFallbackPosterUrl(url) {
+    const cleanUrl = String(url || '').trim() || null;
+    const now = new Date().toISOString();
+    await this.automationSettings.updateOne(
+      { _id: 'imgbb-settings' },
+      { $set: { fallbackPosterUrl: cleanUrl, updatedAt: now } },
+      { upsert: true }
+    );
+    return cleanUrl;
+  }
+
+  async exportBackupData() {
+    const entries = await Promise.all([
+      this.contents.find({}).toArray(),
+      this.sessions.find({}).toArray(),
+      this.requests.find({}).toArray(),
+      this.botUsers.find({}).toArray(),
+      this.siteVisitors.find({}).toArray(),
+      this.siteVisits.find({}).toArray(),
+      this.announcementChannels.find({}).toArray(),
+      this.automationSettings.find({}).toArray(),
+      this.backupSettings.find({}).toArray()
+    ]);
+    return backupSnapshot(Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name, index) => [name, entries[index]])));
+  }
+
+  async restoreBackupData(data) {
+    const collections = safeBackupCollections(data);
+    const targets = {
+      content: this.contents,
+      upload_sessions: this.sessions,
+      requests: this.requests,
+      bot_users: this.botUsers,
+      site_visitors: this.siteVisitors,
+      site_visits: this.siteVisits,
+      announcement_channels: this.announcementChannels,
+      automation_settings: this.automationSettings,
+      backup_settings: this.backupSettings
+    };
+    const replaceAll = async (session = undefined) => {
+      for (const name of BACKUP_COLLECTION_NAMES) {
+        const collection = targets[name];
+        const options = session ? { session } : undefined;
+        await collection.deleteMany({}, options);
+        if (collections[name].length) await collection.insertMany(collections[name], options);
+      }
+    };
+
+    // Atlas supports transactions and keeps a bad/partial upload from
+    // replacing only half the application. A standalone development MongoDB
+    // has no transaction support, so it falls back to a validated sequential
+    // replacement rather than making recovery unavailable.
+    let completed = false;
+    const session = this.client.startSession();
+    try {
+      await session.withTransaction(async () => replaceAll(session));
+      completed = true;
+    } catch (error) {
+      if (!/transaction numbers are only allowed|replica set|mongos|transactions are not supported/i.test(String(error?.message || ''))) throw error;
+    } finally {
+      await session.endSession();
+    }
+    if (!completed) await replaceAll();
+    // Stream imports are ephemeral prompts and intentionally are not present in
+    // signed backups. Clear them so an old pending manifest cannot be applied
+    // to the recovered catalog.
+    await this.streamImports.deleteMany({});
+    await this.init();
+    return Object.fromEntries(BACKUP_COLLECTION_NAMES.map((name) => [name, collections[name].length]));
+  }
+
+  async getBackupSettings() {
+    return (await this.backupSettings.findOne({ _id: 'monthly-backup' })) || {
+      lastBackupMonth: null,
+      lastBackupAt: null,
+      inProgressMonth: null,
+      claimExpiresAt: null,
+      updatedAt: null
+    };
+  }
+
+  async claimMonthlyBackup({ month, now = new Date(), claimTtlMs = 30 * 60_000 } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return false;
+    const current = safeDateTime(now) || new Date();
+    const claimExpiresAt = new Date(current.getTime() + Math.max(60_000, Number(claimTtlMs) || 30 * 60_000));
+    try {
+      const claimed = await this.backupSettings.findOneAndUpdate(
+        {
+          _id: 'monthly-backup',
+          lastBackupMonth: { $ne: safeMonth },
+          $or: [
+            { inProgressMonth: { $ne: safeMonth } },
+            { claimExpiresAt: { $lte: current } }
+          ]
+        },
+        {
+          $set: {
+            inProgressMonth: safeMonth,
+            claimExpiresAt,
+            updatedAt: current
+          },
+          $setOnInsert: { lastBackupMonth: null, lastBackupAt: null }
+        },
+        { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+      );
+      return Boolean(claimed);
+    } catch (error) {
+      // If another replica created the singleton settings document between our
+      // non-match and upsert, it owns the claim; do not send a duplicate file.
+      if (error?.code === 11000) return false;
+      throw error;
+    }
+  }
+
+  async markMonthlyBackupCreated({ month, createdAt = new Date() } = {}) {
+    const safeMonth = /^\d{4}-\d{2}$/.test(String(month || '')) ? String(month) : null;
+    if (!safeMonth) return null;
+    const current = safeDateTime(createdAt) || new Date();
+    const result = await this.backupSettings.findOneAndUpdate(
+      { _id: 'monthly-backup' },
+      {
+        $set: {
+          lastBackupMonth: safeMonth,
+          lastBackupAt: current,
+          inProgressMonth: null,
+          claimExpiresAt: null,
+          updatedAt: current
+        }
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async releaseMonthlyBackupClaim({ month } = {}) {
+    const result = await this.backupSettings.findOneAndUpdate(
+      { _id: 'monthly-backup', inProgressMonth: String(month || '') },
+      {
+        $set: {
+          inProgressMonth: null,
+          claimExpiresAt: null,
+          updatedAt: new Date()
+        }
+      },
+      { returnDocument: 'after', includeResultMetadata: false }
+    );
+    return result;
+  }
+
+  async close() {
+    await this.client.close();
+  }
+}
+
+/**
+ * How long the app is willing to wait for its database at boot, and why the wait happens here.
+ *
+ * MongoDB used to be reached exactly once, and a single failed attempt ended the process. On Koyeb
+ * that is the difference between "the cluster is waking up" and a reader seeing `404: No active
+ * service` for the whole site — a paused free-tier cluster, a failover, or a resolver that is not
+ * ready yet all recover well inside a minute, which is precisely the window a deploy restarts in.
+ * So the retries and their delays live here, the reason is logged, and giving up still means
+ * giving up loudly rather than serving an empty catalog.
+ */
+export const STORE_CONNECT_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000];
+
+export async function connectCatalogStore({
+  uri,
+  database,
+  open = async () => {
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8_000, maxPoolSize: 10 });
+    try {
+      await client.connect();
+    } catch (error) {
+      // A client that never completed its handshake still owns timers and sockets.
+      await Promise.resolve(client.close?.()).catch(() => {});
+      throw error;
+    }
+    const repository = new MongoCatalogRepository(client, client.db(database));
+    await repository.init();
+    return repository;
+  },
+  delays = STORE_CONNECT_DELAYS_MS,
+  wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+  log = console
+} = {}) {
+  const attempts = Math.max(1, delays.length);
+  let lastError = null;
+  for (let index = 0; index < attempts; index += 1) {
+    if (index) {
+      const pauseMs = delays[index] ?? delays.at(-1);
+      (log.warn || console.warn).call(log, `[server] catalog storage is not answering yet (attempt ${index + 1}/${attempts}) — waiting ${Math.round(pauseMs / 1000)}s before trying again. Last error: ${lastError?.message || 'unknown'}`);
+      await wait(pauseMs);
+    }
+    let candidate = null;
+    try {
+      candidate = await open();
+      if (index) (log.info || console.info).call(log, `[server] catalog storage is reachable again after ${index + 1} attempts.`);
+      return candidate;
+    } catch (error) {
+      lastError = error;
+      // A half-open client from a failed attempt must not be left holding sockets.
+      await Promise.resolve(candidate?.close?.()).catch(() => {});
+    }
+  }
+  const reason = lastError?.message || 'the connection was refused without a message';
+  const failure = new Error(`MongoDB could not be reached after ${attempts} attempts: ${reason}. Check that the cluster is running (a paused Atlas free tier answers nothing), that this service's egress address is on its network allowlist, and that MONGODB_URI still matches its credentials.`);
+  failure.cause = lastError;
+  throw failure;
+}
+
+export async function createCatalogRepository(config) {
+  if (!config.mongodbUri) {
+    const repository = new MemoryCatalogRepository();
+    await repository.init();
+    return repository;
+  }
+
+  return connectCatalogStore({ uri: config.mongodbUri, database: config.mongodbDb });
+}

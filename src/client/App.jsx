@@ -1,0 +1,1192 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, Navigate, Route, Routes, useLocation, useParams, useSearchParams } from 'react-router-dom';
+import { confirmAdultAccess, getCategories, getConfig, getContent, getContentBySlug, getContentMagnets, getGenres } from './api.js';
+import AdultGate from './components/AdultGate.jsx';
+import DeliveryDialog from './components/DeliveryDialog.jsx';
+import Footer from './components/Footer.jsx';
+import Header from './components/Header.jsx';
+import { Icon } from './components/Icons.jsx';
+import Artwork from './components/Artwork.jsx';
+import ReleaseCard from './components/ReleaseCard.jsx';
+import { episodePagePath, episodeSeasonNumber, episodeStreamEntries, fileChoicesForEpisode, findEpisodeGroup, formatEpisodeNumber, getEntryQualities, getPlayerIframeUrl, getProtectedPlaybackTarget, hasReleaseLevelWatch, parseEpisodeRoute, playerDisplayName, playerShortName, releaseLevelStreamEntries, resolveActiveQualityOption, splitEpisodeGroups, watchHeading, watchPagePath } from './watch-utils.js';
+
+const categoryOrder = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
+// 18+ stays out of the public homepage rail; it is reachable from the menu and
+// the age-confirmed browse collection.
+const homeCategoryOrder = categoryOrder.filter((category) => category !== 'adult');
+const categoryCopy = {
+  anime: { eyebrow: 'ANIMATED WORLDS', title: 'Anime worth crossing worlds for.', description: 'Fresh series, feature films and hand-picked adventures gathered in one focused collection.' },
+  cartoon: { eyebrow: 'ALL-AGES ADVENTURES', title: 'Bright worlds. Big imagination.', description: 'A playful corner of the catalog for family animation, classic characters and original adventures.' },
+  donghua: { eyebrow: 'EASTERN FANTASY', title: 'Legends move differently here.', description: 'Explore cultivation sagas, mythic worlds and beautifully animated stories from across China.' },
+  kdrama: { eyebrow: 'STORIES WITH A PULSE', title: 'One more episode energy.', description: 'Romance, mystery, comedy and high-stakes drama, organized for your next late-night watch.' },
+  movie: { eyebrow: 'FEATURE PRESENTATION', title: 'Make tonight a movie night.', description: 'A curated shelf of features, from edge-of-your-seat thrillers to big-hearted adventures.' },
+  'web-series': { eyebrow: 'BINGE-READY SERIES', title: 'The next tab-open-worthy series.', description: 'Smartly organized seasons and new episodes for your watchlist.' },
+  tv: { eyebrow: 'SCREENED AT HOME', title: 'TV and OTT, straight from the broadcaster.', description: 'Broadcast shows, streaming originals and premieres that never had a theatrical release.' },
+  adult: { eyebrow: 'AGE-RESTRICTED ACCESS', title: 'A private 18+ collection.', description: 'This area is available only after you confirm that you are 18 or older.' },
+  all: { eyebrow: 'EVERYTHING TO EXPLORE', title: 'A world of stories, neatly cataloged.', description: 'Browse every release across the SoraBox catalog.' }
+};
+
+const categoryLabels = Object.fromEntries(categoryOrder.map((id) => [id, id === 'adult' ? '18+' : id === 'web-series' ? 'Web Series' : id === 'tv' ? 'TV & OTT' : id === 'kdrama' ? 'K-Drama' : id[0].toUpperCase() + id.slice(1)]));
+
+function useRemote(loader, dependencies = []) {
+  const [state, setState] = useState({ loading: true, data: null, error: null });
+
+  useEffect(() => {
+    let active = true;
+    setState((previous) => ({ loading: true, data: previous.data, error: null }));
+    loader()
+      .then((data) => {
+        if (active) setState({ loading: false, data, error: null });
+      })
+      .catch((error) => {
+        if (active) setState({ loading: false, data: null, error });
+      });
+    return () => {
+      active = false;
+    };
+    // loader is intentionally supplied at the callsite with dependency values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, dependencies);
+
+  return state;
+}
+
+/**
+ * Put the top of a listing under the sticky header, which is where a reader expects to be after
+ * asking for another page. A short hop animates so the grid is seen to change; the distance a page
+ * number covers does not, because gliding past two hundred cards is the lag this replaced.
+ */
+function scrollToListingTop() {
+  const listing = document.querySelector('[data-listing-top]');
+  if (!listing) return;
+  const header = document.querySelector('.site-header');
+  const offset = (header?.offsetHeight || 0) + 12;
+  const target = Math.max(0, listing.getBoundingClientRect().top + window.scrollY - offset);
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  const near = Math.abs(target - window.scrollY) < window.innerHeight * 1.5;
+  window.scrollTo({ top: target, behavior: !reduced && near ? 'smooth' : 'auto' });
+}
+
+/**
+ * A listing, one page at a time.
+ *
+ * Pressing a page number replaces the grid rather than stacking another thirty cards under it: the
+ * appended shelf grew to hundreds of posters on a phone, which is slow to paint and never told the
+ * reader where they were. The page comes from the URL, so a listing is shareable, the back button
+ * returns to the page you were reading, and `total` stays the count the store made rather than the
+ * number of cards on hand. A response that arrives after the reader moved on is dropped, so a slow
+ * page can never mix two listings into one grid.
+ */
+function useCatalog(fetchPage, dependencies = [], page = 1) {
+  const [state, setState] = useState({ loading: true, error: null, errorPage: 0, items: [], total: 0, page: 1, pages: 0, limit: 0 });
+  const listingId = useRef(0);
+  const rendered = useRef(0);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    listingId.current += 1;
+    const listing = listingId.current;
+    // Scrolling happens on the way out rather than when the cards land, so the new page arrives at
+    // the top of the grid instead of swapping underneath a reader still standing at the old foot.
+    if (rendered.current !== 0 && rendered.current !== page) scrollToListingTop();
+    let active = true;
+    setState((previous) => ({ ...previous, loading: true, error: null }));
+    fetchPage(page)
+      .then((data) => {
+        if (!active || !data || listing !== listingId.current) return;
+        rendered.current = Number(data.page) || page;
+        setState({
+          loading: false,
+          error: null,
+          errorPage: 0,
+          items: Array.isArray(data.items) ? data.items : [],
+          total: Number(data.total) || 0,
+          page: Number(data.page) || page,
+          pages: Number(data.pages) || 0,
+          limit: Number(data.limit) || 0
+        });
+      })
+      .catch((error) => {
+        // A failed page must not eat the shelf: the cards already on screen stay, and the pager
+        // says which page could not be loaded instead of pretending the grid is empty.
+        if (active && listing === listingId.current) setState((previous) => ({ ...previous, loading: false, error, errorPage: page }));
+      });
+    // fetchPage is supplied at the callsite with the values it depends on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...dependencies, page, attempt]);
+
+  return { ...state, retry: () => setAttempt((current) => current + 1) };
+}
+
+/** Page numbers with the gaps a real pager shows — `1 … 4 5 6 … 20`, never twenty pills. */
+function pageNumbers(current, pages) {
+  const wanted = new Set([1, pages, current]);
+  for (let offset = 1; offset <= 1; offset += 1) {
+    wanted.add(current - offset);
+    wanted.add(current + offset);
+  }
+  if (current <= 3) [2, 3, 4].forEach((number) => wanted.add(number));
+  if (current >= pages - 2) [pages - 1, pages - 2, pages - 3].forEach((number) => wanted.add(number));
+  const numbers = [...wanted].filter((number) => number >= 1 && number <= pages).sort((first, second) => first - second);
+  const steps = [];
+  let previous = 0;
+  for (const number of numbers) {
+    if (previous && number - previous > 1) steps.push('gap');
+    steps.push(number);
+    previous = number;
+  }
+  return steps;
+}
+
+function PagerStep({ to, off, direction, children }) {
+  const arrow = <Icon name="chevron" size={15} className={`catalog-pager__arrow catalog-pager__arrow--${direction}`} />;
+  const inner = direction === 'prev' ? <>{arrow}{children}</> : <>{children}{arrow}</>;
+  if (off) return <span className="catalog-pager__step is-off" aria-hidden="true">{inner}</span>;
+  return <Link className="catalog-pager__step" to={to} aria-label={`${children} page`}>{inner}</Link>;
+}
+
+/**
+ * The line under a grid: which slice of the shelf is on screen, and the pages holding the rest of it.
+ * Every number is a link rather than a button that mutates state, so this is ordinary navigation — a
+ * middle click, a back press, and a copied URL all behave like the page they look like.
+ */
+function CatalogPager({ catalog, unit = 'release' }) {
+  const { pathname, search } = useLocation();
+  if (!catalog.items.length) return null;
+  const current = catalog.page || 1;
+  const pages = catalog.pages || 0;
+  const size = catalog.limit || catalog.items.length;
+  const from = (current - 1) * size + 1;
+  const to = Math.min(current * size, catalog.total || from + catalog.items.length - 1);
+  const plural = catalog.total === 1 ? '' : 's';
+  const hrefFor = (next) => {
+    const params = new URLSearchParams(search);
+    if (next <= 1) params.delete('page');
+    else params.set('page', String(next));
+    const suffix = params.size ? `?${params}` : '';
+    return `${pathname}${suffix}`;
+  };
+  return (
+    <nav className="catalog-pager" aria-label="Catalog pages">
+      <p className="catalog-pager__count">
+        {pages > 1
+          ? <>Showing <strong>{from}&ndash;{to}</strong> of <strong>{catalog.total}</strong> {unit}{plural}</>
+          : <><strong>{catalog.total}</strong> {unit}{plural} on this shelf</>}
+      </p>
+      {pages > 1 ? (
+        <div className="catalog-pager__pages">
+          <PagerStep to={hrefFor(current - 1)} off={current <= 1} direction="prev">Prev</PagerStep>
+          {pageNumbers(current, pages).map((step, index) => (step === 'gap'
+            ? <span className="catalog-pager__gap" key={`gap-${index}`} aria-hidden="true">&hellip;</span>
+            : step === current
+              ? <span className="catalog-pager__num is-current" key={step} aria-current="page">{step}</span>
+              : <Link className="catalog-pager__num" key={step} to={hrefFor(step)} aria-label={`Page ${step}`}>{step}</Link>))}
+          <PagerStep to={hrefFor(current + 1)} off={current >= pages} direction="next">Next</PagerStep>
+        </div>
+      ) : null}
+      {catalog.error ? (
+        <p className="catalog-pager__error">
+          {catalog.error.message} Page {catalog.errorPage || current} did not load — the cards above are the page that did.
+          <button type="button" className="catalog-pager__retry" onClick={catalog.retry}>Try again</button>
+        </p>
+      ) : null}
+    </nav>
+  );
+}
+
+function PageShell({ children }) {
+  return <><Header /><main>{children}</main><Footer /></>;
+}
+
+function Eyebrow({ children }) {
+  return <p className="eyebrow"><span />{children}</p>;
+}
+
+function LoadingGrid({ count = 6 }) {
+  return <div className="release-grid release-grid--loading">{Array.from({ length: count }, (_, index) => <div className="release-skeleton" key={index}><span /><i /><i /><b /></div>)}</div>;
+}
+
+function ErrorBlock({ error, compact = false }) {
+  return (
+    <div className={`error-block ${compact ? 'error-block--compact' : ''}`}>
+      <Icon name="info" size={20} />
+      <div><strong>Catalog temporarily unavailable</strong><p>{error?.message || 'Please refresh and try again.'}</p></div>
+    </div>
+  );
+}
+
+function EmptyState({ query, category }) {
+  return (
+    <div className="empty-state">
+      <span className="empty-state__icon"><Icon name="search" size={27} /></span>
+      <h2>{query ? `Nothing matched “${query}”` : 'Nothing here yet'}</h2>
+      <p>{category ? 'Try another category, or check back for the next release.' : 'A new release is on its way.'}</p>
+      <Link className="button button--secondary" to="/browse">Browse everything <Icon name="arrow" size={17} /></Link>
+    </div>
+  );
+}
+
+function HomePage({ onGetFiles }) {
+  const catalog = useRemote(() => getContent(), []);
+  const appConfig = useRemote(() => getConfig(), []);
+  const items = catalog.data?.items || [];
+  const featured = items.find((item) => item.featured) || items[0];
+  const latest = items.slice(0, 8);
+  const spotlight = items.filter((item) => item.slug !== featured?.slug).slice(0, 4);
+
+  return (
+    <PageShell>
+      <section className="home-hero">
+        <div className="home-hero__noise" aria-hidden="true" />
+        <div className="home-hero__halo home-hero__halo--one" aria-hidden="true" />
+        <div className="home-hero__halo home-hero__halo--two" aria-hidden="true" />
+        <div className="home-hero__inner page-width">
+          <div className="home-hero__copy">
+            <Eyebrow><Icon name="spark" size={13} /> CURATED FOR TONIGHT</Eyebrow>
+            {catalog.loading ? <div className="hero-title-skeleton" /> : <h1>Find your <em>next world.</em></h1>}
+            <p className="home-hero__lede">A calm, carefully organized home for anime, cartoons, movies, K-drama and more — delivered through Telegram when you are ready.</p>
+            <div className="hero-actions">
+              <a className="button button--primary" href="#latest">Browse latest <Icon name="arrow" size={18} /></a>
+              {featured ? <button type="button" className="button button--ghost" onClick={() => onGetFiles(featured)}><Icon name="telegram" size={19} /> Get featured files</button> : null}
+            </div>
+            <div className="hero-assurances">
+              <span><Icon name="check" size={15} /> Permanent poster hosting</span>
+              <span><Icon name="check" size={15} /> Private Telegram delivery</span>
+            </div>
+          </div>
+          <div className="home-hero__feature">
+            {featured ? (
+              <Link className="hero-feature-card" to={`/${featured.category}/${featured.slug}`}>
+                <Artwork item={featured} size="hero" priority />
+                <div className="hero-feature-card__frame" aria-hidden="true" />
+                <div className="hero-feature-card__caption">
+                  <span className={`category-pill category-pill--${featured.tone}`}>{featured.categoryLabel}</span>
+                  <strong>{featured.title}</strong>
+                  <span>{featured.year || 'New'} · {featured.releaseLabel || 'Latest drop'}</span>
+                </div>
+                <span className="hero-feature-card__open"><Icon name="arrow" size={18} /></span>
+              </Link>
+            ) : <div className="hero-feature-card hero-feature-card--skeleton" />}
+            <span className="hero-sticker hero-sticker--top">FRESH<br />FINDS</span>
+            <span className="hero-sticker hero-sticker--bottom"><Icon name="spark" size={14} /> handpicked</span>
+          </div>
+        </div>
+        <div className="home-hero__ticker" aria-label="Catalog types">
+          <div><span>ANIME</span><i /> <span>CARTOONS</span><i /> <span>DONGHUA</span><i /> <span>K-DRAMA</span><i /> <span>MOVIES</span><i /> <span>WEB SERIES</span><i /> <span>ANIME</span><i /> <span>CARTOONS</span></div>
+        </div>
+      </section>
+
+      {appConfig.data?.demoMode ? (
+        <div className="demo-banner page-width"><Icon name="info" size={16} /><span><strong>Preview catalog</strong> — connect MongoDB and your Telegram bot to publish your own permanent records.</span></div>
+      ) : null}
+
+      <section className="category-rail page-width" aria-labelledby="explore-categories">
+        <div className="section-heading section-heading--rail">
+          <div><Eyebrow>EXPLORE BY MOOD</Eyebrow><h2 id="explore-categories">Choose a universe.</h2></div>
+          <Link className="text-link" to="/browse">See everything <Icon name="arrow" size={16} /></Link>
+        </div>
+        {/* The age-restricted collection is deliberately absent from the public
+            home rail. It remains reachable from the menu and from the
+            age-confirmed browse pages, where its consent prompt is shown. */}
+        <div className="category-rail__items">
+          {homeCategoryOrder.map((category, index) => {
+            const label = category === 'web-series' ? 'Web Series' : category === 'tv' ? 'TV & OTT' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+            // One glyph per shelf, in the same order as `categoryOrder`, so a new category never
+            // arrives with an empty icon slot in the middle of the rail.
+            const icons = ['✦', '☺', '◇', '♡', '▶', '▣', '▤'];
+            return <Link className={`category-tile category-tile--${category}`} key={category} to={`/browse/${category}`}>
+              <span className="category-tile__number">0{index + 1}</span>
+              <span className="category-tile__icon" aria-hidden="true">{icons[index]}</span>
+              <span>{label}</span><Icon name="arrow" size={16} />
+            </Link>;
+          })}
+        </div>
+      </section>
+
+      <section className="catalog-section page-width" id="latest" aria-labelledby="latest-title">
+        <div className="section-heading">
+          <div><Eyebrow>JUST ADDED</Eyebrow><h2 id="latest-title">Latest <em>releases.</em></h2></div>
+          <Link className="text-link" to="/browse">View all releases <Icon name="arrow" size={16} /></Link>
+        </div>
+        {catalog.loading ? <LoadingGrid count={6} /> : catalog.error ? <ErrorBlock error={catalog.error} /> : latest.length ? <div className="release-grid">{latest.map((item, index) => <ReleaseCard key={item.id} item={item} index={index} />)}</div> : <EmptyState />}
+      </section>
+
+      <section className="spotlight page-width">
+        <div className="spotlight__copy">
+          <Eyebrow><Icon name="bolt" size={13} /> LOW-LIFT DELIVERY</Eyebrow>
+          <h2>A big catalog without the heavy hosting bill.</h2>
+          <p>Artwork is mirrored once to ImgBB. Release files are held in your Telegram database channel and copied only when someone opens a delivery link.</p>
+          <div className="spotlight__stats">
+            <div><strong>01</strong><span>poster copy<br />at publish time</span></div>
+            <div><strong>02</strong><span>storage channel<br />for file delivery</span></div>
+            <div><strong>03</strong><span>MongoDB catalog<br />for every record</span></div>
+          </div>
+          <Link className="button button--secondary" to="/browse">Explore the catalog <Icon name="arrow" size={18} /></Link>
+        </div>
+        <div className="spotlight__orbital" aria-hidden="true">
+          <div className="spotlight__orbit spotlight__orbit--one" /><div className="spotlight__orbit spotlight__orbit--two" />
+          <div className="spotlight__core"><span>SB</span><small>delivery<br />system</small></div>
+          <span className="spotlight__satellite spotlight__satellite--one"><Icon name="telegram" size={18} /></span>
+          <span className="spotlight__satellite spotlight__satellite--two"><Icon name="spark" size={16} /></span>
+        </div>
+      </section>
+
+      {spotlight.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="picked-title">
+        <div className="section-heading"><div><Eyebrow>KEEP EXPLORING</Eyebrow><h2 id="picked-title">A few more <em>to save.</em></h2></div></div>
+        <div className="release-grid release-grid--four">{spotlight.map((item, index) => <ReleaseCard key={item.id} item={item} index={index} />)}</div>
+      </section> : null}
+    </PageShell>
+  );
+}
+
+function CategoryNav({ activeCategory }) {
+  const active = activeCategory || 'all';
+  return <nav className="browse-category-nav" aria-label="Catalog categories">
+    <Link className={active === 'all' ? 'is-active' : ''} to="/browse">All</Link>
+    {categoryOrder.map((category) => {
+      const label = category === 'adult' ? '18+' : category === 'web-series' ? 'Series' : category === 'kdrama' ? 'K-Drama' : category[0].toUpperCase() + category.slice(1);
+      return <Link key={category} className={active === category ? 'is-active' : ''} to={`/browse/${category}`}>{label}</Link>;
+    })}
+  </nav>;
+}
+
+function BrowsePage({ adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
+  const { category: requestedCategory } = useParams();
+  const [params] = useSearchParams();
+  const category = categoryOrder.includes(requestedCategory) ? requestedCategory : undefined;
+  // A genre arrives as a query rather than a path, because it is a shelf cut across categories:
+  // `/browse?genre=Action` holds everything tagged action, in any format. It is never combined with
+  // 18+ — the server leaves adult cards out of a genre listing whatever the URL claims.
+  const genre = params.get('genre')?.trim() || '';
+  const copy = genre
+    ? { eyebrow: 'BROWSE BY GENRE', title: `Everything tagged ${genre}.`, description: `Every release carrying the ${genre} tag across the catalog, newest first.` }
+    : categoryCopy[category || 'all'];
+  const requestedAdultCategory = category === 'adult';
+  // The adult endpoint is never requested before the visitor confirms. This
+  // avoids rendering, preloading, or even receiving adult cards behind a UI
+  // overlay; the server independently enforces the same cookie gate.
+  // A page number belongs in the URL, not in a stack of cards: `/browse/anime?page=3` is the same
+  // listing someone else can open, and the back button returns to the page they came from.
+  const page = Math.max(1, Number.parseInt(params.get('page'), 10) || 1);
+  const catalog = useCatalog(
+    (requested) => requestedAdultCategory && !adultAccess
+      ? Promise.resolve({ items: [], total: 0, page: 1, pages: 1, limit: 0 })
+      : getContent({ category, genre, page: requested, limit: 30 }),
+    [category, genre, requestedAdultCategory, adultAccess, adultAccessVersion],
+    page
+  );
+  // A sessionStorage marker can outlive the HTTP-only server cookie. A denied
+  // request returns to the same confirmation safely rather than presenting an
+  // error or stale restricted data.
+  const adultLocked = requestedAdultCategory && (!adultAccess || catalog.error?.status === 403);
+  const [filterOpen, setFilterOpen] = useState(false);
+
+  return (
+    <PageShell>
+      <section className={`browse-hero browse-hero--${category || 'all'}`}>
+        <div className="page-width">
+          <Eyebrow>{copy.eyebrow}</Eyebrow>
+          <h1>{copy.title}</h1>
+          <p>{copy.description}</p>
+          {genre ? <Link className="browse-hero__clear" to="/browse">Show every genre <Icon name="close" size={15} /></Link> : null}
+          <CategoryNav activeCategory={category} />
+        </div>
+      </section>
+      <section className={`browse-results page-width ${adultLocked ? 'browse-results--gated' : ''}`} data-listing-top>
+        {adultLocked ? <AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /> : <>
+          <div className="browse-results__top browse-results__top--shelves">
+            <p><strong>{catalog.loading ? '…' : catalog.total || 0}</strong> release{catalog.total === 1 ? '' : 's'} {genre ? `tagged ${genre}` : category ? `in ${categoryLabels[category]}` : 'in the catalog'}</p>
+            <div className="browse-results__actions">
+              <Link className={`shelf-button ${genre ? 'is-active' : ''}`} to="/genres"><Icon name="grid" size={16} /> Genres</Link>
+              <button type="button" className={`shelf-button shelf-button--categories ${filterOpen ? 'is-active' : ''}`} onClick={() => setFilterOpen((current) => !current)} aria-expanded={filterOpen} aria-controls="browse-shelf-panel"><Icon name="filter" size={16} /> Categories <Icon name="chevron" size={14} className={filterOpen ? 'is-open' : ''} /></button>
+            </div>
+          </div>
+          {/* A shelf switch that expands in place instead of floating a popover over the grid: on a
+              phone an overlay panel lands on top of the cards it is meant to replace. */}
+          <div className={`browse-shelf-panel ${filterOpen ? 'is-open' : ''}`} id="browse-shelf-panel" aria-hidden={!filterOpen}>
+            <div className="browse-shelf-panel__inner"><CategoryNav activeCategory={category} /></div>
+          </div>
+          {catalog.loading || (requestedAdultCategory && adultAccess && !catalog.items.length && !catalog.error) ? <LoadingGrid count={8} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
+            <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
+            <CatalogPager catalog={catalog} />
+          </> : <EmptyState category={category} />}
+        </>}
+      </section>
+    </PageShell>
+  );
+}
+
+function SearchPage() {
+  const [params] = useSearchParams();
+  const query = params.get('q')?.trim() || '';
+  // A search for "love" or "dragon" matches far more than one screen of cards, so the results page
+  // pages like the catalog does, one page at a time.
+  const page = Math.max(1, Number.parseInt(params.get('page'), 10) || 1);
+  const catalog = useCatalog((requested) => getContent({ query, page: requested, limit: 30 }), [query], page);
+
+  if (!query) return <Navigate to="/browse" replace />;
+
+  return (
+    <PageShell>
+      <section className="search-hero page-width">
+        <Eyebrow>CATALOG SEARCH</Eyebrow>
+        <h1>Results for <em>“{query}”</em></h1>
+        <p>Searches titles, episode numbers, genres and available languages across the catalog.</p>
+      </section>
+      <section className="browse-results page-width search-results" data-listing-top>
+        <div className="browse-results__top"><p>{catalog.loading ? 'Searching…' : <><strong>{catalog.total || 0}</strong> matching release{catalog.total === 1 ? '' : 's'}</>}</p><Link className="text-link" to="/browse">Clear search <Icon name="close" size={15} /></Link></div>
+        {catalog.loading ? <LoadingGrid count={6} /> : catalog.error && !catalog.items.length ? <ErrorBlock error={catalog.error} /> : catalog.items.length ? <>
+          <div className="release-grid">{catalog.items.map((item, index) => <ReleaseCard item={item} index={index} key={item.id} />)}</div>
+          <CatalogPager catalog={catalog} unit="match" />
+        </> : <EmptyState query={query} />}
+      </section>
+    </PageShell>
+  );
+}
+
+/**
+ * One delivery row. The uploader's own wording stays visible in full — a
+ * shortened "half name" tells a visitor nothing about which file they receive,
+ * so the complete label is the heading and the raw upload name is its own line.
+ */
+function FileChoiceList({ item, choices, onGetFiles, showWatch = true }) {
+  const magnets = useRemote(
+    () => item.category === 'anime' && item.slug ? getContentMagnets(item.slug) : Promise.resolve(null),
+    [item.slug, item.category, item.magnetRevision]
+  );
+  const sameRevision = magnets.data?.revision === item.magnetRevision && Boolean(item.magnetRevision);
+  const discovered = new Map(sameRevision ? (magnets.data?.files || []).map((file) => [file.id, file.magnet]) : []);
+  const lookupState = magnets.error ? 'unavailable' : magnets.data?.state;
+  const staleMagnets = lookupState === 'stale' || lookupState === 'not-applicable' || (magnets.data?.revision && !sameRevision);
+  return <div className="file-choice-list">
+    {item.category === 'anime' && (staleMagnets || lookupState === 'unavailable') ? <p className="file-choice__magnet-status" role="status">{staleMagnets ? 'This release changed. Reload to refresh downloads.' : 'Magnet lookup is temporarily unavailable. Telegram downloads still work.'}</p> : null}
+    {choices.map((original) => {
+      const file = staleMagnets ? { ...original, magnet: null } : discovered.has(original.id) ? { ...original, magnet: discovered.get(original.id) } : original;
+      const heading = file.label || file.episode?.label || `Delivery file ${file.position}`;
+      const rawName = file.fileName && file.fileName.toLowerCase() !== String(file.label || '').toLowerCase() ? file.fileName : '';
+      const episodeIndex = file.episode
+        ? file.episode.start === file.episode.end
+          ? `EP ${formatEpisodeNumber(file.episode.start)}`
+          : `EP ${formatEpisodeNumber(file.episode.start)}–${formatEpisodeNumber(file.episode.end)}`
+        : file.seasonPack
+          // A season pack says which season it is rather than pretending to be file 07.
+          ? `S${String(file.seasonPack).padStart(2, '0')}`
+          : `FILE ${String(file.position).padStart(2, '0')}`;
+      const deliveryHref = file.deliveryUrl || file.telegramUrl;
+      // An episode row deliberately ignores release-level players. Only a
+      // player attached to this episode earns a Watch action beside it.
+      const hasEpisodeWatch = Boolean(file.episode && episodeStreamEntries(item?.stream?.entries, file.episode).length);
+      return <article className="file-choice" key={file.id}>
+        <span className={`file-choice__index ${file.episode ? (file.episode.combined ? 'file-choice__index--pack' : 'file-choice__index--episode') : ''}`}>{episodeIndex}</span>
+        <div className="file-choice__details">
+          <strong title={heading}>{heading}</strong>
+          {rawName ? <span className="file-choice__label" title={rawName}>{rawName}</span> : null}
+          <div className="file-choice__meta">
+            {file.quality ? <span className="file-choice__quality">{file.quality}</span> : null}
+            {file.size ? <span>{file.size}</span> : null}
+            <span>{file.kind}</span>
+            {file.episode?.combined ? <span className="file-choice__pack">Combined upload</span> : null}
+            {file.episode?.fileCount > 1 ? <span>{file.episode.fileCount} files in this range</span> : null}
+          </div>
+        </div>
+        <div className="file-choice__actions">
+          {item.category === 'anime' && file.magnet?.url ? <a className="file-choice__action file-choice__action--watch" href={file.magnet.url} title={`SubsPlease · ${file.magnet.quality}`} aria-label={`Download ${heading} via SubsPlease magnet, ${file.magnet.quality}`}><Icon name="download" size={15} /> Magnet</a> : null}
+          {showWatch && hasEpisodeWatch ? <Link className="file-choice__action file-choice__action--watch" to={watchPagePath(item, file.episode)} aria-label={`Watch ${heading}`}><Icon name="play" size={15} /> Watch</Link> : null}
+          {file.deliveryReady && deliveryHref ? <a className="file-choice__action" href={deliveryHref} target="_blank" rel="noreferrer" aria-label={`Get ${heading} on Telegram`}><Icon name="telegram" size={17} /> Get file</a> : <button className="file-choice__action" type="button" onClick={() => onGetFiles(item)} aria-label={`Open delivery for ${heading}`}><Icon name="telegram" size={17} /> Delivery</button>}
+        </div>
+      </article>;
+    })}
+  </div>;
+}
+
+/**
+ * The publisher attached players per episode with /cmd. Those links belong on
+ * the episode's own page, where the quality is chosen, so a visitor never has
+ * to find a Watch button hidden beside one particular file.
+ */
+function EpisodeWatchPanel({ item, episode, entries }) {
+  if (!entries?.length) return null;
+  const names = entries.map((entry) => playerDisplayName(entry));
+  return <div className="episode-watch-panel">
+    <div className="episode-watch-panel__copy">
+      <Eyebrow><Icon name="play" size={13} /> AVAILABLE NOW</Eyebrow>
+      <strong>{entries.length === 1 ? `${names[0]} is ready for this episode` : `${names.length} players are ready for this episode`}</strong>
+      <p><span>Source{names.length > 1 ? 's' : ''}: {names.join(' · ')}</span><span>Streaming opens in the site player. Telegram delivery below stays a separate choice.</span></p>
+    </div>
+    <div className="episode-watch-panel__actions">
+      {entries.map((entry, index) => <Link className={`button ${index === 0 ? 'button--watch' : 'button--secondary'}`} key={entry.id} to={watchPagePath(item, episode)}>
+        <Icon name="play" size={18} /> {entries.length > 1 ? `Watch on ${playerShortName(entry)}` : 'Watch now'}
+      </Link>)}
+    </div>
+  </div>;
+}
+
+/**
+ * Every shelf a visitor can land on, counted in the store rather than off one page of results.
+ *
+ * 18+ is not here by construction: an age-restricted shelf is reached through its own confirmed
+ * route, so a genre and category list offered to everyone simply never contains it. Genres are
+ * whatever the publishers tagged, sorted by how much of the catalog wears the tag.
+ */
+function GenresPage() {
+  const categories = useRemote(() => getCategories(), []);
+  const genres = useRemote(() => getGenres(), []);
+  const shelves = (categories.data?.categories || []).filter((category) => category.id !== 'adult');
+  const tagged = genres.data?.genres || [];
+  return (
+    <PageShell>
+      <section className="browse-hero browse-hero--genres">
+        <div className="page-width">
+          <Eyebrow>FIND SOMETHING TO WATCH</Eyebrow>
+          <h1>Pick a shelf, not a guess.</h1>
+          <p>Categories and genres across the whole catalog — tap one and every release carrying it opens, oldest included.</p>
+        </div>
+      </section>
+      <section className="page-width browse-results">
+        <div className="shelf-block">
+          <div className="shelf-block__head">
+            <h2>Categories</h2>
+            <Link className="text-link" to="/browse">Everything at once <Icon name="arrow" size={16} /></Link>
+          </div>
+          {categories.loading ? <LoadingGrid count={2} /> : categories.error ? <ErrorBlock error={categories.error} compact /> : (
+            <div className="shelf-grid">
+              {shelves.map((category) => (
+                <Link className={`shelf-tile ${category.count ? '' : 'shelf-tile--empty'}`} key={category.id} to={`/browse/${category.id}`}>
+                  <span className={`shelf-tile__dot shelf-tile__dot--${category.tone || 'violet'}`} aria-hidden="true" />
+                  <span className="shelf-tile__label"><strong>{category.label}</strong><small>{category.count ? `${category.count} ${category.count === 1 ? 'release' : 'releases'}` : 'Nothing added yet'}</small></span>
+                  <Icon name="arrow" size={18} />
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="shelf-block">
+          <div className="shelf-block__head">
+            <h2>Genres</h2>
+            <span className="shelf-block__note">{genres.loading ? 'Counting…' : tagged.length ? `${tagged.length} in the catalog` : null}</span>
+          </div>
+          {genres.loading ? <p className="shelf-note">Counting what every shelf holds…</p> : genres.error ? <ErrorBlock error={genres.error} compact /> : tagged.length ? (
+            <div className="genre-grid">
+              {tagged.map((genre) => (
+                <Link className="genre-tile" key={genre.name} to={`/browse?genre=${encodeURIComponent(genre.name)}`}>
+                  {genre.name}<span>{genre.count}</span>
+                </Link>
+              ))}
+            </div>
+          ) : <p className="shelf-note">Nothing is tagged with a genre yet, so the categories above hold the whole catalog.</p>}
+        </div>
+      </section>
+    </PageShell>
+  );
+}
+
+function DetailPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
+  const { category, slug } = useParams();
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const related = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [] }) : getContent({ category: requestedAdultCategory ? 'adult' : undefined }),
+    [requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const item = release.data?.item;
+  const groups = useMemo(() => splitEpisodeGroups(item?.episodeGroups), [item?.episodeGroups]);
+  // A card uploaded as complete seasons has no episode index, so its file list is
+  // grouped per season instead of leaving twenty season packs in one column. A card
+  // with a single season, or with numbered episodes, keeps the list it always had.
+  const seasonFileBlocks = useMemo(() => {
+    const bySeason = new Map();
+    for (const choice of item?.fileChoices || []) {
+      const season = Number(choice?.season);
+      if (!Number.isInteger(season) || season < 1) continue;
+      const entry = bySeason.get(season) || { season, label: `Season ${season}`, choices: [], packs: 0 };
+      entry.choices.push(choice);
+      if (choice.seasonPack) entry.packs += 1;
+      bySeason.set(season, entry);
+    }
+    const blocks = [...bySeason.values()].sort((first, second) => first.season - second.season);
+    return blocks.length > 1 ? blocks : [];
+  }, [item?.fileChoices]);
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
+  const relatedItems = useMemo(() => {
+    if (!item) return [];
+    return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
+  }, [item, related.data]);
+
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
+    return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
+  }
+  if (release.error || !item) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>NOT FOUND</Eyebrow><h1>This release slipped through a portal.</h1><p>{release.error?.message || 'It may have been removed or the link is no longer valid.'}</p><Link className="button button--primary" to="/browse">Return to catalog <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+
+  return (
+    <PageShell>
+      <section className={`detail-hero detail-hero--${item.tone}`}>
+        <div className="detail-hero__glow" aria-hidden="true" />
+        <div className="detail-hero__backdrop" style={item.backdropUrl ? { backgroundImage: `url("${item.backdropUrl}")` } : undefined} aria-hidden="true" />
+        <div className="page-width detail-hero__inner">
+          <Link className="back-link" to={`/browse/${item.category}`}><Icon name="chevron" size={16} /> Back to {item.categoryLabel}</Link>
+          <div className="detail-layout">
+            <Artwork item={item} size="detail" priority className="detail-layout__art" />
+            <div className="detail-layout__copy">
+              <div className="detail-layout__pills"><span className={`category-pill category-pill--${item.tone}`}>{item.categoryLabel}</span><span className="status-pill"><span /> {item.status}</span></div>
+              <h1>{item.title}</h1>
+              <div className="detail-facts">
+                {item.year ? <span><Icon name="calendar" size={15} /> {item.year}</span> : null}
+                {item.releaseLabel ? <span><Icon name="clock" size={15} /> {item.releaseLabel}</span> : null}
+                {item.episodeCount ? <span><Icon name="layers" size={15} /> {item.episodeCount} episode{item.episodeCount === 1 ? '' : 's'}</span> : null}
+                <span><Icon name="layers" size={15} /> {item.filesCount || '—'} file{item.filesCount === 1 ? '' : 's'}</span>
+              </div>
+              {item.description ? <p className="detail-layout__description">{item.description}</p> : <p className="detail-layout__description detail-layout__description--muted">A catalog entry ready to be delivered via Telegram.</p>}
+              <div className="tag-list">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div>
+              <div className="detail-actions">
+                {hasReleaseLevelWatch(item.stream) ? <Link className="button button--watch" to={watchPagePath(item)}><Icon name="play" size={19} /> Watch</Link> : null}
+                {item.episodeGroups?.length
+                  ? <a className="button button--telegram" href={groups.episodes.length ? '#episode-guide-title' : '#episode-packs-title'}><Icon name="layers" size={20} /> Browse episode guide</a>
+                  : <button className="button button--telegram" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={20} /> Get all files on Telegram</button>}
+                <Link className="button button--ghost" to={`/browse/${item.category}`}>More {item.categoryLabel}</Link>
+              </div>
+              <p className="detail-layout__delivery-note"><Icon name="shield" size={15} /> No file is hosted on this website. Telegram delivers a copy from the private storage channel.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="detail-info detail-info--single page-width">
+        <div className="detail-info__languages">
+          <Eyebrow>AVAILABLE LABELS</Eyebrow>
+          <h2>Language & <em>release details.</em></h2>
+          <p className="detail-info__track-label">Audio</p>
+          <div className="language-tags">{item.languages.length ? item.languages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>) : <span><Icon name="check" size={14} /> Check Telegram delivery</span>}</div>
+          {(item.subtitleLanguages || []).length ? <><p className="detail-info__track-label">Subtitles</p><div className="language-tags language-tags--subtitles">{item.subtitleLanguages.map((language) => <span key={language}><Icon name="check" size={14} /> {language}</span>)}</div></> : null}
+          {item.episodeGroups?.length ? <p className="detail-info__episode-hint"><Icon name="arrow" size={15} /> {groups.episodes.length ? 'Select an episode below to see its available files and qualities.' : 'Select a combined pack below to see its available files and qualities.'}</p> : null}
+        </div>
+      </section>
+
+      {item.fileChoices?.length && !item.episodeGroups?.length ? <section className="file-choice-section page-width" aria-labelledby="file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>CHOOSE YOUR DELIVERY</Eyebrow><h2 id="file-choice-title">Pick a file or <em>quality.</em></h2><p>{seasonFileBlocks.length ? 'This release arrived as complete seasons, so the files are grouped by season. Every choice opens its own Telegram delivery link.' : 'Every choice opens its own Telegram delivery link. Episode labels and quality tags are read from the uploaded file details.'}</p></div>
+          <button className="button button--secondary" type="button" onClick={() => onGetFiles(item)}><Icon name="telegram" size={18} /> Get all {item.filesCount} files</button>
+        </div>
+        {seasonFileBlocks.length ? seasonFileBlocks.map((block) => <div className="episode-season" key={block.season}>
+          <p className="episode-season__title"><Icon name="layers" size={13} /> {block.label}<span>{block.choices.length} file{block.choices.length === 1 ? '' : 's'}{block.packs === block.choices.length ? ' · complete season' : ''}</span></p>
+          <FileChoiceList item={item} choices={block.choices} onGetFiles={onGetFiles} />
+        </div>) : <FileChoiceList item={item} choices={item.fileChoices} onGetFiles={onGetFiles} />}
+      </section> : null}
+
+      {groups.episodes.length ? <section className="episode-section page-width" aria-labelledby="episode-guide-title">
+        <div className="episode-section__heading">
+          <div><Eyebrow>SMART EPISODE INDEX</Eyebrow><h2 id="episode-guide-title">Episode <em>guide.</em></h2></div>
+          <span>{item.episodeCount || item.episodeGroups.length} indexed episode{(item.episodeCount || item.episodeGroups.length) === 1 ? '' : 's'}</span>
+        </div>
+        {/* A card spanning seasons shows one labelled block per season; a single
+            season renders the same flat grid it always did. */}
+        {(groups.seasons.length ? groups.seasons : [null]).map((block) => block ? <div className="episode-season" key={block.season}>
+          <p className="episode-season__title"><Icon name="layers" size={13} /> {block.seasonLabel}<span>{block.episodes.length} episode{block.episodes.length === 1 ? '' : 's'}</span></p>
+          <div className="episode-grid">
+            {block.episodes.map((group) => <EpisodeCard item={item} group={group} key={`${group.season}-${group.start}-${group.end}`} />)}
+          </div>
+        </div> : <div className="episode-grid" key="all-episodes">
+          {groups.episodes.map((group) => <EpisodeCard item={item} group={group} key={`${group.start}-${group.end}`} />)}
+        </div>)}
+        <p className="episode-section__note"><Icon name="spark" size={14} /> Built from the uploader’s cleaned caption first, with filename detection as a fallback. Select an episode to open its own delivery page and compare every available file option.</p>
+      </section> : null}
+
+      {groups.packs.length ? <section className="episode-packs page-width" aria-labelledby="episode-packs-title">
+        <div className="episode-section__heading">
+          <div><Eyebrow>COMBINED UPLOADS</Eyebrow><h2 id="episode-packs-title">Batch <em>packs.</em></h2><p>Multi-episode files live here instead of inside the single-episode list, so each pack keeps its own quality choices.</p></div>
+          <span>{groups.packs.length} combined upload{groups.packs.length === 1 ? '' : 's'}</span>
+        </div>
+        <div className="episode-grid episode-grid--packs">
+          {groups.packs.map((group) => <Link className="episode-card episode-card--pack" to={episodePagePath(item, group)} key={`${group.season ?? 0}-${group.start}-${group.end}`} aria-label={`View delivery options for ${group.seasonLabel ? `${group.seasonLabel} ${group.label}` : group.label}`}>
+            <span className="episode-card__number episode-card__number--range">{formatEpisodeNumber(group.start)}–{formatEpisodeNumber(group.end)}</span>
+            {/* Two seasons can pack the same range, so the block name belongs in the label. */}
+            <strong>{group.seasonLabel ? `${group.seasonLabel} · ${group.label}` : group.label}</strong>
+            <small>{group.fileCount} combined file{group.fileCount === 1 ? '' : 's'} · episodes {group.start} to {group.end} in one upload</small>
+            <Icon name="arrow" size={15} />
+          </Link>)}
+        </div>
+      </section> : null}
+
+      {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="related-title">
+        <div className="section-heading"><div><Eyebrow>MORE IN {String(item?.categoryLabel || item?.category || '').toUpperCase()}</Eyebrow><h2 id="related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
+        <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
+      </section> : null}
+    </PageShell>
+  );
+}
+
+/**
+ * One card of the episode guide. Its look is deliberately unchanged: a season
+ * adds a heading above the row and the season name inside the label, never a
+ * different card.
+ */
+function EpisodeCard({ item, group }) {
+  return <Link className="episode-card" to={episodePagePath(item, group)} aria-label={`View delivery options for ${group.seasonLabel ? `${group.seasonLabel} ${group.label}` : group.label}`}>
+    <span className="episode-card__number">EP {formatEpisodeNumber(group.start)}</span>
+    {/* The season is the heading above the row, so the card itself still reads
+        exactly as it always did. */}
+    <strong>{group.label}</strong>
+    <small>{group.fileCount} delivery file{group.fileCount === 1 ? '' : 's'} included</small>
+    <Icon name="arrow" size={15} />
+  </Link>;
+}
+
+function EpisodePage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
+  const { category, slug, episodeRange } = useParams();
+  const [searchParams] = useSearchParams();
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const item = release.data?.item;
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
+
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
+  // ?s=N says which season this number belongs to. A merged card holds more than
+  // one Episode 01, so the number alone cannot pick the right block.
+  const requestedEpisode = parseEpisodeRoute(episodeRange, searchParams.get('s'));
+  const matchingGroup = findEpisodeGroup(item?.episodeGroups, requestedEpisode);
+  const episodeLabel = matchingGroup?.label || requestedEpisode?.label || 'Episode delivery';
+  const routeSeason = episodeSeasonNumber(item, requestedEpisode);
+  const isPack = Boolean(matchingGroup && matchingGroup.start !== matchingGroup.end);
+  // Only this episode's own uploads are listed. A combined file that spans this
+  // episode belongs to its pack page, not to every episode it touches.
+  const choices = item && requestedEpisode
+    ? fileChoicesForEpisode(item.fileChoices, requestedEpisode)
+    : [];
+  const watchEntries = item && requestedEpisode
+    ? episodeStreamEntries(item.stream?.entries, requestedEpisode)
+    : [];
+  const groupFileCount = matchingGroup?.fileCount || 0;
+  const hiddenPackCount = groupFileCount > choices.length ? groupFileCount - choices.length : 0;
+
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
+    return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
+  }
+  if (release.error || !item || !requestedEpisode || item.category !== category) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>EPISODE NOT FOUND</Eyebrow><h1>That episode page is off the map.</h1><p>{release.error?.message || 'Return to the release and choose an available episode.'}</p><Link className="button button--primary" to={item ? `/${item.category}/${item.slug}` : '/browse'}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+
+  return (
+    <PageShell>
+      <section className={`detail-hero detail-hero--${item.tone} episode-page-hero`}>
+        <div className="detail-hero__glow" aria-hidden="true" />
+        <div className="detail-hero__backdrop" style={item.backdropUrl ? { backgroundImage: `url("${item.backdropUrl}")` } : undefined} aria-hidden="true" />
+        <div className="page-width detail-hero__inner episode-page-hero__inner">
+          <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
+          <div className="episode-page-hero__content">
+            <Eyebrow>EPISODE DELIVERY</Eyebrow>
+            <h1>{episodeLabel} <span>for</span> <em>{item.title}</em></h1>
+            <p>Choose one version below. Each Telegram link delivers only that selected file, so you can pick the quality or upload that suits you.</p>
+            <div className="episode-page-hero__facts">
+              {matchingGroup?.seasonLabel || routeSeason ? <span><Icon name="layers" size={15} /> {matchingGroup?.seasonLabel || `Season ${routeSeason}`}</span> : null}
+              <span><Icon name="layers" size={15} /> {choices.length} file option{choices.length === 1 ? '' : 's'}</span>
+              {isPack ? <span><Icon name="layers" size={15} /> Combined upload</span> : null}
+              {item.languages.length ? <span><Icon name="check" size={15} /> {item.languages.join(' · ')}</span> : null}
+              {(item.subtitleLanguages || []).length ? <span><Icon name="check" size={15} /> Subs: {item.subtitleLanguages.join(' · ')}</span> : null}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="file-choice-section file-choice-section--episode page-width" aria-labelledby="episode-file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>FILES FOR {String(episodeLabel || '').toUpperCase()}</Eyebrow><h2 id="episode-file-choice-title">Choose your <em>version.</em></h2><p>All matching uploaded files are listed here. Use a file action to open its individual Telegram delivery link.</p></div>
+          <Link className="button button--secondary" to={`/${item.category}/${item.slug}`}><Icon name="layers" size={18} /> Episode guide</Link>
+        </div>
+        <EpisodeWatchPanel item={item} episode={requestedEpisode} entries={watchEntries} />
+        {choices.length ? <>
+          <FileChoiceList item={item} choices={choices} onGetFiles={onGetFiles} />
+          {hiddenPackCount ? <p className="episode-section__note"><Icon name="info" size={14} /> {hiddenPackCount} combined upload{hiddenPackCount === 1 ? ' is' : 's are'} also available for this release in the pack list on the release page — they are kept out of this episode on purpose so every option here covers exactly {String(episodeLabel || '').toLowerCase()}.</p> : null}
+        </> : <div className="episode-file-empty"><Icon name="info" size={20} /><div><strong>No individual files are indexed for this episode yet.</strong><p>Return to the release page to view its available delivery options.</p></div></div>}
+      </section>
+    </PageShell>
+  );
+}
+
+function WatchPage({ onGetFiles, adultAccess, adultAccessVersion, onConfirmAdult, adultAccessError, confirmingAdult }) {
+  const { category, slug, episodeRange } = useParams();
+  const [searchParams] = useSearchParams();
+  const requestedAdultCategory = category === 'adult';
+  const release = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ item: null }) : getContentBySlug(slug),
+    [slug, requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const related = useRemote(
+    () => requestedAdultCategory && !adultAccess ? Promise.resolve({ items: [] }) : getContent({ category: requestedAdultCategory ? 'adult' : undefined }),
+    [requestedAdultCategory, adultAccess, adultAccessVersion]
+  );
+  const item = release.data?.item;
+  const adultLocked = (requestedAdultCategory && !adultAccess) || release.error?.status === 403;
+  const requestedEpisode = parseEpisodeRoute(episodeRange, searchParams.get('s'));
+  const allEntries = item?.stream?.entries || [];
+  // A generic /watch page is reserved for intentional release-level players.
+  // An episode route sees only players attached to that episode.
+  const entries = requestedEpisode
+    ? episodeStreamEntries(allEntries, requestedEpisode)
+    : releaseLevelStreamEntries(allEntries);
+  // The delivery files shown under a player are this episode's own files. A
+  // combined pack is offered here only when nothing matches the episode
+  // exactly, so a single-episode Watch page is never filled with a batch file.
+  const matchingFiles = requestedEpisode && entries.length
+    ? fileChoicesForEpisode(item?.fileChoices, requestedEpisode)
+    : [];
+  const [selectedId, setSelectedId] = useState(null);
+  const [selectedQuality, setSelectedQuality] = useState(null);
+  const [manualSubtitle, setManualSubtitle] = useState(null);
+  const subtitleFileInputRef = useRef(null);
+  const selected = entries.find((entry) => entry.id === selectedId) || entries[0] || null;
+  // The framed provider owns its controls; this is the one thing our side has to offer,
+  // because a framed player cannot ask the browser for a screen of its own. It is asked of
+  // the iframe element, so the browser leaves the page — and its own bar — behind exactly
+  // as the provider's full-screen button does, instead of growing a box inside the layout.
+  const playerFrame = useRef(null);
+  const [fullScreen, setFullScreen] = useState(false);
+  const canFullScreen = typeof Element === 'function' && ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen', 'mozRequestFullScreen'].some((name) => typeof Element.prototype[name] === 'function');
+  useEffect(() => {
+    function syncFullScreen() {
+      setFullScreen(Boolean(playerFrame.current) && [document.fullscreenElement, document.webkitFullscreenElement, document.mozFullScreenElement].includes(playerFrame.current));
+    }
+    document.addEventListener('fullscreenchange', syncFullScreen);
+    document.addEventListener('webkitfullscreenchange', syncFullScreen);
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFullScreen);
+      document.removeEventListener('webkitfullscreenchange', syncFullScreen);
+    };
+  }, []);
+  function toggleFullScreen() {
+    const frame = playerFrame.current;
+    if (!frame) return;
+    const active = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement;
+    if (active) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.webkitCancelFullScreen || document.mozCancelFullScreen;
+      Promise.resolve(exit?.call(document)).catch(() => { /* already leaving, or the browser kept its own state */ });
+      return;
+    }
+    const enter = frame.requestFullscreen || frame.webkitRequestFullscreen || frame.webkitRequestFullScreen || frame.mozRequestFullScreen;
+    if (!enter) return;
+    // navigationUI: 'hide' is the part that makes it real rather than decorative — the
+    // browser's own address bar goes with it, which the legacy spellings simply ignore.
+    Promise.resolve(enter.call(frame, { navigationUI: 'hide' })).catch(() => {
+      // A gesture that expired on the way here, or a browser that will not let this frame
+      // take the screen. The provider's own button is still inside the player in that case.
+    });
+  }
+  const relatedItems = useMemo(() => {
+    if (!item) return [];
+    return (related.data?.items || []).filter((entry) => entry.category === item.category && entry.slug !== item.slug).slice(0, 4);
+  }, [item, related.data]);
+
+  useEffect(() => {
+    setSelectedId(entries[0]?.id || null);
+    setSelectedQuality(null);
+    setManualSubtitle(null);
+  }, [slug, episodeRange, item?.stream?.updatedAt]);
+
+  useEffect(() => {
+    setSelectedQuality(null);
+  }, [selected?.id]);
+
+  function handleManualSubtitleFile(event) {
+    const file = event.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setManualSubtitle({
+          url: reader.result,
+          label: file.name.replace(/\.(srt|vtt|ass|ssa)$/i, '') || 'Manual Sub'
+        });
+      }
+    };
+    reader.readAsDataURL(file);
+    event.target.value = '';
+  }
+
+  if (adultLocked) {
+    return <PageShell><AdultGate onConfirm={onConfirmAdult} confirming={confirmingAdult} error={adultAccessError} /></PageShell>;
+  }
+  if (release.loading || (requestedAdultCategory && adultAccess && !item && !release.error)) {
+    return <PageShell><section className="detail-loading page-width"><div /><div><span /><i /><i /><i /></div></section></PageShell>;
+  }
+  if (release.error || !item || item.category !== category || (episodeRange && !requestedEpisode)) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="info" size={28} /></span><Eyebrow>WATCH NOT FOUND</Eyebrow><h1>This player page is off the map.</h1><p>{release.error?.message || 'Return to the release and choose an available Watch option.'}</p><Link className="button button--primary" to={item ? `/${item.category}/${item.slug}` : '/browse'}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+  if (!item.stream?.available) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>A player has not been attached yet.</h1><p>The publisher can add an authorized player to this existing release without changing its delivery links.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+  if (requestedEpisode && !entries.length) {
+    return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>No player is attached to {String(requestedEpisode?.label || '').toLowerCase()} yet.</h1><p>{item.title} has a Watch link for other episodes, and SoraBox will not play an unrelated one here. Open this episode page to see its delivery files, or pick another episode from the guide.</p><div className="not-found__actions"><Link className="button button--primary" to={episodePagePath(item, requestedEpisode)}><Icon name="telegram" size={18} /> Episode files</Link><Link className="button button--secondary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></div></section></PageShell>;
+  }
+  if (!selected) {
+    if (!requestedEpisode && allEntries.some((entry) => entry?.episode?.start)) {
+      return <PageShell><section className="page-width not-found"><span><Icon name="layers" size={28} /></span><Eyebrow>EPISODE WATCH</Eyebrow><h1>Select an episode to watch.</h1><p>Players are attached to individual episodes, not the whole release. Open the matching episode delivery page to find its Watch button.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}#episode-guide-title`}><Icon name="layers" size={18} /> Open episode guide</Link></section></PageShell>;
+    }
+    return <PageShell><section className="page-width not-found"><span><Icon name="play" size={28} /></span><Eyebrow>WATCH PAGE</Eyebrow><h1>This Watch option is unavailable.</h1><p>The selected player is no longer available. Return to the release to choose another option.</p><Link className="button button--primary" to={`/${item.category}/${item.slug}`}>Return to release <Icon name="arrow" size={18} /></Link></section></PageShell>;
+  }
+
+  const selectedTitle = playerDisplayName(selected);
+  const availableQualities = getEntryQualities(selected);
+  const activeQualityOption = resolveActiveQualityOption(selected, selectedQuality);
+  const activeQualityKey = activeQualityOption?.id || activeQualityOption?.quality || selectedQuality || null;
+  const target = getProtectedPlaybackTarget(selected, { selectedQuality: activeQualityKey });
+  const nextEpisodeGroup = requestedEpisode && Array.isArray(item?.episodeGroups)
+    ? item.episodeGroups.find((g) => {
+        const currentEnd = Number(requestedEpisode.end) || Number(requestedEpisode.start);
+        return Number(g.start) > currentEnd;
+      }) || null
+    : null;
+  const nextEpisodeUrl = nextEpisodeGroup ? watchPagePath(item, nextEpisodeGroup) : null;
+
+  // The Watch page announces the episode and its place in the season, not the
+  // release title repeated; a movie has no season, so its languages are shown.
+  const heading = watchHeading(item, {
+    episode: requestedEpisode || selected?.episode || null,
+    fileLabel: requestedEpisode ? matchingFiles[0]?.label || null : null
+  });
+  const selectedFileTitle = heading.title;
+
+  let playerIframeSrc = null;
+  if (target) {
+    playerIframeSrc = getPlayerIframeUrl(target, {
+      title: `${item.title} — ${selectedFileTitle}`,
+      label: playerShortName(selected),
+      poster: item.posterUrl || '',
+      next: nextEpisodeUrl || '',
+      quality: activeQualityOption?.quality || selected?.quality || '',
+      qualities: availableQualities,
+      subUrl: manualSubtitle?.url || '',
+      subLabel: manualSubtitle?.label || '',
+      noAudioSelect: true
+    });
+  } else if (selected?.embedUrl && !/t\.me\/c\//i.test(selected.embedUrl)) {
+    playerIframeSrc = selected.embedUrl;
+  }
+
+  // Nothing here sends a visitor to the provider to watch: the framed player is the whole
+  // experience, and its URL already carries the playback-only chrome the frame needs. The
+  // external link stays for a source that publishes no embeddable player at all (an OK.ru
+  // live broadcast), where a link is the only way to watch rather than a way to leave.
+  const externalPlayerUrl = (playerIframeSrc || selected?.embedUrl) ? null : selected?.watchUrl || null;
+  const episodeContext = requestedEpisode?.label || selected?.episode?.label || null;
+  const hasEpisodeDelivery = matchingFiles.length > 0;
+  const deliveryTitle = episodeContext ? `${item.title} — ${episodeContext}` : item.title;
+
+  return (
+    <PageShell>
+      <section className={`watch-hero detail-hero--${item.tone}`}>
+        <div className="watch-hero__glow" aria-hidden="true" />
+        <div className="page-width watch-hero__inner">
+          <Link className="back-link" to={`/${item.category}/${item.slug}`}><Icon name="chevron" size={16} /> Back to {item.title}</Link>
+          <div className="watch-hero__heading">
+            <div>
+              <Eyebrow><Icon name="play" size={13} /> {heading.isEpisode ? 'WATCH' : `WATCH · ${String(item?.categoryLabel || item?.category || '').toUpperCase()}`}</Eyebrow>
+              <h1>{selectedFileTitle}</h1>
+              <p className="watch-hero__meta">
+                {heading.meta.map((line) => <span className="watch-hero__episode" key={line}>{line}</span>)}
+                {activeQualityOption?.quality ? <span className="watch-hero__episode">{activeQualityOption.quality}</span> : null}
+                {entries.length > 1 ? <span>{entries.length} players available</span> : null}
+                <span>Now playing on {selectedTitle}</span>
+              </p>
+            </div>
+          </div>
+          <div className="watch-player-shell">
+            {playerIframeSrc ? (
+              <iframe
+                key={`${selected?.id || 'main-player'}:${activeQualityKey || 'default'}:${manualSubtitle?.label || 'nosub'}`}
+                ref={playerFrame}
+                className="watch-player-shell__frame"
+                src={playerIframeSrc}
+                title={`${item.title} — ${selectedFileTitle}`}
+                allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+                referrerPolicy="strict-origin-when-cross-origin"
+                allowFullScreen
+              />
+            ) : (
+              <div className="watch-player-shell__fallback">
+                <Icon name="play" size={24} />
+                <strong>This video opens in its approved player.</strong>
+                <p>Use the play button to continue.</p>
+                {selected.watchUrl ? (
+                  <a className="button button--watch" href={selected.watchUrl} target="_blank" rel="noreferrer">
+                    Play video <Icon name="arrow" size={16} />
+                  </a>
+                ) : null}
+              </div>
+            )}
+          </div>
+          {playerIframeSrc ? (
+            <div className="watch-player-controls">
+              {canFullScreen ? (
+                <button
+                  type="button"
+                  onClick={toggleFullScreen}
+                  aria-pressed={fullScreen}
+                  title="Fill the screen with the player, as its own full-screen button would"
+                >
+                  <Icon name="expand" size={13} /> {fullScreen ? 'Exit full screen' : 'Full screen'}
+                </button>
+              ) : null}
+              <input
+                ref={subtitleFileInputRef}
+                type="file"
+                accept=".srt,.vtt,.ass,.ssa"
+                style={{ display: 'none' }}
+                onChange={handleManualSubtitleFile}
+              />
+              <button
+                type="button"
+                onClick={() => subtitleFileInputRef.current?.click()}
+                title="Load a manual subtitle file (.srt or .vtt)"
+              >
+                <Icon name="layers" size={13} /> {manualSubtitle ? `Subtitle: ${manualSubtitle.label}` : 'Add manual subtitle'}
+              </button>
+              {manualSubtitle ? (
+                <button
+                  type="button"
+                  onClick={() => setManualSubtitle(null)}
+                  title="Remove manual subtitle"
+                >
+                  Clear subtitle
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {availableQualities.length > 0 ? (
+            <div className="watch-player-options watch-player-options--quality" aria-label="Quality options">
+              <span>Quality</span>
+              <div>
+                {availableQualities.map((qOpt) => {
+                  const optKey = qOpt.id || qOpt.quality;
+                  const isActive = (activeQualityOption?.id || activeQualityOption?.quality) === optKey;
+                  return (
+                    <button
+                      className={isActive ? 'is-active' : ''}
+                      type="button"
+                      key={optKey}
+                      onClick={() => setSelectedQuality(optKey)}
+                      aria-pressed={isActive}
+                    >
+                      <Icon name="play" size={13} /> {qOpt.label || qOpt.quality}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+          {externalPlayerUrl ? <div className="watch-player-note">
+            <span>This source has no embeddable player URL.</span>
+            <a href={externalPlayerUrl} target="_blank" rel="noreferrer">Open on {playerShortName(selected)} <Icon name="arrow" size={14} /></a>
+          </div> : null}
+          {(hasEpisodeDelivery || item.deliveryReady) ? <div className="watch-delivery">
+            <div>
+              <span>{episodeContext || 'TELEGRAM DELIVERY'}</span>
+              <strong>{hasEpisodeDelivery ? 'Get these matching files on Telegram' : 'Get files on Telegram'}</strong>
+            </div>
+            <button className="button button--telegram" type="button" onClick={() => onGetFiles(item, hasEpisodeDelivery ? { files: matchingFiles, title: deliveryTitle, episodeLabel: episodeContext } : undefined)}><Icon name="telegram" size={18} /> Get files</button>
+          </div> : null}
+          {entries.length > 1 ? <div className="watch-player-options" aria-label="Player options">
+            <span>Choose a server</span>
+            <div>{entries.map((entry) => <button className={entry.id === selected.id ? 'is-active' : ''} type="button" key={entry.id} onClick={() => setSelectedId(entry.id)} aria-pressed={entry.id === selected.id}><Icon name="play" size={13} /> {playerShortName(entry)}{entry.episode?.label && !requestedEpisode ? ` · ${entry.episode.label}` : ''}</button>)}</div>
+          </div> : null}
+        </div>
+      </section>
+
+      {hasEpisodeDelivery ? <section className="file-choice-section file-choice-section--watch page-width" aria-labelledby="watch-file-choice-title">
+        <div className="file-choice-section__heading">
+          <div><Eyebrow>{episodeContext || 'EPISODE'} · TELEGRAM DELIVERY</Eyebrow><h2 id="watch-file-choice-title">Choose your <em>file.</em></h2><p>These are the files matched to this Watch page. Each Telegram action delivers only the selected file.</p></div>
+          <Link className="button button--secondary" to={episodePagePath(item, requestedEpisode)}><Icon name="layers" size={18} /> Episode delivery</Link>
+        </div>
+        <FileChoiceList item={item} choices={matchingFiles} onGetFiles={onGetFiles} showWatch={false} />
+      </section> : null}
+
+      {relatedItems.length ? <section className="catalog-section catalog-section--last page-width" aria-labelledby="watch-related-title">
+        <div className="section-heading"><div><Eyebrow>MORE IN {String(item?.categoryLabel || item?.category || '').toUpperCase()}</Eyebrow><h2 id="watch-related-title">Keep the <em>queue going.</em></h2></div><Link className="text-link" to={`/browse/${item.category}`}>View collection <Icon name="arrow" size={16} /></Link></div>
+        <div className="release-grid release-grid--four">{relatedItems.map((entry, index) => <ReleaseCard item={entry} index={index} key={entry.id} />)}</div>
+      </section> : null}
+    </PageShell>
+  );
+}
+
+function NotFoundPage() {
+  return <PageShell><section className="page-width not-found"><span><Icon name="spark" size={28} /></span><Eyebrow>404</Eyebrow><h1>That page is off the map.</h1><p>Return to the catalog and find something worth opening next.</p><Link className="button button--primary" to="/browse">Explore catalog <Icon name="arrow" size={18} /></Link></section></PageShell>;
+}
+
+export default function App() {
+  const [deliveryItem, setDeliveryItem] = useState(null);
+  const [adultAccess, setAdultAccess] = useState(() => {
+    try {
+      return window.sessionStorage.getItem('sorabox_adult_access') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [confirmingAdult, setConfirmingAdult] = useState(false);
+  const [adultAccessError, setAdultAccessError] = useState(null);
+  const [adultAccessVersion, setAdultAccessVersion] = useState(0);
+
+  function openDelivery(item, options = {}) {
+    if (!item) return;
+    setDeliveryItem({ item, ...options });
+  }
+
+  async function handleAdultConfirmation() {
+    if (confirmingAdult) return;
+    setConfirmingAdult(true);
+    setAdultAccessError(null);
+    try {
+      await confirmAdultAccess();
+      try {
+        window.sessionStorage.setItem('sorabox_adult_access', '1');
+      } catch {
+        // The server cookie still keeps this route available when storage is
+        // disabled by a privacy mode or embedded browser.
+      }
+      setAdultAccess(true);
+      // Retry a protected endpoint after renewed consent even if a restored
+      // tab already held `adultAccess: true` while its server cookie expired.
+      setAdultAccessVersion((version) => version + 1);
+    } catch (error) {
+      setAdultAccessError(error?.message || 'We could not confirm access. Please try again.');
+    } finally {
+      setConfirmingAdult(false);
+    }
+  }
+
+  const adultGateProps = {
+    adultAccess,
+    adultAccessVersion,
+    onConfirmAdult: handleAdultConfirmation,
+    adultAccessError,
+    confirmingAdult
+  };
+
+  return (
+    <>
+      <Routes>
+        <Route path="/" element={<HomePage onGetFiles={openDelivery} />} />
+        <Route path="/browse" element={<BrowsePage {...adultGateProps} />} />
+        <Route path="/browse/:category" element={<BrowsePage {...adultGateProps} />} />
+        <Route path="/search" element={<SearchPage />} />
+        {/* This page renders its own PageShell, as every other page here does. */}
+        <Route path="/genres" element={<GenresPage />} />
+        <Route path="/:category/:slug/watch/episode/:episodeRange" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug/watch" element={<WatchPage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug/episode/:episodeRange" element={<EpisodePage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="/:category/:slug" element={<DetailPage onGetFiles={openDelivery} {...adultGateProps} />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+      {deliveryItem ? <DeliveryDialog item={deliveryItem.item} files={deliveryItem.files} title={deliveryItem.title} episodeLabel={deliveryItem.episodeLabel} onClose={() => setDeliveryItem(null)} /> : null}
+    </>
+  );
+}

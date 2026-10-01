@@ -1,0 +1,106 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { getContentPageUrl, getDeliveryRedirectPath, getTelegramFileDeliveryUrl, loadConfig } from '../src/server/config.js';
+
+test('MediaInfo and signed backup safety settings have bounded production defaults', () => {
+  const config = loadConfig({
+    ADMIN_LOGIN_CODE: 'long-enough-admin-code',
+    MEDIAINFO_MAX_DOWNLOAD_BYTES: '12345',
+    MEDIAINFO_TIMEOUT_MS: '5000',
+    MEDIAINFO_MAX_FILES: '44',
+    BACKUP_MAX_BYTES: '23456',
+    BACKUP_MONTHLY_ENABLED: 'false',
+    STREAMING_ALLOWED_HOSTS: 'media.example.com, player.example.com',
+    STREAMING_MANIFEST_MAX_BYTES: '123456',
+    STREAMING_MANIFEST_DOWNLOAD_TIMEOUT_MS: '3210',
+    TELEGRAM_ADULT_STORAGE_CHANNEL_ID: '-1009876543210'
+  });
+  assert.equal(config.mediaInfo.maxDownloadBytes, 12345);
+  assert.equal(config.mediaInfo.timeoutMs, 5000);
+  assert.equal(config.mediaInfo.maxFiles, 44);
+  assert.equal(config.backup.signingSecret, 'long-enough-admin-code');
+  assert.equal(config.backup.maxBytes, 23456);
+  assert.equal(config.backup.monthlyEnabled, false);
+  assert.deepEqual(config.streaming.allowedHosts, ['media.example.com', 'player.example.com']);
+  assert.equal(config.streaming.manifestMaxBytes, 123456);
+  assert.equal(config.streaming.downloadTimeoutMs, 3210);
+  assert.equal(config.telegram.adultStorageChannelId, '-1009876543210');
+});
+
+test('announcement URLs resolve to a public content detail page', () => {
+  const config = loadConfig({
+    PUBLIC_SITE_URL: 'https://sorabox-demo.koyeb.app/',
+    TELEGRAM_MODE: 'disabled'
+  });
+
+  assert.equal(config.siteUrl, 'https://sorabox-demo.koyeb.app');
+  assert.equal(
+    getContentPageUrl(config, { category: 'donghua', slug: 'perfect-world' }),
+    'https://sorabox-demo.koyeb.app/donghua/perfect-world'
+  );
+});
+
+test('an invalid announcement site URL cannot create an external button', () => {
+  const config = loadConfig({ PUBLIC_SITE_URL: 'javascript:alert(1)' });
+  assert.equal(config.siteUrl, '');
+  assert.equal(getContentPageUrl(config, { category: 'movie', slug: 'toxic' }), null);
+});
+
+test('quoted hostnames and Koyeb-style site URL aliases normalize into an announcement URL', () => {
+  const config = loadConfig({
+    PUBLIC_SITE_URL: 'not a URL',
+    WEBSITE_URL: '  "catalog-example.koyeb.app/"  ',
+    TELEGRAM_BOT_USERNAME: '@DeliveryBot'
+  });
+
+  assert.equal(config.siteUrl, 'https://catalog-example.koyeb.app');
+  assert.equal(
+    getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 12),
+    'https://t.me/DeliveryBot?start=file-aB-cD_ef-12'
+  );
+  assert.equal(getDeliveryRedirectPath('aB-cD_ef', 12), '/deliver/aB-cD_ef/file/12');
+  assert.equal(getTelegramFileDeliveryUrl(config, 'aB-cD_ef', 0), null);
+});
+
+test('ImgBB keys are pooled in the order the operator wrote them', () => {
+  const single = loadConfig({ ADMIN_LOGIN_CODE: 'x', IMGBB_API_KEY: 'only' });
+  assert.deepEqual(single.imgbbApiKeys, ['only'], 'one key behaves exactly as it always did');
+
+  const pooled = loadConfig({
+    ADMIN_LOGIN_CODE: 'x',
+    IMGBB_API_KEY: 'primary',
+    IMGBB_API_KEYS: 'a,b c\nd , a',
+    IMGBB_API_KEY_3: 'third'
+  });
+  assert.deepEqual(pooled.imgbbApiKeys, ['primary', 'a', 'b', 'c', 'd', 'third'], 'duplicated, and every spelling of the secret is read');
+  assert.equal(pooled.imgbbApiKey, 'primary', 'the primary key stays the one /poster names in its errors');
+
+  const many = loadConfig({ ADMIN_LOGIN_CODE: 'x', IMGBB_API_KEYS: Array.from({ length: 40 }, (unused, index) => `k${index}`).join(',') });
+  assert.equal(many.imgbbApiKeys.length, 20, 'twenty keys is the ceiling on the pool, never a cap on how many posters a publish hosts');
+
+  const none = loadConfig({ ADMIN_LOGIN_CODE: 'x' });
+  assert.deepEqual(none.imgbbApiKeys, []);
+});
+
+test('playback configuration loads player origin, issuer key, and multiple Telegram storage channels', () => {
+  const custom = loadConfig({
+    WATCH_PLAYER_ORIGIN: ' "https://player-service.koyeb.app/ " ',
+    PLAYBACK_ISSUER_KEY: 'secret-token-key-123',
+    PLAYBACK_SESSION_SECRET: 'session-secret-456',
+    TELEGRAM_CHANNEL_IDS: '-1002617067511, -1002456789012, 2987654321',
+    PLAYBACK_RATE_LIMIT_MAX: '50',
+    PLAYBACK_RATE_LIMIT_WINDOW_MS: '30000'
+  });
+
+  assert.equal(custom.playback.playerOrigin, 'https://player-service.koyeb.app');
+  assert.equal(custom.playback.issuerKey, 'secret-token-key-123');
+  assert.equal(custom.playback.sessionSecret, 'session-secret-456');
+  assert.deepEqual(custom.playback.allowedChannelIds, ['-1002617067511', '-1002456789012', '2987654321']);
+  assert.equal(custom.playback.rateLimitMax, 50);
+  assert.equal(custom.playback.rateLimitWindowMs, 30000);
+
+  const fallback = loadConfig({});
+  assert.equal(fallback.playback.playerOrigin, 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app');
+  assert.equal(fallback.playback.issuerKey, '');
+  assert.deepEqual(fallback.playback.allowedChannelIds, ['-1002617067511']);
+});
