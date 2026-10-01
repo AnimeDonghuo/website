@@ -307,7 +307,10 @@ function adminContentListOptions(value) {
   const limit = Math.max(1, Math.min(Number(supplied.limit) || 25, MAX_ADMIN_CONTENT_RESULTS));
   const startAt = safeDateTime(supplied.startAt);
   const endAt = safeDateTime(supplied.endAt);
-  return { limit, startAt, endAt };
+  const category = CATEGORY_IDS.has(supplied.category) ? supplied.category : null;
+  const query = cleanText(supplied.query, 120) || null;
+  const sort = supplied.sort === 'updated' ? 'updated' : 'recent';
+  return { limit, startAt, endAt, category, query, sort };
 }
 
 function requestListOptions(value) {
@@ -939,24 +942,44 @@ export function reconcileContentMediaRecord(content, config = null) {
   };
 }
 
-function removeFileFromContentRecord(content, { storageMessageId = null, fileIndex = null, config = null } = {}) {
+function removeFileFromContentRecord(content, { storageMessageId = null, fileIndex = null, fileIndexes = null, config = null } = {}) {
   if (!content || typeof content !== 'object' || !Array.isArray(content.files)) {
-    return { content: null, removedFile: null, patch: null };
+    return { content: null, removedFile: null, removedFiles: [], patch: null };
   }
   const files = [...content.files];
-  let targetIdx = -1;
-  if (storageMessageId !== null && storageMessageId !== undefined && Number(storageMessageId) > 0) {
-    targetIdx = files.findIndex((f) => Number(f?.storageMessageId) === Number(storageMessageId));
-  }
-  if (targetIdx === -1 && fileIndex !== null && fileIndex !== undefined && Number.isInteger(Number(fileIndex))) {
-    const idx = Number(fileIndex);
-    if (idx >= 0 && idx < files.length) targetIdx = idx;
-  }
-  if (targetIdx === -1) {
-    return { content, removedFile: null, patch: null };
+  const removedFiles = [];
+
+  if (Array.isArray(fileIndexes) && fileIndexes.length > 0) {
+    const idxSet = new Set(
+      fileIndexes
+        .map((n) => Number(n))
+        .filter((n) => Number.isInteger(n) && n >= 0 && n < files.length)
+    );
+    if (!idxSet.size) return { content, removedFile: null, removedFiles: [], patch: null };
+    const kept = [];
+    for (let i = 0; i < files.length; i += 1) {
+      if (idxSet.has(i)) removedFiles.push(files[i]);
+      else kept.push(files[i]);
+    }
+    files.length = 0;
+    files.push(...kept);
+  } else {
+    let targetIdx = -1;
+    if (storageMessageId !== null && storageMessageId !== undefined && Number(storageMessageId) > 0) {
+      targetIdx = files.findIndex((f) => Number(f?.storageMessageId) === Number(storageMessageId));
+    }
+    if (targetIdx === -1 && fileIndex !== null && fileIndex !== undefined && Number.isInteger(Number(fileIndex))) {
+      const idx = Number(fileIndex);
+      if (idx >= 0 && idx < files.length) targetIdx = idx;
+    }
+    if (targetIdx === -1) {
+      return { content, removedFile: null, removedFiles: [], patch: null };
+    }
+    const [single] = files.splice(targetIdx, 1);
+    if (single) removedFiles.push(single);
   }
 
-  const [removedFile] = files.splice(targetIdx, 1);
+  const removedFile = removedFiles[0] || null;
   const repairedFiles = repairEpisodeGaps(files, {
     episodic: isEpisodicCategory(content.category)
   }).map(sanitizeStoredFileRecord).filter(Boolean);
@@ -989,13 +1012,13 @@ function removeFileFromContentRecord(content, { storageMessageId = null, fileInd
     subtitleLanguageSource
   };
 
-  // Strip any stored Telegram stream entry pointing to the removed file's storageMessageId
+  // Strip any stored Telegram stream entry pointing to the removed file(s)' storageMessageId
   let cleanedExistingStream = content.stream;
-  if (cleanedExistingStream && Array.isArray(cleanedExistingStream.entries) && Number(removedFile?.storageMessageId) > 0) {
-    const msgId = Number(removedFile.storageMessageId);
+  const removedMsgIds = removedFiles.map((f) => Number(f?.storageMessageId)).filter((id) => Number.isInteger(id) && id > 0);
+  if (cleanedExistingStream && Array.isArray(cleanedExistingStream.entries) && removedMsgIds.length > 0) {
     const filteredEntries = cleanedExistingStream.entries.filter((entry) => {
       const url = `${entry?.telegramUrl || ''} ${entry?.embedUrl || ''} ${entry?.watchUrl || ''}`;
-      return !new RegExp(`/${msgId}(?:\\b|$|[?&])`).test(url);
+      return !removedMsgIds.some((msgId) => new RegExp(`/${msgId}(?:\\b|$|[?&])`).test(url));
     });
     cleanedExistingStream = filteredEntries.length ? { ...cleanedExistingStream, entries: filteredEntries } : null;
   }
@@ -1033,6 +1056,7 @@ function removeFileFromContentRecord(content, { storageMessageId = null, fileInd
   return {
     content: { ...content, ...patch },
     removedFile,
+    removedFiles,
     patch
   };
 }
@@ -1246,25 +1270,45 @@ export class MemoryCatalogRepository {
   }
 
   async listAdminContent(options = {}) {
-    const { limit, startAt, endAt } = adminContentListOptions(options);
-    return sortByPublishedAt([...this.contents.values()])
+    const { limit, startAt, endAt, category, query, sort } = adminContentListOptions(options);
+    const items = [...this.contents.values()]
       .filter((item) => item.published !== false)
+      .filter((item) => !category || item.category === category)
+      .filter((item) => {
+        if (!query) return true;
+        const q = query.toLowerCase();
+        return String(item.title || '').toLowerCase().includes(q)
+          || String(item.adminId || '').toLowerCase().includes(q)
+          || String(item.slug || '').toLowerCase().includes(q)
+          || searchPredicate(item, query);
+      })
       .filter((item) => {
         if (!startAt && !endAt) return true;
         const publishedAt = safeDateTime(item.publishedAt);
         if (!publishedAt) return false;
         return (!startAt || publishedAt >= startAt) && (!endAt || publishedAt < endAt);
-      })
+      });
+    const sorted = sort === 'updated'
+      ? items.sort((a, b) => new Date(b.updatedAt || b.publishedAt || 0) - new Date(a.updatedAt || a.publishedAt || 0))
+      : sortByPublishedAt(items);
+    return sorted
       .slice(0, limit)
-      .map((item) => clone({
-        adminId: item.adminId,
-        title: item.title,
-        category: item.category,
-        filesCount: item.filesCount || item.files?.length || 0,
-        episodeCount: item.episodeCount || 0,
-        publishedAt: item.publishedAt,
-        updatedAt: item.updatedAt
-      }));
+      .map((item) => {
+        const filesCount = Array.isArray(item.files) ? item.files.length : (Number(item.filesCount) || Number(item.fileCount) || 0);
+        return clone({
+          adminId: item.adminId,
+          slug: item.slug,
+          title: item.title,
+          category: item.category,
+          year: item.year || null,
+          releaseLabel: item.releaseLabel || null,
+          filesCount,
+          fileCount: filesCount,
+          episodeCount: Number(item.episodeCount) || 0,
+          publishedAt: item.publishedAt,
+          updatedAt: item.updatedAt
+        });
+      });
   }
 
   async findContentByTitle(title, { category = null, limit = 3 } = {}) {
@@ -1345,12 +1389,12 @@ export class MemoryCatalogRepository {
 
   async removeFileFromContentByAdminId(adminId, options = {}) {
     const item = await this.findContentByAdminId(adminId);
-    if (!item) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
+    if (!item) return { content: null, removed: null, removedFile: null, removedFiles: [], remainingCount: 0 };
     const saved = this.contents.get(item.slug);
-    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
-    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!saved) return { content: null, removed: null, removedFile: null, removedFiles: [], remainingCount: 0 };
+    const { removedFile, removedFiles, patch } = removeFileFromContentRecord(saved, options);
     if (!removedFile || !patch) {
-      return { content: clone(saved), removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+      return { content: clone(saved), removed: null, removedFile: null, removedFiles: [], remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
     }
     Object.assign(saved, patch);
     this.contents.set(saved.slug, saved);
@@ -1359,6 +1403,7 @@ export class MemoryCatalogRepository {
       content: clone(saved),
       removed: clonedRemoved,
       removedFile: clonedRemoved,
+      removedFiles: clone(removedFiles),
       remainingCount: Array.isArray(saved.files) ? saved.files.length : 0
     };
   }
@@ -2475,32 +2520,57 @@ export class MongoCatalogRepository {
   }
 
   async listAdminContent(options = {}) {
-    const { limit, startAt, endAt } = adminContentListOptions(options);
+    const { limit, startAt, endAt, category, query, sort } = adminContentListOptions(options);
     const filter = { published: { $ne: false } };
+    if (category) filter.category = category;
+    if (query) {
+      const expr = new RegExp(escapeRegex(query), 'i');
+      filter.$or = [
+        { title: expr },
+        { adminId: expr },
+        { slug: expr },
+        { searchText: expr }
+      ];
+    }
     if (startAt || endAt) {
       filter.publishedAt = {
         ...(startAt ? { $gte: startAt.toISOString() } : {}),
         ...(endAt ? { $lt: endAt.toISOString() } : {})
       };
     }
-    return this.contents
+    const sortSpec = sort === 'updated' ? { updatedAt: -1, publishedAt: -1 } : { publishedAt: -1 };
+    const rows = await this.contents
       .find(
         filter,
         {
           projection: {
             adminId: 1,
+            slug: 1,
             title: 1,
             category: 1,
+            year: 1,
+            releaseLabel: 1,
             filesCount: 1,
             episodeCount: 1,
             publishedAt: 1,
-            updatedAt: 1
+            updatedAt: 1,
+            'files.storageMessageId': 1
           }
         }
       )
-      .sort({ publishedAt: -1 })
+      .sort(sortSpec)
       .limit(limit)
       .toArray();
+    return rows.map((row) => {
+      const filesCount = Array.isArray(row.files) ? row.files.length : (Number(row.filesCount) || 0);
+      const { files: _files, ...rest } = row;
+      return {
+        ...rest,
+        filesCount,
+        fileCount: filesCount,
+        episodeCount: Number(row.episodeCount) || 0
+      };
+    });
   }
 
   async findContentByTitle(title, { category = null, limit = 3 } = {}) {
@@ -2594,10 +2664,10 @@ export class MongoCatalogRepository {
 
   async removeFileFromContentByAdminId(adminId, options = {}) {
     const saved = await this.findContentByAdminId(adminId);
-    if (!saved) return { content: null, removed: null, removedFile: null, remainingCount: 0 };
-    const { removedFile, patch } = removeFileFromContentRecord(saved, options);
+    if (!saved) return { content: null, removed: null, removedFile: null, removedFiles: [], remainingCount: 0 };
+    const { removedFile, removedFiles, patch } = removeFileFromContentRecord(saved, options);
     if (!removedFile || !patch) {
-      return { content: saved, removed: null, removedFile: null, remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
+      return { content: saved, removed: null, removedFile: null, removedFiles: [], remainingCount: Array.isArray(saved.files) ? saved.files.length : 0 };
     }
     const updated = await this.contents.findOneAndUpdate(
       { _id: saved._id },
@@ -2608,6 +2678,7 @@ export class MongoCatalogRepository {
       content: updated,
       removed: removedFile,
       removedFile,
+      removedFiles,
       remainingCount: Array.isArray(updated?.files) ? updated.files.length : 0
     };
   }

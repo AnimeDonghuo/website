@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { Markup, Telegraf } from 'telegraf';
 import { getContentPageUrl, getTelegramDeliveryUrl, isTelegramAdmin } from '../config.js';
 import { CATEGORY_IDS, categoryDetails, cleanMultilineText, cleanText, formatBytes, parseCommandArgument, parseMultilineCommandArgument, resolveCategoryId, slugify } from '../lib/strings.js';
-import { attributeUploadSeasons, cleanDeliveryFileName, cleanMediaName, hasEpisodeRange, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
+import { attributeUploadSeasons, cleanDeliveryFileName, cleanMediaName, compareQualityAscending, hasEpisodeRange, normalizeQualityLabel, publicFileDisplayName, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages, detectMediaQuality, detectUploadEpisode, detectUploadLanguages, detectUploadSubtitleLanguages, detectUploadSeason, formatSeasonLabel, groupFilesBySeason, needsMediaTrackInspection } from './episode-service.js';
 import { canonicalMetadataTitle, categoryFromHints, findMetadata, searchCategoryHints, searchPosterCandidates } from './metadata-service.js';
 import { reindexContentRecord } from '../catalog.repository.js';
 import {
@@ -7315,97 +7315,266 @@ export { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.j
 const REMOVE_FILE_POSTS_PAGE_SIZE = 8;
 const REMOVE_FILE_ITEMS_PAGE_SIZE = 8;
 
-export function formatRemoveFileButtonLabel(file, index = 0) {
-  const quality = cleanText(file?.quality || detectMediaQuality({
-    caption: file?.sourceLabel || file?.displayName,
-    filename: file?.name,
-    height: file?.height,
-    width: file?.width
-  }), 24);
-  const episodeLabel = cleanText(
-    file?.episodeLabel
-    || (Number.isInteger(Number(file?.episode?.start))
-      ? (Number.isInteger(Number(file?.seasonNumber))
-        ? `S${file.seasonNumber} E${file.episode.start}`
-        : `Episode ${file.episode.start}`)
-      : ''),
-    32
+const REMOVE_FILE_CATEGORY_FILTERS = [
+  { id: 'all', label: '🌟 All' },
+  { id: 'anime', label: '✦ Anime' },
+  { id: 'movie', label: '▶ Movie' },
+  { id: 'web-series', label: '▣ Series' },
+  { id: 'tv', label: '▤ TV/OTT' },
+  { id: 'cartoon', label: '☻ Cartoon' },
+  { id: 'donghua', label: '◇ Donghua' },
+  { id: 'kdrama', label: '♡ K-Drama' },
+  { id: 'adult', label: '🔞 18+' }
+];
+
+function isUsableRemoveFileLabel(value) {
+  const text = cleanText(value, 240);
+  return Boolean(text) && !/^(?:document|video|audio|animation|photo|file)-\d+$/i.test(text);
+}
+
+export function inspectPostFileForRemoval(file, index = 0, { attributedSeason = null, postTitle = '' } = {}) {
+  const caption = file?.sourceLabel || file?.displayName || '';
+  const filename = file?.name || '';
+  const rawQuality = cleanText(
+    file?.quality || detectMediaQuality({ caption, filename, height: file?.height, width: file?.width }),
+    24
   );
+  const normalizedQuality = rawQuality ? (normalizeQualityLabel(rawQuality) || rawQuality) : null;
+
+  const detectedSeasonObj = detectUploadSeason({ caption, filename });
+  const explicitSeasonNum = Number.isInteger(Number(file?.seasonNumber)) && Number(file.seasonNumber) >= 1
+    ? Number(file.seasonNumber)
+    : null;
+  const storedSeasonNum = Number.isInteger(Number(file?.season)) && Number(file.season) >= 1
+    ? Number(file.season)
+    : null;
+  const season = attributedSeason ?? storedSeasonNum ?? explicitSeasonNum ?? detectedSeasonObj?.season ?? null;
+
+  const detectedEp = detectUploadEpisode({ caption, filename });
+  const epStart = Number.isInteger(Number(file?.episode?.start)) && Number(file.episode.start) >= 1
+    ? Number(file.episode.start)
+    : (Number.isInteger(Number(detectedEp?.start)) && Number(detectedEp.start) >= 1 ? Number(detectedEp.start) : null);
+  const epEnd = Number.isInteger(Number(file?.episode?.end)) && Number(file.episode.end) >= (epStart || 1)
+    ? Number(file.episode.end)
+    : (epStart || null);
+  const pack = seasonPackOf(file);
+
+  let episodeDisplay = '';
+  if (file?.episodeLabel) {
+    episodeDisplay = explicitSeasonNum && !/^s\d+/i.test(String(file.episodeLabel))
+      ? `${file.episodeLabel} (S${explicitSeasonNum})`
+      : cleanText(file.episodeLabel, 36);
+  } else if (epStart !== null) {
+    const epRange = epEnd && epEnd > epStart
+      ? `${String(epStart).padStart(2, '0')}–${String(epEnd).padStart(2, '0')}`
+      : String(epStart).padStart(2, '0');
+    episodeDisplay = season
+      ? `S${String(season).padStart(2, '0')} E${epRange}`
+      : `Episode ${epRange}`;
+  } else if (pack?.season) {
+    episodeDisplay = `Season ${pack.season} Pack`;
+  } else if (season) {
+    episodeDisplay = `Season ${season}`;
+  }
+
+  const preferredRawName = isUsableRemoveFileLabel(file?.displayName)
+    ? file.displayName
+    : isUsableRemoveFileLabel(file?.sourceLabel)
+      ? file.sourceLabel
+      : isUsableRemoveFileLabel(file?.name)
+        ? file.name
+        : (postTitle || `File ${index + 1}`);
   const cleanedName = cleanText(
-    cleanDeliveryFileName(file?.displayName || file?.name || file?.sourceLabel || '')
-    || file?.displayName
-    || file?.name
+    cleanDeliveryFileName(preferredRawName)
+    || publicFileDisplayName(preferredRawName)
+    || preferredRawName
     || `File ${index + 1}`,
     48
   );
+  const fullReadableName = cleanText(
+    publicFileDisplayName(
+      isUsableRemoveFileLabel(file?.sourceLabel)
+        ? file.sourceLabel
+        : isUsableRemoveFileLabel(file?.name)
+          ? file.name
+          : (file?.displayName || postTitle || `File ${index + 1}`)
+    ),
+    160
+  );
+
+  const audioLanguages = Array.isArray(file?.audioLanguages) && file.audioLanguages.length
+    ? file.audioLanguages
+    : Array.isArray(file?.languages) && file.languages.length
+      ? file.languages
+      : detectUploadLanguages({ caption, filename });
+  const subtitleLanguages = Array.isArray(file?.subtitleLanguages) && file.subtitleLanguages.length
+    ? file.subtitleLanguages
+    : detectUploadSubtitleLanguages({ caption, filename });
+  const sizeBytes = Number(file?.size) || 0;
+  const sizeLabel = sizeBytes > 0 ? formatBytes(sizeBytes) : null;
+
+  return {
+    file,
+    index,
+    quality: rawQuality || null,
+    normalizedQuality,
+    season,
+    epStart,
+    epEnd,
+    episodeDisplay,
+    cleanedName,
+    fullReadableName,
+    audioLanguages,
+    subtitleLanguages,
+    sizeBytes,
+    sizeLabel
+  };
+}
+
+export function formatRemoveFileButtonLabel(file, index = 0, options = {}) {
+  const info = inspectPostFileForRemoval(file, index, options);
   const parts = [];
-  if (episodeLabel) {
-    parts.push(episodeLabel);
-    if (cleanedName && cleanedName.toLowerCase() !== episodeLabel.toLowerCase()) {
-      parts.push(cleanedName);
+  if (info.episodeDisplay) {
+    parts.push(info.episodeDisplay);
+    if (info.cleanedName && info.cleanedName.toLowerCase() !== info.episodeDisplay.toLowerCase()) {
+      parts.push(info.cleanedName);
     }
   } else {
-    parts.push(cleanedName || `File ${index + 1}`);
+    parts.push(info.cleanedName || `File ${index + 1}`);
   }
   const base = parts.join(' · ');
-  return telegramButtonText(quality ? `${base} [${quality}]` : base);
+  const badgeParts = [info.quality, info.sizeLabel].filter(Boolean);
+  const suffix = badgeParts.length ? ` [${badgeParts.join(' · ')}]` : '';
+  return telegramButtonText(`${base}${suffix}`);
 }
 
-async function listPostsForFileRemoval(repository, query = '') {
+async function listPostsForFileRemoval(repository, options = '') {
+  const opts = typeof options === 'string' ? { query: options } : (options || {});
+  const rawCategory = cleanText(opts.category, 32).toLowerCase();
+  const category = rawCategory && rawCategory !== 'all' && CATEGORY_IDS.has(rawCategory) ? rawCategory : null;
+  const query = cleanText(opts.query, 120);
+  const sort = opts.sort === 'updated' ? 'updated' : 'recent';
+
   let posts = [];
   if (typeof repository?.listRecentContentForAdmin === 'function') {
-    posts = await repository.listRecentContentForAdmin(100, { includeAdult: true });
+    posts = await repository.listRecentContentForAdmin(100, { includeAdult: true, category, query, sort });
   } else if (typeof repository?.listAdminContent === 'function') {
-    posts = await repository.listAdminContent({ limit: 100 });
+    posts = await repository.listAdminContent({ limit: 100, category, query, sort });
   }
-  const list = Array.isArray(posts) ? posts : [];
-  const trimmed = cleanText(query, 120).toLowerCase();
-  if (!trimmed) return list;
-  return list.filter((post) => {
-    const title = cleanText(post?.title, 180).toLowerCase();
-    const adminId = cleanText(post?.adminId, 40).toLowerCase();
-    const slug = cleanText(post?.slug, 180).toLowerCase();
-    return title.includes(trimmed) || adminId.includes(trimmed) || slug.includes(trimmed);
-  });
+  let list = Array.isArray(posts) ? posts : [];
+  if (category) {
+    list = list.filter((post) => post?.category === category);
+  }
+  if (query) {
+    const trimmed = query.toLowerCase();
+    list = list.filter((post) => {
+      const title = cleanText(post?.title, 180).toLowerCase();
+      const adminId = cleanText(post?.adminId, 40).toLowerCase();
+      const slug = cleanText(post?.slug, 180).toLowerCase();
+      return title.includes(trimmed) || adminId.includes(trimmed) || slug.includes(trimmed);
+    });
+  }
+  if (sort === 'updated') {
+    list = [...list].sort((a, b) => new Date(b?.updatedAt || b?.publishedAt || 0) - new Date(a?.updatedAt || a?.publishedAt || 0));
+  }
+  return list;
 }
 
-async function renderRemoveFilePostsPicker(ctx, repository, { page = 0, query = '', edit = false } = {}) {
-  const posts = await listPostsForFileRemoval(repository, query);
+function buildRemoveFileCategoryFilterRows(activeCategory = 'all', sort = 'recent') {
+  const cat = activeCategory && CATEGORY_IDS.has(activeCategory) ? activeCategory : 'all';
+  const sortCode = sort === 'updated' ? 'u' : 'r';
+  const rows = [];
+  for (let i = 0; i < REMOVE_FILE_CATEGORY_FILTERS.length; i += 3) {
+    const chunk = REMOVE_FILE_CATEGORY_FILTERS.slice(i, i + 3);
+    rows.push(chunk.map((item) => {
+      const active = item.id === cat;
+      return Markup.button.callback(
+        `${active ? '✓ ' : ''}${item.label}`,
+        `rmfile:cat:${item.id}:${sortCode}:0`
+      );
+    }));
+  }
+  rows.push([
+    Markup.button.callback(
+      `${sortCode === 'r' ? '✓ ' : ''}🕒 Recent Added`,
+      `rmfile:cat:${cat}:r:0`
+    ),
+    Markup.button.callback(
+      `${sortCode === 'u' ? '✓ ' : ''}🔄 Recently Updated`,
+      `rmfile:cat:${cat}:u:0`
+    )
+  ]);
+  return rows;
+}
+
+async function renderRemoveFilePostsPicker(ctx, repository, { page = 0, query = '', category = 'all', sort = 'recent', edit = false } = {}) {
+  const normalizedCategory = category && CATEGORY_IDS.has(category) ? category : 'all';
+  const sortMode = sort === 'updated' ? 'updated' : 'recent';
+  const sortCode = sortMode === 'updated' ? 'u' : 'r';
+  const posts = await listPostsForFileRemoval(repository, { category: normalizedCategory, query, sort: sortMode });
   if (!posts.length) {
+    const catLabel = normalizedCategory === 'all' ? 'any category' : categoryDetails(normalizedCategory).label;
     const text = query
-      ? `No published posts matched "${cleanText(query, 80)}". Try /removefile with a Post ID (e.g. /removefile SB-0123ABCDEF) or /removefile with no arguments to browse recent posts.`
-      : 'No published posts were found in the catalog.';
-    if (edit) await replaceInteractiveMessage(ctx, text);
-    else await ctx.reply(text);
-    return { handled: true, mode: 'empty-posts' };
+      ? `No published posts matched "${cleanText(query, 80)}" in ${catLabel}. Try /removefile with a Post ID (e.g. /removefile SB-0123ABCDEF) or choose another category below.`
+      : `No published posts were found in ${catLabel}. Choose another category below:`;
+    const keyboard = Markup.inlineKeyboard(buildRemoveFileCategoryFilterRows(normalizedCategory, sortMode));
+    if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
+    else await ctx.reply(text, keyboard);
+    return { handled: true, mode: 'empty-posts', category: normalizedCategory };
   }
   const totalPages = Math.max(1, Math.ceil(posts.length / REMOVE_FILE_POSTS_PAGE_SIZE));
   const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
   const slice = posts.slice(clampedPage * REMOVE_FILE_POSTS_PAGE_SIZE, (clampedPage + 1) * REMOVE_FILE_POSTS_PAGE_SIZE);
   const rows = slice.map((post) => {
-    const fileCount = Array.isArray(post?.files) ? post.files.length : (Number(post?.fileCount) || 0);
-    const label = telegramButtonText(`🎬 ${cleanText(post.title, 30)} (${post.adminId} · ${fileCount} file${fileCount === 1 ? '' : 's'})`);
+    const fileCount = Array.isArray(post?.files)
+      ? post.files.length
+      : (Number(post?.filesCount) || Number(post?.fileCount) || 0);
+    const epCount = Number(post?.episodeCount) || 0;
+    const catShort = categoryDetails(post?.category).shortLabel || post?.category || 'Post';
+    const countSummary = epCount > 0 && epCount !== fileCount
+      ? `${fileCount} file${fileCount === 1 ? '' : 's'} · ${epCount} ep${epCount === 1 ? '' : 's'}`
+      : `${fileCount} file${fileCount === 1 ? '' : 's'}`;
+    const label = telegramButtonText(
+      `🎬 ${cleanText(post.title, 22)} (${catShort} · ${countSummary} · ${post.adminId})`,
+      64
+    );
     return [Markup.button.callback(label, `rmfile:post:${post.adminId}:0`)];
   });
   if (totalPages > 1) {
     const nav = [];
-    if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:posts:${clampedPage - 1}`));
+    if (clampedPage > 0) {
+      nav.push(Markup.button.callback('⬅️ Prev', normalizedCategory === 'all' && sortCode === 'r' ? `rmfile:posts:${clampedPage - 1}` : `rmfile:cat:${normalizedCategory}:${sortCode}:${clampedPage - 1}`));
+    }
     nav.push(Markup.button.callback(`Page ${clampedPage + 1}/${totalPages}`, 'rmfile:noop'));
-    if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:posts:${clampedPage + 1}`));
+    if (clampedPage < totalPages - 1) {
+      nav.push(Markup.button.callback('Next ➡️', normalizedCategory === 'all' && sortCode === 'r' ? `rmfile:posts:${clampedPage + 1}` : `rmfile:cat:${normalizedCategory}:${sortCode}:${clampedPage + 1}`));
+    }
     rows.push(nav);
   }
+  rows.push(...buildRemoveFileCategoryFilterRows(normalizedCategory, sortMode));
+
+  const catHeading = normalizedCategory === 'all' ? 'All Categories' : categoryDetails(normalizedCategory).label;
+  const sortHeading = sortMode === 'updated' ? 'Recently Updated' : 'Recently Published';
   const text = [
     'Select a post below to inspect or remove its episodes, movie files, or series files:',
-    query ? `Filter: "${cleanText(query, 60)}" (${posts.length} matching post${posts.length === 1 ? '' : 's'})` : `Showing ${slice.length} of ${posts.length} recent post${posts.length === 1 ? '' : 's'}.`,
-    'You can also jump directly with: /removefile SB-0123ABCDEF'
+    `▸ Category: ${catHeading} · Sort: ${sortHeading}`,
+    query
+      ? `▸ Filter: "${cleanText(query, 60)}" (${posts.length} matching post${posts.length === 1 ? '' : 's'})`
+      : `▸ Showing ${slice.length} of ${posts.length} post${posts.length === 1 ? '' : 's'} (Page ${clampedPage + 1}/${totalPages}).`,
+    'Tip: Tap any category button below to filter category-wise, or send /removefile <category|title|SB-ID>.'
   ].join('\n');
   const keyboard = Markup.inlineKeyboard(rows);
   if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
   else await ctx.reply(text, keyboard);
-  return { handled: true, mode: 'posts', page: clampedPage, total: posts.length };
+  return { handled: true, mode: 'posts', page: clampedPage, total: posts.length, category: normalizedCategory, sort: sortMode };
 }
 
-export async function renderRemoveFileListForPost(ctx, repository, adminId, { page = 0, edit = false, notice = null } = {}) {
+export async function renderRemoveFileListForPost(
+  ctx,
+  repository,
+  adminId,
+  { page = 0, edit = false, notice = null, filterQuality = null, filterSeason = null } = {}
+) {
   const content = await repository.findContentByAdminId?.(adminId);
   if (!content) {
     const text = `No published catalog post was found for ${adminId}. Use /removefile to choose from recent posts.`;
@@ -7429,17 +7598,41 @@ export async function renderRemoveFileListForPost(ctx, repository, adminId, { pa
     else await ctx.reply(text, keyboard);
     return { handled: true, mode: 'empty-files', content };
   }
-  const totalPages = Math.max(1, Math.ceil(files.length / REMOVE_FILE_ITEMS_PAGE_SIZE));
+
+  const attributedSeasons = attributeUploadSeasons(files).entries.map((entry) => entry.season ?? null);
+  const inspectedAll = files.map((file, idx) => inspectPostFileForRemoval(file, idx, {
+    attributedSeason: attributedSeasons[idx],
+    postTitle: content.title
+  }));
+
+  const availableQualities = [...new Set(inspectedAll.map((item) => item.normalizedQuality).filter(Boolean))].sort(compareQualityAscending);
+  const availableSeasons = [...new Set(inspectedAll.map((item) => item.season).filter((s) => Number.isInteger(s) && s >= 1))].sort((a, b) => a - b);
+
+  let filtered = inspectedAll;
+  if (filterQuality) {
+    filtered = filtered.filter((item) => String(item.normalizedQuality || '').toUpperCase() === String(filterQuality).toUpperCase());
+  }
+  if (filterSeason !== null && filterSeason !== undefined && Number.isInteger(Number(filterSeason))) {
+    filtered = filtered.filter((item) => item.season === Number(filterSeason));
+  }
+  if (!filtered.length) {
+    filtered = inspectedAll;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / REMOVE_FILE_ITEMS_PAGE_SIZE));
   const clampedPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
   const startIdx = clampedPage * REMOVE_FILE_ITEMS_PAGE_SIZE;
-  const slice = files.slice(startIdx, startIdx + REMOVE_FILE_ITEMS_PAGE_SIZE);
-  const rows = slice.map((file, offset) => {
-    const fileIndex = startIdx + offset;
-    return [Markup.button.callback(
-      formatRemoveFileButtonLabel(file, fileIndex),
-      `rmfile:pick:${content.adminId}:${fileIndex}:${clampedPage}`
-    )];
-  });
+  const slice = filtered.slice(startIdx, startIdx + REMOVE_FILE_ITEMS_PAGE_SIZE);
+  const rows = slice.map((item) => [
+    Markup.button.callback(
+      formatRemoveFileButtonLabel(item.file, item.index, {
+        attributedSeason: item.season,
+        postTitle: content.title
+      }),
+      `rmfile:pick:${content.adminId}:${item.index}:${clampedPage}`
+    )
+  ]);
+
   if (totalPages > 1) {
     const nav = [];
     if (clampedPage > 0) nav.push(Markup.button.callback('⬅️ Prev', `rmfile:post:${content.adminId}:${clampedPage - 1}`));
@@ -7447,11 +7640,56 @@ export async function renderRemoveFileListForPost(ctx, repository, adminId, { pa
     if (clampedPage < totalPages - 1) nav.push(Markup.button.callback('Next ➡️', `rmfile:post:${content.adminId}:${clampedPage + 1}`));
     rows.push(nav);
   }
-  rows.push([Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0')]);
+
+  // Quality filter / bulk remove chips when multiple qualities exist
+  if (availableQualities.length > 1) {
+    const qButtons = availableQualities.slice(0, 4).map((q) => Markup.button.callback(
+      `${filterQuality === q ? '✓ ' : ''}🔎 ${q}`,
+      filterQuality === q ? `rmfile:post:${content.adminId}:0` : `rmfile:fq:${content.adminId}:${q}`
+    ));
+    rows.push(qButtons);
+  }
+
+  // Season filter chips when multiple seasons exist
+  if (availableSeasons.length > 1) {
+    const sButtons = availableSeasons.slice(0, 4).map((s) => Markup.button.callback(
+      `${Number(filterSeason) === s ? '✓ ' : ''}📁 S${s}`,
+      Number(filterSeason) === s ? `rmfile:post:${content.adminId}:0` : `rmfile:fs:${content.adminId}:${s}`
+    ));
+    rows.push(sButtons);
+  }
+
+  // Bulk remove row (by quality / season) + delete entire post
+  const bulkRow = [];
+  if (availableQualities.length > 1) {
+    bulkRow.push(Markup.button.callback('🧹 Remove a Quality', `rmfile:bulkqmenu:${content.adminId}`));
+  }
+  if (availableSeasons.length > 1) {
+    bulkRow.push(Markup.button.callback('🧹 Remove a Season', `rmfile:bulksmenu:${content.adminId}`));
+  }
+  if (bulkRow.length) rows.push(bulkRow);
+
+  rows.push([
+    Markup.button.callback('⬅️ Choose another post', 'rmfile:posts:0'),
+    Markup.button.callback('🗑 Delete whole post', `rmfile:delpostask:${content.adminId}`)
+  ]);
+
+  const catLabel = categoryDetails(content.category).label;
+  const audioList = Array.isArray(content.languages) && content.languages.length ? content.languages.join(', ') : 'Auto/Default';
+  const qualitySummary = availableQualities.length ? availableQualities.join(', ') : 'Standard';
+  const activeFilterLine = filterQuality
+    ? `▪ Active Filter: Quality ${filterQuality} (${filtered.length} of ${files.length} files)`
+    : filterSeason
+      ? `▪ Active Filter: Season ${filterSeason} (${filtered.length} of ${files.length} files)`
+      : null;
+
   const text = [
     notice,
     `▸ ${content.adminId} · ${content.title} (${files.length} file${files.length === 1 ? '' : 's'})`,
-    'Tap any episode, movie file, or series file below to remove it:'
+    `▪ Category: ${catLabel}${content.year ? ` (${content.year})` : ''} · Episodes: ${Number(content.episodeCount) || 0}`,
+    `▪ Qualities: ${qualitySummary} · Audio: ${audioList}`,
+    activeFilterLine,
+    'Tap any episode, movie file, or series file below to inspect or remove it:'
   ].filter(Boolean).join('\n\n');
   const keyboard = Markup.inlineKeyboard(rows);
   if (edit) await replaceInteractiveMessage(ctx, text, keyboard);
@@ -7467,13 +7705,31 @@ export async function handleRemoveFileCommand(ctx, repository, config) {
     return renderRemoveFileListForPost(ctx, repository, explicitIds[0], { page: 0, edit: false });
   }
   if (argument) {
-    const matched = await listPostsForFileRemoval(repository, argument);
+    const lowerArg = argument.toLowerCase();
+    if (lowerArg === 'updated' || lowerArg === 'recent') {
+      return renderRemoveFilePostsPicker(ctx, repository, {
+        page: 0,
+        category: 'all',
+        sort: lowerArg === 'updated' ? 'updated' : 'recent',
+        edit: false
+      });
+    }
+    const resolvedCategory = resolveCategoryId(argument);
+    if (resolvedCategory) {
+      return renderRemoveFilePostsPicker(ctx, repository, {
+        page: 0,
+        category: resolvedCategory,
+        sort: 'recent',
+        edit: false
+      });
+    }
+    const matched = await listPostsForFileRemoval(repository, { query: argument });
     if (matched.length === 1) {
       return renderRemoveFileListForPost(ctx, repository, matched[0].adminId, { page: 0, edit: false });
     }
     return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: argument, edit: false });
   }
-  return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: '', edit: false });
+  return renderRemoveFilePostsPicker(ctx, repository, { page: 0, query: '', category: 'all', sort: 'recent', edit: false });
 }
 
 export async function handleRemoveFileAction(ctx, repository, config, actionData = '') {
@@ -7493,10 +7749,197 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
     return true;
   }
 
+  const catPageMatch = key.match(/^rmfile:cat:([a-z0-9-]+):(r|u):(\d{1,3})$/i);
+  if (catPageMatch) {
+    const category = catPageMatch[1].toLowerCase();
+    const sort = catPageMatch[2].toLowerCase() === 'u' ? 'updated' : 'recent';
+    const page = Number(catPageMatch[3]) || 0;
+    await acknowledgeTap(ctx, category === 'all' ? 'All Categories' : categoryDetails(category).label);
+    await renderRemoveFilePostsPicker(ctx, repository, { page, category, sort, edit: true });
+    return true;
+  }
+
   const postMatch = key.match(/^rmfile:post:(SB-[A-F0-9]{10}):(\d{1,3})$/i);
   if (postMatch) {
     await acknowledgeTap(ctx);
     await renderRemoveFileListForPost(ctx, repository, postMatch[1].toUpperCase(), { page: Number(postMatch[2]), edit: true });
+    return true;
+  }
+
+  const filterQualityMatch = key.match(/^rmfile:fq:(SB-[A-F0-9]{10}):([A-Za-z0-9]+)$/i);
+  if (filterQualityMatch) {
+    const adminId = filterQualityMatch[1].toUpperCase();
+    const filterQuality = filterQualityMatch[2].toUpperCase();
+    await acknowledgeTap(ctx, `Filtered: ${filterQuality}`);
+    await renderRemoveFileListForPost(ctx, repository, adminId, { page: 0, edit: true, filterQuality });
+    return true;
+  }
+
+  const filterSeasonMatch = key.match(/^rmfile:fs:(SB-[A-F0-9]{10}):(\d{1,2})$/i);
+  if (filterSeasonMatch) {
+    const adminId = filterSeasonMatch[1].toUpperCase();
+    const filterSeason = Number(filterSeasonMatch[2]);
+    await acknowledgeTap(ctx, `Filtered: Season ${filterSeason}`);
+    await renderRemoveFileListForPost(ctx, repository, adminId, { page: 0, edit: true, filterSeason });
+    return true;
+  }
+
+  const bulkQualityMenuMatch = key.match(/^rmfile:bulkqmenu:(SB-[A-F0-9]{10})$/i);
+  if (bulkQualityMenuMatch) {
+    const adminId = bulkQualityMenuMatch[1].toUpperCase();
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    if (!content || !files.length) {
+      await acknowledgeTap(ctx, 'No files found.', { alert: true });
+      return true;
+    }
+    const attributedSeasons = attributeUploadSeasons(files).entries.map((e) => e.season ?? null);
+    const inspected = files.map((f, i) => inspectPostFileForRemoval(f, i, { attributedSeason: attributedSeasons[i], postTitle: content.title }));
+    const countsByQuality = new Map();
+    for (const item of inspected) {
+      if (!item.normalizedQuality) continue;
+      countsByQuality.set(item.normalizedQuality, (countsByQuality.get(item.normalizedQuality) || 0) + 1);
+    }
+    const qRows = [...countsByQuality.entries()].map(([q, count]) => [
+      Markup.button.callback(`🗑 Remove all ${q} (${count} file${count === 1 ? '' : 's'})`, `rmfile:bulkqdo:${adminId}:${q}`)
+    ]);
+    qRows.push([Markup.button.callback('⬅️ Go back', `rmfile:post:${adminId}:0`)]);
+    await acknowledgeTap(ctx);
+    await replaceInteractiveMessage(
+      ctx,
+      `Choose a quality to remove from ${content.adminId} · ${content.title}:\nAll files with that quality will be removed at once.`,
+      Markup.inlineKeyboard(qRows)
+    );
+    return true;
+  }
+
+  const bulkQualityDoMatch = key.match(/^rmfile:bulkqdo:(SB-[A-F0-9]{10}):([A-Za-z0-9]+)$/i);
+  if (bulkQualityDoMatch) {
+    const adminId = bulkQualityDoMatch[1].toUpperCase();
+    const targetQuality = bulkQualityDoMatch[2].toUpperCase();
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    if (!content || !files.length) {
+      await acknowledgeTap(ctx, 'No files found.', { alert: true });
+      return true;
+    }
+    const indexes = files
+      .map((f, i) => ({ i, q: inspectPostFileForRemoval(f, i, { postTitle: content.title }).normalizedQuality }))
+      .filter((item) => item.q === targetQuality)
+      .map((item) => item.i);
+    if (!indexes.length) {
+      await acknowledgeTap(ctx, `No ${targetQuality} files left.`, { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page: 0, edit: true });
+      return true;
+    }
+    const outcome = await repository.removeFileFromContentByAdminId(adminId, { fileIndexes: indexes });
+    await acknowledgeTap(ctx, `Removed ${indexes.length} ${targetQuality} file(s)`);
+    if (outcome?.content && outcome.remainingCount > 0) {
+      queueAnnouncementSync({
+        telegram: ctx.telegram,
+        repository,
+        content: outcome.content,
+        config,
+        adminId: outcome.content.adminId,
+        notifyChatId: chatId(ctx)
+      }, { detached: true });
+    }
+    await renderRemoveFileListForPost(ctx, repository, adminId, {
+      page: 0,
+      edit: true,
+      notice: `✓ Removed ${indexes.length} ${targetQuality} file${indexes.length === 1 ? '' : 's'} from ${adminId} (${outcome?.remainingCount || 0} remaining).`
+    });
+    return true;
+  }
+
+  const bulkSeasonMenuMatch = key.match(/^rmfile:bulksmenu:(SB-[A-F0-9]{10})$/i);
+  if (bulkSeasonMenuMatch) {
+    const adminId = bulkSeasonMenuMatch[1].toUpperCase();
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    if (!content || !files.length) {
+      await acknowledgeTap(ctx, 'No files found.', { alert: true });
+      return true;
+    }
+    const attributedSeasons = attributeUploadSeasons(files).entries.map((e) => e.season ?? null);
+    const inspected = files.map((f, i) => inspectPostFileForRemoval(f, i, { attributedSeason: attributedSeasons[i], postTitle: content.title }));
+    const countsBySeason = new Map();
+    for (const item of inspected) {
+      if (!Number.isInteger(item.season)) continue;
+      countsBySeason.set(item.season, (countsBySeason.get(item.season) || 0) + 1);
+    }
+    const sRows = [...countsBySeason.entries()].map(([s, count]) => [
+      Markup.button.callback(`🗑 Remove Season ${s} (${count} file${count === 1 ? '' : 's'})`, `rmfile:bulksdo:${adminId}:${s}`)
+    ]);
+    sRows.push([Markup.button.callback('⬅️ Go back', `rmfile:post:${adminId}:0`)]);
+    await acknowledgeTap(ctx);
+    await replaceInteractiveMessage(
+      ctx,
+      `Choose a season to remove from ${content.adminId} · ${content.title}:`,
+      Markup.inlineKeyboard(sRows)
+    );
+    return true;
+  }
+
+  const bulkSeasonDoMatch = key.match(/^rmfile:bulksdo:(SB-[A-F0-9]{10}):(\d{1,2})$/i);
+  if (bulkSeasonDoMatch) {
+    const adminId = bulkSeasonDoMatch[1].toUpperCase();
+    const targetSeason = Number(bulkSeasonDoMatch[2]);
+    const content = await repository.findContentByAdminId?.(adminId);
+    const files = Array.isArray(content?.files) ? content.files : [];
+    if (!content || !files.length) {
+      await acknowledgeTap(ctx, 'No files found.', { alert: true });
+      return true;
+    }
+    const attributedSeasons = attributeUploadSeasons(files).entries.map((e) => e.season ?? null);
+    const indexes = files
+      .map((f, i) => ({ i, s: inspectPostFileForRemoval(f, i, { attributedSeason: attributedSeasons[i], postTitle: content.title }).season }))
+      .filter((item) => item.s === targetSeason)
+      .map((item) => item.i);
+    if (!indexes.length) {
+      await acknowledgeTap(ctx, `No Season ${targetSeason} files left.`, { alert: true });
+      await renderRemoveFileListForPost(ctx, repository, adminId, { page: 0, edit: true });
+      return true;
+    }
+    const outcome = await repository.removeFileFromContentByAdminId(adminId, { fileIndexes: indexes });
+    await acknowledgeTap(ctx, `Removed Season ${targetSeason} (${indexes.length} files)`);
+    if (outcome?.content && outcome.remainingCount > 0) {
+      queueAnnouncementSync({
+        telegram: ctx.telegram,
+        repository,
+        content: outcome.content,
+        config,
+        adminId: outcome.content.adminId,
+        notifyChatId: chatId(ctx)
+      }, { detached: true });
+    }
+    await renderRemoveFileListForPost(ctx, repository, adminId, {
+      page: 0,
+      edit: true,
+      notice: `✓ Removed Season ${targetSeason} (${indexes.length} file${indexes.length === 1 ? '' : 's'}) from ${adminId} (${outcome?.remainingCount || 0} remaining).`
+    });
+    return true;
+  }
+
+  const previewMatch = key.match(/^rmfile:preview:(SB-[A-F0-9]{10}):(\d{1,4}):(\d{1,3})$/i);
+  if (previewMatch) {
+    const adminId = previewMatch[1].toUpperCase();
+    const fileIndex = Number(previewMatch[2]);
+    const content = await repository.findContentByAdminId?.(adminId);
+    const file = Array.isArray(content?.files) ? content.files[fileIndex] : null;
+    if (!content || !file) {
+      await acknowledgeTap(ctx, 'That file is no longer in this post.', { alert: true });
+      return true;
+    }
+    const channelId = file.storageChannelId || storageChannelForCategory(config, content.category);
+    if (channelId && file.storageMessageId && typeof ctx.telegram?.copyMessage === 'function') {
+      try {
+        await ctx.telegram.copyMessage(chatId(ctx), channelId, Number(file.storageMessageId));
+        await acknowledgeTap(ctx, 'Sent file preview to chat');
+        return true;
+      } catch {}
+    }
+    await acknowledgeTap(ctx, 'Could not copy preview from storage channel.', { alert: true });
     return true;
   }
 
@@ -7514,22 +7957,26 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
       return true;
     }
     await acknowledgeTap(ctx);
-    const label = formatRemoveFileButtonLabel(file, fileIndex);
-    const quality = cleanText(file.quality || detectMediaQuality({
-      caption: file.sourceLabel || file.displayName,
-      filename: file.name,
-      height: file.height,
-      width: file.width
-    }), 24);
-    const audio = (Array.isArray(file.audioLanguages) && file.audioLanguages.length ? file.audioLanguages : (file.languages || [])).join(', ');
+    const attributedSeasons = attributeUploadSeasons(files).entries.map((entry) => entry.season ?? null);
+    const info = inspectPostFileForRemoval(file, fileIndex, {
+      attributedSeason: attributedSeasons[fileIndex],
+      postTitle: content.title
+    });
+    const label = formatRemoveFileButtonLabel(file, fileIndex, {
+      attributedSeason: info.season,
+      postTitle: content.title
+    });
     const text = [
       `Selected file in ${content.adminId} · ${content.title}:`,
-      `▪ Name: ${label}`,
-      file.name ? `▪ Filename: ${cleanText(file.name, 120)}` : null,
-      file.episodeLabel ? `▪ Episode: ${file.episodeLabel}` : null,
-      quality ? `▪ Quality: ${quality}` : null,
-      audio ? `▪ Audio: ${audio}` : null,
-      file.storageMessageId ? `▪ Storage ID: ${file.storageMessageId}` : null,
+      `▪ Label: ${label}`,
+      info.fullReadableName ? `▪ Full Caption/Name: ${info.fullReadableName}` : null,
+      file.name ? `▪ Raw Filename: ${cleanText(file.name, 120)}` : null,
+      info.episodeDisplay ? `▪ Episode / Season: ${info.episodeDisplay}` : null,
+      info.quality ? `▪ Quality: ${info.quality}` : null,
+      info.sizeLabel ? `▪ File Size: ${info.sizeLabel}` : null,
+      info.audioLanguages?.length ? `▪ Audio: ${info.audioLanguages.join(', ')}` : null,
+      info.subtitleLanguages?.length ? `▪ Subtitles: ${info.subtitleLanguages.join(', ')}` : null,
+      file.storageMessageId ? `▪ Storage Message ID: ${file.storageMessageId}` : null,
       '',
       'Would you like to remove this file from the post, or go back?'
     ].filter(Boolean).join('\n');
@@ -7538,6 +7985,9 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
       [
         Markup.button.callback('⬅️ Go back', `rmfile:post:${content.adminId}:${page}`),
         Markup.button.callback('🗑 Remove', `rmfile:do:${content.adminId}:${fileIndex}:${msgToken}:${page}`)
+      ],
+      [
+        Markup.button.callback('👁 Send File to Check', `rmfile:preview:${content.adminId}:${fileIndex}:${page}`)
       ]
     ]);
     await replaceInteractiveMessage(ctx, text, keyboard);
@@ -7558,12 +8008,13 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
       fileIndex,
       storageMessageId: storageToken === 'idx' ? null : storageToken
     });
-    if (!outcome || !outcome.removed) {
+    const removedFile = outcome?.removed || outcome?.removedFile;
+    if (!outcome || !removedFile) {
       await acknowledgeTap(ctx, 'That file was already removed.', { alert: true });
       await renderRemoveFileListForPost(ctx, repository, adminId, { page, edit: true, notice: '⚠ That file was already removed.' });
       return true;
     }
-    const removedLabel = formatRemoveFileButtonLabel(outcome.removed, fileIndex);
+    const removedLabel = formatRemoveFileButtonLabel(removedFile, fileIndex);
     await acknowledgeTap(ctx, `Removed ${removedLabel}`);
     if (outcome.content && outcome.remainingCount > 0) {
       queueAnnouncementSync({
@@ -7580,6 +8031,30 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
       edit: true,
       notice: `✓ Removed "${removedLabel}" from ${adminId} (${outcome.remainingCount} file${outcome.remainingCount === 1 ? '' : 's'} remaining).`
     });
+    return true;
+  }
+
+  const delPostAskMatch = key.match(/^rmfile:delpostask:(SB-[A-F0-9]{10})$/i);
+  if (delPostAskMatch) {
+    const adminId = delPostAskMatch[1].toUpperCase();
+    const content = await repository.findContentByAdminId?.(adminId);
+    if (!content) {
+      await acknowledgeTap(ctx, `${adminId} was already deleted.`, { alert: true });
+      await renderRemoveFilePostsPicker(ctx, repository, { page: 0, edit: true });
+      return true;
+    }
+    await acknowledgeTap(ctx);
+    const fileCount = Array.isArray(content.files) ? content.files.length : (Number(content.filesCount) || 0);
+    await replaceInteractiveMessage(
+      ctx,
+      `⚠️ Are you sure you want to delete the ENTIRE post ${content.adminId} · ${content.title} (${fileCount} file${fileCount === 1 ? '' : 's'}) and its channel announcements?`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('⬅️ Go back', `rmfile:post:${adminId}:0`),
+          Markup.button.callback(`🗑 Confirm Delete ${adminId}`, `rmfile:delpost:${adminId}`)
+        ]
+      ])
+    );
     return true;
   }
 
@@ -7715,16 +8190,16 @@ export const HELP_TOPICS = {
       'What this is for: Removing an unwanted episode, movie quality, or series file from a post without deleting the whole post, combining duplicate posts, or deleting posts.',
       '',
       'Commands (What each is for):',
-      '• /removefile [SB-ID or search text] (aliases: /rmfile, /delfile, /deletefile, /files) — Interactive button menu to pick a post and remove a specific episode, movie file, or series file.',
+      '• /removefile [category | SB-ID | search text] (aliases: /rmfile, /delfile, /deletefile, /files) — Interactive category-wise & recent post browser to inspect and remove specific episodes, movie files, or series files.',
       '• /merge <Exact Title> <Target SB-ID> <Source SB-ID> [More SB-IDs...] — Combines multiple posts into the target post (moves all files & players, rebuilds seasons, deletes absorbed posts).',
       '• /merge drop <SB-ID> season <N> (or ep <N>, or season <N> ep <A-B>) — Removes a whole season block or episode range from a post by command.',
       '• /delete <SB-ID[, SB-ID2...]> — Permanently deletes entire catalog post(s) and their channel announcements.',
       '',
       'How /removefile works step-by-step:',
-      '1. Send /removefile (to browse recent posts as buttons), /removefile <title> (to filter posts), or /removefile SB-0123ABCDEF (to open that post directly).',
-      '2. Tap the post button to view buttons for every episode, movie file, or series file inside it (with episode number, name, and quality like [144P], [544P], [720P], [1080P]).',
-      '3. Tap the file/episode you want to remove — the bot shows the file details with two buttons: "⬅️ Go back" and "🗑 Remove".',
-      '4. Tap "🗑 Remove" to delete only that file/episode. The post’s episode counts, player qualities, audio/sub languages, and Telegram announcement post update automatically!'
+      '1. Send /removefile to browse recent posts across all categories, or tap any Category button (✦ Anime, ▶ Movie, ▣ Series, ▤ TV/OTT, ☻ Cartoon, ◇ Donghua, ♡ K-Drama, 🔞 18+) or Sort button (🕒 Recent Added / 🔄 Recently Updated). You can also send /removefile anime or /removefile SB-0123ABCDEF directly.',
+      '2. Tap a post button to view accurate buttons for every episode, movie file, or series file inside it (showing Season/Episode, real caption/filename, quality like [144P], [544P], [720P], [1080P], and file size).',
+      '3. Inside a post with multiple qualities or seasons, you can filter files by Quality (🔎 720P) or Season (📁 S1), or use "🧹 Remove a Quality" / "🧹 Remove a Season" for bulk cleanup.',
+      '4. Tap any file/episode button to view full file details with "⬅️ Go back", "🗑 Remove", and "👁 Send File to Check" (which sends the video from storage to your chat so you can verify it before deleting!).'
     ].join('\n')
   },
   players: {

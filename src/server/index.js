@@ -271,6 +271,16 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
   const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
   const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode, content) : [];
   const effectiveStream = mergeContentStreamWithTelegramFiles(content.stream, content, config);
+  const publicStream = publicStreamingData(effectiveStream, config.streaming || {});
+  // Listing endpoints (includeFileChoices === false) expose only availability/count,
+  // never the full player entry list or internal Telegram stream links in bulk.
+  const stream = includeFileChoices
+    ? publicStream
+    : {
+      available: Boolean(publicStream?.available),
+      count: Number(publicStream?.count) || 0,
+      entries: []
+    };
 
   return {
     id: String(content._id || content.id || content.slug),
@@ -291,9 +301,7 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
     backdropUrl: content.backdropUrl || content.posterUrl || null,
     filesCount: Number(content.filesCount) || 0,
     fileChoices,
-    // This contains only previously validated provider URLs. It deliberately
-    // has no upload token, dashboard URL, or private storage data.
-    stream: publicStreamingData(effectiveStream, config.streaming || {}),
+    stream,
     episodeGroups: publicEpisodeGroups(content.episodeGroups),
     episodeCount: Math.max(0, Number(content.episodeCount) || 0),
     featured: Boolean(content.featured),
@@ -307,6 +315,83 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
 function apiError(res, status, message) {
   res.status(status).json({ error: message });
 }
+
+function scalarQueryParam(value) {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return String(value);
+  return '';
+}
+
+const BLOCKED_SCRAPER_UA_REGEX = /\b(?:curl|wget|python-requests|python-urllib|python-httpx|aiohttp|scrapy|beautifulsoup|mechanize|go-http-client|apache-httpclient|okhttp|libwww-perl|lwp-trivial|pycurl|postmanruntime|insomnia|httrack|webcopier|teleport|sitesucker|cyotek|wfuzz|ffuf|gobuster|dirbuster|feroxbuster|sqlmap|nikto|nuclei|nmap|masscan|zgrab|censys|shodan|headlesschrome|phantomjs|selenium|webdriver|puppeteer|playwright|cypress|gptbot|ccbot|claudebot|anthropic-ai|bytespider|petalbot|semrushbot|ahrefsbot|mj12bot|dotbot|blexbot|dataforseobot|megaindex|sogou|yandexbot)\b/i;
+
+export function isBlockedScraperRequest(request) {
+  const ua = String(request.headers?.['user-agent'] || '').trim();
+  const secChUa = String(request.headers?.['sec-ch-ua'] || '').trim();
+  if (BLOCKED_SCRAPER_UA_REGEX.test(ua)) return true;
+  if (/headlesschrome|phantomjs|puppeteer|playwright/i.test(secChUa)) return true;
+  return false;
+}
+
+export function verifySameSiteApiRequest(request, config = {}) {
+  const secFetchSite = String(request.headers?.['sec-fetch-site'] || '').trim().toLowerCase();
+  if (secFetchSite === 'cross-site') {
+    return { allowed: false, error: 'Cross-site API scraping is not permitted.' };
+  }
+  const originHeader = String(request.headers?.origin || '').trim();
+  if (originHeader) {
+    try {
+      const originHost = new URL(originHeader).host.toLowerCase();
+      const requestHost = String(request.headers?.['x-forwarded-host'] || request.headers?.host || '').split(',')[0].trim().toLowerCase();
+      const configuredHost = config?.siteUrl ? new URL(config.siteUrl).host.toLowerCase() : '';
+      if (originHost && requestHost && originHost !== requestHost && (!configuredHost || originHost !== configuredHost)) {
+        return { allowed: false, error: 'Cross-origin API access is not permitted.' };
+      }
+    } catch {
+      return { allowed: false, error: 'Invalid Origin header.' };
+    }
+  }
+  return { allowed: true };
+}
+
+const ROBOTS_TXT = [
+  'User-agent: GPTBot',
+  'Disallow: /',
+  '',
+  'User-agent: CCBot',
+  'Disallow: /',
+  '',
+  'User-agent: ClaudeBot',
+  'Disallow: /',
+  '',
+  'User-agent: Bytespider',
+  'Disallow: /',
+  '',
+  'User-agent: Scrapy',
+  'Disallow: /',
+  '',
+  'User-agent: HTTrack',
+  'Disallow: /',
+  '',
+  'User-agent: AhrefsBot',
+  'Disallow: /',
+  '',
+  'User-agent: SemrushBot',
+  'Disallow: /',
+  '',
+  'User-agent: MJ12bot',
+  'Disallow: /',
+  '',
+  'User-agent: DotBot',
+  'Disallow: /',
+  '',
+  'User-agent: PetalBot',
+  'Disallow: /',
+  '',
+  'User-agent: *',
+  'Disallow: /api/',
+  'Disallow: /deliver/',
+  'Disallow: /watch/'
+].join('\n');
 
 function playerCspOrigin(origin) {
   if (!origin) return null;
@@ -441,6 +526,78 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
     maxRequests: config.playback?.rateLimitMax || 60,
     windowMs: config.playback?.rateLimitWindowMs || 60_000
   });
+  const apiLimiter = new BoundedRateLimiter({
+    maxRequests: config.security?.apiRateLimitMax || 180,
+    windowMs: config.security?.apiRateLimitWindowMs || 60_000
+  });
+  const detailLimiter = new BoundedRateLimiter({
+    maxRequests: config.security?.detailRateLimitMax || 60,
+    windowMs: config.security?.detailRateLimitWindowMs || 60_000
+  });
+  const deliveryLimiter = new BoundedRateLimiter({
+    maxRequests: config.security?.deliveryRateLimitMax || 40,
+    windowMs: config.security?.deliveryRateLimitWindowMs || 60_000
+  });
+
+  app.get('/robots.txt', (_request, response) => {
+    response.set('Cache-Control', 'public, max-age=3600');
+    response.type('text/plain').send(ROBOTS_TXT);
+  });
+
+  // Anti-scraping & rate-limiting guard for all /api/* and /deliver/* routes
+  app.use((request, response, next) => {
+    const isApi = request.path === '/api' || request.path.startsWith('/api/');
+    const isDeliver = request.path === '/deliver' || request.path.startsWith('/deliver/');
+    if (!isApi && !isDeliver) return next();
+
+    response.set('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
+    response.set('X-Permitted-Cross-Domain-Policies', 'none');
+
+    if (request.path === '/api/health') return next();
+
+    if (isBlockedScraperRequest(request)) {
+      return isApi
+        ? apiError(response, 403, 'Automated scraping and bot harvesting are not permitted.')
+        : response.status(403).type('text').send('Automated scraping is not permitted.');
+    }
+
+    if (isApi) {
+      response.set('Cross-Origin-Resource-Policy', 'same-origin');
+      const sameSite = verifySameSiteApiRequest(request, config);
+      if (!sameSite.allowed) {
+        return apiError(response, 403, sameSite.error);
+      }
+      const clientIp = getClientIp(request);
+      const apiCheck = apiLimiter.isAllowed(`api:${clientIp}`);
+      if (!apiCheck.allowed) {
+        response.set('Retry-After', String(apiCheck.retryAfterSeconds));
+        return apiError(response, 429, 'Too many requests. Automated scraping is rate-limited.');
+      }
+      if (/^\/api\/content\/(?!featured$)[^/]+/i.test(request.path)) {
+        const detailCheck = detailLimiter.isAllowed(`detail:${clientIp}`);
+        if (!detailCheck.allowed) {
+          response.set('Retry-After', String(detailCheck.retryAfterSeconds));
+          return apiError(response, 429, 'Too many release detail requests. Please slow down.');
+        }
+      }
+    }
+
+    if (isDeliver) {
+      const secFetchSite = String(request.headers?.['sec-fetch-site'] || '').trim().toLowerCase();
+      const secFetchMode = String(request.headers?.['sec-fetch-mode'] || '').trim().toLowerCase();
+      if (secFetchSite === 'cross-site' && (secFetchMode === 'cors' || secFetchMode === 'no-cors')) {
+        return response.status(403).type('text').send('Cross-site script access to delivery links is not permitted.');
+      }
+      const clientIp = getClientIp(request);
+      const deliverCheck = deliveryLimiter.isAllowed(`deliver:${clientIp}`);
+      if (!deliverCheck.allowed) {
+        response.set('Retry-After', String(deliverCheck.retryAfterSeconds));
+        return response.status(429).type('text').send('Too many delivery requests. Please wait a moment and try again.');
+      }
+    }
+
+    return next();
+  });
 
   app.get('/api/config', (_request, response) => {
     response.set('Cache-Control', 'public, max-age=300');
@@ -543,19 +700,25 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
 
   app.get('/api/content', async (request, response, next) => {
     try {
-      const rawCategory = cleanText(request.query.category, 40);
+      // Reject non-scalar query parameters (NoSQL/parameter pollution attempts like ?q[$ne]=1)
+      for (const val of Object.values(request.query || {})) {
+        if (val !== undefined && typeof val !== 'string' && typeof val !== 'number') {
+          return apiError(response, 400, 'Invalid query parameter format.');
+        }
+      }
+      const rawCategory = cleanText(scalarQueryParam(request.query.category), 40);
       const category = CATEGORY_IDS.has(rawCategory) ? rawCategory : undefined;
-      const query = cleanText(request.query.q, 100);
+      const query = cleanText(scalarQueryParam(request.query.q), 100);
       // A genre comes from the menu in the drawer, which lists every shelf a reader can land on.
-      const genre = cleanText(request.query.genre, 40) || undefined;
+      const genre = cleanText(scalarQueryParam(request.query.genre), 40) || undefined;
       if (category === 'adult' && !hasAdultAccess(request)) {
         return apiError(response, 403, 'Confirm that you are 18 or older to open this category.');
       }
       // A listing is a page, not the whole catalog. The old behaviour — ask for 100 and show those —
       // meant everything past the hundredth card was unreachable, and every new release quietly
       // pushed an old one off the site.
-      const limit = Math.max(1, Math.min(Number.parseInt(request.query.limit, 10) || 60, 100));
-      const asked = Math.max(1, Number.parseInt(request.query.page, 10) || 1);
+      const limit = Math.max(1, Math.min(Number.parseInt(scalarQueryParam(request.query.limit), 10) || 60, 100));
+      const asked = Math.max(1, Math.min(Number.parseInt(scalarQueryParam(request.query.page), 10) || 1, 10_000));
       const scope = { category, query, genre };
       const hideAdult = category !== 'adult';
       // Counting first is what lets a page number be clamped instead of obeyed: `?page=99` on a shelf

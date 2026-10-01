@@ -1,6 +1,8 @@
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
+import { createApp, isBlockedScraperRequest, verifySameSiteApiRequest } from '../src/server/index.js';
 import { cleanMediaName, compareQualityAscending, detectMediaQuality, fileReplacementKey, normalizeQualityLabel } from '../src/server/services/episode-service.js';
 import { canonicalMetadataTitle, categoryFromHints, findMetadata } from '../src/server/services/metadata-service.js';
 import { clearPosterUploadCache, configurePosterKeys, configurePosterUploadOptions, downloadPosterImage, mirrorPosterToImgBB, resetPosterUploadPace } from '../src/server/services/poster-service.js';
@@ -708,4 +710,148 @@ test('/help command displays interactive info buttons for all sections and shows
   await handleHelpAction(makeCtx('', 'help:menu'), repository, config);
   assert.match(messages.at(-1).text, /SoraBox Publisher Help Center/);
 });
+
+test('/removefile supports category-wise & recent/updated filters, accurate file counts, quality filters, and bulk quality removal', async () => {
+  const repository = new MemoryCatalogRepository();
+  const config = {
+    telegram: { adminIds: new Set(['123']), channelId: '-100123' },
+    adminLoginCode: 'secret-pass'
+  };
+  await repository.createAdminSession({ chatId: '123', ownerId: '123', expiresAt: Date.now() + 3_600_000 });
+
+  await repository.createContent({
+    title: 'Jujutsu Kaisen',
+    category: 'anime',
+    files: [
+      { storageMessageId: 1001, name: 'video-1001', sourceLabel: 'Jujutsu Kaisen S01E01 480p Hindi', quality: '480P' },
+      { storageMessageId: 1002, name: 'video-1002', sourceLabel: 'Jujutsu Kaisen S01E01 1080p Hindi', quality: '1080P' },
+      { storageMessageId: 1003, name: 'video-1003', sourceLabel: 'Jujutsu Kaisen S01E02 480p Hindi', quality: '480P' }
+    ]
+  });
+  await repository.createContent({
+    title: 'Oppenheimer',
+    category: 'movie',
+    files: [
+      { storageMessageId: 2001, name: 'Oppenheimer.2023.1080p.mkv', quality: '1080P' }
+    ]
+  });
+
+  const messages = [];
+  const makeCtx = (text = '', callbackData = '') => ({
+    chat: { id: 123, type: 'private' },
+    from: { id: 123 },
+    message: text ? { text } : undefined,
+    callbackQuery: callbackData ? { data: callbackData, message: { message_id: 77 } } : undefined,
+    answerCbQuery: async () => {},
+    telegram: { editMessageText: async () => ({}) },
+    reply: async (msg, extra) => {
+      messages.push({ type: 'reply', text: msg, extra });
+      return { message_id: 77 };
+    },
+    editMessageText: async (msg, extra) => {
+      messages.push({ type: 'edit', text: msg, extra });
+      return { message_id: 77 };
+    }
+  });
+
+  // 1. Filter by category via /removefile movie
+  await handleRemoveFileCommand(makeCtx('/removefile movie'), repository, config);
+  const moviePicker = messages.at(-1);
+  assert.match(moviePicker.text, /Category: Movies/);
+  const firstBtn = moviePicker.extra.reply_markup.inline_keyboard[0][0];
+  assert.match(firstBtn.text, /Oppenheimer.*1 file/);
+
+  // 2. Switch category to Anime via category button callback
+  await handleRemoveFileAction(makeCtx('', 'rmfile:cat:anime:r:0'), repository, config);
+  const animePicker = messages.at(-1);
+  assert.match(animePicker.text, /Category: Anime/);
+  const jjkBtn = animePicker.extra.reply_markup.inline_keyboard[0][0];
+  assert.match(jjkBtn.text, /Jujutsu Kaisen.*3 files · 2 eps/);
+
+  const jjkAdminId = jjkBtn.callback_data.split(':')[2];
+
+  // 3. Bulk remove all 480P files from Jujutsu Kaisen
+  await handleRemoveFileAction(makeCtx('', `rmfile:bulkqdo:${jjkAdminId}:480P`), repository, config);
+  const afterBulk = messages.at(-1);
+  assert.match(afterBulk.text, /Removed 2 480P files/);
+  const updatedJjk = await repository.findContentByAdminId(jjkAdminId);
+  assert.equal(updatedJjk.files.length, 1);
+  assert.equal(updatedJjk.files[0].quality, '1080P');
+});
+
+test('anti-scraping security blocks scraper User-Agents, cross-site API requests, hides bulk stream entries, and enforces rate limits', async (t) => {
+  assert.equal(isBlockedScraperRequest({ headers: { 'user-agent': 'python-requests/2.31.0' } }), true);
+  assert.equal(isBlockedScraperRequest({ headers: { 'user-agent': 'curl/8.5.0' } }), true);
+  assert.equal(isBlockedScraperRequest({ headers: { 'user-agent': 'Mozilla/5.0 HeadlessChrome/124.0' } }), true);
+  assert.equal(isBlockedScraperRequest({ headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }), false);
+
+  assert.equal(verifySameSiteApiRequest({ headers: { 'sec-fetch-site': 'cross-site' } }).allowed, false);
+  assert.equal(verifySameSiteApiRequest({ headers: { origin: 'https://evil-scraper.example', host: 'sorabox.in' } }).allowed, false);
+  assert.equal(verifySameSiteApiRequest({ headers: { origin: 'https://sorabox.in', host: 'sorabox.in' } }).allowed, true);
+
+  const repository = new MemoryCatalogRepository([]);
+  await repository.createContent({
+    title: 'Protected Anime',
+    category: 'anime',
+    storageChannelId: '-1002617067511',
+    files: [
+      { storageMessageId: 501, storageChannelId: '-1002617067511', name: 'Protected.Anime.S01E01.720p.mkv', episode: { start: 1, end: 1, label: 'Episode 01' } }
+    ]
+  });
+
+  const app = createApp({
+    config: {
+      environment: 'test',
+      telegram: { botUsername: 'SoraBoxBot' },
+      security: { apiRateLimitMax: 5, detailRateLimitMax: 3, deliveryRateLimitMax: 3 }
+    },
+    repository,
+    distPath: '/tmp/sorabox-no-static-files'
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  const url = `http://127.0.0.1:${server.address().port}`;
+
+  // 1. /robots.txt disallows /api/, /deliver/, /watch/ and scraper bots
+  const robotsRes = await fetch(`${url}/robots.txt`);
+  assert.equal(robotsRes.status, 200);
+  const robotsText = await robotsRes.text();
+  assert.match(robotsText, /Disallow: \/api\//);
+  assert.match(robotsText, /User-agent: Scrapy/);
+
+  // 2. Scraper User-Agent is blocked with 403
+  const curlRes = await fetch(`${url}/api/content`, {
+    headers: { 'user-agent': 'curl/8.4.0' }
+  });
+  assert.equal(curlRes.status, 403);
+
+  // 3. Cross-site fetch is blocked with 403
+  const crossSiteRes = await fetch(`${url}/api/content`, {
+    headers: { 'sec-fetch-site': 'cross-site' }
+  });
+  assert.equal(crossSiteRes.status, 403);
+
+  // 4. Bulk listing (/api/content) hides stream.entries so internal t.me/c/... links cannot be scraped in bulk
+  const listRes = await fetch(`${url}/api/content`);
+  assert.equal(listRes.status, 200);
+  assert.equal(listRes.headers.get('x-robots-tag'), 'noindex, nofollow, noarchive, nosnippet');
+  const listBody = await listRes.json();
+  assert.equal(listBody.items.length, 1);
+  assert.equal(listBody.items[0].stream.available, true);
+  assert.deepEqual(listBody.items[0].stream.entries, []);
+
+  // 5. Detail endpoint (/api/content/:slug) returns stream.entries for legitimate viewer, then rate-limits rapid scraping (429)
+  const slug = listBody.items[0].slug;
+  const detailRes = await fetch(`${url}/api/content/${slug}`);
+  assert.equal(detailRes.status, 200);
+  const detailBody = await detailRes.json();
+  assert.equal(detailBody.item.stream.entries.length, 1);
+
+  await fetch(`${url}/api/content/${slug}`);
+  await fetch(`${url}/api/content/${slug}`);
+  const rateLimitedRes = await fetch(`${url}/api/content/${slug}`);
+  assert.equal(rateLimitedRes.status, 429);
+});
+
 
