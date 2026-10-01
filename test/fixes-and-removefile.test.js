@@ -7,7 +7,10 @@ import { clearPosterUploadCache, configurePosterKeys, configurePosterUploadOptio
 import { extractMetaTags, scrapeMetadataFromUrl } from '../src/server/services/scraper-service.js';
 import { deriveLowestQualityTelegramStreamEntries, publicStreamingData } from '../src/server/services/streaming-service.js';
 import {
+  HELP_TOPICS,
   formatRemoveFileButtonLabel,
+  handleHelpAction,
+  handleHelpCommand,
   handleRemoveFileAction,
   handleRemoveFileCommand,
   handleScrapeCommand,
@@ -654,3 +657,55 @@ test('/removefile command lists posts, shows file/episode buttons, shows Go back
   // Since the English sample clip was removed, the post's audio languages automatically updated to ['Hindi']!
   assert.deepEqual(updatedPost.languages, ['Hindi']);
 });
+
+test('/help command displays interactive info buttons for all sections and shows detailed command explanations on click', async () => {
+  const repository = new MemoryCatalogRepository();
+  const config = {
+    telegram: { adminIds: new Set(['123']), channelId: '-100123' },
+    adminLoginCode: 'secret-pass'
+  };
+  await repository.createAdminSession({ chatId: '123', ownerId: '123', expiresAt: Date.now() + 3_600_000 });
+
+  const messages = [];
+  const makeCtx = (text = '', callbackData = '') => ({
+    chat: { id: 123, type: 'private' },
+    from: { id: 123 },
+    message: text ? { text } : undefined,
+    callbackQuery: callbackData ? { data: callbackData, message: { message_id: 99 } } : undefined,
+    answerCbQuery: async () => {},
+    reply: async (msg, extra) => {
+      messages.push({ type: 'reply', text: msg, extra });
+      return { message_id: 99 };
+    },
+    editMessageText: async (msg, extra) => {
+      messages.push({ type: 'edit', text: msg, extra });
+      return { message_id: 99 };
+    }
+  });
+
+  // 1. /help shows overview and buttons for all topic sections
+  await handleHelpCommand(makeCtx('/help'), repository, config);
+  const overview = messages.at(-1);
+  assert.match(overview.text, /SoraBox Publisher Help Center/);
+  const allButtons = overview.extra.reply_markup.inline_keyboard.flat();
+  const callbackDataList = allButtons.map((b) => b.callback_data);
+  for (const topicId of Object.keys(HELP_TOPICS)) {
+    assert.ok(callbackDataList.includes(`help:topic:${topicId}`), `Missing button for topic ${topicId}`);
+  }
+  assert.ok(callbackDataList.includes('help:panel'));
+
+  // 2. Clicking each topic button shows what it is for, commands, and how it works
+  for (const [topicId, topic] of Object.entries(HELP_TOPICS)) {
+    await handleHelpAction(makeCtx('', `help:topic:${topicId}`), repository, config);
+    const topicMsg = messages.at(-1);
+    assert.equal(topicMsg.text, topic.text);
+    const navCallbacks = topicMsg.extra.reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+    assert.ok(navCallbacks.includes('help:menu'));
+    assert.ok(navCallbacks.includes('help:panel'));
+  }
+
+  // 3. Clicking "Help Main Menu" returns to the overview
+  await handleHelpAction(makeCtx('', 'help:menu'), repository, config);
+  assert.match(messages.at(-1).text, /SoraBox Publisher Help Center/);
+});
+

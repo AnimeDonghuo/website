@@ -7604,6 +7604,343 @@ export async function handleRemoveFileAction(ctx, repository, config, actionData
   return false;
 }
 
+export const HELP_TOPICS = {
+  publish: {
+    id: 'publish',
+    button: '📤 Publish & Drafts',
+    title: '📤 Publish & Manual Drafts — What It Is For & How It Works',
+    text: [
+      '📤 PUBLISH & MANUAL DRAFTS',
+      'What this is for: Creating a new movie, series, anime, cartoon, donghua, K-Drama, TV/OTT, or private 18+ release by uploading files directly to the bot.',
+      '',
+      'Commands (What each is for):',
+      '• /panel — Opens category buttons to start a new draft.',
+      '• /movie <Title> — Starts a Movie draft.',
+      '• /anime <Title> — Starts an Anime draft.',
+      '• /cartoon <Title> — Starts a Cartoon draft.',
+      '• /donghua <Title> — Starts a Donghua (Chinese animation) draft.',
+      '• /kdrama <Title> — Starts a K-Drama draft.',
+      '• /series <Title> — Starts a Web Series draft.',
+      '• /tv <Title> (or /ott <Title>) — Starts a TV & OTT show draft.',
+      '• /18db <Title> (or /adultdb <Title>) — Starts a private 18+ draft (stored in TELEGRAM_ADULT_STORAGE_CHANNEL_ID, never announced publicly, protected by age gate).',
+      '• /status — Shows your active draft, its metadata, and how many files are attached.',
+      '• /done — Publishes the draft: fetches metadata, mirrors poster to ImgBB, creates website card + delivery link + player qualities, and posts to announcement channels.',
+      '• /cancel — Discards the current draft without publishing.',
+      '',
+      'How it works step-by-step:',
+      '1. Start a draft with a category command (e.g. /anime Solo Leveling) or tap a category on /panel.',
+      '2. Upload your video/document files to this private chat. Episode numbers, seasons, qualities (144p, 240p, 288p, 480p, 544p, 720p, 1080p, 4K, etc.), and audio/subtitle languages are detected from captions and filenames automatically.',
+      '3. Optional: Override draft details before publishing (/lang, /subtitles, /year, /genres, /description, /poster, or /scrape <URL>).',
+      '4. Send /done (or tap Publish now) to publish.'
+    ].join('\n')
+  },
+  batch: {
+    id: 'batch',
+    button: '📦 Batch & Auto-Publish',
+    title: '📦 Batch Import & Storage Auto-Publish — What It Is For & How It Works',
+    text: [
+      '📦 BATCH IMPORT & AUTO-PUBLISH',
+      'What this is for: Publishing files that are already inside your private Telegram database channel — either by message range (/batch) or automatically as you upload (/auto).',
+      '',
+      'Commands (What each is for):',
+      '• /batch [Optional Title] — Starts a range import from your private database channel.',
+      '• /batch <category> | <Optional Title> — Forces a specific category for the batch (e.g. /batch anime | Demon Slayer or /batch adult | Private Title).',
+      '• /auto — Opens ON/OFF controls for automatic storage-channel publishing.',
+      '• /teststorage — Verifies the bot has admin access to your private database channel(s).',
+      '',
+      'How /batch works:',
+      '1. Send /batch (leave title blank to auto-detect from filenames/captions, or provide a title).',
+      '2. Copy and send the FIRST and LAST message links from your private database channel (https://t.me/c/<channel-id>/<msg-id>).',
+      '3. The bot scans every message in that inclusive range, strips release/platform noise (dsnk, dsnp, 4k, 544p, DDP5.1, file sizes, @handles), groups separate titles or seasons automatically, matches metadata/category/poster, and publishes.',
+      '',
+      'How /auto works:',
+      '1. Turn automation ON via /auto.',
+      '2. Whenever files are posted to your private database channel, the bot groups matching titles and waits 90 seconds of quiet (up to 15 minutes max) so all episodes/qualities land in one post.',
+      '3. Later uploads of the same title automatically append to the existing catalog post.'
+    ].join('\n')
+  },
+  edit: {
+    id: 'edit',
+    button: '✏️ Edit Posts & Titles',
+    title: '✏️ Edit Published Posts & Titles — What It Is For & How It Works',
+    text: [
+      '✏️ EDIT PUBLISHED POSTS & TITLES',
+      'What this is for: Renaming or updating metadata on an active draft, a single published post (by Post ID), or many published posts at once.',
+      '',
+      'Commands (What each is for):',
+      '• /title SB-ID <New Title> — Renames a published post, re-matches its poster & category (e.g. cartoon/anime/movie), and updates its Telegram channel announcement.',
+      '• /titlebatch — Renames multiple posts in one message (one "SB-ID New Title" per line, or separated by " , "). Add --merge to auto-merge duplicate titles.',
+      '• /category SB-ID[, SB-ID2] <category> — Changes category (movie, anime, cartoon, donghua, kdrama, series, tv, adult) and updates announcements.',
+      '• /lang SB-ID[, SB-ID2] <Languages> (aliases: /lan, /lam) — Sets audio languages (e.g. /lang SB-0123ABCDEF Hindi, English).',
+      '• /subtitles SB-ID[, SB-ID2] <Languages> (alias: /subs) — Sets manual subtitle languages (or "none" to clear).',
+      '• /year SB-ID[, SB-ID2] <YYYY> — Updates release year.',
+      '• /genres SB-ID[, SB-ID2] <Genre1, Genre2> — Updates genres.',
+      '• /description SB-ID <Synopsis text> — Updates story synopsis.',
+      '• /release SB-ID[, SB-ID2] <Label> — Sets custom release label (e.g. Season 1, Feature Film).',
+      '• /status SB-ID[, SB-ID2] <Status> — Sets status badge (e.g. Completed, Ongoing).',
+      '',
+      'How it works:',
+      '• Use without a Post ID while a draft is open to edit the draft.',
+      '• Include one or more Post IDs (SB-XXXXXXXXXX) to update live catalog posts and automatically refresh their Telegram announcement posts.'
+    ].join('\n')
+  },
+  scrape: {
+    id: 'scrape',
+    button: '🖼 Poster & Web Scrape',
+    title: '🖼 Artwork (/poster), Web Scraper (/scrape) & ImgBB Pool — What It Is For & How It Works',
+    text: [
+      '🖼 POSTER ARTWORK, WEB SCRAPER & IMGBB KEYS',
+      'What this is for: Pulling accurate metadata and high-res posters from any website (IMDb, TMDB, AniList, MyAnimeList, etc.) or choosing artwork interactively.',
+      '',
+      'Commands (What each is for):',
+      '• /scrape SB-ID <URL> — Scrapes title, year, genres, synopsis, category, and poster from a web link and updates the post + Telegram channel announcement.',
+      '• /scrape <URL> — Scrapes metadata & poster into your currently open draft.',
+      '• /poster (aliases: /p, /imgdd) — Opens artwork updater with two modes: Old style (paste direct image URL) or New style (search AniList/TMDB/OMDb by title and tap a poster button).',
+      '• /imgapis — Shows all configured ImgBB API keys, upload/failure stats, and fallback poster.',
+      '• /addimgapi <KEY> — Adds one or more ImgBB API keys to the rotation pool.',
+      '• /removeimgapi <KEY> — Removes an ImgBB API key from the pool.',
+      '',
+      'How /scrape & /poster work:',
+      '• /scrape supports IMDb (with automatic fallback APIs when WAF blocks HTML), TMDB, AniList, MyAnimeList, and general media pages.',
+      '• Audio & Subtitles protection: /scrape NEVER overwrites your post’s audio or subtitle languages with website languages — it keeps what your uploaded files actually have (or your manual subtitles).',
+      '• Category & Announcement sync: Updating title/poster/scrape automatically updates the category (e.g. animated movie -> cartoon/anime/donghua) and edits the Telegram channel post.'
+    ].join('\n')
+  },
+  files: {
+    id: 'files',
+    button: '🗂 Remove File & Merge',
+    title: '🗂 Remove Specific Files (/removefile), Merge (/merge) & Delete (/delete)',
+    text: [
+      '🗂 REMOVE SPECIFIC EPISODES/FILES, MERGE & DELETE',
+      'What this is for: Removing an unwanted episode, movie quality, or series file from a post without deleting the whole post, combining duplicate posts, or deleting posts.',
+      '',
+      'Commands (What each is for):',
+      '• /removefile [SB-ID or search text] (aliases: /rmfile, /delfile, /deletefile, /files) — Interactive button menu to pick a post and remove a specific episode, movie file, or series file.',
+      '• /merge <Exact Title> <Target SB-ID> <Source SB-ID> [More SB-IDs...] — Combines multiple posts into the target post (moves all files & players, rebuilds seasons, deletes absorbed posts).',
+      '• /merge drop <SB-ID> season <N> (or ep <N>, or season <N> ep <A-B>) — Removes a whole season block or episode range from a post by command.',
+      '• /delete <SB-ID[, SB-ID2...]> — Permanently deletes entire catalog post(s) and their channel announcements.',
+      '',
+      'How /removefile works step-by-step:',
+      '1. Send /removefile (to browse recent posts as buttons), /removefile <title> (to filter posts), or /removefile SB-0123ABCDEF (to open that post directly).',
+      '2. Tap the post button to view buttons for every episode, movie file, or series file inside it (with episode number, name, and quality like [144P], [544P], [720P], [1080P]).',
+      '3. Tap the file/episode you want to remove — the bot shows the file details with two buttons: "⬅️ Go back" and "🗑 Remove".',
+      '4. Tap "🗑 Remove" to delete only that file/episode. The post’s episode counts, player qualities, audio/sub languages, and Telegram announcement post update automatically!'
+    ].join('\n')
+  },
+  players: {
+    id: 'players',
+    button: '▶️ Watch Players & Quality',
+    title: '▶️ Watch Page Quality Selector & External Players (/cmd, /players)',
+    text: [
+      '▶️ WATCH PLAYERS, QUALITY SWITCHING & MAGNETS',
+      'What this is for: Streaming episodes/movies on the website Watch page with multi-quality switching, manual subtitles, and optional external embed links.',
+      '',
+      'Commands (What each is for):',
+      '• /cmd SB-ID ep <N> <Player URL> — Attaches an external player link (e.g. Rumble, Dailymotion, iframe/embed URL) to Episode N (or ep <A-B> for a range).',
+      '• /cmd [SB-ID] — Starts JSON/CSV manifest upload or multi-line paste to attach many player links at once.',
+      '• /cmd SB-ID del ep <A-B> (or del <index>) — Removes attached external players for an episode range or index.',
+      '• /players SB-ID — Lists all players attached to a post with interactive Remove buttons and pagination.',
+      '• /searchm <SB-ID> [Optional Title] — Searches SubsPlease magnets for an anime post.',
+      '',
+      'How Watch Page Quality & Controls work automatically:',
+      '• Every uploaded video quality (including 144p, 240p, 288p, 360p, 480p, 544p, 720p, 1080p, 4K) is grouped per movie or episode.',
+      '• On the Watch page, playback defaults to the lowest quality for fast startup, and visitors can click any available quality button (e.g. 144P, 544P, 1080P) to switch the active Telegram post link (https://t.me/c/<channel>/<msgId>) in the player.',
+      '• Audio selector is disabled in the player UI, and visitors can load custom/manual subtitles (.srt/.vtt) directly in the player.'
+    ].join('\n')
+  },
+  sync: {
+    id: 'sync',
+    button: '🔄 Sync, Repair & Channels',
+    title: '🔄 Channel Sync (/sync), Catalog Repair (/repair) & Announcement Channels',
+    text: [
+      '🔄 SYNC ANNOUNCEMENTS, REPAIR CATALOG & MANAGE CHANNELS',
+      'What this is for: Keeping Telegram announcement posts, database captions, and catalog indexes in sync without re-uploading files.',
+      '',
+      'Commands (What each is for):',
+      '• /repair — Previews which catalog posts need re-indexing or audio/subtitle/quality reconciliation from their files.',
+      '• /repair go — Applies the repair across the catalog and queues announcement updates for changed cards.',
+      '• /sync — Previews which Telegram announcement posts differ from their current catalog card.',
+      '• /sync go — Edits every outdated channel announcement post (one paced edit at a time, obeying Telegram flood limits).',
+      '• /sync SB-ID — Immediately refreshes that single post’s Telegram announcement.',
+      '• /sync retry — Clears remembered edit errors (e.g. after granting the bot admin rights) so /sync go retries them.',
+      '• /sync force — Forces a fresh scan of all announced cards.',
+      '• /sync db (and /sync db go) — Scans and cleans @channel handles from captions inside the private database channel.',
+      '• /addchannel <@username or -100... ID> — Adds a Telegram announcement channel.',
+      '• /channels — Lists all connected announcement channels.',
+      '• /removechannel <@username or -100... ID> — Removes an announcement channel.',
+      '',
+      'How Startup Auto-Fix works:',
+      '• On every deploy/startup, SoraBox automatically checks stored posts and updates their file qualities, audio languages, and subtitles from what their files actually have (if files do not mention languages, no change is made).'
+    ].join('\n')
+  },
+  admin: {
+    id: 'admin',
+    button: '🔍 Search, IDs & System',
+    title: '🔍 Find Post IDs, Requests, Backups, Maintenance & System Controls',
+    text: [
+      '🔍 FIND POST IDS, REQUESTS, BACKUPS & SYSTEM ADMIN',
+      'What this is for: Finding Post IDs quickly, managing user title requests, creating/restoring backups, and controlling site maintenance.',
+      '',
+      'Commands (What each is for):',
+      '• /search <text> — Finds Post IDs matching a title, filename, or ID.',
+      '• /posts [limit] — Lists the newest published posts (up to 50) with their Post IDs.',
+      '• /postid — Interactive date/time lookup to find Post IDs by the day they were uploaded.',
+      '• Forward an announcement or paste a site URL — Send any channel announcement or catalog link to the bot and it replies with that post’s SB-ID.',
+      '• /requests — Opens the interactive viewer to review, select, and resolve user /request submissions.',
+      '• /stats — Shows catalog counts, bot user activity, and website visitor analytics.',
+      '• /backup — Creates a signed, compressed backup archive and sends it to the private storage channel.',
+      '• /recover — Arms backup recovery; upload a signed backup archive to restore catalog data.',
+      '• /maintanence [on|off] — Toggles website maintenance mode ON or OFF.',
+      '• /restart — Gracefully restarts the SoraBox bot and web server.',
+      '• /login <passcode> / /logout — Unlocks or locks publisher controls in this chat.'
+    ].join('\n')
+  },
+  all: {
+    id: 'all',
+    button: '📋 All Commands A–Z',
+    title: '📋 Complete Command Reference (What Every Command Is For)',
+    text: [
+      '📋 ALL COMMANDS QUICK REFERENCE',
+      '',
+      '▸ Draft & Publishing:',
+      '/panel · /movie · /anime · /cartoon · /donghua · /kdrama · /series · /tv (/ott) · /18db (/adultdb) · /done · /status · /cancel',
+      '',
+      '▸ Batch & Automation:',
+      '/batch [cat |] [Title] · /auto · /teststorage',
+      '',
+      '▸ Edit Metadata & Artwork:',
+      '/title · /titlebatch · /category · /lang (/lan, /lam) · /subtitles (/subs) · /year · /genres · /description · /release · /status · /poster (/p, /imgdd) · /scrape',
+      '',
+      '▸ Files, Merge & Delete:',
+      '/removefile (/rmfile, /delfile, /deletefile, /files) — Pick a post & remove specific episode/movie/series file with Go back / Remove buttons',
+      '/merge — Merge posts or drop seasons/episodes (/merge drop)',
+      '/delete — Delete whole post(s) by SB-ID',
+      '',
+      '▸ Watch Players & Magnets:',
+      '/cmd · /players · /searchm',
+      '',
+      '▸ Sync, Repair & Channels:',
+      '/repair · /repair go · /sync · /sync go · /sync retry · /sync force · /sync db · /addchannel · /channels · /removechannel',
+      '',
+      '▸ Search, Requests, Backups & System:',
+      '/search · /posts · /postid · /requests · /stats · /backup · /recover · /imgapis · /addimgapi · /removeimgapi · /maintanence · /restart · /login · /logout · /request · /help'
+    ].join('\n')
+  }
+};
+
+const HELP_TOPIC_ORDER = ['publish', 'batch', 'edit', 'scrape', 'files', 'players', 'sync', 'admin', 'all'];
+
+export function publisherHelpOverviewText() {
+  return [
+    '📚 SoraBox Publisher Help Center',
+    'Tap any button below to view full details on what each feature is for, every command name, and step-by-step how it works:',
+    '',
+    '• 📤 Publish & Drafts — /panel, /movie, /anime, /cartoon, /donghua, /kdrama, /series, /tv (/ott), /18db, /done, /cancel',
+    '• 📦 Batch & Auto-Publish — /batch range imports (FIRST & LAST links), /auto 90s quiet-window storage automation, /teststorage',
+    '• ✏️ Edit Posts & Titles — /title, /titlebatch, /category, /lang, /subtitles, /year, /genres, /description, /release, /status',
+    '• 🖼 Poster & Web Scrape — /scrape [SB-ID] <URL> (keeps file audio/subs, auto-updates category & announcement), /poster (/p, /imgdd), /imgapis',
+    '• 🗂 Remove File & Merge — /removefile (select post -> tap episode/file -> Go back or Remove), /merge, /merge drop, /delete',
+    '• ▶️ Watch Players & Quality — Watch page quality selector (144p/288p/544p/720p/1080p/4K Telegram link switching), /cmd, /players, /searchm',
+    '• 🔄 Sync, Repair & Channels — /repair, /repair go, /sync, /sync go, /sync db, /addchannel, /channels, /removechannel',
+    '• 🔍 Search, IDs & System — /search, /posts, /postid, /requests, /stats, /backup, /recover, /maintanence, /restart',
+    '• 📋 All Commands A–Z — Complete command checklist in one view',
+    '',
+    'Tip: You can also type /help <topic> (e.g. /help scrape, /help removefile, /help batch) or tap any button below:'
+  ].join('\n');
+}
+
+export function helpMenuKeyboard(activeTopicId = null) {
+  const rows = [];
+  for (let i = 0; i < HELP_TOPIC_ORDER.length; i += 2) {
+    const leftId = HELP_TOPIC_ORDER[i];
+    const rightId = HELP_TOPIC_ORDER[i + 1];
+    const row = [];
+    if (leftId && HELP_TOPICS[leftId]) {
+      const prefix = activeTopicId === leftId ? '✓ ' : '';
+      row.push(Markup.button.callback(`${prefix}${HELP_TOPICS[leftId].button}`, `help:topic:${leftId}`));
+    }
+    if (rightId && HELP_TOPICS[rightId]) {
+      const prefix = activeTopicId === rightId ? '✓ ' : '';
+      row.push(Markup.button.callback(`${prefix}${HELP_TOPICS[rightId].button}`, `help:topic:${rightId}`));
+    }
+    if (row.length) rows.push(row);
+  }
+  const bottomRow = [];
+  if (activeTopicId) {
+    bottomRow.push(Markup.button.callback('⬅️ Help Main Menu', 'help:menu'));
+  }
+  bottomRow.push(Markup.button.callback('🎛 Open Draft Panel', 'help:panel'));
+  rows.push(bottomRow);
+  return Markup.inlineKeyboard(rows);
+}
+
+function resolveHelpTopicFromQuery(rawQuery = '') {
+  const q = cleanText(rawQuery, 60).toLowerCase().replace(/^\/+/, '');
+  if (!q) return null;
+  if (HELP_TOPICS[q]) return HELP_TOPICS[q];
+  if (/^(?:movie|anime|cartoon|donghua|kdrama|series|tv|ott|18db|adultdb|done|cancel|draft|drafts|panel)$/.test(q)) return HELP_TOPICS.publish;
+  if (/^(?:batch|auto|teststorage|automation)$/.test(q)) return HELP_TOPICS.batch;
+  if (/^(?:title|titlebatch|lang|lan|lam|subtitles|subs|year|genres|description|release|category|edit)$/.test(q)) return HELP_TOPICS.edit;
+  if (/^(?:scrape|poster|p|imgdd|imgapis|addimgapi|removeimgapi|artwork)$/.test(q)) return HELP_TOPICS.scrape;
+  if (/^(?:removefile|rmfile|delfile|deletefile|files|merge|delete|remove)$/.test(q)) return HELP_TOPICS.files;
+  if (/^(?:cmd|players|player|watch|quality|searchm|magnet)$/.test(q)) return HELP_TOPICS.players;
+  if (/^(?:sync|repair|addchannel|channels|removechannel|channel)$/.test(q)) return HELP_TOPICS.sync;
+  if (/^(?:search|posts|postid|requests|stats|backup|recover|maintanence|maintenance|restart|login|logout|admin)$/.test(q)) return HELP_TOPICS.admin;
+  if (/^(?:all|commands|list)$/.test(q)) return HELP_TOPICS.all;
+  return null;
+}
+
+export async function handleHelpCommand(ctx, repository, config) {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await ctx.reply(visitorWelcomeText(hasAllowedPublisherId(ctx, config)));
+    return { handled: true, mode: 'visitor' };
+  }
+  const arg = parseCommandArgument(ctx.message?.text, 80);
+  const matchedTopic = resolveHelpTopicFromQuery(arg);
+  if (matchedTopic) {
+    await ctx.reply(matchedTopic.text, helpMenuKeyboard(matchedTopic.id));
+    return { handled: true, mode: 'topic', topic: matchedTopic.id };
+  }
+  await ctx.reply(publisherHelpOverviewText(), helpMenuKeyboard(null));
+  return { handled: true, mode: 'menu' };
+}
+
+export async function handleHelpAction(ctx, repository, config, actionData = '') {
+  if (!(await isPublisher(ctx, repository, config))) {
+    await acknowledgeTap(ctx, 'Publisher login required. Use /login first.', { alert: true });
+    return false;
+  }
+  const key = String(actionData || ctx.callbackQuery?.data || '');
+  if (!key.startsWith('help:')) return false;
+
+  if (key === 'help:menu') {
+    await acknowledgeTap(ctx, 'Help Main Menu');
+    await replaceInteractiveMessage(ctx, publisherHelpOverviewText(), helpMenuKeyboard(null));
+    return true;
+  }
+
+  if (key === 'help:panel') {
+    await acknowledgeTap(ctx, 'Publisher Draft Panel');
+    await replaceInteractiveMessage(ctx, 'Choose a category for a new draft, or use /help to return to the Help Center.', panelKeyboard());
+    return true;
+  }
+
+  const topicMatch = key.match(/^help:topic:([a-z0-9_-]+)$/i);
+  if (topicMatch) {
+    const topicId = topicMatch[1].toLowerCase();
+    const topic = HELP_TOPICS[topicId];
+    if (!topic) {
+      await acknowledgeTap(ctx, 'Unknown help section');
+      return true;
+    }
+    await acknowledgeTap(ctx, topic.button);
+    await replaceInteractiveMessage(ctx, topic.text, helpMenuKeyboard(topic.id));
+    return true;
+  }
+
+  return false;
+}
+
 export async function launchTelegramBot({ config, repository, subsPlease = null, serializeMagnetContent = null, onRestart = null }) {
   if (!config.telegram.botToken || config.telegram.mode !== 'polling') {
     console.info('[telegram] Bot polling is disabled; web catalog remains available.');
@@ -7759,34 +8096,11 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   });
 
   bot.command('help', async (ctx) => {
-    if (await isPublisher(ctx, repository, config)) {
-      await ctx.reply(
-        [
-          'Publisher quick guide',
-          '1. /movie Title, /anime Title, /cartoon Title, /donghua Title, /kdrama Title, /series Title, or /18db Title',
-          '2. Upload your files to this private chat',
-          '3. Use /done to create the catalog post, permanent ImgBB poster, delivery link, and channel announcements',
-          '',
-          'Episode parsing checks a cleaned caption first, then the filename. @channel handles and t.me links are ignored.',
-          'Batch import: /batch Optional title, then send FIRST and LAST https://t.me/c/<internal-channel-id>/<message-id> links. The range is inclusive; omit the title to infer it from file details. Optional category override: /batch anime | Your title.',
-          '18+ publishing: /18db Title (or /adultdb Title) stores files only in TELEGRAM_ADULT_STORAGE_CHANNEL_ID. Use /batch adult | Your title for an existing adult-storage range. These releases are never sent to announcement channels and use the website age gate.',
-          'Automation: /auto opens persistent ON/OFF controls. Matching direct-storage files are grouped by cleaned title and published once after 90 seconds of quiet (15-minute maximum); later matching uploads append silently to the same post.',
-          'Draft metadata: /lang Hindi, English · /subtitles English · /year 2026 · /genres Action, Fantasy · /description Text · /poster HTTPS_URL. Ambiguous Dual/Multi or unlabeled media tracks are checked once at final publishing when Telegram download limits allow it.',
-          'Artwork: /poster (also /p and /imgdd) asks which style you want. Old style sends the Post ID then an image link. New style sends the Post ID then the title, and you tap the exact poster found on AniList/TMDB/OMDb — it is mirrored to ImgBB and saved on the card.',
-          'After a deploy, /repair shows which cards would be re-indexed by today’s rules and /repair go applies it to the whole site — no re-uploading.',
-          'If the announcement channel still shows old text (an @channel handle, a stale file or episode count), /sync lists which posts differ and /sync go refreshes them one edit at a time — it reports how many cards were checked and only touches the ones that differ, so a second /sync costs no re-reading, and /sync force checks the archive again. A Telegram flood limit is waited out and retried instead of dropped, and /repair go refreshes the announcements of the cards it re-indexes.',
-          'If the file posts in your database channel still open with an @channel handle, /sync db shows them and /sync db go rewrites each caption to the clean label the catalog stored for it. Only posts this bot sent can be edited by a bot — the rest are listed instead of retried, and the website label is clean either way.',
-          'Edit published posts by ID: /lang SB-0123ABCDEF Hindi, English (aliases /lan and /lam) · /subtitles SB-0123ABCDEF English · /year SB-0123ABCDEF 2026 · /title SB-0123ABCDEF New title · /genres, /description, /poster, /category, /release, or /status followed by the post ID. Several posts at once works for category, languages, subtitles, genres, year, release, and status: /category SB-0123ABCDEF, SB-1122334455 anime — every named post is corrected and each posted announcement is edited with it. /title renames a whole list in one message: one line per post ID, with or without /title at the start of each line, and titles pasted from a filename are tidied as they are saved.',
-          'Manual Watch pages: /cmd SB-0123ABCDEF ep 2 <player URL> saves one player immediately — paste several links in one message and all of them are kept, and a Rumble or Dailymotion page link works as sent. /cmd SB-0123ABCDEF ep 2-7 <URL> covers a whole episode range, and the provider’s small JSON/CSV export still works for a full season. /players SB-0123ABCDEF lists what is attached with Remove buttons, and /cmd SB-0123ABCDEF del ep 2-7 removes a range. It updates only the existing post, never uploads media through Koyeb and never sends an announcement.',
-          'Merging cards: /merge <exact title> <target Post ID> <Post ID to absorb> [more IDs] — the target keeps its ID, slug, poster, and delivery links, every file and player of the others moves onto it, its season blocks are rebuilt, and the absorbed cards plus their announcement messages are deleted. Nothing changes until you tap Confirm merge. /merge drop SB-0123ABCDEF season 2 (or ep 5, or season 2 ep 5-7) trims files back off one card; /merge help lists every form.',
-          'Remove specific files/episodes: /removefile (or /removefile SB-0123ABCDEF) lets you choose a post, view buttons for every episode, movie file, or series file in that post, and tap any file to choose Go back or Remove.',
-          'Management: /status · /teststorage · /cancel · /posts 50 · /postid · /stats · /cmd · /backup · /recover · /delete POST_ID[, POST_ID] · /removefile · /addchannel CHANNEL_ID · /channels · /requests · /logout'
-        ].join('\n'),
-        panelKeyboard()
-      );
-    } else {
-      await ctx.reply(visitorWelcomeText(hasAllowedPublisherId(ctx, config)));
-    }
+    await handleHelpCommand(ctx, repository, config);
+  });
+
+  bot.action(/^help:(?:menu|panel|topic:[a-z0-9_-]+)$/i, async (ctx) => {
+    await handleHelpAction(ctx, repository, config, ctx.match[0]);
   });
 
   bot.command('panel', async (ctx) => {
