@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemoryCatalogRepository } from '../src/server/catalog.repository.js';
 import { createApp, isBlockedScraperRequest, verifySameSiteApiRequest } from '../src/server/index.js';
-import { cleanMediaName, compareQualityAscending, detectMediaQuality, fileReplacementKey, normalizeQualityLabel } from '../src/server/services/episode-service.js';
+import { cleanMediaName, compareQualityAscending, detectMediaQuality, extractEpisodeRange, fileReplacementKey, normalizeQualityLabel } from '../src/server/services/episode-service.js';
 import { canonicalMetadataTitle, categoryFromHints, findMetadata } from '../src/server/services/metadata-service.js';
 import { clearPosterUploadCache, configurePosterKeys, configurePosterUploadOptions, downloadPosterImage, mirrorPosterToImgBB, resetPosterUploadPace } from '../src/server/services/poster-service.js';
 import { extractMetaTags, scrapeMetadataFromUrl } from '../src/server/services/scraper-service.js';
@@ -14,6 +14,7 @@ import {
   formatRemoveFileButtonLabel,
   handleCatalogueFixAction,
   handleCatalogueFixCommand,
+  handleCatalogueFixRangeMessage,
   handleHelpAction,
   handleHelpCommand,
   handleRemoveFileAction,
@@ -1026,6 +1027,98 @@ test('/cateloguefix inspects a post range (e.g. 1 to 50) and provides Recheck Na
   assert.equal(remainingAyla.files.length, 2);
   assert.equal(remainingAyla.title, 'Ayla and the Mirrors');
 });
+
+test('/cateloguefix cleans template captions ("ANIME Doraemon SEASON 11 EPISODES: 40 QUALITY AUDIO"), accepts plain-text ranges ("20 to 35"), and shows live status', async () => {
+  assert.deepEqual(
+    extractEpisodeRange('ANIME Doraemon SEASON 11 EPISODES: 40 QUALITY AUDIO'),
+    { start: 40, end: 40, label: 'Episode 40' }
+  );
+  assert.equal(
+    inferBatchTitle([{ displayName: 'ANIME Doraemon SEASON 11 EPISODES: 40 QUALITY AUDIO', name: 'Doraemon.mkv' }]),
+    'Doraemon'
+  );
+
+  const repository = new MemoryCatalogRepository([]);
+  const config = {
+    telegram: {
+      adminIds: [777],
+      storageChannelId: '-1001234567890',
+      botUsername: 'SoraBoxBot'
+    },
+    adminLoginCode: 'secret'
+  };
+
+  const ep38 = await repository.createContent({
+    title: 'ANIME Doraemon SEASON 11 EPISODES: 38 QUALITY AUDIO',
+    category: 'anime',
+    files: [
+      {
+        storageMessageId: 338,
+        storageChannelId: '-1001234567890',
+        displayName: 'ANIME Doraemon SEASON 11 EPISODES: 38 QUALITY AUDIO',
+        name: 'Doraemon_38.mkv'
+      }
+    ]
+  });
+  const ep40 = await repository.createContent({
+    title: 'ANIME Doraemon SEASON 11 EPISODES: 40 QUALITY AUDIO',
+    category: 'anime',
+    files: [
+      {
+        storageMessageId: 340,
+        storageChannelId: '-1001234567890',
+        displayName: 'ANIME Doraemon SEASON 11 EPISODES: 40 QUALITY AUDIO',
+        name: 'Doraemon_40.mkv'
+      }
+    ]
+  });
+
+  const edits = [];
+  const replies = [];
+  const makeCtx = (text = '', callbackData = '') => ({
+    chat: { id: 777, type: 'private' },
+    from: { id: 777, username: 'admin' },
+    message: text ? { text } : undefined,
+    callbackQuery: callbackData ? { data: callbackData, message: { message_id: 55 } } : undefined,
+    answerCbQuery: async () => {},
+    telegram: {
+      editMessageText: async (chatIdVal, msgId, inlineId, msgText, extra) => {
+        edits.push({ chatIdVal, msgId, text: msgText, extra });
+        return { message_id: msgId };
+      }
+    },
+    reply: async (msg, extra) => {
+      replies.push({ text: msg, extra });
+      return { message_id: 55 + replies.length };
+    },
+    editMessageText: async (msg, extra) => {
+      edits.push({ text: msg, extra });
+      return { message_id: 55 };
+    }
+  });
+
+  // 1. Plain-text range message "1 to 10" works without /cateloguefix command prefix and shows status first
+  const handled = await handleCatalogueFixRangeMessage(makeCtx('1 to 10'), repository);
+  assert.equal(handled, true);
+  assert.match(replies[0].text, /⏳ Checking Catalogue range 1 to 10/);
+  assert.match(edits.at(-1).text, /Catalogue Fix · Range 1 to 10/);
+  assert.match(edits.at(-1).text, /Doraemon Season 11/);
+  assert.match(edits.at(-1).text, /Same-name duplicate groups: 1 group/);
+
+  // 2. Clicking Merge & Fix Name shows live status updates and merges both episodes into 1 "Doraemon Season 11" post
+  await handleCatalogueFixAction(makeCtx('', 'catfix:merge:1:10:all'), { telegram: {} }, repository, config);
+  assert.ok(replies.some((r) => /⏳ Catalogue Fix/.test(r.text)));
+  assert.match(edits.at(-1).text, /✅ Catalogue Merge & Name Fix complete/);
+
+  const kept = await repository.findContentByAdminId(ep38.adminId);
+  const removed = await repository.findContentByAdminId(ep40.adminId);
+  assert.ok(kept);
+  assert.equal(removed, null);
+  assert.equal(kept.title, 'Doraemon Season 11');
+  assert.equal(kept.files.length, 2);
+  assert.equal(kept.episodeCount, 2);
+});
+
 
 
 

@@ -1606,7 +1606,8 @@ const RELEASE_TITLE_NOISE = new Set([
   'unrated', 'remastered', 'dual', 'multi', 'audio', 'subs', 'sub', 'subbed', 'dub', 'dubbed', 'engsub', 'esub', 'esubs', 'msub', 'msubs', 'multisub', 'multisubs', 'korsub',
   'org', 'original', 'hq', 'hc', 'hd', 'sd', 'qhd', '2k', '5k', '6k',
   'fhd', 'uhd', '4k', '8k', 'dvdscr', 'webdl', 'webrip', 'webhd', 'web', 'bluray', 'bdrip', 'brrip', 'brip', 'hdrip', 'dvdrip',
-  'hdcam', 'cam', 'hdts', 'telesync', 'telecine', 'predvd', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'epi', 'ep', 'eps',
+  'hdcam', 'cam', 'hdts', 'telesync', 'telecine', 'predvd', 'movie', 'movies', 'film', 'full', 'complete', 'episode', 'episodes', 'epi', 'ep', 'eps',
+  'quality', 'resolution', 'language', 'languages', 'subtitle', 'subtitles', 'format', 'size', 'duration',
   'nf', 'netflix', 'amzn', 'amazon', 'prime', 'primevideo', 'dsnp', 'dsnk', 'disney', 'hotstar', 'jiohotstar', 'jiocinema',
   'zee5', 'sonyliv', 'sliv', 'sunnxt', 'snxt', 'aha', 'hoichoi', 'voot', 'ullu', 'chaupal', 'stage', 'hulu', 'hbomax', 'hmax',
   'atvp', 'pcok', 'peacock', 'pmtp', 'paramount', 'lionsgate', 'lgp', 'crunchyroll', 'cr', 'bilibili', 'bglobal', 'wetv', 'iqiyi',
@@ -1644,6 +1645,11 @@ export function tidyReleaseTitle(value) {
     .replace(/\[[^\]]{0,120}\]/g, ' ')
     .replace(/\{[^}]{0,80}\}/g, ' ')
     .replace(/\.(?:mkv|mp4|avi|webm|mov|m4v|ts|m4a|mp3|flac)$/i, ' ')
+    .replace(/^(?:anime|cartoon|donghua|k[\s-]?drama|movie|web[\s-]?series|series|title|name|show)\s*[:\-–—]+\s*/i, '')
+    .replace(/^(?:anime|cartoon|donghua|kdrama)\s+(?=[A-Za-z0-9].*\b(?:season|episodes?|quality|audio|language|subtitles?)\b)/i, '')
+    .replace(/\bS(?:EASON)?[\s:\-–—#]*\d{1,2}(?![\s:\-–—#]*\d)[\s:\-–—#]*E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#]*\d{1,3}(?:\s*(?:-|–|—|~|to|through)\s*(?:E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#]*)?\d{1,3})?\b/gi, ' ')
+    .replace(/\b(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP)[\s:\-–—#.]*\d{1,4}(?:\s*(?:-|–|—|~|to|through)\s*(?:(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP)[\s:\-–—#.]*)?\d{1,4})?\b/gi, ' ')
+    .replace(/\b(?:S(?:EASON)?[\s:\-–—#.]*0*\d{1,2})\b/gi, ' ')
     .replace(/\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|gib|mib)\b/gi, ' ')
     .replace(/\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/g, ' ')
     .replace(/\s+/g, ' ')
@@ -1721,12 +1727,12 @@ export function inferBatchTitle(files = []) {
       }
 
       const candidate = cleanMediaName(source)
-        .replace(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*)?\d{1,3})?\b/gi, ' ')
-        .replace(/\b(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPI|EPS?|EP|E)\.?\s*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\bS(?:EASON)?[\s:\-–—#.]*\d{1,2}(?![\s:\-–—#.]*\d)[\s:\-–—#.]*E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#.]*\d{1,3}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#.]*)?\d{1,3})?\b/gi, ' ')
+        .replace(/\b(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP|E)[\s:\-–—#.]*\d{1,4}(?:\s*(?:-|–|—|~|TO|THROUGH)\s*(?:(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP|E)[\s:\-–—#.]*)?\d{1,4})?\b/gi, ' ')
         // Keep sequel numbers (Cocktail 2), but remove a standalone season
         // marker because it describes packaging rather than the series title.
-        .replace(/\b(?:S(?:EASON)?\s*0*\d{1,2})\b/gi, ' ')
-        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|esubs?|msubs?|eng|indo|cc)\b/gi, ' ')
+        .replace(/\b(?:S(?:EASON)?[\s:\-–—#.]*0*\d{1,2})\b/gi, ' ')
+        .replace(/\b(?:multi(?:\s+audio)?|dual\s+audio|audio|dub(?:bed)?|sub(?:title)?s?|engsub|esubs?|msubs?|eng|indo|cc|quality|resolution|languages?|format|size|duration)\b/gi, ' ')
         .replace(/\b(?:hindi|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|punjabi|gujarati|urdu|english|japanese|korean|chinese|mandarin|cantonese|indonesian|thai|vietnamese|spanish|french|german|portuguese|arabic|russian)\b/gi, ' ')
         .replace(/\b(?:[1-3]\d{3}|4[0-3]\d{2}|[1-9]\d{2})\s*[pPiI]\b/g, ' ')
         .replace(/\b(?:144|240|288|360|480|540|544|576|720|1080|1440|2160|4k|8k)\s*p?\b/gi, ' ')
@@ -5447,6 +5453,13 @@ export function parseCatalogueFixRange(value = '') {
   return { start: 1, end: 50, period, explicit: Boolean(periodMatch) };
 }
 
+const catalogueFixSessionByChat = new Map();
+const catalogueFixActiveJobs = new Map();
+
+function catalogueFixChatKey(ctx) {
+  return `${chatId(ctx) || 'chat'}:${userId(ctx) || 'user'}`;
+}
+
 export async function inspectCatalogueFixRange(repository, { start = 1, end = 50, period = 'all' } = {}) {
   const safeStart = Math.max(1, Number(start) || 1);
   const safeEnd = Math.min(250, Math.max(safeStart, Number(end) || 50));
@@ -5472,30 +5485,37 @@ export async function inspectCatalogueFixRange(repository, { start = 1, end = 50
     const files = Array.isArray(card.files) ? card.files : [];
     const fileInferred = cleanText(inferBatchTitle(files), 180);
     const tidiedCurrent = cleanText(tidyReleaseTitle(card.title), 180);
-    let suggestedTitle = cleanText(card.title, 180);
+    let baseTitle = cleanText(card.title, 180);
     if (fileInferred && isPlausibleReleaseTitle(fileInferred)) {
-      suggestedTitle = fileInferred;
+      baseTitle = fileInferred;
     } else if (tidiedCurrent && isPlausibleReleaseTitle(tidiedCurrent)) {
-      suggestedTitle = tidiedCurrent;
+      baseTitle = tidiedCurrent;
     }
-    if (tidiedCurrent && isPlausibleReleaseTitle(tidiedCurrent) && tidiedCurrent.length < suggestedTitle.length) {
+    if (tidiedCurrent && isPlausibleReleaseTitle(tidiedCurrent) && tidiedCurrent.length < baseTitle.length) {
       const currentCanon = canonicalMetadataTitle(tidiedCurrent);
-      const fileCanon = canonicalMetadataTitle(suggestedTitle);
+      const fileCanon = canonicalMetadataTitle(baseTitle);
       if (currentCanon && currentCanon === fileCanon) {
-        suggestedTitle = tidiedCurrent;
+        baseTitle = tidiedCurrent;
       }
     }
+
+    const explicitSeasonMatch = String(card.title || '').match(/\bseason[\s:\-–—#]*0*(\d{1,2})\b/i);
+    const explicitSeason = explicitSeasonMatch ? Number(explicitSeasonMatch[1]) : null;
+    const suggestedTitle = (explicitSeason && Number.isInteger(explicitSeason) && explicitSeason >= 1 && explicitSeason <= 99)
+      ? withSeasonLabel(baseTitle, explicitSeason, { replace: true })
+      : baseTitle;
 
     const currentTitle = cleanText(card.title, 180);
     const needsNameFix = Boolean(
       suggestedTitle
-      && suggestedTitle.toLowerCase() !== currentTitle.toLowerCase()
-    ) || Boolean(suggestedTitle && suggestedTitle !== currentTitle);
+      && (suggestedTitle.toLowerCase() !== currentTitle.toLowerCase() || suggestedTitle !== currentTitle)
+    );
 
-    const canonicalKey = canonicalMetadataTitle(suggestedTitle || currentTitle)
-      || slugify(suggestedTitle || currentTitle).replace(/-/g, ' ');
-    const groupKey = canonicalKey
-      ? `${isAdultCategory(card.category) ? 'adult' : 'safe'}::${slugify(canonicalKey)}`
+    const canonicalBase = canonicalMetadataTitle(baseTitle || currentTitle)
+      || slugify(baseTitle || currentTitle).replace(/-/g, ' ');
+    const seasonSuffix = explicitSeason ? `-s${explicitSeason}` : '';
+    const groupKey = canonicalBase
+      ? `${isAdultCategory(card.category) ? 'adult' : 'safe'}::${slugify(canonicalBase)}${seasonSuffix}`
       : '';
 
     const item = {
@@ -5601,7 +5621,7 @@ export function formatCatalogueFixInspection(inspection) {
       `🛠 Catalogue Fix · Range ${start} to ${end}${periodLabel}`,
       '',
       'No published posts were found in this range.',
-      'Choose another range or time window below, or send `/cateloguefix 1 to 50`.'
+      'Choose another range or time window below, or type a range directly like `20 to 35` or `/cateloguefix 1 to 50`.'
     ].join('\n');
   }
 
@@ -5644,7 +5664,7 @@ export function formatCatalogueFixInspection(inspection) {
     ...previewLines,
     ...dupSummaryLines,
     '',
-    'Choose an action below:',
+    'Choose an action below (or send a custom range like `20 to 35` in chat):',
     '1️⃣ Recheck Name & Fix — cleans noisy/misparsed names from files and checks if any posts share the same name.',
     '2️⃣ Merge & Fix Name — cleans the names AND merges same-name duplicate posts into one combined catalog post.'
   ].join('\n');
@@ -5660,134 +5680,230 @@ export async function executeCatalogueFix({
   period = 'all',
   mergeDuplicates = false
 }) {
-  const inspection = await inspectCatalogueFixRange(repository, { start, end, period });
-  if (!inspection.items.length) {
-    await ctx.reply(
-      `No posts found in range ${inspection.start} to ${inspection.end}.`,
-      catalogueFixKeyboard({ start: inspection.start, end: inspection.end, period: inspection.period, hasPosts: false })
-    );
-    return { inspection, renamed: [], merged: null };
+  const jobKey = catalogueFixChatKey(ctx);
+  const existingJob = catalogueFixActiveJobs.get(jobKey);
+  if (existingJob) {
+    await ctx.reply(`⏳ Catalogue Fix is already working (${existingJob.statusText}). Please wait for the live status message to complete.`);
+    return existingJob.promise;
   }
 
-  const renamed = [];
-  for (const item of inspection.items) {
-    if (item.needsNameFix && item.suggestedTitle) {
-      const updated = await repository.updateContentByAdminId(item.adminId, { title: item.suggestedTitle });
-      if (updated) {
-        renamed.push({
-          adminId: item.adminId,
-          oldTitle: item.currentTitle,
-          newTitle: updated.title
-        });
-        queuePosterRematchForTitle(
-          { telegram: ctx.telegram, repository, config, content: updated, notifyChatId: chatId(ctx) },
-          { detached: true }
+  const jobState = {
+    statusText: `Inspecting range ${start} to ${end}…`,
+    promise: null
+  };
+
+  const run = async () => {
+    let statusMessageId = null;
+    const targetChatId = chatId(ctx);
+    const updateLiveStatus = async (statusLine) => {
+      jobState.statusText = statusLine;
+      if (!statusMessageId || !ctx.telegram?.editMessageText || !targetChatId) return;
+      try {
+        await ctx.telegram.editMessageText(
+          targetChatId,
+          statusMessageId,
+          undefined,
+          `⏳ Catalogue Fix (${mergeDuplicates ? 'Merge & Fix Name' : 'Recheck Name & Fix'}) · Range ${start} to ${end}\n▪ Status: ${statusLine}`
         );
-        await queueAnnouncementSync({
-          telegram: ctx.telegram,
-          repository,
-          content: updated,
-          config,
-          adminId: updated.adminId
-        });
+      } catch {
+        // Ignore transient Telegram message-not-modified or rate-limit errors on progress edits
       }
-    } else if (typeof repository.reindexContent === 'function') {
-      await repository.reindexContent(item.adminId);
+    };
+
+    try {
+      const initialMsg = await ctx.reply(
+        `⏳ Catalogue Fix (${mergeDuplicates ? 'Merge & Fix Name' : 'Recheck Name & Fix'}) · Range ${start} to ${end}\n▪ Status: Inspecting posts in range ${start} to ${end}…`
+      );
+      statusMessageId = initialMsg?.message_id || null;
+    } catch {
+      statusMessageId = null;
     }
-  }
 
-  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
-    await repository.reconcileCatalogMediaFromFiles();
-  }
+    const inspection = await inspectCatalogueFixRange(repository, { start, end, period });
+    if (!inspection.items.length) {
+      await ctx.reply(
+        `No posts found in range ${inspection.start} to ${inspection.end}.`,
+        catalogueFixKeyboard({ start: inspection.start, end: inspection.end, period: inspection.period, hasPosts: false })
+      );
+      return { inspection, renamed: [], merged: null };
+    }
 
-  // Re-inspect after fixing names so any newly matching titles are grouped accurately
-  const postRenameInspection = await inspectCatalogueFixRange(repository, {
-    start: inspection.start,
-    end: inspection.end,
-    period: inspection.period
-  });
-  const duplicateGroups = postRenameInspection.duplicateGroups.length
-    ? postRenameInspection.duplicateGroups
-    : inspection.duplicateGroups;
+    const absorbedIds = mergeDuplicates
+      ? new Set(inspection.duplicateGroups.flatMap((group) => group.sources.map((s) => s.adminId)))
+      : new Set();
 
-  let mergeOutcome = null;
-  if (mergeDuplicates && duplicateGroups.length > 0) {
-    mergeOutcome = await applyMergePlan({
-      bot,
-      repository,
-      config,
-      plan: { groups: duplicateGroups }
-    });
-    for (const group of duplicateGroups) {
-      if (group.title) {
-        const refreshedTarget = await repository.findContentByAdminId(group.targetAdminId);
-        if (refreshedTarget && refreshedTarget.title !== group.title) {
-          await repository.updateContentByAdminId(group.targetAdminId, { title: group.title });
+    await updateLiveStatus(
+      `Re-indexing episodes & fixing ${inspection.renameItems.length} noisy name(s) across ${inspection.items.length} post(s)…`
+    );
+
+    const renamed = [];
+    for (let i = 0; i < inspection.items.length; i += 1) {
+      const item = inspection.items[i];
+      if (typeof repository.reindexContent === 'function') {
+        await repository.reindexContent(item.adminId);
+      }
+      if (item.needsNameFix && item.suggestedTitle) {
+        const updated = await repository.updateContentByAdminId(item.adminId, { title: item.suggestedTitle });
+        if (updated) {
+          renamed.push({
+            adminId: item.adminId,
+            oldTitle: item.currentTitle,
+            newTitle: updated.title
+          });
+          // Only queue background poster/announcement sync for cards that will survive the merge
+          if (!absorbedIds.has(item.adminId)) {
+            queuePosterRematchForTitle(
+              { telegram: ctx.telegram, repository, config, content: updated, notifyChatId: chatId(ctx) },
+              { detached: true }
+            );
+            queueAnnouncementSync(
+              { telegram: ctx.telegram, repository, content: updated, config, adminId: updated.adminId },
+              { detached: true }
+            );
+          }
+        }
+      }
+      if ((i + 1) % 10 === 0 && i + 1 < inspection.items.length) {
+        await updateLiveStatus(`Processed ${i + 1}/${inspection.items.length} posts (${renamed.length} names fixed)…`);
+      }
+    }
+
+    const duplicateGroups = inspection.duplicateGroups;
+
+    let mergeOutcome = null;
+    if (mergeDuplicates && duplicateGroups.length > 0) {
+      const totalDuplicatePosts = duplicateGroups.reduce((sum, g) => sum + g.sources.length, 0);
+      await updateLiveStatus(
+        `Merging ${totalDuplicatePosts} duplicate post(s) into ${duplicateGroups.length} combined release(s)…`
+      );
+      mergeOutcome = await applyMergePlan({
+        bot,
+        repository,
+        config,
+        plan: { groups: duplicateGroups },
+        detachedAnnouncements: true
+      });
+      for (const group of duplicateGroups) {
+        if (group.title) {
+          const refreshedTarget = await repository.findContentByAdminId(group.targetAdminId);
+          if (refreshedTarget && refreshedTarget.title !== group.title) {
+            const updatedTarget = await repository.updateContentByAdminId(group.targetAdminId, { title: group.title });
+            if (updatedTarget) {
+              queuePosterRematchForTitle(
+                { telegram: ctx.telegram, repository, config, content: updatedTarget, notifyChatId: chatId(ctx) },
+                { detached: true }
+              );
+              queueAnnouncementSync(
+                { telegram: ctx.telegram, repository, content: updatedTarget, config, adminId: updatedTarget.adminId },
+                { detached: true }
+              );
+            }
+          }
         }
       }
     }
-  }
 
-  const lines = [
-    mergeDuplicates
-      ? `✅ Catalogue Merge & Name Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
-      : `✅ Catalogue Name Recheck & Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
-  ];
+    const lines = [
+      mergeDuplicates
+        ? `✅ Catalogue Merge & Name Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
+        : `✅ Catalogue Name Recheck & Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
+    ];
 
-  if (renamed.length) {
-    lines.push(
-      '',
-      `Fixed ${renamed.length} post name${renamed.length === 1 ? '' : 's'}:`,
-      ...renamed.slice(0, 25).map((r) => `▪ ${r.adminId}: “${cleanText(r.oldTitle, 45)}” → “${cleanText(r.newTitle, 45)}”`)
-    );
-  } else {
-    lines.push('▪ All post names in this range were already clean.');
-  }
-
-  if (mergeDuplicates) {
-    if (mergeOutcome && !mergeOutcome.error && mergeOutcome.moved?.length) {
+    if (renamed.length) {
       lines.push(
         '',
-        `Merged ${mergeOutcome.moved.length} duplicate post${mergeOutcome.moved.length === 1 ? '' : 's'} (${mergeOutcome.filesMoved || 0} file${mergeOutcome.filesMoved === 1 ? '' : 's'} combined):`,
-        ...duplicateGroups.map((g) => `▪ Kept ${g.targetAdminId} · “${cleanText(g.title, 55)}” ← absorbed ${g.sources.map((s) => s.adminId).join(', ')}`)
+        `Fixed ${renamed.length} post name${renamed.length === 1 ? '' : 's'}:`,
+        ...renamed.slice(0, 25).map((r) => `▪ ${r.adminId}: “${cleanText(r.oldTitle, 45)}” → “${cleanText(r.newTitle, 45)}”`)
       );
-    } else if (mergeOutcome?.error) {
-      lines.push('', `⚠️ Merge note: ${mergeOutcome.error}`);
+      if (renamed.length > 25) {
+        lines.push(`…and ${renamed.length - 25} more renamed post(s).`);
+      }
     } else {
-      lines.push('▪ No duplicate same-name posts needed merging in this range.');
+      lines.push('▪ All post names in this range were already clean.');
     }
-  } else if (duplicateGroups.length > 0) {
-    lines.push(
-      '',
-      `⚠️ Found ${duplicateGroups.length} same-name group${duplicateGroups.length === 1 ? '' : 's'} in this range:`,
-      ...duplicateGroups.slice(0, 15).map((g) => `▪ “${cleanText(g.title, 55)}”: ${g.targetAdminId} + ${g.sources.map((s) => s.adminId).join(', ')}`),
-      '',
-      'Tap “🔗 Merge & Fix Name” below to merge these same-name posts into 1 card each.'
-    );
-  } else {
-    lines.push('▪ No duplicate same-name posts were found in this range.');
-  }
 
-  const followUpKeyboard = (!mergeDuplicates && duplicateGroups.length > 0)
-    ? Markup.inlineKeyboard([
-      [Markup.button.callback(
-        `🔗 Merge & Fix Name (${duplicateGroups.length} group${duplicateGroups.length === 1 ? '' : 's'})`,
-        `catfix:merge:${inspection.start}:${inspection.end}:${inspection.period}`
-      )],
-      [
-        Markup.button.callback('1 to 25', `catfix:range:1:25:${inspection.period}`),
-        Markup.button.callback('1 to 50', `catfix:range:1:50:${inspection.period}`),
-        Markup.button.callback('1 to 100', `catfix:range:1:100:${inspection.period}`)
-      ]
-    ])
-    : undefined;
+    if (mergeDuplicates) {
+      if (mergeOutcome && !mergeOutcome.error && mergeOutcome.moved?.length) {
+        lines.push(
+          '',
+          `Merged ${mergeOutcome.moved.length} duplicate post${mergeOutcome.moved.length === 1 ? '' : 's'} (${mergeOutcome.filesMoved || 0} file${mergeOutcome.filesMoved === 1 ? '' : 's'} combined):`,
+          ...duplicateGroups.map((g) => `▪ Kept ${g.targetAdminId} · “${cleanText(g.title, 55)}” ← absorbed ${g.sources.map((s) => s.adminId).join(', ')}`)
+        );
+      } else if (mergeOutcome?.error) {
+        lines.push('', `⚠️ Merge note: ${mergeOutcome.error}`);
+      } else {
+        lines.push('▪ No duplicate same-name posts needed merging in this range.');
+      }
+    } else if (duplicateGroups.length > 0) {
+      lines.push(
+        '',
+        `⚠️ Found ${duplicateGroups.length} same-name group${duplicateGroups.length === 1 ? '' : 's'} in this range:`,
+        ...duplicateGroups.slice(0, 15).map((g) => `▪ “${cleanText(g.title, 55)}”: ${g.targetAdminId} + ${g.sources.map((s) => s.adminId).join(', ')}`),
+        '',
+        'Tap “🔗 Merge & Fix Name” below to merge these same-name posts into 1 card each.'
+      );
+    } else {
+      lines.push('▪ No duplicate same-name posts were found in this range.');
+    }
 
-  await ctx.reply(lines.join('\n'), followUpKeyboard);
-  return { inspection, renamed, merged: mergeOutcome, duplicateGroups };
+    const followUpKeyboard = (!mergeDuplicates && duplicateGroups.length > 0)
+      ? Markup.inlineKeyboard([
+        [Markup.button.callback(
+          `🔗 Merge & Fix Name (${duplicateGroups.length} group${duplicateGroups.length === 1 ? '' : 's'})`,
+          `catfix:merge:${inspection.start}:${inspection.end}:${inspection.period}`
+        )],
+        [
+          Markup.button.callback('1 to 25', `catfix:range:1:25:${inspection.period}`),
+          Markup.button.callback('1 to 50', `catfix:range:1:50:${inspection.period}`),
+          Markup.button.callback('1 to 100', `catfix:range:1:100:${inspection.period}`)
+        ]
+      ])
+      : undefined;
+
+    const finalText = lines.join('\n');
+    let editedStatus = false;
+    if (statusMessageId && ctx.telegram?.editMessageText && targetChatId) {
+      try {
+        await ctx.telegram.editMessageText(targetChatId, statusMessageId, undefined, finalText, followUpKeyboard);
+        editedStatus = true;
+      } catch {
+        editedStatus = false;
+      }
+    }
+    if (!editedStatus) {
+      await ctx.reply(finalText, followUpKeyboard);
+    }
+    return { inspection, renamed, merged: mergeOutcome, duplicateGroups };
+  };
+
+  const promise = run().finally(() => {
+    catalogueFixActiveJobs.delete(jobKey);
+  });
+  jobState.promise = promise;
+  catalogueFixActiveJobs.set(jobKey, jobState);
+  return promise;
 }
 
-export async function handleCatalogueFixCommand(ctx, repository) {
-  const parsed = parseCatalogueFixRange(ctx.message?.text || '');
+export async function handleCatalogueFixCommand(ctx, repository, rawInput = null) {
+  const parsed = parseCatalogueFixRange(rawInput ?? (ctx.message?.text || ''));
+  catalogueFixSessionByChat.set(catalogueFixChatKey(ctx), {
+    start: parsed.start,
+    end: parsed.end,
+    period: parsed.period,
+    updatedAt: Date.now()
+  });
+
+  let statusMessageId = null;
+  const targetChatId = chatId(ctx);
+  if (ctx.telegram?.editMessageText && targetChatId) {
+    try {
+      const pending = await ctx.reply(`⏳ Checking Catalogue range ${parsed.start} to ${parsed.end}…`);
+      statusMessageId = pending?.message_id || null;
+    } catch {
+      statusMessageId = null;
+    }
+  }
+
   const inspection = await inspectCatalogueFixRange(repository, parsed);
   const text = formatCatalogueFixInspection(inspection);
   const keyboard = catalogueFixKeyboard({
@@ -5798,8 +5914,32 @@ export async function handleCatalogueFixCommand(ctx, repository) {
     renameCount: inspection.renameItems.length,
     duplicateCount: inspection.duplicateGroups.length
   });
+
+  if (statusMessageId && ctx.telegram?.editMessageText && targetChatId) {
+    try {
+      await ctx.telegram.editMessageText(targetChatId, statusMessageId, undefined, text, keyboard);
+      return inspection;
+    } catch {
+      // Fall back to ctx.reply if editing the status message failed
+    }
+  }
   await ctx.reply(text, keyboard);
   return inspection;
+}
+
+export async function handleCatalogueFixRangeMessage(ctx, repository) {
+  const raw = String(ctx.message?.text || '').trim();
+  if (!raw || raw.startsWith('/')) return false;
+  // Match explicit plain-text ranges like "20 to 35", "1-50", "range 10 to 40", "from 5 to 25"
+  const isExplicitRange = /^(?:range\s+|from\s+)?(\d{1,4})\s*(?:to|-|–|—|\.\.+)\s*(\d{1,4})(?:\s+(today|yesterday|week|month|all))?$/i.test(raw);
+  if (!isExplicitRange) return false;
+
+  const activeState = catalogueFixSessionByChat.get(catalogueFixChatKey(ctx));
+  const defaultPeriod = activeState?.period || 'all';
+  const parsed = parseCatalogueFixRange(raw);
+  const period = parsed.period !== 'all' ? parsed.period : defaultPeriod;
+  await handleCatalogueFixCommand(ctx, repository, `${parsed.start} to ${parsed.end} ${period}`);
+  return true;
 }
 
 export async function handleCatalogueFixAction(ctx, bot, repository, config) {
@@ -5809,6 +5949,13 @@ export async function handleCatalogueFixAction(ctx, bot, repository, config) {
   const [, mode, startRaw, endRaw, period] = match;
   const start = Math.max(1, Number(startRaw) || 1);
   const end = Math.min(250, Math.max(start, Number(endRaw) || 50));
+
+  catalogueFixSessionByChat.set(catalogueFixChatKey(ctx), {
+    start,
+    end,
+    period,
+    updatedAt: Date.now()
+  });
 
   if (mode === 'range') {
     const inspection = await inspectCatalogueFixRange(repository, { start, end, period });
@@ -5827,7 +5974,7 @@ export async function handleCatalogueFixAction(ctx, bot, repository, config) {
     return;
   }
 
-  await executeCatalogueFix({
+  return executeCatalogueFix({
     ctx,
     bot,
     repository,
@@ -7038,11 +7185,11 @@ export function mergeDropResultText(outcome, config = {}) {
  * catalog change between preview and confirmation is applied as it stands rather
  * than from a stale snapshot.
  */
-export async function applyMergePlan({ bot, repository, config = {}, plan = {} }) {
+export async function applyMergePlan({ bot, repository, config = {}, plan = {}, detachedAnnouncements = false }) {
   if (Array.isArray(plan.groups) && plan.groups.length > 0) {
     const allOutcomes = [];
     for (const group of plan.groups) {
-      const outcome = await applyMergePlan({ bot, repository, config, plan: group });
+      const outcome = await applyMergePlan({ bot, repository, config, plan: group, detachedAnnouncements });
       allOutcomes.push(outcome);
     }
     const successful = allOutcomes.filter((o) => !o.error);
@@ -7140,7 +7287,10 @@ export async function applyMergePlan({ bot, repository, config = {}, plan = {} }
   }
   // The merged card shows a new episode summary, so its own announcement must
   // say the same thing.
-  const sync = await queueAnnouncementSync({ telegram, repository, content, config, adminId: content?.adminId });
+  const sync = await queueAnnouncementSync(
+    { telegram, repository, content, config, adminId: content?.adminId },
+    { detached: Boolean(detachedAnnouncements) }
+  );
   return {
     plan,
     content,
@@ -9745,7 +9895,10 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   for (const cmd of ['cateloguefix', 'cataloguefix', 'catalogfix', 'catfix']) {
     bot.command(cmd, async (ctx) => {
       if (!(await requirePublisher(ctx, repository, config))) return;
-      await handleCatalogueFixCommand(ctx, repository);
+      void handleCatalogueFixCommand(ctx, repository).catch((error) => {
+        console.error('[telegram] cateloguefix command failed:', automationDiagnostic(error));
+        ctx.reply(`Catalogue Fix failed: ${cleanText(error?.message || 'Unknown error', 200)}`).catch(() => {});
+      });
     });
   }
 
@@ -10471,9 +10624,13 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   });
 
   bot.action(/^catfix:(range|fix|merge):\d+:\d+:(all|today|yesterday|week|month)$/, async (ctx) => {
-    await ctx.answerCbQuery();
+    const mode = ctx.match?.[1] || 'range';
+    await ctx.answerCbQuery(mode === 'range' ? '⏳ Loading range…' : '⏳ Catalogue Fix started — check status in chat…').catch(() => {});
     if (!(await requirePublisher(ctx, repository, config))) return;
-    await handleCatalogueFixAction(ctx, bot, repository, config);
+    void handleCatalogueFixAction(ctx, bot, repository, config).catch((error) => {
+      console.error('[telegram] cateloguefix action failed:', automationDiagnostic(error));
+      ctx.reply(`Catalogue Fix failed: ${cleanText(error?.message || 'Unknown error', 200)}`).catch(() => {});
+    });
   });
 
   bot.action('postid:back', async (ctx) => {
@@ -10629,7 +10786,14 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     }
 
     if (message.text && !message.text.startsWith('/') && session?.workflow === 'batch') {
+      if (!parsePrivateStorageMessageLink(message.text) && await handleCatalogueFixRangeMessage(ctx, repository)) {
+        return;
+      }
       await handleBatchLink(ctx, session, bot, repository, config);
+      return;
+    }
+
+    if (message.text && !message.text.startsWith('/') && await handleCatalogueFixRangeMessage(ctx, repository)) {
       return;
     }
 

@@ -186,13 +186,13 @@ export function extractSeasonNumber(value) {
     .replace(/\s+/g, ' ');
   if (!text) return null;
 
-  const explicit = text.match(/\b(?:SEASON|S)[\s-]*0*(\d{1,2})\b/i);
+  const explicit = text.match(/\b(?:SEASON|S)[\s:\-–—#]*0*(\d{1,2})\b/i);
   if (explicit && validSeason(Number.parseInt(explicit[1], 10))) return Number.parseInt(explicit[1], 10);
 
   // A compact package marker such as `S01E05`, `S01 1080p`, or `S2`. The token
   // must not continue into another word, so `Soul`, `1080p`, and `8bit` can
   // never be mistaken for a season.
-  const compact = text.match(/\bS[\s-]*0*(\d{1,2})(?!\d)(?![a-df-z])/i);
+  const compact = text.match(/\bS[\s:\-–—#]*0*(\d{1,2})(?!\d)(?![a-df-z])/i);
   if (compact && validSeason(Number.parseInt(compact[1], 10))) return Number.parseInt(compact[1], 10);
 
   const classic = text.match(/\b(\d{1,2})\s*x\s*\d{1,3}\b/);
@@ -291,11 +291,11 @@ export function extractEpisodeRange(value) {
   if (!text) return null;
 
   // S01E01, S1 E01, and a range such as S01E01-E05.
-  const seasonEpisode = text.match(/\bS(?:EASON)?\s*\d{1,2}\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*)?0*(\d{1,3}))?\b/i);
+  const seasonEpisode = text.match(/\bS(?:EASON)?[\s:\-–—#]*\d{1,2}(?![\s:\-–—#]*\d)[\s:\-–—#]*E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#]*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#]*)?0*(\d{1,3}))?\b/i);
   if (seasonEpisode) return parseRange(seasonEpisode[1], seasonEpisode[2] || seasonEpisode[1]);
 
-  // Explicit forms: Episode 1, EP 01, E5, Ep 1 To 5, Episodes 01-05.
-  const explicit = text.match(/\b(?:EPISODES?|EPI(?:S(?:ODE)?)?|EPS?|EP|E)\s*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:(?:EPISODES?|EPI(?:S(?:ODE)?)?|EPS?|EP|E)\s*)?0*(\d{1,3}))?\b/i);
+  // Explicit forms: Episode 1, EP 01, E5, Ep 1 To 5, Episodes 01-05, EPISODES: 40.
+  const explicit = text.match(/\b(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP|E)[\s:\-–—#]*0*(\d{1,3})(?:\s*(?:-|–|—|~|\bTO\b|\bTHROUGH\b)\s*(?:(?:EPISODES?|EPI(?:S(?:ODES?)?)?|EPS?|EP|E)[\s:\-–—#]*)?0*(\d{1,3}))?\b/i);
   if (explicit) return parseRange(explicit[1], explicit[2] || explicit[1]);
 
   // A clean title caption sometimes only says "1 to 5". This intentionally
@@ -317,19 +317,22 @@ export function cleanMediaName(value) {
     .replace(/\.(mkv|mp4|avi|webm|mov|m4v|ts|zip|rar|7z|srt|ass|mka|mp3|flac)$/i, '')
     .replace(/[\[\(][^\]\)]{0,160}[\]\)]/g, ' ')
     .replace(/[._~|]+/g, ' ')
+    // Strip leading template category/title prefix such as "ANIME: Doraemon" or "ANIME Doraemon SEASON 11..."
+    .replace(/^(?:anime|cartoon|donghua|k[\s-]?drama|movie|web[\s-]?series|series|title|name|show)\s*[:\-–—]+\s*/i, '')
+    .replace(/^(?:anime|cartoon|donghua|kdrama)\s+(?=[A-Za-z0-9].*\b(?:season|episodes?|quality|audio|language|subtitles?)\b)/i, '')
     // A year belongs in metadata. Keeping it in the inferred title causes every
     // re-encode of one film to be treated as a new catalog entry.
     .replace(/\b(?:19\d{2}|20\d{2})\b/g, ' ')
     // Remove only a standalone season package label. The negative lookahead
     // deliberately keeps S01E03 / Season 1 Episode 3 for episode detection.
-    .replace(/\bS(?:EASON)?\s*0*\d{1,2}(?!\s*[- ]?E(?:P(?:I(?:S(?:ODE)?)?)?)?\s*\d{1,3})\b/gi, ' ')
+    .replace(/\bS(?:EASON)?[\s:\-–—#]*0*\d{1,2}(?![\s:\-–—#]*E(?:P(?:I(?:S(?:ODES?)?)?)?)?(?![a-z])[\s:\-–—#]*\d{1,3})\b/gi, ' ')
     .replace(QUALITY_NOISE_REGEX, ' ')
     .replace(/\b(?:2k|4k|5k|6k|8k|uhd|qhd|fhd|hd|sd)\b/gi, ' ')
     .replace(ENCODER_AND_RIP_NOISE_REGEX, ' ')
     .replace(CODEC_AND_SIZE_NOISE_REGEX, ' ')
     // Common providers/release labels found in direct Telegram uploads.
     .replace(PROVIDER_NOISE_REGEX, ' ')
-    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio|org|hq|hc|korsub|msubs?|multisubs?)\b/gi, ' ')
+    .replace(/\b(?:dubbed|subbed|dual[- ]?audio|multi[- ]?audio|original[- ]?audio|org|hq|hc|korsub|msubs?|multisubs?|quality|resolution|languages?|audio|subtitles?|format|size|duration)\s*[:\-–—]?\b/gi, ' ')
     .replace(RELEASE_SUBTITLE_TAG, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -834,9 +837,9 @@ export function seasonPackOf(file) {
   if (hasEpisodeRange(file)) return null;
   const raw = `${file?.displayName || ''} ${file?.sourceLabel || ''} ${file?.name || ''}`.trim();
   if (!raw || EXTRA_TEXT.test(raw)) return null;
-  // Anything that names an episode — `S01E05`, `Ep 7`, `Epi.01-06` — is a delivery of episodes,
+  // Anything that names an episode — `S01E05`, `Ep 7`, `Epi.01-06`, `EPISODES: 40` — is a delivery of episodes,
   // not the whole season, and must be indexed as the range it holds rather than shown as one pack.
-  if (/\bS\d{1,2}[\s._-]*E\d/i.test(raw) || /\b(?:epi(?:s(?:ode)?)?|eps?|ep)\.?\s*0*\d/i.test(raw) || /\b\d{1,3}\s*[xX]\s*\d/.test(raw)) return null;
+  if (/\bS\d{1,2}[\s._-]*E\d/i.test(raw) || /\b(?:episodes?|epi(?:s(?:odes?)?)?|eps?|ep)[\s.:\-–—#]*0*\d/i.test(raw) || /\b\d{1,3}\s*[xX]\s*\d/.test(raw)) return null;
   const detected = detectUploadSeason({ caption: file?.displayName || file?.sourceLabel, filename: file?.name });
   const season = Number(detected.season);
   if (validSeason(season)) return { season, label: `Season ${season}`, wholeSeason: true };
