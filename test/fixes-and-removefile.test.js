@@ -10,14 +10,20 @@ import { extractMetaTags, scrapeMetadataFromUrl } from '../src/server/services/s
 import { deriveLowestQualityTelegramStreamEntries, publicStreamingData } from '../src/server/services/streaming-service.js';
 import {
   HELP_TOPICS,
+  beginBatch,
   formatRemoveFileButtonLabel,
+  handleCatalogueFixAction,
+  handleCatalogueFixCommand,
   handleHelpAction,
   handleHelpCommand,
   handleRemoveFileAction,
   handleRemoveFileCommand,
   handleScrapeCommand,
   inferBatchTitle,
+  inspectCatalogueFixRange,
   isPlausibleReleaseTitle,
+  parseCatalogueFixRange,
+  planDraftPublicationGroups,
   queuePosterRematchForTitle,
   resetAnnouncementLane,
   syncPublishedAnnouncements,
@@ -853,5 +859,173 @@ test('anti-scraping security blocks scraper User-Agents, cross-site API requests
   const rateLimitedRes = await fetch(`${url}/api/content/${slug}`);
   assert.equal(rateLimitedRes.status, 429);
 });
+
+test('/batch1 creates a single-post batch (singlePost: true) that never splits into multiple catalog posts or seasons', async () => {
+  const repository = new MemoryCatalogRepository([]);
+  const config = {
+    telegram: {
+      adminIds: [777],
+      storageChannelId: '-1001234567890',
+      botUsername: 'SoraBoxBot'
+    },
+    adminLoginCode: 'secret'
+  };
+  await repository.createAdminSession({
+    chatId: '777',
+    ownerId: '777',
+    expiresAt: new Date(Date.now() + 3600_000)
+  });
+
+  const replies = [];
+  const ctx = {
+    chat: { id: 777, type: 'private' },
+    from: { id: 777, username: 'admin' },
+    reply: async (text, extra) => {
+      replies.push({ text, extra });
+      return { message_id: replies.length };
+    },
+    telegram: {}
+  };
+
+  await beginBatch(ctx, '', repository, config, { singlePost: true });
+  const session = await repository.findSession('777', '777');
+  assert.equal(session.workflow, 'batch');
+  assert.equal(session.batch.singlePost, true);
+  assert.match(replies.at(-1).text, /\/batch1.*1 poster only/i);
+
+  // Even when a /batch1 session has mixed release names or multiple seasons, planDraftPublicationGroups returns []
+  const multiFiles = [
+    { name: 'Solo.Leveling.S01E01.720p.mkv', caption: 'Solo Leveling S01E01', episode: { season: 1, start: 1, end: 1 } },
+    { name: 'Solo.Leveling.S02E01.720p.mkv', caption: 'Solo Leveling S02E01', episode: { season: 2, start: 1, end: 1 } },
+    { name: 'Bonus.OVA.1080p.mkv', caption: 'Bonus OVA Special', episode: { season: 1, start: 2, end: 2 } }
+  ];
+  const normalGroups = planDraftPublicationGroups({
+    workflow: 'batch',
+    title: 'Solo Leveling',
+    category: 'anime',
+    batch: { singlePost: false },
+    files: multiFiles
+  });
+  assert.equal(normalGroups.length, 3);
+
+  const singlePostGroups = planDraftPublicationGroups({
+    workflow: 'batch',
+    title: 'Solo Leveling',
+    category: 'anime',
+    batch: { singlePost: true },
+    files: multiFiles
+  });
+  assert.deepEqual(singlePostGroups, []);
+});
+
+test('/cateloguefix inspects a post range (e.g. 1 to 50) and provides Recheck Name & Fix and Merge & Fix Name buttons', async () => {
+  assert.deepEqual(parseCatalogueFixRange('/cateloguefix 1 to 50'), {
+    start: 1,
+    end: 50,
+    period: 'all',
+    explicit: true
+  });
+  assert.deepEqual(parseCatalogueFixRange('/cataloguefix 5-25'), {
+    start: 5,
+    end: 25,
+    period: 'all',
+    explicit: true
+  });
+
+  const repository = new MemoryCatalogRepository([]);
+  const config = {
+    telegram: {
+      adminIds: [777],
+      storageChannelId: '-1001234567890',
+      botUsername: 'SoraBoxBot'
+    },
+    adminLoginCode: 'secret'
+  };
+  await repository.createAdminSession({
+    chatId: '777',
+    ownerId: '777',
+    expiresAt: new Date(Date.now() + 3600_000)
+  });
+
+  // Create two duplicate posts with noisy release names that resolve to the same clean title "Ayla and the Mirrors"
+  const post1 = await repository.createContent({
+    title: 'Ayla and the Mirrors dsnk 1080p DDP5 1',
+    category: 'web-series',
+    files: [
+      { storageMessageId: 101, storageChannelId: '-1001234567890', name: 'Ayla.and.the.Mirrors.S01E01.dsnk.1080p.mkv', caption: 'Ayla and the Mirrors S01E01 dsnk 1080p' }
+    ]
+  });
+  const post2 = await repository.createContent({
+    title: 'Ayla and the Mirrors dsnp 720p',
+    category: 'web-series',
+    files: [
+      { storageMessageId: 102, storageChannelId: '-1001234567890', name: 'Ayla.and.the.Mirrors.S01E02.dsnp.720p.mkv', caption: 'Ayla and the Mirrors S01E02 dsnp 720p' }
+    ]
+  });
+  const post3 = await repository.createContent({
+    title: 'Inside Out 2 4k 10bit',
+    category: 'cartoon',
+    files: [
+      { storageMessageId: 103, storageChannelId: '-1001234567890', name: 'Inside.Out.2.2024.2160p.4k.10bit.mkv', caption: 'Inside Out 2 2024 4k 10bit' }
+    ]
+  });
+
+  const inspection = await inspectCatalogueFixRange(repository, { start: 1, end: 50 });
+  assert.equal(inspection.items.length, 3);
+  assert.equal(inspection.renameItems.length, 3);
+  assert.equal(inspection.duplicateGroups.length, 1);
+  assert.equal(inspection.duplicateGroups[0].title, 'Ayla and the Mirrors');
+
+  const messages = [];
+  const makeCtx = (text = '', callbackData = '') => ({
+    chat: { id: 777, type: 'private' },
+    from: { id: 777, username: 'admin' },
+    message: text ? { text } : undefined,
+    callbackQuery: callbackData ? { data: callbackData, message: { message_id: 99 } } : undefined,
+    answerCbQuery: async () => {},
+    telegram: {},
+    reply: async (msg, extra) => {
+      messages.push({ type: 'reply', text: msg, extra });
+      return { message_id: 99 };
+    },
+    editMessageText: async (msg, extra) => {
+      messages.push({ type: 'edit', text: msg, extra });
+      return { message_id: 99 };
+    }
+  });
+
+  // 1. Run /cateloguefix 1 to 50 and verify the two primary action buttons
+  await handleCatalogueFixCommand(makeCtx('/cateloguefix 1 to 50'), repository);
+  const cmdReply = messages.at(-1);
+  assert.match(cmdReply.text, /Catalogue Fix · Range 1 to 50/);
+  assert.match(cmdReply.text, /Names to fix\/clean: 3 posts/);
+  assert.match(cmdReply.text, /Same-name duplicate groups: 1 group/);
+  const rows = cmdReply.extra.reply_markup.inline_keyboard;
+  assert.equal(rows[0][0].callback_data, 'catfix:fix:1:50:all');
+  assert.match(rows[0][0].text, /Recheck Name & Fix/);
+  assert.equal(rows[1][0].callback_data, 'catfix:merge:1:50:all');
+  assert.match(rows[1][0].text, /Merge & Fix Name/);
+
+  // 2. Tap Button 1 (Recheck Name & Fix): fixes the names without deleting cards yet, and offers Merge button
+  await handleCatalogueFixAction(makeCtx('', 'catfix:fix:1:50:all'), { telegram: {} }, repository, config);
+  const fixReply = messages.at(-1);
+  assert.match(fixReply.text, /Fixed 3 post names/);
+  assert.match(fixReply.text, /Found 1 same-name group/);
+  assert.equal((await repository.findContentByAdminId(post3.adminId)).title, 'Inside Out 2');
+  assert.equal((await repository.findContentByAdminId(post1.adminId)).title, 'Ayla and the Mirrors');
+  assert.equal((await repository.findContentByAdminId(post2.adminId)).title, 'Ayla and the Mirrors');
+
+  // 3. Tap Button 2 (Merge & Fix Name): merges the two same-name "Ayla and the Mirrors" posts into one post
+  await handleCatalogueFixAction(makeCtx('', 'catfix:merge:1:50:all'), { telegram: {} }, repository, config);
+  const mergeReply = messages.at(-1);
+  assert.match(mergeReply.text, /Merged 1 duplicate post/);
+  const remainingAyla = await repository.findContentByAdminId(post1.adminId);
+  const absorbedAyla = await repository.findContentByAdminId(post2.adminId);
+  assert.ok(remainingAyla);
+  assert.equal(absorbedAyla, null);
+  assert.equal(remainingAyla.files.length, 2);
+  assert.equal(remainingAyla.title, 'Ayla and the Mirrors');
+});
+
 
 

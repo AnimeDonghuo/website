@@ -236,6 +236,8 @@ export const PUBLISHER_COMMANDS = [
   { command: 'tv', description: 'New TV & OTT draft (/ott also works)' },
   { command: 'adultdb', description: 'New private 18+ draft (/18db also works)' },
   { command: 'batch', description: 'Import a private storage range' },
+  { command: 'batch1', description: 'Import a storage link/range into ONE single catalog post (1 poster only)' },
+  { command: 'cateloguefix', description: 'Recheck & fix post names or auto-merge same-name posts in a range (e.g. 1 to 50)' },
   { command: 'repair', description: 'Re-index every card with today’s rules: /repair, then /repair go' },
   { command: 'sync', description: 'Refresh what the announcement channels show: /sync, /sync go, /sync retry, /sync db' },
   { command: 'auto', description: 'Control storage auto-publish' },
@@ -1552,8 +1554,26 @@ export function parsePrivateStorageMessageLink(value) {
   };
 }
 
+export function parseAllPrivateStorageMessageLinks(value) {
+  const text = String(value || '');
+  const regex = /(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d{5,20})\/(\d{1,12})(?:[/?#][^\s)]*)?/gi;
+  const results = [];
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const messageId = Number(match[2]);
+    if (!Number.isSafeInteger(messageId) || messageId < 1) continue;
+    results.push({
+      channelId: `-100${match[1]}`,
+      messageId,
+      url: `https://t.me/c/${match[1]}/${messageId}`
+    });
+  }
+  return results;
+}
+
 function parseBatchArgument(value) {
-  const supplied = cleanText(value, 180);
+  const withoutLinks = String(value || '').replace(/(?:https?:\/\/)?(?:www\.)?t\.me\/c\/\d{5,20}\/\d{1,12}(?:[/?#][^\s)]*)?/gi, ' ');
+  const supplied = cleanText(withoutLinks, 180);
   if (!supplied) return { title: '', category: null };
 
   // An optional category prefix lets a publisher override automatic detection
@@ -1934,13 +1954,17 @@ async function beginDraft(ctx, category, suppliedTitle, repository, config) {
   );
 }
 
-async function beginBatch(ctx, suppliedArgument, repository, config) {
+export async function beginBatch(ctx, suppliedArgument, repository, config, options = {}) {
+  const singlePost = Boolean(options?.singlePost);
+  const bot = options?.bot || null;
+  const cmdName = singlePost ? '/batch1' : '/batch';
   if (ctx.chat?.type && ctx.chat.type !== 'private') {
-    await ctx.reply('For privacy, start /batch in your private chat with this bot. It temporarily forwards each storage file there only to inspect its caption and media details.');
+    await ctx.reply(`For privacy, start ${cmdName} in your private chat with this bot. It temporarily forwards each storage file there only to inspect its caption and media details.`);
     return;
   }
 
   const parsed = parseBatchArgument(suppliedArgument);
+  const inlineLinks = parseAllPrivateStorageMessageLinks(suppliedArgument);
   const category = parsed.category || 'movie';
   const storageChannelId = storageChannelForCategory(config, category);
   if (!storageChannelId) {
@@ -1958,31 +1982,82 @@ async function beginBatch(ctx, suppliedArgument, repository, config) {
     category,
     title: parsed.title
   });
+  const baseBatch = {
+    stage: 'awaiting-first-link',
+    sourceChannelId: null,
+    firstMessageId: null,
+    lastMessageId: null,
+    titleProvided: Boolean(parsed.title),
+    categoryOverride: parsed.category,
+    singlePost
+  };
   await repository.updateSession(chatId(ctx), userId(ctx), {
     workflow: 'batch',
-    batch: {
-      stage: 'awaiting-first-link',
-      sourceChannelId: null,
-      firstMessageId: null,
-      lastMessageId: null,
-      titleProvided: Boolean(parsed.title),
-      categoryOverride: parsed.category
-    }
+    batch: baseBatch
   });
+
+  if (inlineLinks.length >= 1) {
+    const firstLink = inlineLinks[0];
+    if (String(firstLink.channelId) !== String(storageChannelId || '')) {
+      await ctx.reply(`That link is not from the configured ${isAdultCategory(category) ? '18+ ' : ''}database channel. This batch only accepts links whose internal ID maps to ${storageChannelId || `the configured ${storageEnvironmentName(category)}`}.`);
+      return;
+    }
+    if (inlineLinks.length >= 2) {
+      const secondLink = inlineLinks[1];
+      if (String(secondLink.channelId) !== String(firstLink.channelId)) {
+        await ctx.reply('Both links must be from the same private storage channel.');
+        return;
+      }
+      const firstId = Math.min(firstLink.messageId, secondLink.messageId);
+      const lastId = Math.max(firstLink.messageId, secondLink.messageId);
+      const rangeCount = lastId - firstId + 1;
+      const updatedSession = await repository.updateSession(chatId(ctx), userId(ctx), {
+        batch: {
+          ...baseBatch,
+          stage: 'importing',
+          sourceChannelId: firstLink.channelId,
+          firstMessageId: firstId,
+          lastMessageId: lastId
+        }
+      });
+      await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing ${singlePost ? '1 combined catalog post (1 poster only)' : 'the catalog post'}…`);
+      await importStorageRange(ctx, updatedSession, { ...secondLink, messageId: lastId }, bot, repository, config);
+      return;
+    }
+
+    await repository.updateSession(chatId(ctx), userId(ctx), {
+      batch: {
+        ...baseBatch,
+        stage: 'awaiting-last-link',
+        sourceChannelId: firstLink.channelId,
+        firstMessageId: firstLink.messageId
+      }
+    });
+    await ctx.reply(
+      singlePost
+        ? `First storage message saved: ${firstLink.messageId}. Now send the LAST link to combine the entire range into ONE single catalog post (1 poster only), or send /done to import just message ${firstLink.messageId}.`
+        : `First storage message saved: ${firstLink.messageId}. Now send the LAST link (the range is inclusive).`
+    );
+    return;
+  }
 
   await ctx.reply(
     [
-      parsed.title ? `Batch import created for “${parsed.title}”.` : 'Untitled batch import created.',
+      singlePost
+        ? (parsed.title ? `Single-post batch import (/batch1) created for “${parsed.title}”.` : 'Single-post batch import (/batch1) created — 1 catalog post & 1 poster only.')
+        : (parsed.title ? `Batch import created for “${parsed.title}”.` : 'Untitled batch import created.'),
       '',
       'Send the FIRST private database-channel link, then send the LAST link. Both links must look like:',
       'https://t.me/c/1234567890/123',
       '',
-      'Every supported media message in the inclusive range is imported as one release. Large episode ranges are processed patiently with progress updates; the bot briefly forwards each item only to inspect its file details, then removes that preview.',
+      singlePost
+        ? 'Every supported media message in the inclusive range is combined into ONE single catalog post with 1 poster only (never splitting into separate posts or seasons). You can also send 1 link and then /done to import a single post.'
+        : 'Every supported media message in the inclusive range is imported as one release. Large episode ranges are processed patiently with progress updates; the bot briefly forwards each item only to inspect its file details, then removes that preview.',
       isAdultCategory(category)
         ? 'This 18+ batch reads only the separate adult storage channel and will never create a public Telegram announcement.'
         : parsed.title
-          ? 'The category will be detected from the title/files. To force it next time, use /batch anime | Your title.'
-          : 'The title and category will be inferred from the imported file descriptions and names. Use /batch adult | Your title for the isolated 18+ storage channel.'
+          ? `The category will be detected from the title/files. To force it next time, use ${cmdName} anime | Your title.`
+          : `The title and category will be inferred from the imported file descriptions and names. Use ${cmdName} adult | Your title for the isolated 18+ storage channel.`
     ].join('\n')
   );
 }
@@ -2255,7 +2330,10 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
     return { imported: 0, skippedByReason, failures };
   }
 
-  const title = cleanText(session.title || inferBatchTitle(latestSession.files), 180) || `Storage import ${firstMessageId}–${lastMessageId}`;
+  const inferredTitle = batch.singlePost
+    ? (inferBatchTitle([latestSession.files[0]].filter(Boolean)) || inferBatchTitle(latestSession.files))
+    : inferBatchTitle(latestSession.files);
+  const title = cleanText(session.title || inferredTitle, 180) || `Storage import ${firstMessageId}–${lastMessageId}`;
   const category = batch.categoryOverride || inferBatchCategory({ title, files: latestSession.files });
   await repository.updateSession(chatId(ctx), userId(ctx), {
     title,
@@ -2274,7 +2352,7 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
 
   const queuedCaptions = flushCaptionQueue();
   await replyBatchDiagnostics(ctx, [
-    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”.`,
+    `Imported ${imported.length} new file${imported.length === 1 ? '' : 's'} from messages ${firstMessageId}–${lastMessageId}. Detected ${categoryDetails(category).label} · “${title}”${batch.singlePost ? ' (single-post /batch1 mode — 1 poster only)' : ''}.`,
     ...diagnostics,
     batchCaptionQueueNote(queuedCaptions),
     'Matching metadata and publishing now…'
@@ -2284,7 +2362,8 @@ export async function importStorageRange(ctx, session, lastLink, bot, repository
 }
 
 async function handleBatchLink(ctx, session, bot, repository, config) {
-  const link = parsePrivateStorageMessageLink(ctx.message?.text);
+  const allLinks = parseAllPrivateStorageMessageLinks(ctx.message?.text);
+  const link = allLinks[0] || parsePrivateStorageMessageLink(ctx.message?.text);
   if (!link) {
     await ctx.reply('Please send a private storage link in the form https://t.me/c/<internal-channel-id>/<message-id>. Public @channel links cannot safely identify this database channel.');
     return;
@@ -2305,6 +2384,28 @@ async function handleBatchLink(ctx, session, bot, repository, config) {
     await ctx.reply('This batch has already been prepared. Use /done if publishing did not finish, or begin a new /batch import.');
     return;
   }
+  if (!batch.firstMessageId && allLinks.length >= 2) {
+    const secondLink = allLinks[1];
+    if (String(secondLink.channelId) !== String(link.channelId)) {
+      await ctx.reply('Both links must be from the same private storage channel.');
+      return;
+    }
+    const firstId = Math.min(link.messageId, secondLink.messageId);
+    const lastId = Math.max(link.messageId, secondLink.messageId);
+    const rangeCount = lastId - firstId + 1;
+    const updatedSession = await repository.updateSession(chatId(ctx), userId(ctx), {
+      batch: {
+        ...batch,
+        stage: 'importing',
+        sourceChannelId: link.channelId,
+        firstMessageId: firstId,
+        lastMessageId: lastId
+      }
+    });
+    await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing ${batch.singlePost ? '1 combined catalog post (1 poster only)' : 'the catalog post'}…`);
+    await importStorageRange(ctx, updatedSession, { ...secondLink, messageId: lastId }, bot, repository, config);
+    return;
+  }
   if (!batch.firstMessageId) {
     await repository.updateSession(chatId(ctx), userId(ctx), {
       batch: {
@@ -2314,7 +2415,11 @@ async function handleBatchLink(ctx, session, bot, repository, config) {
         firstMessageId: link.messageId
       }
     });
-    await ctx.reply(`First storage message saved: ${link.messageId}. Now send the LAST link (the range is inclusive).`);
+    await ctx.reply(
+      batch.singlePost
+        ? `First storage message saved: ${link.messageId}. Now send the LAST link to combine the range into ONE single catalog post (1 poster only), or send /done to import just message ${link.messageId}.`
+        : `First storage message saved: ${link.messageId}. Now send the LAST link (the range is inclusive).`
+    );
     return;
   }
 
@@ -2331,7 +2436,7 @@ async function handleBatchLink(ctx, session, bot, repository, config) {
   await repository.updateSession(chatId(ctx), userId(ctx), {
     batch: { ...batch, stage: 'importing', lastMessageId: link.messageId }
   });
-  await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing the catalog post…`);
+  await ctx.reply(`Inspecting ${rangeCount} storage message${rangeCount === 1 ? '' : 's'} and preparing ${batch.singlePost ? '1 combined catalog post (1 poster only)' : 'the catalog post'}…`);
   await importStorageRange(ctx, session, link, bot, repository, config);
 }
 
@@ -4036,6 +4141,7 @@ export function groupFilesByReleaseTitle(files = []) {
  * single coherent post, so nothing about the ordinary flow changes.
  */
 export function planDraftPublicationGroups(session) {
+  if (session?.batch?.singlePost) return [];
   const files = Array.isArray(session?.files) ? session.files : [];
   if (files.length < 2) return [];
   const seasonGroups = groupFilesBySeason(files);
@@ -5304,8 +5410,433 @@ function formatPostIdResults(window, posts) {
     '',
     ...posts.map((post, index) => `${index + 1}. ${post.adminId} · ${cleanText(post.title, 130)} — ${categoryDetails(post.category).shortLabel}`),
     '',
-    'Copy an ID into /delete if you need to remove a post.'
+    'Copy an ID into /delete if you need to remove a post, or use /cateloguefix 1 to 50 to recheck/fix names and merge same-name posts.'
   ].join('\n');
+}
+
+export function parseCatalogueFixRange(value = '') {
+  const raw = String(value || '')
+    .replace(/^\/(?:cateloguefix|cataloguefix|catalogfix|catfix)(?:@[A-Za-z0-9_]+)?\b/i, '')
+    .trim();
+  if (!raw) {
+    return { start: 1, end: 50, period: 'all', explicit: false };
+  }
+
+  let period = 'all';
+  const periodMatch = raw.match(/\b(today|yesterday|week|month|all)\b/i);
+  if (periodMatch) {
+    period = periodMatch[1].toLowerCase();
+  }
+
+  const withoutPeriod = raw.replace(/\b(today|yesterday|week|month|all|from|range|posts?)\b/gi, ' ').trim();
+  const rangeMatch = withoutPeriod.match(/(\d{1,4})\s*(?:to|-|–|—|\.\.+|\s)\s*(\d{1,4})/i);
+  if (rangeMatch) {
+    const a = Math.max(1, Number(rangeMatch[1]) || 1);
+    const b = Math.max(1, Number(rangeMatch[2]) || 50);
+    const start = Math.min(a, b);
+    const end = Math.min(250, Math.max(a, b));
+    return { start, end, period, explicit: true };
+  }
+
+  const singleMatch = withoutPeriod.match(/\b(\d{1,4})\b/);
+  if (singleMatch) {
+    const end = Math.min(250, Math.max(1, Number(singleMatch[1]) || 50));
+    return { start: 1, end, period, explicit: true };
+  }
+
+  return { start: 1, end: 50, period, explicit: Boolean(periodMatch) };
+}
+
+export async function inspectCatalogueFixRange(repository, { start = 1, end = 50, period = 'all' } = {}) {
+  const safeStart = Math.max(1, Number(start) || 1);
+  const safeEnd = Math.min(250, Math.max(safeStart, Number(end) || 50));
+  const safePeriod = ['today', 'yesterday', 'week', 'month'].includes(period) ? period : 'all';
+  const window = safePeriod !== 'all' ? postIdTimeWindow(safePeriod) : null;
+
+  const listOptions = {
+    limit: Math.max(safeEnd, 100),
+    ...(window ? { startAt: window.startAt, endAt: window.endAt } : {})
+  };
+  const allPosts = await repository.listAdminContent(listOptions);
+  const sliced = allPosts.slice(safeStart - 1, safeEnd);
+  const cards = (await Promise.all(
+    sliced.map((summary) => repository.findContentByAdminId(summary.adminId))
+  )).filter(Boolean);
+
+  const items = [];
+  const groupsByKey = new Map();
+
+  for (let index = 0; index < cards.length; index += 1) {
+    const card = cards[index];
+    const rank = safeStart + index;
+    const files = Array.isArray(card.files) ? card.files : [];
+    const fileInferred = cleanText(inferBatchTitle(files), 180);
+    const tidiedCurrent = cleanText(tidyReleaseTitle(card.title), 180);
+    let suggestedTitle = cleanText(card.title, 180);
+    if (fileInferred && isPlausibleReleaseTitle(fileInferred)) {
+      suggestedTitle = fileInferred;
+    } else if (tidiedCurrent && isPlausibleReleaseTitle(tidiedCurrent)) {
+      suggestedTitle = tidiedCurrent;
+    }
+    if (tidiedCurrent && isPlausibleReleaseTitle(tidiedCurrent) && tidiedCurrent.length < suggestedTitle.length) {
+      const currentCanon = canonicalMetadataTitle(tidiedCurrent);
+      const fileCanon = canonicalMetadataTitle(suggestedTitle);
+      if (currentCanon && currentCanon === fileCanon) {
+        suggestedTitle = tidiedCurrent;
+      }
+    }
+
+    const currentTitle = cleanText(card.title, 180);
+    const needsNameFix = Boolean(
+      suggestedTitle
+      && suggestedTitle.toLowerCase() !== currentTitle.toLowerCase()
+    ) || Boolean(suggestedTitle && suggestedTitle !== currentTitle);
+
+    const canonicalKey = canonicalMetadataTitle(suggestedTitle || currentTitle)
+      || slugify(suggestedTitle || currentTitle).replace(/-/g, ' ');
+    const groupKey = canonicalKey
+      ? `${isAdultCategory(card.category) ? 'adult' : 'safe'}::${slugify(canonicalKey)}`
+      : '';
+
+    const item = {
+      rank,
+      card,
+      adminId: card.adminId,
+      currentTitle,
+      suggestedTitle: suggestedTitle || currentTitle,
+      needsNameFix,
+      groupKey,
+      filesCount: files.length || Number(card.filesCount) || 0
+    };
+    items.push(item);
+
+    if (groupKey) {
+      const group = groupsByKey.get(groupKey) || [];
+      group.push(item);
+      groupsByKey.set(groupKey, group);
+    }
+  }
+
+  const duplicateGroups = [];
+  for (const [, groupItems] of groupsByKey.entries()) {
+    if (groupItems.length < 2) continue;
+    // Keep the oldest card (or lowest rank if published at the same instant) as target so existing links stay stable
+    const ordered = [...groupItems].sort((a, b) => {
+      const timeA = new Date(a.card.publishedAt || a.card.createdAt || 0).getTime();
+      const timeB = new Date(b.card.publishedAt || b.card.createdAt || 0).getTime();
+      if (timeA && timeB && timeA !== timeB) return timeA - timeB;
+      return a.rank - b.rank;
+    });
+    const target = ordered[0];
+    const sources = ordered.slice(1);
+    duplicateGroups.push({
+      title: target.suggestedTitle || target.currentTitle,
+      targetAdminId: target.adminId,
+      targetTitle: target.suggestedTitle || target.currentTitle,
+      sources: sources.map((source) => ({
+        adminId: source.adminId,
+        title: source.currentTitle,
+        suggestedTitle: source.suggestedTitle,
+        files: source.filesCount
+      }))
+    });
+  }
+
+  return {
+    start: safeStart,
+    end: safeEnd,
+    period: safePeriod,
+    window,
+    totalAvailable: allPosts.length,
+    items,
+    renameItems: items.filter((item) => item.needsNameFix),
+    duplicateGroups
+  };
+}
+
+export function catalogueFixKeyboard({
+  start = 1,
+  end = 50,
+  period = 'all',
+  hasPosts = true,
+  renameCount = 0,
+  duplicateCount = 0
+} = {}) {
+  const safePeriod = ['today', 'yesterday', 'week', 'month'].includes(period) ? period : 'all';
+  const rows = [];
+  if (hasPosts) {
+    rows.push([
+      Markup.button.callback(
+        `🔍 Recheck Name & Fix${renameCount ? ` (${renameCount})` : ''}`,
+        `catfix:fix:${start}:${end}:${safePeriod}`
+      )
+    ]);
+    rows.push([
+      Markup.button.callback(
+        `🔗 Merge & Fix Name${duplicateCount ? ` (${duplicateCount} group${duplicateCount === 1 ? '' : 's'})` : ''}`,
+        `catfix:merge:${start}:${end}:${safePeriod}`
+      )
+    ]);
+  }
+  rows.push([
+    Markup.button.callback('1 to 10', `catfix:range:1:10:${safePeriod}`),
+    Markup.button.callback('1 to 25', `catfix:range:1:25:${safePeriod}`),
+    Markup.button.callback('1 to 50', `catfix:range:1:50:${safePeriod}`),
+    Markup.button.callback('1 to 100', `catfix:range:1:100:${safePeriod}`)
+  ]);
+  rows.push([
+    Markup.button.callback('Today', `catfix:range:${start}:${end}:today`),
+    Markup.button.callback('Yesterday', `catfix:range:${start}:${end}:yesterday`),
+    Markup.button.callback('Week', `catfix:range:${start}:${end}:week`),
+    Markup.button.callback('All Recent', `catfix:range:${start}:${end}:all`)
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function formatCatalogueFixInspection(inspection) {
+  const { start, end, period, window, items, renameItems, duplicateGroups } = inspection;
+  const periodLabel = window ? ` · ${window.label}` : '';
+  if (!items.length) {
+    return [
+      `🛠 Catalogue Fix · Range ${start} to ${end}${periodLabel}`,
+      '',
+      'No published posts were found in this range.',
+      'Choose another range or time window below, or send `/cateloguefix 1 to 50`.'
+    ].join('\n');
+  }
+
+  const duplicateSourceIds = new Set(
+    duplicateGroups.flatMap((group) => group.sources.map((source) => source.adminId))
+  );
+  const duplicateTargetBySource = new Map();
+  for (const group of duplicateGroups) {
+    for (const source of group.sources) {
+      duplicateTargetBySource.set(source.adminId, group.targetAdminId);
+    }
+  }
+
+  const previewLines = items.slice(0, 35).map((item) => {
+    const renameSuffix = item.needsNameFix ? ` → “${cleanText(item.suggestedTitle, 60)}”` : '';
+    const dupSuffix = duplicateSourceIds.has(item.adminId)
+      ? ` [Same name as ${duplicateTargetBySource.get(item.adminId)}]`
+      : '';
+    return `${item.rank}. ${item.adminId} · ${cleanText(item.currentTitle, 55)}${renameSuffix}${dupSuffix}`;
+  });
+  if (items.length > 35) {
+    previewLines.push(`…and ${items.length - 35} more post${items.length - 35 === 1 ? '' : 's'} in range ${start} to ${end}.`);
+  }
+
+  const dupSummaryLines = duplicateGroups.length
+    ? [
+      '',
+      `Same-name groups detected (${duplicateGroups.length}):`,
+      ...duplicateGroups.slice(0, 12).map((group) => (
+        `▪ “${cleanText(group.title, 60)}”: keep ${group.targetAdminId} ← merge ${group.sources.map((s) => `${s.adminId} (${s.files}f)`).join(', ')}`
+      ))
+    ]
+    : [];
+
+  return [
+    `🛠 Catalogue Fix · Range ${start} to ${end}${periodLabel} (${items.length} post${items.length === 1 ? '' : 's'})`,
+    `▪ Names to fix/clean: ${renameItems.length} post${renameItems.length === 1 ? '' : 's'}`,
+    `▪ Same-name duplicate groups: ${duplicateGroups.length} group${duplicateGroups.length === 1 ? '' : 's'}`,
+    '',
+    ...previewLines,
+    ...dupSummaryLines,
+    '',
+    'Choose an action below:',
+    '1️⃣ Recheck Name & Fix — cleans noisy/misparsed names from files and checks if any posts share the same name.',
+    '2️⃣ Merge & Fix Name — cleans the names AND merges same-name duplicate posts into one combined catalog post.'
+  ].join('\n');
+}
+
+export async function executeCatalogueFix({
+  ctx,
+  bot,
+  repository,
+  config,
+  start = 1,
+  end = 50,
+  period = 'all',
+  mergeDuplicates = false
+}) {
+  const inspection = await inspectCatalogueFixRange(repository, { start, end, period });
+  if (!inspection.items.length) {
+    await ctx.reply(
+      `No posts found in range ${inspection.start} to ${inspection.end}.`,
+      catalogueFixKeyboard({ start: inspection.start, end: inspection.end, period: inspection.period, hasPosts: false })
+    );
+    return { inspection, renamed: [], merged: null };
+  }
+
+  const renamed = [];
+  for (const item of inspection.items) {
+    if (item.needsNameFix && item.suggestedTitle) {
+      const updated = await repository.updateContentByAdminId(item.adminId, { title: item.suggestedTitle });
+      if (updated) {
+        renamed.push({
+          adminId: item.adminId,
+          oldTitle: item.currentTitle,
+          newTitle: updated.title
+        });
+        queuePosterRematchForTitle(
+          { telegram: ctx.telegram, repository, config, content: updated, notifyChatId: chatId(ctx) },
+          { detached: true }
+        );
+        await queueAnnouncementSync({
+          telegram: ctx.telegram,
+          repository,
+          content: updated,
+          config,
+          adminId: updated.adminId
+        });
+      }
+    } else if (typeof repository.reindexContent === 'function') {
+      await repository.reindexContent(item.adminId);
+    }
+  }
+
+  if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
+    await repository.reconcileCatalogMediaFromFiles();
+  }
+
+  // Re-inspect after fixing names so any newly matching titles are grouped accurately
+  const postRenameInspection = await inspectCatalogueFixRange(repository, {
+    start: inspection.start,
+    end: inspection.end,
+    period: inspection.period
+  });
+  const duplicateGroups = postRenameInspection.duplicateGroups.length
+    ? postRenameInspection.duplicateGroups
+    : inspection.duplicateGroups;
+
+  let mergeOutcome = null;
+  if (mergeDuplicates && duplicateGroups.length > 0) {
+    mergeOutcome = await applyMergePlan({
+      bot,
+      repository,
+      config,
+      plan: { groups: duplicateGroups }
+    });
+    for (const group of duplicateGroups) {
+      if (group.title) {
+        const refreshedTarget = await repository.findContentByAdminId(group.targetAdminId);
+        if (refreshedTarget && refreshedTarget.title !== group.title) {
+          await repository.updateContentByAdminId(group.targetAdminId, { title: group.title });
+        }
+      }
+    }
+  }
+
+  const lines = [
+    mergeDuplicates
+      ? `✅ Catalogue Merge & Name Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
+      : `✅ Catalogue Name Recheck & Fix complete for range ${inspection.start} to ${inspection.end} (${inspection.items.length} post${inspection.items.length === 1 ? '' : 's'} inspected).`
+  ];
+
+  if (renamed.length) {
+    lines.push(
+      '',
+      `Fixed ${renamed.length} post name${renamed.length === 1 ? '' : 's'}:`,
+      ...renamed.slice(0, 25).map((r) => `▪ ${r.adminId}: “${cleanText(r.oldTitle, 45)}” → “${cleanText(r.newTitle, 45)}”`)
+    );
+  } else {
+    lines.push('▪ All post names in this range were already clean.');
+  }
+
+  if (mergeDuplicates) {
+    if (mergeOutcome && !mergeOutcome.error && mergeOutcome.moved?.length) {
+      lines.push(
+        '',
+        `Merged ${mergeOutcome.moved.length} duplicate post${mergeOutcome.moved.length === 1 ? '' : 's'} (${mergeOutcome.filesMoved || 0} file${mergeOutcome.filesMoved === 1 ? '' : 's'} combined):`,
+        ...duplicateGroups.map((g) => `▪ Kept ${g.targetAdminId} · “${cleanText(g.title, 55)}” ← absorbed ${g.sources.map((s) => s.adminId).join(', ')}`)
+      );
+    } else if (mergeOutcome?.error) {
+      lines.push('', `⚠️ Merge note: ${mergeOutcome.error}`);
+    } else {
+      lines.push('▪ No duplicate same-name posts needed merging in this range.');
+    }
+  } else if (duplicateGroups.length > 0) {
+    lines.push(
+      '',
+      `⚠️ Found ${duplicateGroups.length} same-name group${duplicateGroups.length === 1 ? '' : 's'} in this range:`,
+      ...duplicateGroups.slice(0, 15).map((g) => `▪ “${cleanText(g.title, 55)}”: ${g.targetAdminId} + ${g.sources.map((s) => s.adminId).join(', ')}`),
+      '',
+      'Tap “🔗 Merge & Fix Name” below to merge these same-name posts into 1 card each.'
+    );
+  } else {
+    lines.push('▪ No duplicate same-name posts were found in this range.');
+  }
+
+  const followUpKeyboard = (!mergeDuplicates && duplicateGroups.length > 0)
+    ? Markup.inlineKeyboard([
+      [Markup.button.callback(
+        `🔗 Merge & Fix Name (${duplicateGroups.length} group${duplicateGroups.length === 1 ? '' : 's'})`,
+        `catfix:merge:${inspection.start}:${inspection.end}:${inspection.period}`
+      )],
+      [
+        Markup.button.callback('1 to 25', `catfix:range:1:25:${inspection.period}`),
+        Markup.button.callback('1 to 50', `catfix:range:1:50:${inspection.period}`),
+        Markup.button.callback('1 to 100', `catfix:range:1:100:${inspection.period}`)
+      ]
+    ])
+    : undefined;
+
+  await ctx.reply(lines.join('\n'), followUpKeyboard);
+  return { inspection, renamed, merged: mergeOutcome, duplicateGroups };
+}
+
+export async function handleCatalogueFixCommand(ctx, repository) {
+  const parsed = parseCatalogueFixRange(ctx.message?.text || '');
+  const inspection = await inspectCatalogueFixRange(repository, parsed);
+  const text = formatCatalogueFixInspection(inspection);
+  const keyboard = catalogueFixKeyboard({
+    start: inspection.start,
+    end: inspection.end,
+    period: inspection.period,
+    hasPosts: inspection.items.length > 0,
+    renameCount: inspection.renameItems.length,
+    duplicateCount: inspection.duplicateGroups.length
+  });
+  await ctx.reply(text, keyboard);
+  return inspection;
+}
+
+export async function handleCatalogueFixAction(ctx, bot, repository, config) {
+  const data = String(ctx.callbackQuery?.data || '');
+  const match = data.match(/^catfix:(range|fix|merge):(\d+):(\d+):(all|today|yesterday|week|month)$/);
+  if (!match) return;
+  const [, mode, startRaw, endRaw, period] = match;
+  const start = Math.max(1, Number(startRaw) || 1);
+  const end = Math.min(250, Math.max(start, Number(endRaw) || 50));
+
+  if (mode === 'range') {
+    const inspection = await inspectCatalogueFixRange(repository, { start, end, period });
+    await replaceInteractiveMessage(
+      ctx,
+      formatCatalogueFixInspection(inspection),
+      catalogueFixKeyboard({
+        start: inspection.start,
+        end: inspection.end,
+        period: inspection.period,
+        hasPosts: inspection.items.length > 0,
+        renameCount: inspection.renameItems.length,
+        duplicateCount: inspection.duplicateGroups.length
+      })
+    );
+    return;
+  }
+
+  await executeCatalogueFix({
+    ctx,
+    bot,
+    repository,
+    config,
+    start,
+    end,
+    period,
+    mergeDuplicates: mode === 'merge'
+  });
 }
 
 function formatAnalyticsTime(value) {
@@ -8119,7 +8650,8 @@ export const HELP_TOPICS = {
       '',
       'Commands (What each is for):',
       '• /batch [Optional Title] — Starts a range import from your private database channel.',
-      '• /batch <category> | <Optional Title> — Forces a specific category for the batch (e.g. /batch anime | Demon Slayer or /batch adult | Private Title).',
+      '• /batch1 [Optional Title] — Imports a private database channel link or range into ONE single catalog post with 1 poster only (never splitting into separate posts or seasons).',
+      '• /batch <category> | <Optional Title> (or /batch1 <category> | <Optional Title>) — Forces a specific category for the batch (e.g. /batch anime | Demon Slayer or /batch1 adult | Private Title).',
       '• /auto — Opens ON/OFF controls for automatic storage-channel publishing.',
       '• /teststorage — Verifies the bot has admin access to your private database channel(s).',
       '',
@@ -8191,6 +8723,7 @@ export const HELP_TOPICS = {
       '',
       'Commands (What each is for):',
       '• /removefile [category | SB-ID | search text] (aliases: /rmfile, /delfile, /deletefile, /files) — Interactive category-wise & recent post browser to inspect and remove specific episodes, movie files, or series files.',
+      '• /cateloguefix <range> (e.g. /cateloguefix 1 to 50, /cataloguefix 1-50, /catfix 50) — Inspects posts in a range and gives two buttons: (1) Recheck Name & Fix, or (2) Merge & Fix Name (auto-merges same-name duplicate posts).',
       '• /merge <Exact Title> <Target SB-ID> <Source SB-ID> [More SB-IDs...] — Combines multiple posts into the target post (moves all files & players, rebuilds seasons, deletes absorbed posts).',
       '• /merge drop <SB-ID> season <N> (or ep <N>, or season <N> ep <A-B>) — Removes a whole season block or episode range from a post by command.',
       '• /delete <SB-ID[, SB-ID2...]> — Permanently deletes entire catalog post(s) and their channel announcements.',
@@ -8281,13 +8814,14 @@ export const HELP_TOPICS = {
       '/panel · /movie · /anime · /cartoon · /donghua · /kdrama · /series · /tv (/ott) · /18db (/adultdb) · /done · /status · /cancel',
       '',
       '▸ Batch & Automation:',
-      '/batch [cat |] [Title] · /auto · /teststorage',
+      '/batch [cat |] [Title] · /batch1 [cat |] [Title] · /auto · /teststorage',
       '',
       '▸ Edit Metadata & Artwork:',
-      '/title · /titlebatch · /category · /lang (/lan, /lam) · /subtitles (/subs) · /year · /genres · /description · /release · /status · /poster (/p, /imgdd) · /scrape',
+      '/title · /titlebatch · /cateloguefix <1 to 50> · /category · /lang (/lan, /lam) · /subtitles (/subs) · /year · /genres · /description · /release · /status · /poster (/p, /imgdd) · /scrape',
       '',
       '▸ Files, Merge & Delete:',
       '/removefile (/rmfile, /delfile, /deletefile, /files) — Pick a post & remove specific episode/movie/series file with Go back / Remove buttons',
+      '/cateloguefix (/cataloguefix, /catalogfix, /catfix) — Recheck & fix names or merge same-name posts in a range (e.g. 1 to 50)',
       '/merge — Merge posts or drop seasons/episodes (/merge drop)',
       '/delete — Delete whole post(s) by SB-ID',
       '',
@@ -8311,13 +8845,13 @@ export function publisherHelpOverviewText() {
     'Tap any button below to view full details on what each feature is for, every command name, and step-by-step how it works:',
     '',
     '• 📤 Publish & Drafts — /panel, /movie, /anime, /cartoon, /donghua, /kdrama, /series, /tv (/ott), /18db, /done, /cancel',
-    '• 📦 Batch & Auto-Publish — /batch range imports (FIRST & LAST links), /auto 90s quiet-window storage automation, /teststorage',
-    '• ✏️ Edit Posts & Titles — /title, /titlebatch, /category, /lang, /subtitles, /year, /genres, /description, /release, /status',
+    '• 📦 Batch & Auto-Publish — /batch range imports, /batch1 (1 single catalog post & 1 poster only), /auto 90s quiet-window storage automation, /teststorage',
+    '• ✏️ Edit Posts & Titles — /title, /titlebatch, /cateloguefix <1 to 50>, /category, /lang, /subtitles, /year, /genres, /description, /release, /status',
     '• 🖼 Poster & Web Scrape — /scrape [SB-ID] <URL> (keeps file audio/subs, auto-updates category & announcement), /poster (/p, /imgdd), /imgapis',
-    '• 🗂 Remove File & Merge — /removefile (select post -> tap episode/file -> Go back or Remove), /merge, /merge drop, /delete',
+    '• 🗂 Remove File & Merge — /removefile (select post -> tap episode/file -> Go back or Remove), /cateloguefix <1 to 50>, /merge, /merge drop, /delete',
     '• ▶️ Watch Players & Quality — Watch page quality selector (144p/288p/544p/720p/1080p/4K Telegram link switching), /cmd, /players, /searchm',
     '• 🔄 Sync, Repair & Channels — /repair, /repair go, /sync, /sync go, /sync db, /addchannel, /channels, /removechannel',
-    '• 🔍 Search, IDs & System — /search, /posts, /postid, /requests, /stats, /backup, /recover, /maintanence, /restart',
+    '• 🔍 Search, IDs & System — /search, /posts, /postid, /cateloguefix, /requests, /stats, /backup, /recover, /maintanence, /restart',
     '• 📋 All Commands A–Z — Complete command checklist in one view',
     '',
     'Tip: You can also type /help <topic> (e.g. /help scrape, /help removefile, /help batch) or tap any button below:'
@@ -8354,10 +8888,10 @@ function resolveHelpTopicFromQuery(rawQuery = '') {
   if (!q) return null;
   if (HELP_TOPICS[q]) return HELP_TOPICS[q];
   if (/^(?:movie|anime|cartoon|donghua|kdrama|series|tv|ott|18db|adultdb|done|cancel|draft|drafts|panel)$/.test(q)) return HELP_TOPICS.publish;
-  if (/^(?:batch|auto|teststorage|automation)$/.test(q)) return HELP_TOPICS.batch;
+  if (/^(?:batch|batch1|auto|teststorage|automation)$/.test(q)) return HELP_TOPICS.batch;
   if (/^(?:title|titlebatch|lang|lan|lam|subtitles|subs|year|genres|description|release|category|edit)$/.test(q)) return HELP_TOPICS.edit;
   if (/^(?:scrape|poster|p|imgdd|imgapis|addimgapi|removeimgapi|artwork)$/.test(q)) return HELP_TOPICS.scrape;
-  if (/^(?:removefile|rmfile|delfile|deletefile|files|merge|delete|remove)$/.test(q)) return HELP_TOPICS.files;
+  if (/^(?:removefile|rmfile|delfile|deletefile|files|cateloguefix|cataloguefix|catalogfix|catfix|merge|delete|remove)$/.test(q)) return HELP_TOPICS.files;
   if (/^(?:cmd|players|player|watch|quality|searchm|magnet)$/.test(q)) return HELP_TOPICS.players;
   if (/^(?:sync|repair|addchannel|channels|removechannel|channel)$/.test(q)) return HELP_TOPICS.sync;
   if (/^(?:search|posts|postid|requests|stats|backup|recover|maintanence|maintenance|restart|login|logout|admin)$/.test(q)) return HELP_TOPICS.admin;
@@ -8606,7 +9140,12 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
 
   bot.command('batch', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
-    await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config);
+    await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config, { singlePost: false, bot });
+  });
+
+  bot.command('batch1', async (ctx) => {
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await beginBatch(ctx, parseCommandArgument(ctx.message.text), repository, config, { singlePost: true, bot });
   });
 
   bot.command('auto', async (ctx) => {
@@ -8972,6 +9511,26 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
 
   bot.command('done', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
+    const session = await repository.findSession(chatId(ctx), userId(ctx));
+    if (
+      session?.workflow === 'batch'
+      && session?.batch?.stage === 'awaiting-last-link'
+      && session?.batch?.firstMessageId
+      && !(Array.isArray(session?.files) && session.files.length)
+    ) {
+      const firstId = Number(session.batch.firstMessageId);
+      const sourceChannelId = session.batch.sourceChannelId || storageChannelForCategory(config, session.category || session.batch?.categoryOverride || 'movie');
+      const updatedSession = await repository.updateSession(chatId(ctx), userId(ctx), {
+        batch: {
+          ...session.batch,
+          stage: 'importing',
+          lastMessageId: firstId
+        }
+      });
+      await ctx.reply(`Inspecting storage message ${firstId} and preparing ${session.batch?.singlePost ? '1 combined catalog post (1 poster only)' : 'the catalog post'}…`);
+      await importStorageRange(ctx, updatedSession, { channelId: sourceChannelId, messageId: firstId }, bot, repository, config);
+      return;
+    }
     await publishDraft(ctx, bot, repository, config);
   });
 
@@ -9182,6 +9741,13 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
     if (!(await requirePublisher(ctx, repository, config))) return;
     await ctx.reply('Choose an upload period. I will return the post IDs and names uploaded in that time window.', postIdKeyboard());
   });
+
+  for (const cmd of ['cateloguefix', 'cataloguefix', 'catalogfix', 'catfix']) {
+    bot.command(cmd, async (ctx) => {
+      if (!(await requirePublisher(ctx, repository, config))) return;
+      await handleCatalogueFixCommand(ctx, repository);
+    });
+  }
 
   bot.command('stats', async (ctx) => {
     if (!(await requirePublisher(ctx, repository, config))) return;
@@ -9898,9 +10464,16 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
   bot.action(/^postid:(today|yesterday|week|month)$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (!(await requirePublisher(ctx, repository, config))) return;
-    const window = postIdTimeWindow(ctx.match[1]);
+    const period = ctx.match[1];
+    const window = postIdTimeWindow(period);
     const posts = await repository.listAdminContent({ startAt: window.startAt, endAt: window.endAt, limit: 100 });
     await replyBatchDiagnostics(ctx, formatPostIdResults(window, posts).split('\n'));
+  });
+
+  bot.action(/^catfix:(range|fix|merge):\d+:\d+:(all|today|yesterday|week|month)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!(await requirePublisher(ctx, repository, config))) return;
+    await handleCatalogueFixAction(ctx, bot, repository, config);
   });
 
   bot.action('postid:back', async (ctx) => {
