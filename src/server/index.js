@@ -20,6 +20,7 @@ import {
   verifyPlaybackCsrf
 } from './services/playback-service.js';
 import { addSubsPleaseMagnets, createSubsPleaseService, magnetContentRevision } from './services/subsplease-service.js';
+import { normalizePlayerApiSettings, playerApiFrameSources } from './services/player-api-service.js';
 import { launchTelegramBot } from './services/telegram-bot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -271,7 +272,10 @@ export function toPublicContent(content, config, { includeFileChoices = true } =
   const deliveryUrl = content.hasDelivery ? getDeliveryRedirectPath(shareCode) : null;
   const fileChoices = includeFileChoices && content.hasDelivery ? publicFileChoices(content.files, config, shareCode, content) : [];
   const effectiveStream = mergeContentStreamWithTelegramFiles(content.stream, content, config);
-  const publicStream = publicStreamingData(effectiveStream, config.streaming || {});
+  const publicStream = publicStreamingData(effectiveStream, {
+    ...(config.streaming || {}),
+    playerApis: config.playback?.playerApis || {}
+  });
   // Listing endpoints (includeFileChoices === false) expose only availability/count,
   // never the full player entry list or internal Telegram stream links in bulk.
   const stream = includeFileChoices
@@ -402,6 +406,26 @@ function playerCspOrigin(origin) {
   }
 }
 
+function addFrameSourcesToPolicy(policy, sources) {
+  if (!policy || !sources?.length) return policy;
+  const directives = String(policy).split(';').map((directive) => directive.trim()).filter(Boolean);
+  const frameIndex = directives.findIndex((directive) => /^frame-src(?:\s|$)/i.test(directive));
+  if (frameIndex < 0) {
+    directives.push(`frame-src ${[...new Set(sources)].join(' ')}`);
+    return directives.join('; ');
+  }
+  const parts = directives[frameIndex].split(/\s+/);
+  const seen = new Set(parts.slice(1));
+  for (const source of sources) {
+    if (!seen.has(source)) {
+      parts.push(source);
+      seen.add(source);
+    }
+  }
+  directives[frameIndex] = parts.join(' ');
+  return directives.join('; ');
+}
+
 export function createApp({ config, repository, distPath = defaultDistPath, subsPlease = null }) {
   const app = express();
   app.disable('x-powered-by');
@@ -421,9 +445,9 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
           scriptSrc: ["'self'", configuredPlayerOrigin].filter(Boolean),
           styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
           connectSrc: ["'self'"],
-          // /watch embeds only approved HTTPS player hosts. Koyeb serves the
-          // page; the video itself remains at the provider and never transits
-          // this process.
+          // /watch embeds approved stream hosts and publisher-configured player
+          // API origins. Koyeb serves the catalog only; video bytes never pass
+          // through this process.
           frameSrc: ["'self'", configuredPlayerOrigin, ...streamingFrameSources(config.streaming || {})].filter(Boolean),
           frameAncestors: null,
           upgradeInsecureRequests: config.environment === 'production' ? [] : null
@@ -431,6 +455,19 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
       }
     })
   );
+  // Telegram commands can add endpoints while this process is running. Extend
+  // Helmet's frame-src header per request so a newly configured API works
+  // immediately without redeploying or weakening the policy for other hosts.
+  app.use((_request, response, next) => {
+    const sources = playerApiFrameSources(config.playback?.playerApis);
+    if (sources.length) {
+      const policy = response.getHeader('Content-Security-Policy');
+      if (typeof policy === 'string') {
+        response.setHeader('Content-Security-Policy', addFrameSourcesToPolicy(policy, sources));
+      }
+    }
+    next();
+  });
   app.use(compression());
   app.use(express.json({ limit: '32kb' }));
   app.use(async (request, response, next) => {
@@ -878,6 +915,16 @@ export function createApp({ config, repository, distPath = defaultDistPath, subs
 export async function startServer() {
   const config = loadConfig();
   const repository = await createCatalogRepository(config);
+  config.playback ||= {};
+  try {
+    const playerSettings = typeof repository.getPlayerApiSettings === 'function'
+      ? await repository.getPlayerApiSettings()
+      : null;
+    config.playback.playerApis = normalizePlayerApiSettings(playerSettings?.apis);
+  } catch (error) {
+    config.playback.playerApis = {};
+    console.warn('[server] player API settings could not be loaded:', error?.message || 'Unknown error');
+  }
   if (typeof repository.reconcileCatalogMediaFromFiles === 'function') {
     await repository.reconcileCatalogMediaFromFiles({ dryRun: false }).catch((error) => {
       console.warn('[server] startup media reconciliation skipped:', error?.message || error);

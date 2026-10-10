@@ -1,6 +1,7 @@
 import { cleanText, resolveCategoryId } from '../lib/strings.js';
 import { detectMediaQuality, normalizeQualityLabel, qualityHeight } from './episode-service.js';
 import { bareChannelId } from './playback-service.js';
+import { buildTelegramPlayerApiUrl, normalizePlayerApiSettings } from './player-api-service.js';
 
 // This feature deliberately imports only a small publisher-supplied manifest.
 // It never downloads, buffers, transcodes, or relays video through Koyeb.
@@ -719,7 +720,8 @@ export function mergeStreamingEntries(existingStream, incomingEntries, { allowed
 }
 
 /** Return only safe, public player fields; database/post IDs never travel here. */
-export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_HOSTS } = {}) {
+export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_HOSTS, playerApis = {} } = {}) {
+  const normalizedPlayerApis = normalizePlayerApiSettings(playerApis);
   const entries = (Array.isArray(stream?.entries) ? stream.entries : [])
     .map((entry) => normalizedStoredEntry(entry, { allowedHosts }))
     .filter(Boolean)
@@ -738,7 +740,16 @@ export function publicStreamingData(stream, { allowedHosts = DEFAULT_STREAMING_H
       telegramUrl: entry.telegramUrl || null,
       watchId: entry.watchId || null,
       quality: entry.quality || null,
-      qualities: Array.isArray(entry.qualities) ? entry.qualities : []
+      qualities: Array.isArray(entry.qualities)
+        ? entry.qualities.map((option) => {
+          const playerApiUrl = buildTelegramPlayerApiUrl(
+            normalizedPlayerApis,
+            option.quality || option.label,
+            option.telegramUrl || option.watchUrl
+          );
+          return playerApiUrl ? { ...option, playerApiUrl } : option;
+        })
+        : []
     }));
   return {
     available: entries.length > 0,

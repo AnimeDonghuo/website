@@ -3,6 +3,7 @@ import { demoContent } from './demo-content.js';
 import { CATEGORY_IDS, categoryDetails, cleanText, makeReference, makeShareCode, slugify } from './lib/strings.js';
 import { cleanMediaName, detectMediaQuality, detectUploadLanguages, detectUploadSubtitleLanguages, fileReplacementKey, hasEpisodeRange, repairEpisodeGaps, seasonPackOf, stripTelegramAttribution, summarizeEpisodes, summarizeSubtitleLanguages, summarizeUploadLanguages } from './services/episode-service.js';
 import { mergeContentStreamWithTelegramFiles } from './services/streaming-service.js';
+import { normalizePlayerApiSettings } from './services/player-api-service.js';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const REQUEST_SELECTION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -1094,6 +1095,7 @@ export class MemoryCatalogRepository {
     this.backupSettings = { lastBackupMonth: null, lastBackupAt: null, inProgressMonth: null, claimExpiresAt: null, updatedAt: null };
     this.maintenanceSettings = { enabled: false, updatedAt: null, updatedBy: null };
     this.imgbbSettings = { keys: [], stats: {}, fallbackPosterUrl: null, updatedAt: null };
+    this.playerApiSettings = { apis: {}, updatedAt: null, updatedBy: null };
   }
 
   async init() {}
@@ -2144,6 +2146,20 @@ export class MemoryCatalogRepository {
     return this.imgbbSettings.fallbackPosterUrl;
   }
 
+  async getPlayerApiSettings() {
+    const settings = this.playerApiSettings || { apis: {}, updatedAt: null, updatedBy: null };
+    return { ...clone(settings), apis: normalizePlayerApiSettings(settings.apis) };
+  }
+
+  async setPlayerApiSettings(apis, updatedBy = null) {
+    this.playerApiSettings = {
+      apis: normalizePlayerApiSettings(apis),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    return this.getPlayerApiSettings();
+  }
+
   async exportBackupData() {
     return backupSnapshot({
       content: [...this.contents.values()].map(clone),
@@ -2156,7 +2172,8 @@ export class MemoryCatalogRepository {
       automation_settings: [
         { _id: 'auto-publish', ...clone(this.autoPublishSettings) },
         ...(this.maintenanceSettings?.enabled ? [{ _id: 'maintenance-mode', ...clone(this.maintenanceSettings) }] : []),
-        ...(this.imgbbSettings?.keys?.length || this.imgbbSettings?.fallbackPosterUrl ? [{ _id: 'imgbb-settings', ...clone(this.imgbbSettings) }] : [])
+        ...(this.imgbbSettings?.keys?.length || this.imgbbSettings?.fallbackPosterUrl ? [{ _id: 'imgbb-settings', ...clone(this.imgbbSettings) }] : []),
+        ...(Object.keys(this.playerApiSettings?.apis || {}).length ? [{ _id: 'player-api-settings', ...clone(this.playerApiSettings) }] : [])
       ],
       backup_settings: [{ _id: 'monthly-backup', ...clone(this.backupSettings) }]
     });
@@ -2190,6 +2207,16 @@ export class MemoryCatalogRepository {
     if (imgbbSettingsDoc) {
       const { _id: ignoredImgbbId, ...savedImgbb } = imgbbSettingsDoc;
       this.imgbbSettings = clone(savedImgbb);
+    }
+    const playerApiSettingsDoc = collections.automation_settings.find((item) => String(item._id) === 'player-api-settings');
+    if (playerApiSettingsDoc) {
+      const { _id: ignoredPlayerApiSettingsId, ...savedPlayerApiSettings } = playerApiSettingsDoc;
+      this.playerApiSettings = {
+        ...clone(savedPlayerApiSettings),
+        apis: normalizePlayerApiSettings(savedPlayerApiSettings.apis)
+      };
+    } else {
+      this.playerApiSettings = { apis: {}, updatedAt: null, updatedBy: null };
     }
     const backupSettings = collections.backup_settings.find((item) => String(item._id) === 'monthly-backup');
     const { _id: ignoredBackupSettingsId, ...savedBackupSettings } = backupSettings || {};
@@ -3455,6 +3482,28 @@ export class MongoCatalogRepository {
       fallbackPosterUrl: null,
       updatedAt: null
     };
+  }
+
+  async getPlayerApiSettings() {
+    const settings = await this.automationSettings.findOne({ _id: 'player-api-settings' });
+    return {
+      ...(settings || { updatedAt: null, updatedBy: null }),
+      apis: normalizePlayerApiSettings(settings?.apis)
+    };
+  }
+
+  async setPlayerApiSettings(apis, updatedBy = null) {
+    const settings = {
+      apis: normalizePlayerApiSettings(apis),
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy === null || updatedBy === undefined ? null : String(updatedBy)
+    };
+    await this.automationSettings.updateOne(
+      { _id: 'player-api-settings' },
+      { $set: settings },
+      { upsert: true }
+    );
+    return settings;
   }
 
   async getPosterApiKeys() {

@@ -28,6 +28,7 @@ import {
 import { inspectDeferredMediaTracks, isInspectableMediaFile } from './media-info-service.js';
 import { createAndSendBackup, downloadTelegramDocument, indiaMonthKey, readSignedBackupArchive } from './backup-service.js';
 import { extractStreamingUrl, inferStreamManifestFormat, oneClickDownloadHost, mergeContentStreamWithTelegramFiles, mergeStreamingEntries, parseStreamingManifest, publicStreamingData, removeStreamingEntries, safeStreamingLink, streamServerName } from './streaming-service.js';
+import { normalizePlayerApiBaseUrl, normalizePlayerApiQuality, normalizePlayerApiSettings } from './player-api-service.js';
 import { parseScrapeArguments, scrapeMetadataFromUrl } from './scraper-service.js';
 
 const PUBLISH_CATEGORIES = ['anime', 'cartoon', 'donghua', 'kdrama', 'movie', 'web-series', 'tv', 'adult'];
@@ -271,6 +272,7 @@ export const PUBLISHER_COMMANDS = [
   { command: 'stats', description: 'View publisher analytics' },
   { command: 'cmd', description: 'Add an episode player or import JSON/CSV links' },
   { command: 'players', description: 'List or remove attached players' },
+  { command: 'playerapi', description: 'Route qualities through player APIs' },
   { command: 'backup', description: 'Send a signed private data backup' },
   { command: 'recover', description: 'Restore a signed backup file' },
   { command: 'addchannel', description: 'Add an announcement channel' },
@@ -7513,6 +7515,11 @@ async function handleBackupRecoveryUpload(ctx, repository, config) {
       options: backupOptionsFromConfig(config)
     });
     const counts = await repository.restoreBackupData(backup.data);
+    if (typeof repository.getPlayerApiSettings === 'function' && config) {
+      const playerSettings = await repository.getPlayerApiSettings();
+      config.playback ||= {};
+      config.playback.playerApis = normalizePlayerApiSettings(playerSettings?.apis);
+    }
     await repository.deleteBackupRecovery?.(chatId(ctx), userId(ctx));
     await ctx.reply([
       '✅ Backup recovery completed.',
@@ -7701,6 +7708,120 @@ export async function handleRemoveImgApiCommand(ctx, repository, config) {
     }
   }
   await ctx.reply(`✓ Removed ImgBB API key: ${maskApiKey(targetKey)}. Remaining keys: ${posterKeyPoolStatus().configured}`);
+}
+
+export function parsePlayerApiCommand(value) {
+  const argument = String(value || '').trim();
+  if (!argument) return { action: 'list' };
+
+  const [first, ...rest] = argument.split(/\s+/);
+  const command = first.toLowerCase();
+  if (['remove', 'delete', 'del', 'unset'].includes(command)) {
+    const quality = normalizePlayerApiQuality(rest[0]);
+    return quality ? { action: 'remove', quality } : { error: 'Choose a quality to remove, for example /playerapi remove 1080p.' };
+  }
+
+  const quality = normalizePlayerApiQuality(first);
+  if (!quality) {
+    return { error: 'Use a resolution such as 480p, 720p, 1080p, or 4k. Run /playerapi to see current settings.' };
+  }
+  if (!rest.length) return { action: 'show', quality };
+  if (rest.length === 1 && /^(?:off|remove|unset|delete)$/i.test(rest[0])) {
+    return { action: 'remove', quality };
+  }
+
+  const url = normalizePlayerApiBaseUrl(rest.join(' '));
+  if (!url) {
+    return { error: 'That player API URL is invalid. Use a full HTTP(S) base URL without a query or fragment, such as /playerapi 720p https://player.example/.' };
+  }
+  return { action: 'set', quality, url };
+}
+
+function playerApiSettingsText(apis = {}) {
+  const entries = Object.entries(normalizePlayerApiSettings(apis)).sort(([first], [second]) => {
+    const firstHeight = Number(first.match(/^\d{3,4}P$/)?.[0]?.replace(/P$/, '')) || 0;
+    const secondHeight = Number(second.match(/^\d{3,4}P$/)?.[0]?.replace(/P$/, '')) || 0;
+    return firstHeight - secondHeight || first.localeCompare(second);
+  });
+  if (!entries.length) {
+    return [
+      'No quality-specific player APIs are configured.',
+      'All qualities will keep using the existing Koyeb player.',
+      '',
+      'Set one: /playerapi 720p https://player.example/',
+      'Remove one: /playerapi remove 720p'
+    ].join('\n');
+  }
+  return [
+    'Quality player APIs:',
+    ...entries.map(([quality, url]) => `• ${quality}: ${url}`),
+    '',
+    'Qualities without an override continue using the existing Koyeb player.',
+    'Set or replace: /playerapi 720p https://player.example/',
+    'Remove: /playerapi remove 720p'
+  ].join('\n');
+}
+
+export async function handlePlayerApiCommand(ctx, repository, config) {
+  if (!(await requirePublisher(ctx, repository, config))) return;
+  const parsed = parsePlayerApiCommand(parseCommandArgument(ctx.message?.text, 1_000));
+  if (parsed.error) {
+    await ctx.reply(`${parsed.error}\n\nUsage: /playerapi <quality> <base URL> — for example /playerapi 720p https://player.example/`);
+    return;
+  }
+
+  const savedSettings = typeof repository?.getPlayerApiSettings === 'function'
+    ? await repository.getPlayerApiSettings()
+    : { apis: config?.playback?.playerApis || {} };
+  const apis = normalizePlayerApiSettings(savedSettings?.apis || config?.playback?.playerApis);
+  if (parsed.action === 'list') {
+    await ctx.reply(playerApiSettingsText(apis));
+    return;
+  }
+  if (parsed.action === 'show') {
+    const current = apis[parsed.quality];
+    await ctx.reply(current
+      ? `${parsed.quality} uses ${current}. Change it with /playerapi ${parsed.quality} <base URL>, or remove it with /playerapi remove ${parsed.quality}.`
+      : `${parsed.quality} has no custom API and will continue using the existing Koyeb player. Set one with /playerapi ${parsed.quality} <base URL>.`);
+    return;
+  }
+
+  if (parsed.action === 'remove') {
+    if (!apis[parsed.quality]) {
+      await ctx.reply(`${parsed.quality} has no custom player API. It will keep using the existing Koyeb player.`);
+      return;
+    }
+    delete apis[parsed.quality];
+    const updated = typeof repository?.setPlayerApiSettings === 'function'
+      ? await repository.setPlayerApiSettings(apis, userId(ctx))
+      : { apis };
+    const effective = normalizePlayerApiSettings(updated?.apis || apis);
+    if (config) {
+      config.playback ||= {};
+      config.playback.playerApis = effective;
+    }
+    await ctx.reply(`Removed the ${parsed.quality} player API. ${parsed.quality} and all other unmapped qualities now use the existing Koyeb player.`);
+    return;
+  }
+
+  const unchanged = apis[parsed.quality] === parsed.url;
+  apis[parsed.quality] = parsed.url;
+  const updated = typeof repository?.setPlayerApiSettings === 'function'
+    ? await repository.setPlayerApiSettings(apis, userId(ctx))
+    : { apis };
+  const effective = normalizePlayerApiSettings(updated?.apis || apis);
+  if (config) {
+    config.playback ||= {};
+    config.playback.playerApis = effective;
+  }
+  const insecureWarning = parsed.url.startsWith('http://')
+    ? '\n\n⚠️ This is HTTP. If your catalog is opened over HTTPS, browsers may block the player frame; an HTTPS player endpoint is recommended.'
+    : '';
+  await ctx.reply(`${unchanged ? 'Already set' : 'Saved'}: ${parsed.quality} → ${effective[parsed.quality] || parsed.url}.${
+    typeof repository?.setPlayerApiSettings === 'function'
+      ? ' This setting is stored in the database and applies to matching qualities on the Watch page without a redeploy.'
+      : ' This process has no persistent settings store, so the mapping lasts until restart.'
+  }${insecureWarning}`);
 }
 
 export async function handleMaintenanceCommand(ctx, repository, config) {
@@ -8888,7 +9009,7 @@ export const HELP_TOPICS = {
   players: {
     id: 'players',
     button: '▶️ Watch Players & Quality',
-    title: '▶️ Watch Page Quality Selector & External Players (/cmd, /players)',
+    title: '▶️ Watch Page Quality Selector & External Players (/cmd, /players, /playerapi)',
     text: [
       '▶️ WATCH PLAYERS, QUALITY SWITCHING & MAGNETS',
       'What this is for: Streaming episodes/movies on the website Watch page with multi-quality switching, manual subtitles, and optional external embed links.',
@@ -8898,6 +9019,7 @@ export const HELP_TOPICS = {
       '• /cmd [SB-ID] — Starts JSON/CSV manifest upload or multi-line paste to attach many player links at once.',
       '• /cmd SB-ID del ep <A-B> (or del <index>) — Removes attached external players for an episode range or index.',
       '• /players SB-ID — Lists all players attached to a post with interactive Remove buttons and pagination.',
+      '• /playerapi 720p <base URL> — Routes matching Telegram quality links through that player API; /playerapi lists mappings and /playerapi remove 720p clears one. Unmapped qualities keep using Koyeb.',
       '• /searchm <SB-ID> [Optional Title] — Searches SubsPlease magnets for an anime post.',
       '',
       'How Watch Page Quality & Controls work automatically:',
@@ -9042,7 +9164,7 @@ function resolveHelpTopicFromQuery(rawQuery = '') {
   if (/^(?:title|titlebatch|lang|lan|lam|subtitles|subs|year|genres|description|release|category|edit)$/.test(q)) return HELP_TOPICS.edit;
   if (/^(?:scrape|poster|p|imgdd|imgapis|addimgapi|removeimgapi|artwork)$/.test(q)) return HELP_TOPICS.scrape;
   if (/^(?:removefile|rmfile|delfile|deletefile|files|cateloguefix|cataloguefix|catalogfix|catfix|merge|delete|remove)$/.test(q)) return HELP_TOPICS.files;
-  if (/^(?:cmd|players|player|watch|quality|searchm|magnet)$/.test(q)) return HELP_TOPICS.players;
+  if (/^(?:cmd|players|player|playerapi|watch|quality|searchm|magnet)$/.test(q)) return HELP_TOPICS.players;
   if (/^(?:sync|repair|addchannel|channels|removechannel|channel)$/.test(q)) return HELP_TOPICS.sync;
   if (/^(?:search|posts|postid|requests|stats|backup|recover|maintanence|maintenance|restart|login|logout|admin)$/.test(q)) return HELP_TOPICS.admin;
   if (/^(?:all|commands|list)$/.test(q)) return HELP_TOPICS.all;
@@ -10550,6 +10672,7 @@ export async function launchTelegramBot({ config, repository, subsPlease = null,
 
   bot.command('imgapis', async (ctx) => handleImgApisCommand(ctx, repository, config));
   bot.command('addimgapi', async (ctx) => handleAddImgApiCommand(ctx, repository, config));
+  bot.command('playerapi', async (ctx) => handlePlayerApiCommand(ctx, repository, config));
   for (const cmd of ['removeimgapi', 'delimgapi']) {
     bot.command(cmd, async (ctx) => handleRemoveImgApiCommand(ctx, repository, config));
   }

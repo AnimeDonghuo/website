@@ -196,6 +196,8 @@ export function loadConfig(env = process.env) {
     },
     playback: {
       playerOrigin: normalizePlayerOrigin(env.WATCH_PLAYER_ORIGIN),
+      // Filled from the persisted `/playerapi` Telegram command settings during startup.
+      playerApis: {},
       issuerKey: (env.PLAYBACK_ISSUER_KEY || '').trim(),
       sessionSecret: (env.PLAYBACK_SESSION_SECRET || env.ADMIN_LOGIN_CODE || env.BACKUP_SIGNING_SECRET || 'sorabox-playback-session-secret').trim(),
       allowedChannelIds: resolvePlaybackChannels(env),

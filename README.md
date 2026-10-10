@@ -355,6 +355,7 @@ Useful commands:
 | `/sync` — then `/sync go` | Show which announcement-channel posts no longer match their card (an old `@channel` handle, a stale file or episode count, replaced artwork) and refresh them one edit at a time; `/sync SB-0123ABCDEF` does one now, `/sync force` re-reads every card instead of answering from the sweep just done, and what Telegram refused stays listed instead of lost |
 | `/sync db` — then `/sync db go` | The database channel on its own: read the caption of every copied file post and rewrite the ones still carrying a `@channel` prefix, a page at a time until the archive is done. `/sync db status` asks how far it got |
 | `/players SB-0123ABCDEF` — or `176`, `ep 170-180`, `missing`, `#12`, `3` | List the card's players with their server name, provider URL, and a working Remove button: the whole list paged, one episode, a range of episodes, or only the episodes that still have no player |
+| `/playerapi 720p https://player.example/` | Route only matching uploaded qualities through that player API; `/playerapi` lists mappings and `/playerapi remove 720p` removes one. Unmapped qualities keep using the existing Koyeb player |
 | `/cmd SB-0123ABCDEF` | Arm a 15-minute private JSON/CSV import for that post; send a provider export with `Embed Link`/`Embed Code` or `embedUrl` columns, or paste player links straight into the chat |
 | `/cmd` | Arm a JSON/CSV import that resolves each row by its `postId`/`adminId` or exact `Title`; use `/cmd cancel` to stop it |
 | `/backup` | Create a signed compressed application-data snapshot and send it only to the private storage channel |
@@ -607,6 +608,20 @@ The reply reports how many files and episodes are left, warns when the card beca
 On the website, a card that spans seasons gets one heading per block, and an episode page keeps its season in the link (`/donghua/bleach/episode/1?s=2`) so Season 2's Episode 01 opens its own files rather than Season 1's. Cards with a single season are untouched, and the episode card design never changed: only the block heading and the season name inside the label were added.
 
 Bare `/players` opens a short list of recent post IDs to choose from, and `/players SB-…` lists that card's players with **Remove** buttons — `176`, `ep 170-180`, `missing`, `#12`, or a page number narrow the same list when a card carries hundreds of episodes.
+
+### Route each Telegram quality through its own player API
+
+After a post has been published, configure an API prefix for any resolution from the private publisher chat:
+
+```text
+/playerapi 720p http://node2-it.botkeep.cloud:30172/
+/playerapi 1080p https://another-player.example/
+/playerapi
+```
+
+When the Watch page selects a matching file, it builds the API link by appending that file's private Telegram post URL as a path, for example `http://node2-it.botkeep.cloud:30172/https://t.me/c/2617067511/25962`. No video is uploaded or proxied through Koyeb. Each quality has its own mapping; an unmapped quality (for example, 1080p before you configure it) continues to use the existing Koyeb player. Use `/playerapi remove 720p` to clear an override. The mappings are stored in the application database, apply without a redeploy, and survive restarts/backups.
+
+If the catalog is served over HTTPS, use an **HTTPS** player API endpoint whenever possible: browsers can block an HTTP player iframe as mixed content even though the bot accepts and stores the URL.
 
 ### Manage requests, post IDs, and publisher analytics
 

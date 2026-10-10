@@ -365,6 +365,24 @@ export function getProtectedPlaybackTarget(entry, { selectedQuality = null } = {
   const activeQuality = resolveActiveQualityOption(entry, selectedQuality);
   const source = activeQuality || entry;
 
+  // A quality-specific API URL is generated from the configured endpoint and
+  // Telegram post link on the server. It intentionally bypasses the default
+  // Koyeb wrapper only for this quality; missing mappings keep using Koyeb.
+  if (activeQuality?.playerApiUrl) {
+    try {
+      const playerApiUrl = new URL(activeQuality.playerApiUrl);
+      if (['http:', 'https:'].includes(playerApiUrl.protocol) && !playerApiUrl.username && !playerApiUrl.password) {
+        return {
+          type: 'player-api',
+          url: playerApiUrl.toString(),
+          ...(activeQuality.quality ? { quality: activeQuality.quality } : {})
+        };
+      }
+    } catch {
+      // Invalid API URLs fall through to the existing protected Koyeb player.
+    }
+  }
+
   // 1. Direct telegramUrl property
   if (source.telegramUrl && typeof source.telegramUrl === 'string') {
     const match = source.telegramUrl.match(/(?:t(?:elegram)?\.me\/c\/|tg:\/\/privatepost\?channel=)([1-9]\d{0,15})(?:\/|&post=)([1-9]\d{0,9})/i);
@@ -437,6 +455,15 @@ export function getPlayerIframeUrl(target, {
   origin = 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app'
 } = {}) {
   if (!target) return null;
+  if (target.type === 'player-api') {
+    try {
+      const playerApiUrl = new URL(target.url);
+      if (!['http:', 'https:'].includes(playerApiUrl.protocol) || playerApiUrl.username || playerApiUrl.password) return null;
+      return playerApiUrl.toString();
+    } catch {
+      return null;
+    }
+  }
   const base = String(origin || 'https://v0qcx8-s9dg2f-grassfirepooltheee-2b27b1d3.koyeb.app').replace(/\/+$/, '');
   const url = new URL(target.type === 'id' ? `/watch/${encodeURIComponent(target.id)}` : '/watch', base);
   if (target.type === 'url') {
